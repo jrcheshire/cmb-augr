@@ -9,6 +9,7 @@ dependencies:
       - jax
       - numpy
       - scipy
+      - matplotlib
       - pytest
       - camb  # only needed to regenerate data/ templates via generate_camb_templates.py
       - jupyterlab
