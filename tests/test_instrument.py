@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from cmb_forecast.instrument import (
+from augr.instrument import (
     ScalarEfficiency,
     Channel,
     Instrument,

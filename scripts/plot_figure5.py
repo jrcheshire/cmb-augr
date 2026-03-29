@@ -16,12 +16,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from cmb_forecast.instrument import Channel, Instrument, ScalarEfficiency
-from cmb_forecast.foregrounds import GaussianForegroundModel
-from cmb_forecast.spectra import CMBSpectra
-from cmb_forecast.signal import SignalModel
-from cmb_forecast.fisher import FisherForecast
-from cmb_forecast.config import FIDUCIAL_BK15
+from augr.instrument import Channel, Instrument, ScalarEfficiency
+from augr.foregrounds import GaussianForegroundModel
+from augr.spectra import CMBSpectra
+from augr.signal import SignalModel
+from augr.fisher import FisherForecast
+from augr.config import FIDUCIAL_BK15
 
 # ---------------------------------------------------------------------------
 # Survey parameters

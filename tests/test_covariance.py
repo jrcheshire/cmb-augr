@@ -4,11 +4,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from cmb_forecast.covariance import bandpower_covariance, _nu_b, _build_M
-from cmb_forecast.signal import SignalModel, flatten_params
-from cmb_forecast.instrument import Channel, Instrument, ScalarEfficiency
-from cmb_forecast.foregrounds import GaussianForegroundModel
-from cmb_forecast.spectra import CMBSpectra
+from augr.covariance import bandpower_covariance, _nu_b, _build_M
+from augr.signal import SignalModel, flatten_params
+from augr.instrument import Channel, Instrument, ScalarEfficiency
+from augr.foregrounds import GaussianForegroundModel
+from augr.spectra import CMBSpectra
 
 
 # -----------------------------------------------------------------------
@@ -134,7 +134,7 @@ def test_auto_spectrum_variance(signal_model, two_chan_instrument):
     cov = bandpower_covariance(signal_model, two_chan_instrument, params)
     M = _build_M(signal_model, two_chan_instrument, params)
 
-    from cmb_forecast.covariance import _nu_b
+    from augr.covariance import _nu_b
     nu = _nu_b(signal_model._bin_edges, two_chan_instrument.f_sky)
 
     n_bins = signal_model.n_bins

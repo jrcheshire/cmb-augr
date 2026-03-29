@@ -16,15 +16,15 @@ Channels ≥462 GHz are dropped (pure dust monitors, cond. number ~10^33).
 
 import numpy as np
 
-from cmb_forecast.instrument import (
+from augr.instrument import (
     Channel, Instrument, ScalarEfficiency,
     white_noise_power, ARCMIN_TO_RAD, SECONDS_PER_YEAR,
 )
-from cmb_forecast.foregrounds import GaussianForegroundModel
-from cmb_forecast.spectra import CMBSpectra
-from cmb_forecast.signal import SignalModel
-from cmb_forecast.fisher import FisherForecast
-from cmb_forecast.config import FIDUCIAL_BK15
+from augr.foregrounds import GaussianForegroundModel
+from augr.spectra import CMBSpectra
+from augr.signal import SignalModel
+from augr.fisher import FisherForecast
+from augr.config import FIDUCIAL_BK15
 
 # -----------------------------------------------------------------------
 # PICO Table 3.2 baseline polarization map depths (μK-arcmin) and beams.

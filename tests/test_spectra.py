@@ -3,7 +3,7 @@
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from cmb_forecast.spectra import CMBSpectra
+from augr.spectra import CMBSpectra
 
 
 @pytest.fixture(scope="module")

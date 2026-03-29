@@ -4,11 +4,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from cmb_forecast.fisher import FisherForecast
-from cmb_forecast.signal import SignalModel, flatten_params
-from cmb_forecast.instrument import Channel, Instrument, ScalarEfficiency
-from cmb_forecast.foregrounds import GaussianForegroundModel
-from cmb_forecast.spectra import CMBSpectra
+from augr.fisher import FisherForecast
+from augr.signal import SignalModel, flatten_params
+from augr.instrument import Channel, Instrument, ScalarEfficiency
+from augr.foregrounds import GaussianForegroundModel
+from augr.spectra import CMBSpectra
 
 
 # -----------------------------------------------------------------------

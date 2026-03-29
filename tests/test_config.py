@@ -1,7 +1,7 @@
 """Tests for config.py."""
 
 import pytest
-from cmb_forecast.config import (
+from augr.config import (
     FIDUCIAL_BK15,
     DEFAULT_PRIORS,
     DEFAULT_FIXED,
@@ -9,7 +9,7 @@ from cmb_forecast.config import (
     pico_like,
     litebird_like,
 )
-from cmb_forecast.foregrounds import GaussianForegroundModel
+from augr.foregrounds import GaussianForegroundModel
 
 
 def test_fiducial_has_all_params():

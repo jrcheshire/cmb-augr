@@ -1,4 +1,4 @@
-ENV_NAME := cmb-forecast
+ENV_NAME := augr
 
 .PHONY: install test explore clean help
 

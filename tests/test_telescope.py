@@ -1,10 +1,10 @@
-"""Tests for cmb_forecast.telescope — physical telescope model."""
+"""Tests for augr.telescope — physical telescope model."""
 
 import math
 
 import pytest
 
-from cmb_forecast.telescope import (
+from augr.telescope import (
     BandSpec,
     FocalPlaneSpec,
     PixelGroup,

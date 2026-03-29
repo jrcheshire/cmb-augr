@@ -1,4 +1,4 @@
-name: cmb-forecast
+name: augr
 channels:
   - conda-forge
   - defaults

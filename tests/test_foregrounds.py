@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from cmb_forecast.foregrounds import (
+from augr.foregrounds import (
     GaussianForegroundModel,
     MomentExpansionModel,
     ForegroundModel,
@@ -12,7 +12,7 @@ from cmb_forecast.foregrounds import (
     _dust_moment_factor,
     _sync_moment_factor,
 )
-from cmb_forecast.units import NU_DUST_REF_GHZ, NU_SYNC_REF_GHZ
+from augr.units import NU_DUST_REF_GHZ, NU_SYNC_REF_GHZ
 
 
 @pytest.fixture

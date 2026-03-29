@@ -5,16 +5,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from cmb_forecast.signal import (
+from augr.signal import (
     SignalModel,
     flatten_params,
     unflatten_params,
     _make_bin_edges,
     _build_bin_matrix,
 )
-from cmb_forecast.instrument import Channel, Instrument, ScalarEfficiency
-from cmb_forecast.foregrounds import GaussianForegroundModel
-from cmb_forecast.spectra import CMBSpectra
+from augr.instrument import Channel, Instrument, ScalarEfficiency
+from augr.foregrounds import GaussianForegroundModel
+from augr.spectra import CMBSpectra
 
 
 # -----------------------------------------------------------------------

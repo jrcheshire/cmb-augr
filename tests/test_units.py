@@ -2,7 +2,7 @@
 
 import jax.numpy as jnp
 import pytest
-from cmb_forecast.units import (
+from augr.units import (
     x_factor, rj_to_cmb, cmb_to_rj, dust_sed, sync_sed,
     sync_sed_curved, dust_sed_deriv_beta, dust_sed_deriv_T,
     sync_sed_deriv_beta, sync_sed_deriv_c,
