@@ -118,6 +118,67 @@ The `telescope.py` module derives a complete `Instrument` from physical specific
 
 **Moment expansion (Chluba+ 2017):** Extends the Gaussian model with second-order terms capturing spatial variation of spectral parameters (variance of beta_d, T_d, beta_s, c_s, and their cross-moments). 17 free parameters. Reduces exactly to the Gaussian model when all moment amplitudes are zero.
 
+## Key findings so far
+
+Results from systematic exploration of the probe/flagship design space:
+
+- **Band count matters more than aperture for foregrounds.** Under the moment expansion, sigma(r) improves steadily out to 15+ bands. With only 6 bands, the moment model gives 3-5x worse sigma(r) than the Gaussian model. By ~15 bands, the penalty drops to ~2x.
+- **Feedhorn coupling limits band count.** At 2Flambda pitch, 30 GHz horns are 40mm diameter. A 0.4m focal plane with 12 bands and equal allocation gives only 24 detectors at 30 GHz. Past ~15 bands on a probe FP, low-freq channels are starved of detectors.
+- **Area allocation and band layout are coupled.** With only 3 bands above 200 GHz, the moment expansion's 8 dust parameters are underdetermined, so adding more *detectors* in that regime doesn't help. You need more *bands* in the dust regime, not more *area*. Optimizing one while the other is fixed can mislead.
+- **PICO's advantage is technology, not design.** PICO's sinuous antennas at Flambda pitch give 4x the pixel density of feedhorns. Their ~70% optical efficiency vs our 35% conservative assumption compounds this. A feedhorn-based probe with PICO-level optimism (f/1.42, eta=0.50, 95% obs efficiency) gets within ~2x of PICO's sigma(r).
+- **Delensing is critical but has diminishing returns for foregrounds.** Going from no delensing to 73% helps sigma(r) by 2-3x. Going from 73% to 95% helps another 2-3x for the Gaussian model, but only ~2x for the moment model, because the foreground floor dominates.
+- **Frequency range below 30 GHz barely helps.** Synchrotron is subdominant to dust for B-mode foregrounds. Extending above 400 GHz helps the moment model slightly but runs into dust SED degeneracies.
+
+## Future work
+
+### Self-consistent delensing
+
+Currently A_lens is a fixed external parameter controlling the residual lensing B-mode amplitude. A more complete treatment would:
+
+1. Derive the lensing reconstruction noise N_L^{dd} from the instrument's high-ell temperature and polarization sensitivity (iterative EB estimator)
+2. Compute the delensed BB residual power spectrum as a function of N_L^{dd}
+3. Replace the fixed A_lens with a self-consistently derived delensing level
+
+This would properly capture the value of larger apertures: better high-ell resolution enables better lensing reconstruction, which lowers A_lens, which improves sigma(r). Currently our scans show aperture has little effect because the foreground information content doesn't depend on beam size, but the delensing benefit is real and unaccounted for.
+
+References: Carron et al. (2017) for iterative EB delensing; PICO Sec. 2.3.2; Bianchini et al. (2025) Sec. 5; S4 Science Book Sec. 8.10.
+
+### Differentiable instrument optimization
+
+The Fisher pipeline is built on JAX, so sigma(r) is in principle differentiable with respect to continuous instrument parameters. By relaxing discrete quantities (e.g. dropping `floor()` in detector counting), one could compute exact gradients d(sigma(r))/d(theta) for:
+
+- Focal plane area fractions per dichroic pair (replace the coarse 3-group simplex scan with gradient descent over 6+ area fractions)
+- Optical efficiency, mission duration, f_sky (sensitivity trade studies)
+- Per-channel depths (for matching achieved/measured performance rather than photon noise)
+
+Requires rewriting `photon_noise_net()` in JAX (currently numpy), relaxing `count_pixels()` to continuous, and composing the full chain: design params -> instrument -> Fisher -> sigma(r). Not needed for the current exploration scans (discrete band layouts), but powerful for fine-tuning a specific design once the broad parameter space is understood.
+
+### Scale-dependent foreground complexity
+
+The moment expansion currently assumes frequency decorrelation is scale-independent. In reality, foreground SED variation has a characteristic angular scale: at small scales (high ell), each pixel's SED is more uniform, so decorrelation is weaker. A scale-dependent variant would:
+
+1. Make the moment amplitude parameters (omega_d_beta, etc.) functions of ell
+2. Model as e.g. omega(ell) = omega_0 * (ell / ell_pivot)^gamma with a tilt parameter
+3. Propagate through the Jacobian (straightforward since JAX handles the extra parameters)
+
+This would couple the foreground and ell-range questions: scale-dependent decorrelation would make high-ell data more valuable for foregrounds, since cross-frequency coherence is better preserved there. Lower priority than self-consistent delensing, but relevant for understanding the true foreground floor.
+
+### Achieved-performance noise mode
+
+Currently all noise is computed from first principles (photon NEP). An alternative mode that rescales from measured/achieved detector performance would be useful for:
+
+- Validating against published experiment sensitivities
+- Forecasting for partially-built experiments where detector yield and noise are measured
+- Comparing "what the physics says" against "what we actually get" to understand systematic noise penalties
+
+### Assumption tracking and reproducibility
+
+Fisher forecasts are notoriously sensitive to unstated assumptions (efficiency factors, fiducial values, which parameters are fixed, ell range, bin width). Every published sigma(r) number should carry a complete provenance record. The `FisherForecast.summary()` method dumps all assumptions for a given forecast. Future work: structured machine-readable output (JSON/YAML) for automated comparison across studies.
+
+### Joint probe + ground analysis
+
+A space probe doesn't operate in isolation. Combining with ground-based data (SO, CMB-S4) would change optimal band allocation: the ground experiments provide deep CMB-band data, so the space mission could focus more on frequency leverage (low and high freq). This requires modeling the joint covariance across experiments with different sky coverage and ell ranges.
+
 ## References
 
 - Buza 2019, PhD thesis (Harvard) -- Fisher formalism, BICEP/Keck forecasting
