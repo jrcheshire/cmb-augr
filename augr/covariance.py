@@ -113,10 +113,46 @@ def bandpower_covariance(signal_model: SignalModel,
     cov_blocks = (M_ik * M_jl + M_il * M_jk) / nu[None, None, :]
 
     # Assemble block-diagonal full covariance (n_data, n_data)
-    # cov_4d[s1, b1, s2, b2] = cov_blocks[s1, s2, b1] * δ(b1, b2)
+    # cov_4d[s1, b1, s2, b2] = cov_blocks[s1, s2, b1] * delta(b1, b2)
     eye_b = jnp.eye(n_bins)                                 # (n_bins, n_bins)
     cov_4d = cov_blocks[:, :, :, None] * eye_b[None, None, :, :]
     # cov_4d has shape (n_spec, n_spec, n_bins, n_bins)
     # Reorder to (n_spec, n_bins, n_spec, n_bins) then flatten to (n_data, n_data)
     cov_4d = cov_4d.transpose(0, 2, 1, 3)
     return cov_4d.reshape(n_spec * n_bins, n_spec * n_bins)
+
+
+def bandpower_covariance_blocks(signal_model: SignalModel,
+                                instrument: Instrument,
+                                fiducial_params: jnp.ndarray,
+                                ) -> jnp.ndarray:
+    """Compute per-bin Knox covariance blocks.
+
+    Returns shape (n_bins, n_spec, n_spec) — one small covariance matrix
+    per ell-bin.  Each block is well-conditioned (typ. condition number
+    ~10^4-10^6) even when the full assembled matrix would have condition
+    numbers > 10^20.
+
+    This is the preferred interface for the Fisher computation, which
+    can Cholesky-solve each block independently.
+    """
+    n_bins = signal_model.n_bins
+    pairs  = signal_model.freq_pairs
+    n_spec = len(pairs)
+
+    M  = _build_M(signal_model, instrument, fiducial_params)
+    nu = _nu_b(signal_model._bin_edges, instrument.f_sky)
+
+    i_arr = jnp.array([p[0] for p in pairs])
+    j_arr = jnp.array([p[1] for p in pairs])
+
+    M_ik = M[i_arr[:, None], i_arr[None, :], :]
+    M_jl = M[j_arr[:, None], j_arr[None, :], :]
+    M_il = M[i_arr[:, None], j_arr[None, :], :]
+    M_jk = M[j_arr[:, None], i_arr[None, :], :]
+
+    # (n_spec, n_spec, n_bins)
+    cov_blocks = (M_ik * M_jl + M_il * M_jk) / nu[None, None, :]
+
+    # Transpose to (n_bins, n_spec, n_spec)
+    return cov_blocks.transpose(2, 0, 1)
