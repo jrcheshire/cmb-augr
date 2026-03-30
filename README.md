@@ -34,7 +34,7 @@ from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
 from augr.config import FIDUCIAL_MOMENT, DEFAULT_PRIORS_MOMENT, DEFAULT_FIXED_MOMENT
 
-# Build instrument from physical telescope specs
+# Build instrument from mission+physical telescope specs
 inst = to_instrument(probe_design())
 
 # Set up the signal model
