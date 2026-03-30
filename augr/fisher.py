@@ -23,14 +23,12 @@ Conditional constraint:   σ_α^{cond} = 1/√(F_{αα})
 
 from __future__ import annotations
 
-import math
-
 import jax
 import jax.numpy as jnp
 
 from augr.signal import SignalModel, flatten_params
 from augr.covariance import bandpower_covariance_blocks
-from augr.instrument import Instrument, white_noise_power, ARCMIN_TO_RAD
+from augr.instrument import Instrument
 
 
 @jax.jit
@@ -213,96 +211,3 @@ class FisherForecast:
             "rho": rho,
             "angle_deg": float(jnp.degrees(angle)),
         }
-
-    # ------------------------------------------------------------------
-    # Summary
-    # ------------------------------------------------------------------
-
-    def summary(self, name: str = "") -> str:
-        """Human-readable summary of all assumptions and results.
-
-        Includes instrument channels, efficiency factors, foreground model,
-        fiducial parameters, priors, fixed parameters, ℓ-binning,
-        and (if computed) sigma(r).
-        """
-        lines: list[str] = []
-        sep = "-" * 70
-
-        if name:
-            lines.append(f"{'=' * 70}")
-            lines.append(f"  {name}")
-            lines.append(f"{'=' * 70}")
-        else:
-            lines.append(sep)
-
-        inst = self._instrument
-        sig = self._signal
-
-        # Foreground model
-        fg_name = type(sig._fg_model).__name__
-        lines.append(f"Foreground model:  {fg_name}")
-        lines.append(f"Mission:           {inst.mission_duration_years:.1f} yr, "
-                      f"f_sky = {inst.f_sky:.2f}")
-
-        # Efficiency factors (from first channel — assumed same for all)
-        eff = inst.channels[0].efficiency
-        lines.append(f"Efficiency:        yield={eff.detector_yield:.2f}, "
-                      f"obs_eff={eff.observing_efficiency:.2f}, "
-                      f"data_cuts={eff.data_cut_fraction:.2f}, "
-                      f"CR_dead={eff.cosmic_ray_deadtime:.2f}, "
-                      f"pol_eff={eff.polarization_efficiency:.2f} "
-                      f"(total={eff.total:.3f})")
-
-        # ell-binning
-        lines.append(f"ell range:         {sig.ells[0]:.0f} - {sig.ells[-1]:.0f}")
-        lines.append(f"Bandpower bins:    {sig.n_bins}")
-        lines.append(f"Cross-spectra:     {len(sig.freq_pairs)} "
-                      f"({len(inst.channels)} channels)")
-
-        # Channel table
-        lines.append("")
-        lines.append("  Band     N_det    NET_det    FWHM    Map depth   "
-                      "knee_ell  alpha")
-        lines.append("  [GHz]             [uK√s]    [']     [uK-']      "
-                      "                ")
-        for ch in inst.channels:
-            w_inv = white_noise_power(ch, inst.mission_duration_years,
-                                       inst.f_sky)
-            depth = math.sqrt(float(w_inv)) / float(ARCMIN_TO_RAD)
-            lines.append(
-                f"  {ch.nu_ghz:6.1f}  {ch.n_detectors:6d}  "
-                f"{ch.net_per_detector:8.1f}  {ch.beam_fwhm_arcmin:6.1f}  "
-                f"{depth:9.2f}   {ch.knee_ell:6.1f}  {ch.alpha_knee:.1f}")
-        n_det_total = sum(ch.n_detectors for ch in inst.channels)
-        lines.append(f"  {'Total':>6s}  {n_det_total:6d}")
-
-        # Fiducial parameters
-        lines.append("")
-        lines.append("Fiducial parameters:")
-        for name_p in self._all_names:
-            val = self._fiducial[name_p]
-            status = ""
-            if name_p in self._fixed:
-                status = "  [FIXED]"
-            elif name_p in self._priors:
-                status = f"  [prior σ={self._priors[name_p]:.4g}]"
-            else:
-                status = "  [free, no prior]"
-            lines.append(f"  {name_p:20s} = {val:12.4g}{status}")
-
-        # Results
-        if self._fisher_matrix is not None:
-            lines.append("")
-            lines.append("Results:")
-            lines.append(f"  Free parameters:  {self.n_free}")
-            for p in self._free_names:
-                try:
-                    s = self.sigma(p)
-                    sc = self.sigma_conditional(p)
-                    lines.append(f"  σ({p:15s}) = {s:.4e}  "
-                                  f"(conditional: {sc:.4e})")
-                except Exception:
-                    lines.append(f"  σ({p:15s}) = [error]")
-
-        lines.append(sep)
-        return "\n".join(lines)

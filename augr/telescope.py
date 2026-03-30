@@ -497,33 +497,20 @@ def probe_idealized() -> TelescopeDesign:
 
     1.5 m aperture, f/1.42 (PICO's focal ratio), PICO-sized focal plane.
     eta_optical = 0.50 (optimistic feedhorn), 95% observing efficiency.
-    12 bands in 6 dichroic pairs spanning 30-400 GHz.
-    Weighted area allocation: 15% low-freq, 50% CMB, 35% high-freq.
+    Same band layout as probe_design() for direct comparison.
     """
     pixel_groups = (
         PixelGroup(
             bands=(BandSpec(30.0), BandSpec(40.0)),
-            area_fraction=0.075,
+            area_fraction=1.0 / 3.0,
         ),
         PixelGroup(
-            bands=(BandSpec(55.0), BandSpec(75.0)),
-            area_fraction=0.075,
+            bands=(BandSpec(85.0), BandSpec(150.0)),
+            area_fraction=1.0 / 3.0,
         ),
         PixelGroup(
-            bands=(BandSpec(95.0), BandSpec(130.0)),
-            area_fraction=0.25,
-        ),
-        PixelGroup(
-            bands=(BandSpec(155.0), BandSpec(195.0)),
-            area_fraction=0.25,
-        ),
-        PixelGroup(
-            bands=(BandSpec(235.0), BandSpec(290.0)),
-            area_fraction=0.175,
-        ),
-        PixelGroup(
-            bands=(BandSpec(340.0), BandSpec(400.0)),
-            area_fraction=0.175,
+            bands=(BandSpec(220.0), BandSpec(340.0)),
+            area_fraction=1.0 / 3.0,
         ),
     )
     return TelescopeDesign(
@@ -539,49 +526,31 @@ def probe_idealized() -> TelescopeDesign:
 def flagship_idealized() -> TelescopeDesign:
     """Flagship-class with PICO-level optimism, feedhorn-coupled.
 
-    3.0 m aperture, f/1.42, 0.8 m focal plane (larger than PICO's,
-    reflecting flagship budget).
+    3.0 m aperture, f/1.42, PICO-sized focal plane (could be larger for
+    flagship, but matching PICO for direct comparison).
     eta_optical = 0.50, 95% observing efficiency.
-    16 bands in 8 dichroic pairs spanning 25-550 GHz.
-    Weighted area allocation: 10% low-freq, 50% CMB, 40% high-freq.
     """
     pixel_groups = (
         PixelGroup(
-            bands=(BandSpec(25.0), BandSpec(35.0)),
-            area_fraction=0.05,
+            bands=(BandSpec(30.0), BandSpec(40.0)),
+            area_fraction=0.25,
         ),
         PixelGroup(
-            bands=(BandSpec(45.0), BandSpec(60.0)),
-            area_fraction=0.05,
+            bands=(BandSpec(85.0), BandSpec(150.0)),
+            area_fraction=0.25,
         ),
         PixelGroup(
-            bands=(BandSpec(75.0), BandSpec(100.0)),
-            area_fraction=0.50 / 3,
-        ),
-        PixelGroup(
-            bands=(BandSpec(120.0), BandSpec(150.0)),
-            area_fraction=0.50 / 3,
-        ),
-        PixelGroup(
-            bands=(BandSpec(175.0), BandSpec(210.0)),
-            area_fraction=0.50 / 3,
-        ),
-        PixelGroup(
-            bands=(BandSpec(250.0), BandSpec(300.0)),
-            area_fraction=0.40 / 3,
+            bands=(BandSpec(220.0), BandSpec(280.0)),
+            area_fraction=0.25,
         ),
         PixelGroup(
             bands=(BandSpec(340.0), BandSpec(400.0)),
-            area_fraction=0.40 / 3,
-        ),
-        PixelGroup(
-            bands=(BandSpec(450.0), BandSpec(550.0)),
-            area_fraction=0.40 / 3,
+            area_fraction=0.25,
         ),
     )
     return TelescopeDesign(
         focal_plane=FocalPlaneSpec(
-            aperture_m=3.0, f_number=1.42, fp_diameter_m=0.8,
+            aperture_m=3.0, f_number=1.42, fp_diameter_m=_PICO_FP_EQUIV_DIAMETER,
         ),
         thermal=_IDEALIZED_THERMAL,
         pixel_groups=pixel_groups,
