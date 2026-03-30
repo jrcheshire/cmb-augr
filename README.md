@@ -1,6 +1,6 @@
 # augr
 
-![](./assets/logo.svg)
+![](./assets/logo.png)
 
 Fisher-matrix forecasting for CMB B-mode polarization experiments, targeting the tensor-to-scalar ratio *r*.
 
