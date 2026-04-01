@@ -957,11 +957,34 @@ def print_discrepancies():
     print("-" * 72)
 
 
+class _Tee:
+    """Write to both a file and the original stream."""
+    def __init__(self, stream, path):
+        self._stream = stream
+        self._file = open(path, "w")
+    def write(self, data):
+        self._stream.write(data)
+        self._file.write(data)
+    def flush(self):
+        self._stream.flush()
+        self._file.flush()
+    def close(self):
+        self._file.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="PICO validation")
     parser.add_argument("--no-plots", action="store_true",
                         help="Skip plot generation")
     args = parser.parse_args()
+
+    # Save text output alongside plots
+    log_dir = os.path.normpath(os.path.join(
+        os.path.dirname(__file__), "..", "plots", "pico_validation"))
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "validation.log")
+    tee = _Tee(sys.stdout, log_path)
+    sys.stdout = tee
 
     print_header()
     print_assumptions()
@@ -1072,6 +1095,11 @@ def main():
           f"{n_failed} FAILED")
     print(f"         {n_checks_passed}/{n_checks} consistency checks PASSED")
     print("=" * 72)
+
+    # Restore stdout and close log
+    sys.stdout = tee._stream
+    tee.close()
+    print(f"\nLog saved to {log_path}")
 
     if n_failed > 0 or n_checks_passed < n_checks:
         return 1
