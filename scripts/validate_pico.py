@@ -515,6 +515,7 @@ def plot_sigma_r_comparison(results: list[Result], savefig):
     xticks = []
     xticklabels = []
     group_starts = []
+    group_ends = []
 
     for case_names in groups.values():
         group_starts.append(x_pos)
@@ -529,24 +530,24 @@ def plot_sigma_r_comparison(results: list[Result], savefig):
                          hatch=hatch, edgecolor="black", linewidth=0.5,
                          alpha=0.85)
             xticks.append(x_pos)
-            # Short label
+            # Compact label: "0%", "73%", "85% CBE"
             delens_pct = int((1 - c.A_lens) * 100) if c.A_lens < 1.0 else 0
             lbl = f"{delens_pct}%"
             if c.depth_set == "cbe":
-                lbl += "\nCBE"
+                lbl += " CBE"
             xticklabels.append(lbl)
             x_pos += 1
-        x_pos += 0.5  # gap between groups
+        group_ends.append(x_pos - 1)
+        x_pos += 1.5  # wider gap between groups
 
     ax.set_yscale("log")
     ax.set_xticks(xticks)
-    ax.set_xticklabels(xticklabels, fontsize=8)
+    ax.set_xticklabels(xticklabels, fontsize=7, rotation=45, ha="right")
 
-    # Group labels
-    for i, (label, start) in enumerate(zip(groups.keys(), group_starts)):
-        end = group_starts[i + 1] - 0.5 if i + 1 < len(group_starts) else x_pos - 0.5
-        mid = (start + end) / 2
-        ax.text(mid, ax.get_ylim()[0] * 0.15, label, ha="center", va="top",
+    # Group labels below x-axis
+    for i, label in enumerate(groups.keys()):
+        mid = (group_starts[i] + group_ends[i]) / 2
+        ax.text(mid, -0.18, label.replace("\n", " "), ha="center", va="top",
                 fontsize=10, fontweight="bold", transform=ax.get_xaxis_transform())
 
     # Reference lines
@@ -591,44 +592,42 @@ def plot_noise_spectrum(savefig):
     norm = mcolors.Normalize(min(freqs), max(freqs))
     cmap = mcm.get_cmap("viridis")
 
+    # Plot N_ℓ (C_ℓ convention, no ℓ(ℓ+1)/2π scaling) so white noise is flat.
     for ch in inst.channels:
         nl = noise_nl(ch, ells, inst.mission_duration_years, PICO_FSKY)
         color = cmap(norm(ch.nu_ghz))
-        # Convert to D_ℓ
-        dl_factor = np.array(ells * (ells + 1) / (2 * np.pi))
-        ax1.semilogy(ells, np.array(nl) * dl_factor, color=color, alpha=0.7,
-                      linewidth=1.0)
-        # Mark white-noise level
+        ax1.semilogy(ells, np.array(nl), color=color, alpha=0.7, linewidth=1.0)
+        # Mark white-noise level (flat line for N_ℓ)
         w_inv = float(white_noise_power(ch, inst.mission_duration_years, PICO_FSKY))
-        ax1.axhline(w_inv * 80 * 81 / (2 * np.pi), color=color, alpha=0.3,
-                     linewidth=0.5, linestyle=":")
+        ax1.axhline(w_inv, color=color, alpha=0.3, linewidth=0.5, linestyle=":")
 
     sm = mcm.ScalarMappable(cmap=cmap, norm=norm)
     fig.colorbar(sm, ax=ax1, label="Frequency [GHz]", pad=0.02)
-    ax1.set_ylabel(r"$\ell(\ell+1)N_\ell^{BB}/2\pi$ [$\mu$K$^2$]", fontsize=11)
+    ax1.set_ylabel(r"$N_\ell^{BB}$ [$\mu$K$^2$ sr]", fontsize=11)
     ax1.set_xlabel(r"Multipole $\ell$", fontsize=11)
     ax1.set_title("PICO per-channel noise spectra (baseline)", fontsize=12)
     ax1.set_xlim(2, 300)
 
-    # Lower panel: combined noise
+    # Lower panel: combined noise (C_ℓ convention)
     nl_combined = np.zeros(len(ells))
     for ch in inst.channels:
         nl_ch = np.array(noise_nl(ch, ells, inst.mission_duration_years, PICO_FSKY))
         nl_combined += 1.0 / nl_ch
     nl_combined = 1.0 / nl_combined
-    dl_factor = np.array(ells * (ells + 1) / (2 * np.pi))
-    ax2.semilogy(ells, nl_combined * dl_factor, "k-", linewidth=1.5)
+    ax2.semilogy(ells, nl_combined, "k-", linewidth=1.5)
 
-    # Mark combined depth
+    # Mark combined depth (white-noise level = depth² in C_ℓ units)
     combined, _ = compute_combined_depth(inst, PICO_FSKY)
     combined_cl = (combined * float(ARCMIN_TO_RAD))**2
-    ax2.axhline(combined_cl * 80 * 81 / (2 * np.pi), color="red", linestyle="--",
+    ax2.axhline(combined_cl, color="red", linestyle="--", linewidth=2.0,
                 label=f"Combined depth: {combined:.2f} μK-arcmin\n"
                       f"(PICO 21-band: {PICO_COMBINED_DEPTH_BASELINE} μK-arcmin)")
-    ax2.set_ylabel(r"Combined $D_\ell^{N}$ [$\mu$K$^2$]", fontsize=11)
+    ax2.set_ylabel(r"Combined $N_\ell^{BB}$ [$\mu$K$^2$ sr]", fontsize=11)
     ax2.set_xlabel(r"Multipole $\ell$", fontsize=11)
     ax2.legend(fontsize=9)
     ax2.set_xlim(2, 300)
+    # Set y-limits to show the combined depth line clearly
+    ax2.set_ylim(combined_cl * 0.5, np.max(nl_combined) * 2)
 
     fig.tight_layout()
     savefig(fig, "noise_spectrum")
@@ -799,9 +798,11 @@ def plot_reionization_bump(savefig):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    # Left: cumulative σ(r) as bins are added from high-ℓ downward
-    ax1.semilogy(bin_centers, cumul_sigmas, "k-", linewidth=2, marker="o",
-                 markersize=4)
+    # Left: cumulative σ(r) as bins are added from high-ℓ downward.
+    # Zoom to ℓ < 60 where the action is (high-ℓ bins just flatten out).
+    mask = np.array(bin_centers) < 60
+    ax1.semilogy(np.array(bin_centers)[mask], cumul_sigmas[mask],
+                 "k-", linewidth=2, marker="o", markersize=4)
     ax1.axvline(20, color="red", linestyle="--", alpha=0.7,
                 label=r"$\ell = 20$")
     ax1.axhline(sigma_2, color="blue", linestyle=":", alpha=0.5,
@@ -814,18 +815,21 @@ def plot_reionization_bump(savefig):
                   f"(Gaussian FG, 73% delensing, 21 bands)", fontsize=11)
     ax1.legend(fontsize=9)
 
-    # Right: fractional Fisher information by bin
+    # Right: fractional Fisher information by bin (log scale).
     # F_total(r) = 1/σ²(r) from full run; per-bin fraction from
     # difference in cumulative 1/σ².
     fisher_cumul = 1.0 / cumul_sigmas**2
     fisher_per_bin = np.diff(fisher_cumul[::-1])[::-1]
     fisher_per_bin = np.append(fisher_per_bin, fisher_cumul[-1])
     fisher_frac = fisher_per_bin / fisher_cumul[0] * 100
+    # Clamp tiny/negative values for log scale
+    fisher_frac = np.maximum(fisher_frac, 1e-3)
 
-    ax2.bar(bin_centers, fisher_frac, width=np.diff(
-            np.append(bin_centers, bin_centers[-1] + 30)) * 0.8,
+    bin_widths = np.diff(np.append(bin_centers, bin_centers[-1] + 30))
+    ax2.bar(bin_centers, fisher_frac, width=bin_widths * 0.8,
             color=["#E91E63" if c < 20 else "#2196F3" for c in bin_centers],
             edgecolor="black", linewidth=0.5, alpha=0.85)
+    ax2.set_yscale("log")
     ax2.set_xlabel(r"$\ell_{\rm bin}$", fontsize=12)
     ax2.set_ylabel("% of total Fisher info on r", fontsize=12)
     ax2.set_title("Per-bin constraining power", fontsize=11)
