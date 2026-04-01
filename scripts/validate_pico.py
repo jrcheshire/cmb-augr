@@ -260,22 +260,21 @@ def pico_sky_model(n_patches: int = 6) -> SkyModel:
     scaling from clean (high galactic latitude) to dusty (lower latitude).
     Uniform noise weighting (no scan strategy weighting for this comparison).
 
-    Dust amplitude scalings are approximate: the cleanest ~10% of sky has
-    A_dust ~ 0.3× BK15, while moderate sky at |b|~30° has ~5-10×.
+    Dust/sync scales are log-spaced and then renormalized so that the
+    area-weighted mean equals 1.0, matching the single-patch fiducial.
+    This ensures a fair comparison: all models describe the same
+    average sky, just with different spatial resolution.
     """
     f_per = PICO_FSKY / n_patches
 
-    if n_patches == 6:
-        # 6 patches from cleanest to dustiest, uniform f_sky
-        dust_scales = [0.3, 0.7, 1.5, 3.0, 7.0, 15.0]
-        sync_scales = [0.5, 0.7, 1.0, 1.5, 2.0, 3.0]
-    elif n_patches == 3:
-        dust_scales = [0.5, 2.0, 10.0]
-        sync_scales = [0.7, 1.2, 2.5]
-    else:
-        # Linear spacing
-        dust_scales = np.linspace(0.3, 15.0, n_patches).tolist()
-        sync_scales = np.linspace(0.5, 3.0, n_patches).tolist()
+    # Log-spaced raw scales, then normalize so area-weighted mean = 1.0.
+    # Dynamic range ~0.3× to ~3× is typical for f_sky=0.6 on the real sky
+    # (cleanest high-lat regions to moderate-lat galactic plane margin).
+    dust_raw = np.logspace(np.log10(0.3), np.log10(3.0), n_patches)
+    dust_scales = (dust_raw / dust_raw.mean()).tolist()
+
+    sync_raw = np.logspace(np.log10(0.5), np.log10(2.0), n_patches)
+    sync_scales = (sync_raw / sync_raw.mean()).tolist()
 
     patches = tuple(
         SkyPatch(
