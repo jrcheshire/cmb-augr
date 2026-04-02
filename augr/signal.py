@@ -154,13 +154,21 @@ class SignalModel:
                  delta_ell: int = 35,
                  ell_per_bin_below: int = 30,
                  window: str = "tophat",
-                 use_jit: bool = True):
+                 use_jit: bool = True,
+                 delensed_bb: jnp.ndarray | None = None,
+                 delensed_bb_ells: jnp.ndarray | None = None):
         self._instrument = instrument
         self._fg_model = foreground_model
         self._cmb = cmb_spectra
 
-        # Parameter names: [r, A_lens, <foreground params>]
-        self._param_names = ["r", "A_lens"] + foreground_model.parameter_names
+        # Delensed mode: precomputed residual lensing BB replaces A_lens
+        self._delensed = delensed_bb is not None
+        if self._delensed:
+            # Parameter names: [r, <foreground params>] — no A_lens
+            self._param_names = ["r"] + foreground_model.parameter_names
+        else:
+            # Parameter names: [r, A_lens, <foreground params>]
+            self._param_names = ["r", "A_lens"] + foreground_model.parameter_names
 
         # Frequency pairs: unique (i ≤ j), stored as (channel_index, channel_index)
         n_chan = len(instrument.channels)
@@ -177,6 +185,14 @@ class SignalModel:
         # Ell grid: all integer multipoles from ell_min to ell_max
         ells_np = np.arange(ell_min, ell_max + 1, dtype=float)
         self._ells = jnp.array(ells_np)
+
+        # Pre-interpolate delensed BB onto our ell grid (not JAX-traced)
+        if self._delensed:
+            self._delensed_bb = jnp.interp(
+                self._ells, delensed_bb_ells, delensed_bb,
+                left=0.0, right=0.0)
+        else:
+            self._delensed_bb = None
 
         # Binning
         bin_edges = _make_bin_edges(ell_min, ell_max,
@@ -248,11 +264,15 @@ class SignalModel:
             Ordering: spectra vary slowest, bins vary fastest.
         """
         r = params[0]
-        A_lens = params[1]
-        fg_params = params[2:]
-
-        # CMB BB spectrum on the full ℓ grid (same for all freq pairs)
-        cl_cmb = self._cmb.cl_bb(self._ells, r, A_lens)
+        if self._delensed:
+            fg_params = params[1:]
+            # CMB BB = r × tensor + precomputed residual lensing
+            cl_cmb = (r * self._cmb.cl_tensor_r1(self._ells)
+                      + self._delensed_bb)
+        else:
+            A_lens = params[1]
+            fg_params = params[2:]
+            cl_cmb = self._cmb.cl_bb(self._ells, r, A_lens)
 
         # Build bandpowers for each frequency pair
         bandpowers = []
@@ -279,6 +299,29 @@ class SignalModel:
             Jacobian array of shape (n_data, n_params).
         """
         return self._jacobian_fn(params)
+
+    # ------------------------------------------------------------------
+    # Unbinned spectrum (used by covariance.py)
+    # ------------------------------------------------------------------
+
+    def cmb_bb_unbinned(self, params: jnp.ndarray) -> jnp.ndarray:
+        """CMB BB spectrum on the ell grid, from parameters.
+
+        Handles both standard (r, A_lens) and delensed (r only) modes.
+        """
+        r = params[0]
+        if self._delensed:
+            return r * self._cmb.cl_tensor_r1(self._ells) + self._delensed_bb
+        else:
+            A_lens = params[1]
+            return self._cmb.cl_bb(self._ells, r, A_lens)
+
+    def fg_params_from(self, params: jnp.ndarray) -> jnp.ndarray:
+        """Extract foreground parameters from the full parameter vector."""
+        if self._delensed:
+            return params[1:]
+        else:
+            return params[2:]
 
     # ------------------------------------------------------------------
     # Convenience: indexing into the data vector
