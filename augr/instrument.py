@@ -185,6 +185,45 @@ def noise_nl(channel: Channel,
     return w_inv / bl**2 * (1.0 + one_over_f)
 
 
+def noise_nl_temperature(channel: Channel,
+                         ells: jnp.ndarray,
+                         mission_years: float,
+                         f_sky: float) -> jnp.ndarray:
+    """Noise power spectrum N_ℓ^TT for a single channel (temperature).
+
+    Same as noise_nl() but without the √2 polarization factor:
+    w⁻¹_T = w⁻¹_pol / 2.
+
+    Returns:
+        N_ℓ^TT array in [μK²].
+    """
+    return noise_nl(channel, ells, mission_years, f_sky) / 2.0
+
+
+def combined_noise_nl(instrument: Instrument,
+                      ells: jnp.ndarray,
+                      spectrum: str = "BB") -> jnp.ndarray:
+    """Inverse-variance combined noise across all channels.
+
+    1/N_ℓ^{combined} = Σ_i 1/N_ℓ^i
+
+    Args:
+        instrument: Instrument specification.
+        ells:       1-D array of multipoles.
+        spectrum:   "BB" (or "EE") for polarization, "TT" for temperature.
+
+    Returns:
+        Combined N_ℓ array of same shape as ells [μK²].
+    """
+    noise_fn = noise_nl_temperature if spectrum == "TT" else noise_nl
+    inv_nl_sum = jnp.zeros_like(ells, dtype=float)
+    for ch in instrument.channels:
+        nl_ch = noise_fn(ch, ells, instrument.mission_duration_years,
+                         instrument.f_sky)
+        inv_nl_sum = inv_nl_sum + 1.0 / nl_ch
+    return 1.0 / inv_nl_sum
+
+
 def noise_nl_matrix(instrument: Instrument,
                     ells: jnp.ndarray) -> jnp.ndarray:
     """Full noise matrix N_ℓ^{ij} across all channels.

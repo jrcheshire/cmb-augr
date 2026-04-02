@@ -46,11 +46,8 @@ def _build_M(signal_model: SignalModel,
     ells = signal_model.ells
     W = signal_model._bin_matrix          # (n_bins, n_ells)
 
-    r      = fiducial_params[0]
-    A_lens = fiducial_params[1]
-    fg_params = fiducial_params[2:]
-
-    cl_cmb = signal_model._cmb.cl_bb(ells, r, A_lens)
+    cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
+    fg_params = signal_model.fg_params_from(fiducial_params)
 
     # Signal for all (i, j) pairs including i > j
     M = jnp.zeros((n_chan, n_chan, n_bins))
