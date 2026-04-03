@@ -56,14 +56,17 @@ def _build_M(signal_model: SignalModel,
     cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
     fg_params = signal_model.fg_params_from(fiducial_params)
 
-    # Signal for all (i, j) pairs including i > j
+    # Signal: M is symmetric, so compute only upper triangle (i ≤ j)
     M = jnp.zeros((n_chan, n_chan, n_bins))
     for i in range(n_chan):
-        for j in range(n_chan):
+        for j in range(i, n_chan):
             nu_i = float(instrument.channels[i].nu_ghz)
             nu_j = float(instrument.channels[j].nu_ghz)
             cl_fg = signal_model._fg_model.cl_bb(nu_i, nu_j, ells, fg_params)
-            M = M.at[i, j, :].set(W @ (cl_cmb + cl_fg))
+            bp = W @ (cl_cmb + cl_fg)
+            M = M.at[i, j, :].set(bp)
+            if i != j:
+                M = M.at[j, i, :].set(bp)
 
     # Add noise on diagonal
     for i in range(n_chan):
