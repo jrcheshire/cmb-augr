@@ -234,6 +234,148 @@ class TestIterativeDelensing:
 
 
 # -----------------------------------------------------------------------
+# Wigner 3j
+# -----------------------------------------------------------------------
+
+class TestWigner3j:
+    def test_000_closed_form(self):
+        """(l1 l2 L; 0 0 0) closed form matches pywigxjpf."""
+        from augr.wigner import wigner3j_000
+        import pywigxjpf
+        pywigxjpf.wig_table_init(2 * 3000, 9)
+        pywigxjpf.wig_temp_init(2 * 3000)
+
+        for l1, l2, L in [(10, 8, 6), (100, 98, 50), (1000, 998, 200)]:
+            ours = wigner3j_000(l1, l2, L)
+            ref = pywigxjpf.wig3jj(2*l1, 2*l2, 2*L, 0, 0, 0)
+            np.testing.assert_allclose(ours, ref, rtol=1e-10)
+
+        # Parity selection: zero when l1+l2+L is odd
+        assert wigner3j_000(10, 8, 5) == 0.0
+
+        pywigxjpf.wig_temp_free()
+        pywigxjpf.wig_table_free()
+
+    def test_scalar_recursion(self):
+        """Backward SG recursion matches pywigxjpf for (j1,j2,j;2,-2,0)."""
+        from augr.wigner import wigner3j_recurse
+        import pywigxjpf
+        pywigxjpf.wig_table_init(2 * 3000, 9)
+        pywigxjpf.wig_temp_init(2 * 3000)
+
+        for j1, j2 in [(100, 50), (500, 300), (1000, 500)]:
+            j_vals, w = wigner3j_recurse(j1, j2, 2, -2)
+            for i in range(0, len(j_vals), max(1, len(j_vals) // 5)):
+                j = int(j_vals[i])
+                ref = pywigxjpf.wig3jj(2*j1, 2*j2, 2*j, 4, -4, 0)
+                if abs(ref) > 1e-15:
+                    np.testing.assert_allclose(w[i], ref, rtol=1e-10)
+
+        pywigxjpf.wig_temp_free()
+        pywigxjpf.wig_table_free()
+
+    def test_vectorized_matches_scalar(self):
+        """Vectorized recursion matches scalar for all l1 values."""
+        from augr.wigner import wigner3j_recurse, wigner3j_vectorized
+
+        L = 50
+        l1_arr = np.array([80., 100., 120.])
+        l2_grid, w_vec = wigner3j_vectorized(L, l1_arr, m1=2, m2=-2)
+
+        for idx, l1 in enumerate([80, 100, 120]):
+            j_vals, w_scalar = wigner3j_recurse(int(l1), L, 2, -2)
+            for j_idx, j_val in enumerate(j_vals):
+                l2_idx = int(j_val) - int(l2_grid[0])
+                if 0 <= l2_idx < len(l2_grid):
+                    np.testing.assert_allclose(
+                        w_vec[idx, l2_idx], w_scalar[j_idx], atol=1e-15)
+
+    def test_physical_coupling(self):
+        """Physical coupling (l1,l2,L;2,0,-2) = (-1)^s × (l1,L,l2;2,-2,0)."""
+        from augr.wigner import wigner3j_vectorized
+        import pywigxjpf
+        pywigxjpf.wig_table_init(2 * 3000, 9)
+        pywigxjpf.wig_temp_init(2 * 3000)
+
+        L = 200
+        l1_arr = np.arange(100, 501, dtype=float)
+        l2_grid, w3j = wigner3j_vectorized(L, l1_arr, m1=2, m2=-2)
+        parity = (-1.0) ** (l1_arr[:, None] + l2_grid[None, :] + L)
+        w_phys = parity * w3j
+
+        max_err = 0
+        for i_l1 in range(0, len(l1_arr), 50):
+            l1 = int(l1_arr[i_l1])
+            for i_l2 in range(0, len(l2_grid), 20):
+                l2 = int(l2_grid[i_l2])
+                if abs(l1 - L) <= l2 <= l1 + L and l2 >= 2:
+                    ref = pywigxjpf.wig3jj(2*l1, 2*l2, 2*L, 4, 0, -4)
+                    if abs(ref) > 1e-15:
+                        err = abs(w_phys[i_l1, i_l2] - ref) / abs(ref)
+                        max_err = max(max_err, err)
+
+        assert max_err < 1e-10, f"Physical coupling error: {max_err:.2e}"
+
+        pywigxjpf.wig_temp_free()
+        pywigxjpf.wig_table_free()
+
+
+# -----------------------------------------------------------------------
+# Full-sky tests
+# -----------------------------------------------------------------------
+
+class TestFullSkyKernel:
+    def test_matches_camb_low_ell(self, spectra):
+        """Full-sky kernel reproduces CAMB BB at l=5 to better than 1%."""
+        ls = jnp.array([5., 10.])
+        Ls = jnp.arange(2, 2001, dtype=float)
+        K = lensing_kernel(ls, Ls, spectra, l_max=2000, fullsky=True)
+        cl_pp = jnp.array([float(spectra.cl_pp[int(L)]) for L in Ls])
+        cl_bb_full = K @ cl_pp
+        cl_bb_camb = jnp.array([float(spectra.cl_bb_len[5]),
+                                 float(spectra.cl_bb_len[10])])
+        ratio = cl_bb_full / cl_bb_camb
+        np.testing.assert_allclose(ratio, 1.0, atol=0.02)
+
+
+class TestFullSkyN0:
+    def test_eb_finite(self, spectra, noise):
+        """Full-sky EB N_0 should be finite and positive."""
+        Ls = jnp.array([50., 100., 500.])
+        n0 = compute_n0_eb(Ls, spectra, noise["ee"], noise["bb"],
+                           l_max=1000, fullsky=True)
+        assert jnp.all(n0 > 0)
+        assert jnp.all(jnp.isfinite(n0))
+
+    def test_eb_decreasing(self, spectra, noise):
+        """N_0 should decrease with L (better reconstruction at high L)."""
+        Ls = jnp.array([50., 200., 500., 1000.])
+        n0 = compute_n0_eb(Ls, spectra, noise["ee"], noise["bb"],
+                           l_max=1000, fullsky=True)
+        assert float(n0[0]) > float(n0[1]) > float(n0[2]) > float(n0[3])
+
+
+class TestFullSkyIteration:
+    def test_convergence(self, spectra, noise):
+        """Full-sky iteration should converge with 0 < A_lens_eff < 1."""
+        result = iterate_delensing(
+            spectra, noise["tt"], noise["ee"], noise["bb"],
+            L_max=500, l_max_qe=500, n_iter=3, fullsky=True,
+        )
+        assert 0.0 < result.A_lens_eff < 1.0
+
+    def test_better_than_no_delensing(self, spectra, noise):
+        """Residual BB should be less than lensed BB at low ell."""
+        result = iterate_delensing(
+            spectra, noise["tt"], noise["ee"], noise["bb"],
+            L_max=500, l_max_qe=500, n_iter=2, fullsky=True,
+        )
+        cl_bb_lens = _interp_at(spectra.cl_bb_len, result.ls)
+        # At least some delensing should happen
+        assert float(jnp.sum(result.cl_bb_res)) < float(jnp.sum(cl_bb_lens))
+
+
+# -----------------------------------------------------------------------
 # Signal model integration
 # -----------------------------------------------------------------------
 

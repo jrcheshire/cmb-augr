@@ -19,7 +19,7 @@ The telescope design module derives detector counts and photon-noise-limited NET
 
 ## Quick start
 
-An "`augr`" `conda` environment is included with the needed dependencies.
+An "`augr`" `conda` environment is included with the needed dependencies: `conda create --file environment.yaml`
 
 ```bash
 make install   # create conda env + pip install -e .
