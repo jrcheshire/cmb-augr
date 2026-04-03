@@ -163,7 +163,7 @@ The `delensing.py` module computes self-consistent iterative QE delensing, repla
 Two modes are available:
 
 - **Flat-sky** (`fullsky=False`): Gauss-Legendre quadrature over the azimuthal angle. Fast (~2 min for 5 iterations at l_max=3000).
-- **Full-sky** (`fullsky=True`): Wigner 3j coupling via Schulten-Gordon backward recursion, vectorized over l1 for fixed L with log-spaced L sampling. The full-sky lensing kernel matches CAMB to 0.01% at l=5 (vs 1.7% for flat-sky), which matters for the reionization bump where space missions derive most of their r constraining power.
+- **Full-sky** (`fullsky=True`) [EXPERIMENTAL]: Wigner 3j coupling via Schulten-Gordon backward recursion, vectorized over l1 for fixed L with log-spaced L sampling.
 
 ```python
 from augr.delensing import load_lensing_spectra, iterate_delensing
