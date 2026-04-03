@@ -1,12 +1,24 @@
 """
-wigner.py — Wigner 3j symbol computation for full-sky QE delensing.
+wigner.py — Wigner 3j symbol computation for full-sky CMB lensing coupling.
 
 Provides two computation methods:
-  1. Closed-form via log-gamma for (l1 l2 L; 0 0 0) — stable at all ell.
+  1. Closed-form via log-gamma for (l1 l2 L; 0 0 0) — exact, stable at
+     all ell. Used for scalar (TT, TE) QE estimators.
   2. Schulten-Gordon three-term recursion for general (j1 j2 j; m1 m2 m3).
+     Used for spin-2 (EB, TB, EE) QE estimators and the lensing kernel.
 
-The vectorized recursion processes all l1 values simultaneously for fixed L,
-enabling efficient computation of the full coupling table.
+The vectorized recursion processes all l1 values simultaneously for a
+fixed L, enabling efficient computation of the full coupling matrix
+needed for the N_0 and kernel sums. The recursion is bidirectional
+(forward from j_min, backward from j_max) with median-ratio matching
+at the midpoint for numerical stability across the full j range.
+
+The delensing module calls this with two m-value configurations:
+  - m1=-2, m2=0 (m3=2): computes (l_E, L, l_B; -2, 0, 2), which
+    equals Smith et al.'s (l_B, l_E, L; 2, -2, 0) by cyclic symmetry.
+    Used for the parity-odd EB/TB coupling and the lensing kernel.
+  - m1=m2=0 (m3=0): computes (l1, L, l2; 0, 0, 0) via the closed-form
+    path. Used for TT and TE.
 
 References:
   - Schulten & Gordon 1975, J. Math. Phys. 16, 1961
@@ -269,28 +281,30 @@ def wigner3j_vectorized(L: int, l1_array: np.ndarray,
                         l2_min_global: int = 0,
                         l2_max_global: int | None = None
                         ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute (l1, l2, L; m1, m2, m3) for all l1 and valid l2 simultaneously.
+    """Compute (l1, L, l2; m1, m2, m3) for all l1 and valid l2 simultaneously.
 
-    Uses backward Schulten-Gordon recursion vectorized over l1.
-    The recursion varies l2 (third argument of (l1, L, l2; m1, m2, m3)
-    reordered as (j1=l1, j2=L, j=l2)).
+    The Schulten-Gordon three-term recursion varies the THIRD angular
+    momentum (here l2), with l1 and L fixed per recursion step.
+    All l1 values are processed in parallel (vectorized backward sweep).
 
-    Default m1=2, m2=-2, m3=0 gives the spin-2 polarization coupling
-    (l1, l2, L; 2, -2, 0) needed for QE delensing.
+    The 3j symbol ordering is (j1=l1, j2=L, j3=l2) with magnetic quantum
+    numbers (m1, m2, m3) where m3 = -(m1+m2).  Column permutations of
+    the 3j symbol differ only by a sign (-1)^{l1+L+l2}, so |w3j|^2 is
+    independent of column ordering.
 
     Args:
-        L:         Fixed L (enters as j2 in the recursion).
-        l1_array:  Array of l1 values (j1 in the recursion).
-        m1, m2:    Magnetic quantum numbers on l1, L.
-                   m3 = -(m1+m2) is on l2.
-        l2_min_global: Minimum l2 in output.
-        l2_max_global: Maximum l2. Default: max(l1) + L.
+        L:         Fixed second angular momentum (j2 in the recursion).
+        l1_array:  Array of first angular momentum values (j1).
+        m1, m2:    Magnetic quantum numbers on l1 and L respectively.
+                   m3 = -(m1+m2) is assigned to l2.
+        l2_min_global: Minimum l2 in output grid.
+        l2_max_global: Maximum l2 in output grid. Default: max(l1) + L.
 
     Returns:
         l2_grid: 1-D int array of l2 values, shape (n_l2,).
         w3j:     2-D array of shape (n_l1, n_l2).
-               w3j[i, j] = (l1_array[i], l2_grid[j], L; m1, m2, m3).
-               Zero outside triangle conditions.
+               w3j[i, j] = (l1_array[i], L, l2_grid[j]; m1, m2, m3).
+               Zero where triangle condition |l1-L| ≤ l2 ≤ l1+L fails.
     """
     # Recursion on j (=l2) of (j1=l1, j2=L, j=l2; m1, m2, m3=-m1-m2)
     m3 = -(m1 + m2)

@@ -327,7 +327,9 @@ class MomentExpansionModel:
                    * dl_to_cl * decor_s * moment_s)
 
         # --- Dust-sync cross-correlation (symmetrized) ---
-        # Auto-spectra include moment corrections but no cross-freq decorrelation
+        # The cross term ε√(D_ii × S_jj) uses SINGLE-frequency auto-spectra:
+        # no cross-frequency decorrelation (exp(-Δ|ln ν_i/ν_j|) = 1 when i=j)
+        # but moment corrections still apply at each frequency.
         moment_d_ii = _dust_moment_factor(nu_i, nu_i, T_d, om_d_b, om_d_T, om_d_bT)
         moment_d_jj = _dust_moment_factor(nu_j, nu_j, T_d, om_d_b, om_d_T, om_d_bT)
         moment_s_ii = _sync_moment_factor(nu_i, nu_i, om_s_b, om_s_c, om_s_bc)

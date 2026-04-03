@@ -7,9 +7,16 @@ For cross-spectra (i,j) and (k,l) in bandpower bin b:
 
 where M = S + N (signal + noise), and ν_b = f_sky × Σ_{ℓ in b} (2ℓ+1).
 
-The covariance is block-diagonal across bins (different bins are uncorrelated
-in the Knox approximation). Evaluated once at the fiducial model and held
-fixed during Fisher computation.
+The covariance is block-diagonal across ℓ-bins — different bins are
+uncorrelated under the Gaussian/Knox approximation.  We exploit this by
+returning per-bin blocks (n_spec × n_spec) rather than the full
+(n_data × n_data) matrix.  This is both faster and numerically stabler:
+each small block has condition number ~ 10⁴-10⁶, while the assembled
+matrix can exceed 10²⁰ for instruments with many frequency channels.
+
+The covariance is evaluated once at the fiducial model and held fixed
+during Fisher computation (we do NOT include the second-order Fisher
+term Tr(Σ⁻¹ dΣ/dθ ...) — see CLAUDE.md for rationale).
 """
 
 from __future__ import annotations
@@ -49,14 +56,17 @@ def _build_M(signal_model: SignalModel,
     cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
     fg_params = signal_model.fg_params_from(fiducial_params)
 
-    # Signal for all (i, j) pairs including i > j
+    # Signal: M is symmetric, so compute only upper triangle (i ≤ j)
     M = jnp.zeros((n_chan, n_chan, n_bins))
     for i in range(n_chan):
-        for j in range(n_chan):
+        for j in range(i, n_chan):
             nu_i = float(instrument.channels[i].nu_ghz)
             nu_j = float(instrument.channels[j].nu_ghz)
             cl_fg = signal_model._fg_model.cl_bb(nu_i, nu_j, ells, fg_params)
-            M = M.at[i, j, :].set(W @ (cl_cmb + cl_fg))
+            bp = W @ (cl_cmb + cl_fg)
+            M = M.at[i, j, :].set(bp)
+            if i != j:
+                M = M.at[j, i, :].set(bp)
 
     # Add noise on diagonal
     for i in range(n_chan):

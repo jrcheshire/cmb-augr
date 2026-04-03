@@ -8,10 +8,11 @@ Knox covariance block for that bin, and P is the diagonal Gaussian prior
 matrix: P_{αα} = 1/σ_prior_α².
 
 The covariance is block-diagonal across ℓ-bins (Knox approximation), so
-rather than inverting the full (n_data, n_data) matrix, we Cholesky-solve
+rather than inverting the full (n_data, n_data) matrix, we eigendecompose
 each small (n_spec, n_spec) block independently.  This is both faster
-(O(n_bins × n_spec³) vs O(n_data³)) and perfectly conditioned even when
-the full matrix would have condition numbers > 10²⁰.
+(O(n_bins × n_spec³) vs O(n_data³)) and robust to degenerate cross-spectra
+that make the full matrix singular (condition numbers > 10²⁰ for deep
+multifrequency instruments).
 
 Fixed parameters are removed from the Fisher matrix entirely (their rows
 and columns are dropped before inversion), so they do not contribute to
