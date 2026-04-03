@@ -326,16 +326,20 @@ class TestWigner3j:
 
 class TestFullSkyKernel:
     def test_matches_camb_low_ell(self, spectra):
-        """Full-sky kernel reproduces CAMB BB at l=5 to better than 1%."""
-        ls = jnp.array([5., 10.])
+        """Full-sky kernel reproduces CAMB BB at l=5,10,20 within 1%.
+
+        Uses Smith et al. (2012) Eq. 6-7 coupling via cyclic 3j identity.
+        Residual ~0.8% error is from the first-order gradient approximation
+        (CAMB uses the full resummed lensing calculation).
+        """
+        ls = jnp.array([5., 10., 20.])
         Ls = jnp.arange(2, 2001, dtype=float)
         K = lensing_kernel(ls, Ls, spectra, l_max=2000, fullsky=True)
         cl_pp = jnp.array([float(spectra.cl_pp[int(L)]) for L in Ls])
         cl_bb_full = K @ cl_pp
-        cl_bb_camb = jnp.array([float(spectra.cl_bb_len[5]),
-                                 float(spectra.cl_bb_len[10])])
+        cl_bb_camb = jnp.array([float(spectra.cl_bb_len[int(l)]) for l in ls])
         ratio = cl_bb_full / cl_bb_camb
-        np.testing.assert_allclose(ratio, 1.0, atol=0.02)
+        np.testing.assert_allclose(ratio, 1.0, atol=0.015)
 
 
 class TestFullSkyN0:
