@@ -56,6 +56,48 @@ def wigner3j_000(l1: int, l2: int, L: int) -> float:
     return sign * np.exp(log_w)
 
 
+def wigner3j_000_vectorized(L: int, l1_arr: np.ndarray,
+                            l2_min: int = 0,
+                            l2_max: int | None = None
+                            ) -> tuple[np.ndarray, np.ndarray]:
+    """Compute (l1, l2, L; 0 0 0) for all l1 and valid l2, vectorized.
+
+    Returns (l2_grid, w3j) where w3j[i, j] = (l1_arr[i], l2_grid[j], L; 0 0 0).
+    Zero where triangle fails or l1+l2+L is odd.
+    """
+    l1 = np.asarray(l1_arr, dtype=int)
+    n_l1 = len(l1)
+    if l2_max is None:
+        l2_max = int(np.max(l1)) + L
+    l2_grid = np.arange(l2_min, l2_max + 1, dtype=int)
+    n_l2 = len(l2_grid)
+    w = np.zeros((n_l1, n_l2))
+
+    for j in range(n_l2):
+        l2 = l2_grid[j]
+        # Triangle: |l1-l2| <= L <= l1+l2 and parity: l1+l2+L even
+        tri_ok = (np.abs(l1 - l2) <= L) & (l1 + l2 >= L)
+        parity_ok = ((l1 + l2 + L) % 2 == 0)
+        valid = tri_ok & parity_ok
+        if not np.any(valid):
+            continue
+
+        idx = np.where(valid)[0]
+        l1_v = l1[idx]
+        s = (l1_v + l2 + L) // 2
+        a = s - l1_v
+        b = s - l2
+        c = s - L
+        sign = (-1.0) ** s
+        log_w = (gammaln(s + 1)
+                 - gammaln(a + 1) - gammaln(b + 1) - gammaln(c + 1)
+                 + 0.5 * (gammaln(2*a + 1) + gammaln(2*b + 1)
+                          + gammaln(2*c + 1) - gammaln(2*s + 2)))
+        w[idx, j] = sign * np.exp(log_w)
+
+    return l2_grid, w
+
+
 # -----------------------------------------------------------------------
 # Schulten-Gordon recursion coefficients
 # -----------------------------------------------------------------------

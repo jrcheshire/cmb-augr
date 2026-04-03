@@ -263,12 +263,15 @@ def compute_n0_tb(Ls: jnp.ndarray,
                   nl_bb: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
-                  n_phi: int = 128) -> jnp.ndarray:
+                  n_phi: int = 128,
+                  fullsky: bool = False) -> jnp.ndarray:
     """N_0^{TB}(L) — QE reconstruction noise for the TB estimator.
 
     Response: f_TB = C_{l₁}^{TE,unl} × (L·l₁) × sin(2φ_{l₁,l₂})
     Filter:   F_TB = f_TB / (C_{l₁}^{TT,tot} × C_{l₂}^{BB,tot})
     """
+    if fullsky:
+        return _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max)
     phi, w_phi = _gl_nodes(n_phi)
     cl_tt_tot = spectra.cl_tt_len + nl_tt
     cl_bb_tot = spectra.cl_bb_len + nl_bb
@@ -296,13 +299,16 @@ def compute_n0_tt(Ls: jnp.ndarray,
                   nl_tt: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
-                  n_phi: int = 128) -> jnp.ndarray:
+                  n_phi: int = 128,
+                  fullsky: bool = False) -> jnp.ndarray:
     """N_0^{TT}(L) — QE reconstruction noise for the TT estimator.
 
     Response: f_TT = C_{l₁}^{TT,unl} (L·l₁) + C_{l₂}^{TT,unl} (L·l₂)
     Filter:   F_TT = f_TT / (2 × C_{l₁}^{TT,tot} × C_{l₂}^{TT,tot})
     Factor of 2 from same-field estimator.
     """
+    if fullsky:
+        return _compute_n0_tt_fullsky(Ls, spectra, nl_tt, l_min, l_max)
     phi, w_phi = _gl_nodes(n_phi)
     cl_tt_tot = spectra.cl_tt_len + nl_tt
     cl_tt_unl = spectra.cl_tt_unl
@@ -335,12 +341,15 @@ def compute_n0_ee(Ls: jnp.ndarray,
                   nl_ee: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
-                  n_phi: int = 128) -> jnp.ndarray:
+                  n_phi: int = 128,
+                  fullsky: bool = False) -> jnp.ndarray:
     """N_0^{EE}(L) — QE reconstruction noise for the EE estimator.
 
     Response: f_EE = [C_{l₁}^{EE,unl} (L·l₁) + C_{l₂}^{EE,unl} (L·l₂)] cos(2φ_{l₁,l₂})
     Filter:   F_EE = f_EE / (2 × C_{l₁}^{EE,tot} × C_{l₂}^{EE,tot})
     """
+    if fullsky:
+        return _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max)
     phi, w_phi = _gl_nodes(n_phi)
     cl_ee_tot = spectra.cl_ee_len + nl_ee
     cl_ee_unl = spectra.cl_ee_unl
@@ -371,7 +380,8 @@ def compute_n0_te(Ls: jnp.ndarray,
                   nl_ee: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
-                  n_phi: int = 128) -> jnp.ndarray:
+                  n_phi: int = 128,
+                  fullsky: bool = False) -> jnp.ndarray:
     """N_0^{TE}(L) — QE reconstruction noise for the TE estimator.
 
     Response: f_TE = C_{l₁}^{TE,unl} (L·l₁) cos(2φ_{l₁,l₂}) + C_{l₂}^{TE,unl} (L·l₂)
@@ -379,6 +389,8 @@ def compute_n0_te(Ls: jnp.ndarray,
 
     Following Hu & Okamoto Eq. 13-14 for the correlated TE case.
     """
+    if fullsky:
+        return _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max)
     phi, w_phi = _gl_nodes(n_phi)
     cl_tt_tot = spectra.cl_tt_len + nl_tt
     cl_ee_tot = spectra.cl_ee_len + nl_ee
@@ -434,18 +446,24 @@ def compute_n0_mv(Ls: jnp.ndarray,
                   nl_bb: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
-                  n_phi: int = 128) -> jnp.ndarray:
+                  n_phi: int = 128,
+                  fullsky: bool = False) -> jnp.ndarray:
     """Minimum-variance combination of all QE estimators (diagonal approximation).
 
     1/N_0^{MV}(L) = Σ_α 1/N_0^α(L)
 
     Parity decouples into {TT, TE, EE} and {EB, TB}.
     """
-    n0_tt = compute_n0_tt(Ls, spectra, nl_tt, l_min, l_max, n_phi)
-    n0_ee = compute_n0_ee(Ls, spectra, nl_ee, l_min, l_max, n_phi)
-    n0_te = compute_n0_te(Ls, spectra, nl_tt, nl_ee, l_min, l_max, n_phi)
-    n0_eb = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, l_min, l_max, n_phi)
-    n0_tb = compute_n0_tb(Ls, spectra, nl_tt, nl_bb, l_min, l_max, n_phi)
+    n0_tt = compute_n0_tt(Ls, spectra, nl_tt, l_min, l_max, n_phi,
+                          fullsky=fullsky)
+    n0_ee = compute_n0_ee(Ls, spectra, nl_ee, l_min, l_max, n_phi,
+                          fullsky=fullsky)
+    n0_te = compute_n0_te(Ls, spectra, nl_tt, nl_ee, l_min, l_max, n_phi,
+                          fullsky=fullsky)
+    n0_eb = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, l_min, l_max, n_phi,
+                          fullsky=fullsky)
+    n0_tb = compute_n0_tb(Ls, spectra, nl_tt, nl_bb, l_min, l_max, n_phi,
+                          fullsky=fullsky)
 
     inv_n0_mv = (1.0 / n0_tt + 1.0 / n0_ee + 1.0 / n0_te
                  + 1.0 / n0_eb + 1.0 / n0_tb)
@@ -546,6 +564,242 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
     n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float),
                                      log_n0_inv))
 
+    n0_inv_jax = jnp.array(n0_inv_interp)
+    safe = jnp.where(n0_inv_jax > 0, n0_inv_jax, 1.0)
+    return jnp.where(n0_inv_jax > 0, 1.0 / safe, jnp.inf)
+
+
+def _fullsky_L_samples(Ls_np: np.ndarray) -> np.ndarray:
+    """Generate logarithmically-spaced L sample points for interpolation."""
+    L_min = max(2, int(Ls_np.min()))
+    L_max = int(Ls_np.max())
+    n_sample = min(len(Ls_np), max(50, L_max // 20))
+    return np.unique(np.concatenate([
+        np.arange(L_min, min(20, L_max + 1)),
+        np.geomspace(max(20, L_min), L_max, n_sample).astype(int),
+    ]).clip(L_min, L_max).astype(int))
+
+
+def _fullsky_spin2_coupling(L: int, l1_arr: np.ndarray):
+    """Compute spin-2 coupling for fixed L and array of l1 values.
+
+    Returns (l2_grid, F_minus_sq, F_plus_sq):
+        F^{-2}(l1,l2,L): parity-odd coupling squared (EB, TB)
+        F^{+2}(l1,l2,L): parity-even coupling squared (EE)
+    """
+    from augr.wigner import wigner3j_vectorized
+
+    l2_grid, w3j = wigner3j_vectorized(L, l1_arr, m1=2, m2=-2)
+
+    l1_ll1 = l1_arr * (l1_arr + 1)
+    l2_ll2 = l2_grid * (l2_grid + 1)
+    L_LL = L * (L + 1)
+
+    # Common prefactor: sqrt[(2l1+1)(2l2+1)(2L+1)/(8π)]
+    pf = np.sqrt((2 * l1_arr + 1)[:, None]
+                 * (2 * l2_grid + 1)[None, :]
+                 * (2 * L + 1) / (8.0 * np.pi))
+
+    # F^{-}: parity-odd (EB, TB), geometric = l1(l1+1) - l2(l2+1)
+    geom_minus = l1_ll1[:, None] - l2_ll2[None, :]
+    F_minus_sq = (pf * w3j * geom_minus) ** 2
+
+    # F^{+}: parity-even (EE), geometric = L(L+1)
+    F_plus_sq = (pf * w3j * L_LL) ** 2
+
+    return l2_grid, F_minus_sq, F_plus_sq
+
+
+def _fullsky_inv_spectrum(cl_tot: np.ndarray, l2_grid: np.ndarray) -> np.ndarray:
+    """Safe 1/C_l at l2_grid positions."""
+    l2_int = l2_grid.astype(int)
+    valid = (l2_int >= 0) & (l2_int < len(cl_tot))
+    inv_cl = np.zeros(len(l2_grid))
+    inv_cl[valid] = np.where(cl_tot[l2_int[valid]] > 0,
+                             1.0 / cl_tot[l2_int[valid]], 0.0)
+    return inv_cl
+
+
+def _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max):
+    """Full-sky N_0^{TB}: same coupling as EB, but C^{TE} response / C^{TT} filter."""
+    cl_tt_tot = np.asarray(spectra.cl_tt_len + nl_tt)
+    cl_bb_tot = np.asarray(spectra.cl_bb_len + nl_bb)
+    cl_te_unl = np.asarray(spectra.cl_te_unl)
+
+    Ls_np = np.asarray(Ls)
+    l1_arr = np.arange(l_min, l_max + 1, dtype=float)
+    L_samples = _fullsky_L_samples(Ls_np)
+    n0_inv_samples = np.zeros(len(L_samples))
+
+    for i_L, L in enumerate(L_samples):
+        l2_grid, F_minus_sq, _ = _fullsky_spin2_coupling(int(L), l1_arr)
+        inv_bb = _fullsky_inv_spectrum(cl_bb_tot, l2_grid)
+
+        te_unl_sq = cl_te_unl[l_min:l_max + 1] ** 2
+        tt_tot = cl_tt_tot[l_min:l_max + 1]
+        safe_tt = np.where(tt_tot > 0, tt_tot, 1.0)
+        l1_weight = np.where(tt_tot > 0, te_unl_sq / safe_tt, 0.0)
+
+        l2_sum = F_minus_sq @ inv_bb
+        n0_inv_samples[i_L] = np.sum(l1_weight * l2_sum) / (2 * L + 1)
+
+    log_n0_inv = np.log(np.maximum(n0_inv_samples, 1e-300))
+    n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float), log_n0_inv))
+    n0_inv_jax = jnp.array(n0_inv_interp)
+    safe = jnp.where(n0_inv_jax > 0, n0_inv_jax, 1.0)
+    return jnp.where(n0_inv_jax > 0, 1.0 / safe, jnp.inf)
+
+
+def _compute_n0_tt_fullsky(Ls, spectra, nl_tt, l_min, l_max):
+    """Full-sky N_0^{TT} using vectorized (l1 l2 L; 0 0 0)."""
+    from augr.wigner import wigner3j_000_vectorized
+
+    cl_tt_tot = np.asarray(spectra.cl_tt_len + nl_tt)
+    cl_tt_unl = np.asarray(spectra.cl_tt_unl)
+
+    Ls_np = np.asarray(Ls)
+    l1_arr = np.arange(l_min, l_max + 1, dtype=int)
+    L_samples = _fullsky_L_samples(Ls_np)
+    n0_inv_samples = np.zeros(len(L_samples))
+
+    for i_L, L in enumerate(L_samples):
+        L = int(L)
+        L_LL = L * (L + 1)
+        l1_ll1 = l1_arr * (l1_arr + 1)
+
+        l2_grid, w000 = wigner3j_000_vectorized(L, l1_arr, l2_min=l_min,
+                                                 l2_max=l_max)
+        l2_ll2 = l2_grid * (l2_grid + 1)
+
+        # alpha(l1,l2,L) = [L(L+1)+l1(l1+1)-l2(l2+1)] / 2
+        alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
+        alpha2 = (L_LL + l2_ll2[None, :] - l1_ll1[:, None]) / 2.0
+
+        pf = np.sqrt((2*l1_arr+1)[:, None] * (2*l2_grid+1)[None, :] *
+                     (2*L+1) / (4.0 * np.pi))
+
+        # TT response: [C_TT(l1)*alpha1 + C_TT(l2)*alpha2] × pf × w000
+        tt_l1 = cl_tt_unl[l1_arr]
+        tt_l2 = np.zeros(len(l2_grid))
+        valid = (l2_grid >= 0) & (l2_grid < len(cl_tt_unl))
+        tt_l2[valid] = cl_tt_unl[l2_grid[valid]]
+
+        f_sq = (tt_l1[:, None] * alpha1 + tt_l2[None, :] * alpha2) ** 2 \
+               * pf**2 * w000**2
+
+        # Filter: 1 / (2 × C_TT_tot(l1) × C_TT_tot(l2))
+        inv_tt_l1 = np.where(cl_tt_tot[l1_arr] > 0,
+                             1.0 / cl_tt_tot[l1_arr], 0.0)
+        inv_tt_l2 = _fullsky_inv_spectrum(cl_tt_tot, l2_grid.astype(float))
+
+        integrand = f_sq * inv_tt_l1[:, None] * inv_tt_l2[None, :] / 2.0
+        n0_inv_samples[i_L] = np.sum(integrand) / (2 * L + 1)
+
+    log_n0_inv = np.log(np.maximum(n0_inv_samples, 1e-300))
+    n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float), log_n0_inv))
+    n0_inv_jax = jnp.array(n0_inv_interp)
+    safe = jnp.where(n0_inv_jax > 0, n0_inv_jax, 1.0)
+    return jnp.where(n0_inv_jax > 0, 1.0 / safe, jnp.inf)
+
+
+def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
+    """Full-sky N_0^{EE} using parity-even F^{+} coupling."""
+    cl_ee_tot = np.asarray(spectra.cl_ee_len + nl_ee)
+    cl_ee_unl = np.asarray(spectra.cl_ee_unl)
+
+    Ls_np = np.asarray(Ls)
+    l1_arr = np.arange(l_min, l_max + 1, dtype=float)
+    L_samples = _fullsky_L_samples(Ls_np)
+    n0_inv_samples = np.zeros(len(L_samples))
+
+    for i_L, L in enumerate(L_samples):
+        l2_grid, _, F_plus_sq = _fullsky_spin2_coupling(int(L), l1_arr)
+
+        inv_ee = _fullsky_inv_spectrum(cl_ee_tot, l2_grid)
+
+        # Response: [C_EE(l1) + C_EE(l2)] × F^{+}
+        # f^2 = [C_EE(l1) + C_EE(l2)]^2 × F_plus_sq
+        l2_int = l2_grid.astype(int)
+        valid = (l2_int >= l_min) & (l2_int < len(cl_ee_unl))
+        ee_at_l2 = np.zeros(len(l2_grid))
+        ee_at_l2[valid] = cl_ee_unl[l2_int[valid]]
+
+        ee_l1 = cl_ee_unl[l_min:l_max + 1]  # (n_l1,)
+        ee_sum_sq = (ee_l1[:, None] + ee_at_l2[None, :]) ** 2
+
+        ee_tot = cl_ee_tot[l_min:l_max + 1]
+        safe_ee = np.where(ee_tot > 0, ee_tot, 1.0)
+        inv_ee_l1 = np.where(ee_tot > 0, 1.0 / safe_ee, 0.0)
+
+        # f^2/denom = ee_sum^2 × F_plus / (2 × C_EE_tot(l1) × C_EE_tot(l2))
+        integrand = ee_sum_sq * F_plus_sq * inv_ee_l1[:, None] * inv_ee[None, :] / 2.0
+        n0_inv_samples[i_L] = np.sum(integrand) / (2 * int(L) + 1)
+
+    log_n0_inv = np.log(np.maximum(n0_inv_samples, 1e-300))
+    n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float), log_n0_inv))
+    n0_inv_jax = jnp.array(n0_inv_interp)
+    safe = jnp.where(n0_inv_jax > 0, n0_inv_jax, 1.0)
+    return jnp.where(n0_inv_jax > 0, 1.0 / safe, jnp.inf)
+
+
+def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max):
+    """Full-sky N_0^{TE} using vectorized (l1 l2 L; 0 0 0).
+
+    Uses the scalar (0,0,0) coupling with the diagonal approximation
+    for the TE filter denominator (same as flat-sky).
+    """
+    from augr.wigner import wigner3j_000_vectorized
+
+    cl_tt_tot = np.asarray(spectra.cl_tt_len + nl_tt)
+    cl_ee_tot = np.asarray(spectra.cl_ee_len + nl_ee)
+    cl_te_tot = np.asarray(spectra.cl_te_len)
+    cl_te_unl = np.asarray(spectra.cl_te_unl)
+
+    Ls_np = np.asarray(Ls)
+    l1_arr = np.arange(l_min, l_max + 1, dtype=int)
+    L_samples = _fullsky_L_samples(Ls_np)
+    n0_inv_samples = np.zeros(len(L_samples))
+
+    for i_L, L in enumerate(L_samples):
+        L = int(L)
+        L_LL = L * (L + 1)
+        l1_ll1 = l1_arr * (l1_arr + 1)
+
+        l2_grid, w000 = wigner3j_000_vectorized(L, l1_arr, l2_min=l_min,
+                                                 l2_max=l_max)
+        l2_ll2 = l2_grid * (l2_grid + 1)
+
+        alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
+        alpha2 = (L_LL + l2_ll2[None, :] - l1_ll1[:, None]) / 2.0
+
+        pf = np.sqrt((2*l1_arr+1)[:, None] * (2*l2_grid+1)[None, :] *
+                     (2*L+1) / (4.0 * np.pi))
+
+        te_l1 = cl_te_unl[l1_arr]
+        te_l2 = np.zeros(len(l2_grid))
+        valid = (l2_grid >= 0) & (l2_grid < len(cl_te_unl))
+        te_l2[valid] = cl_te_unl[l2_grid[valid]]
+
+        f_sq = (te_l1[:, None] * alpha1 + te_l2[None, :] * alpha2) ** 2 \
+               * pf**2 * w000**2
+
+        # TE diagonal filter: 1 / (C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2))
+        tt_l1 = cl_tt_tot[l1_arr]
+        ee_l2 = np.zeros(len(l2_grid))
+        ee_l2[valid] = cl_ee_tot[l2_grid[valid]]
+        te_tot_l1 = cl_te_tot[l1_arr]
+        te_tot_l2 = np.zeros(len(l2_grid))
+        te_tot_l2[valid] = cl_te_tot[l2_grid[valid]]
+
+        denom = (tt_l1[:, None] * ee_l2[None, :]
+                 + te_tot_l1[:, None] * te_tot_l2[None, :])
+        safe_denom = np.where(np.abs(denom) > 0, denom, 1.0)
+        inv_denom = np.where(np.abs(denom) > 0, 1.0 / safe_denom, 0.0)
+
+        n0_inv_samples[i_L] = np.sum(f_sq * inv_denom) / (2 * L + 1)
+
+    log_n0_inv = np.log(np.maximum(np.abs(n0_inv_samples), 1e-300))
+    n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float), log_n0_inv))
     n0_inv_jax = jnp.array(n0_inv_interp)
     safe = jnp.where(n0_inv_jax > 0, n0_inv_jax, 1.0)
     return jnp.where(n0_inv_jax > 0, 1.0 / safe, jnp.inf)
@@ -905,13 +1159,8 @@ def iterate_delensing(spectra: LensingSpectra,
         nl_bb_eff = cl_bb_current - spectra.cl_bb_len + nl_bb
 
         # Compute MV N_0
-        if fullsky:
-            # Full-sky: only EB estimator for now (dominant for low-noise pol)
-            n0 = compute_n0_eb(Ls, spectra, nl_ee, nl_bb_eff,
-                               l_min_qe, l_max_qe, fullsky=True)
-        else:
-            n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb_eff,
-                               l_min_qe, l_max_qe, n_phi)
+        n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb_eff,
+                           l_min_qe, l_max_qe, n_phi, fullsky=fullsky)
 
         # Compute residual BB
         cl_bb_res = residual_cl_bb(ls, Ls, spectra, n0,

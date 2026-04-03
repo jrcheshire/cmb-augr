@@ -11,7 +11,7 @@ Built for the JPL CMB Probe 2026 study to explore how instrument design choices 
 Given an instrument specification (frequency bands, detector counts, noise levels, beam sizes, integration time), `augr` computes the marginalized Fisher constraint on *r* after accounting for:
 
 - **Foreground contamination** from polarized dust and synchrotron, modeled as either a simple Gaussian (BK15-style, 9 parameters) or a moment expansion (17 parameters) that captures SED spatial variation and frequency decorrelation
-- **Gravitational lensing** B-modes (parameterized by A_lens)
+- **Gravitational lensing** B-modes, either parameterized by A_lens or self-consistently delensed via iterative quadratic-estimator lensing reconstruction (flat-sky or full-sky Wigner 3j)
 - **Priors** on foreground spectral indices from Planck/WMAP
 - **Bandpower covariance** via the Knox formula across all frequency cross-spectra
 
@@ -23,7 +23,7 @@ An "`augr`" `conda` environment is included with the needed dependencies: `conda
 
 ```bash
 make install   # create conda env + pip install -e .
-make test      # run 169 tests
+make test      # run 236 tests
 ```
 
 ```python
@@ -45,7 +45,9 @@ signal = SignalModel(
     ell_min=2, ell_max=1000, delta_ell=30,
 )
 
-# Run the Fisher forecast
+# Run the Fisher forecast -- two options for lensing:
+
+# Option 1: fixed A_lens (fast, approximate)
 fiducial = {**FIDUCIAL_MOMENT, "A_lens": 0.27}  # 73% delensing
 ff = FisherForecast(
     signal, inst, fiducial,
@@ -53,6 +55,20 @@ ff = FisherForecast(
     fixed_params=DEFAULT_FIXED_MOMENT,
 )
 print(f"sigma(r) = {ff.sigma('r'):.2e}")
+
+# Option 2: self-consistent delensing (full-sky QE reconstruction)
+from augr.delensing import load_lensing_spectra, iterate_delensing
+from augr.instrument import combined_noise_nl
+spec = load_lensing_spectra()
+nl_bb = combined_noise_nl(inst, spec.ells, "BB")
+result = iterate_delensing(spec, combined_noise_nl(inst, spec.ells, "TT"),
+                           nl_bb, nl_bb, fullsky=True, n_iter=5)
+signal_d = SignalModel(inst, MomentExpansionModel(), CMBSpectra(),
+                       delensed_bb=result.cl_bb_res, delensed_bb_ells=result.ls)
+ff_d = FisherForecast(signal_d, inst,
+                      {k: v for k, v in FIDUCIAL_MOMENT.items() if k != "A_lens"},
+                      priors=DEFAULT_PRIORS_MOMENT, fixed_params=DEFAULT_FIXED_MOMENT)
+print(f"sigma(r) [delensed] = {ff_d.sigma('r'):.2e}")
 ```
 
 ## Package structure
@@ -74,8 +90,17 @@ augr/
   covariance.py    Bandpower covariance matrix (Knox formula)
   fisher.py        Fisher information matrix, marginalized and conditional
                    constraints; Cholesky solver with eigendecomposition fallback
+  delensing.py     Iterative QE lensing reconstruction: all 5 estimators
+                   (TT, TE, EE, EB, TB) with MV combination, residual BB
+                   via lensing kernel, flat-sky and full-sky (Wigner 3j) modes
+  wigner.py        Wigner 3j symbols: closed-form (0,0,0) via log-gamma,
+                   Schulten-Gordon backward recursion for spin-2, vectorized
+                   over l1 for fixed L
   units.py         Physical constants, RJ/CMB unit conversions, dust and
                    synchrotron SEDs and their log-derivatives
+  multipatch.py    Multi-patch Fisher with shared spectral indices,
+                   per-patch amplitudes, L2 scan strategy model
+  sky_patches.py   Sky patch definitions and scan strategy
 
 scripts/
   explore_designs.py   Band optimization: density scan, frequency range scan,
@@ -83,8 +108,8 @@ scripts/
   validate_pico.py     Validation against PICO published sigma(r) targets
   plot_figure5.py      Reproduction of BICEP/Keck Figure 5 time evolution
 
-tests/              169 tests covering all modules
-data/               CAMB template spectra (tensor r=1, lensing)
+tests/              236 tests covering all modules
+data/               CAMB template spectra (tensor r=1, lensing, unlensed TT/EE/TE/BB, phi-phi)
 plots/              Output from explore_designs.py
 ```
 
@@ -120,11 +145,37 @@ The `telescope.py` module derives a complete `Instrument` from physical specific
 
 ## TODO
 
-- **Self-consistent delensing**: derive A_lens from instrument sensitivity via lensing reconstruction noise, rather than fixing it externally. Also requires expanding to T and E. See Carron et al. (2017), PICO Sec. 2.3.2, S4 Science Book Sec. 8.10.
 - **Differentiable instrument optimization**: relax discrete quantities (floor in detector counting) to enable JAX gradients d(sigma(r))/d(design params) for continuous optimization of area fractions, efficiency, etc.
 - **Scale-dependent moment expansion**: make omega parameters functions of ell to capture the angular-scale dependence of foreground SED variation.
 - **Achieved-performance noise mode**: option to rescale from measured detector performance rather than computing from first principles.
 - **Structured assumption output**: machine-readable (JSON/YAML) provenance records for every forecast, extending `FisherForecast.summary()`.
+- **Full-sky N_0 cross-validation**: compare against plancklens/lenspyx for absolute normalization of the lensing reconstruction noise.
+
+## Delensing
+
+The `delensing.py` module computes self-consistent iterative QE delensing, replacing the external A_lens parameter with a derived residual lensing spectrum:
+
+1. Compute the minimum-variance QE reconstruction noise N_0(L) from all 5 estimators (TT, TE, EE, EB, TB)
+2. Compute the Wiener-filtered residual lensing potential: C_L^{phi,res} = C_L^{phi} N_0 / (C_L^{phi} + N_0)
+3. Compute the residual BB via the lensing kernel: C_l^{BB,res} = K(l,L) @ C_L^{phi,res}
+4. Update the BB in the EB/TB filter denominators and iterate until converged
+
+Two modes are available:
+
+- **Flat-sky** (`fullsky=False`): Gauss-Legendre quadrature over the azimuthal angle. Fast (~2 min for 5 iterations at l_max=3000).
+- **Full-sky** (`fullsky=True`): Wigner 3j coupling via Schulten-Gordon backward recursion, vectorized over l1 for fixed L with log-spaced L sampling. The full-sky lensing kernel matches CAMB to 0.01% at l=5 (vs 1.7% for flat-sky), which matters for the reionization bump where space missions derive most of their r constraining power.
+
+```python
+from augr.delensing import load_lensing_spectra, iterate_delensing
+from augr.instrument import combined_noise_nl
+
+spec = load_lensing_spectra()
+nl_bb = combined_noise_nl(inst, spec.ells, "BB")
+nl_ee, nl_tt = nl_bb, combined_noise_nl(inst, spec.ells, "TT")
+
+result = iterate_delensing(spec, nl_tt, nl_ee, nl_bb, fullsky=True, n_iter=5)
+# result.A_lens_eff ~ 0.29 for probe-class, result.cl_bb_res for Fisher input
+```
 
 ## References
 
@@ -134,3 +185,8 @@ The `telescope.py` module derives a complete `Instrument` from physical specific
 - Hanany et al. 2019 (arXiv:1902.10541) -- PICO probe study report
 - Puglisi et al. 2025 (arXiv:2502.20452) -- PanEx PySM3 foreground models
 - Bianchini et al. 2025 (ApJ 993:105) -- Foreground pipeline comparison (from CMB-S4 effort)
+- Hu & Okamoto 2002 (arXiv:astro-ph/0111606) -- Quadratic estimator lensing reconstruction
+- Okamoto & Hu 2003 (PRD 67, 083002) -- Full-sky QE formalism
+- Smith et al. 2012 (arXiv:1010.0048) -- Residual BB after delensing
+- Maniyar et al. 2021 (arXiv:2101.12193) -- Full-sky N_0 formulas
+- Trendafilova, Meyers et al. 2023 (arXiv:2312.02954) -- CLASS_delens iterative delensing
