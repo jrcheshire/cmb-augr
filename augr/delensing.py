@@ -480,24 +480,19 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
                            nl_bb: jnp.ndarray,
                            l_min: int = 2,
                            l_max: int = 3000) -> jnp.ndarray:
-    """Full-sky N_0^{EB}(L) using Wigner 3j coupling.
+    """Full-sky N_0^{EB}(L) using Smith et al. (2012) Eq. 6-7.
 
-    [N_0(L)]^{-1} = 1/(2L+1) × sum_{l1,l2}
-        [C_{l1}^{EE,unl}]^2 × |F^{-}(l1,l2,L)|^2
-        / (C_{l1}^{EE,tot} × C_{l2}^{BB,tot})
+    [N_0(L)]^{-1} = 1/(2L+1) × sum_{l_E, l_B, odd}
+        [C_{l_E}^{EE,unl}]^2 × |f^{EB}(l_B, l_E, L)|^2
+        / (C_{l_E}^{EE,tot} × C_{l_B}^{BB,tot})
 
-    where the parity-odd coupling is:
-    F^{-}(l1,l2,L) = [1-(-1)^{l1+l2+L}]/2 × xi(l1,l2,L)
-                      × sqrt((2l1+1)(2l2+1)(2L+1)/(4pi))
-                      × (l1, l2, L; 2, 0, -2)
+    where the parity-odd coupling is (Smith Eq. 6-7, odd l_E+l_B+L only):
+    |f^{EB}|^2 = [-l_B(l_B+1)+l_E(l_E+1)+L(L+1)]^2
+                 × (2l_B+1)(2l_E+1)(2L+1)/(16π)
+                 × (l_B, l_E, L; 2, -2, 0)^2
 
-    The 3j symbol (l1, L, l2; 2, -2, 0) is computed directly via vectorized
-    backward recursion (stable since m3=0 on l2), and the coupling simplifies:
-
-    F^{-}(l1,l2,L) = sqrt[(2l1+1)(2l2+1)(2L+1)/(16pi)]
-                       × (l1, L, l2; 2, -2, 0) × [l1(l1+1) - l2(l2+1)]
-
-    (Maniyar et al. 2021, Eq. A3; the (-1)^{l1+l2+L} factors cancel.)
+    Computed via cyclic 3j identity:
+        (l_B, l_E, L; 2, -2, 0) = (l_E, L, l_B; -2, 0, 2)
     """
     from augr.wigner import wigner3j_vectorized
 
@@ -506,7 +501,7 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
     cl_ee_unl = np.asarray(spectra.cl_ee_unl)
 
     Ls_np = np.asarray(Ls)
-    l1_arr = np.arange(l_min, l_max + 1, dtype=float)
+    l_E_arr = np.arange(l_min, l_max + 1, dtype=float)
 
     # Sample L values (logarithmic + linear blend, ~100 points) and interpolate
     L_min_int = max(2, int(Ls_np.min()))
@@ -521,43 +516,37 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
     for i_L, L in enumerate(L_samples):
         L = int(L)
 
-        # Compute (l1, L, l2; 2, -2, 0) for all l1 and l2 simultaneously
-        l2_grid, w3j = wigner3j_vectorized(L, l1_arr, m1=2, m2=-2)
+        # Cyclic: (l_B, l_E, L; 2,-2,0) = (l_E, L, l_B; -2, 0, 2)
+        l_B_grid, w3j = wigner3j_vectorized(L, l_E_arr, m1=-2, m2=0)
 
-        # Geometric factor: l1(l1+1) - l2(l2+1)
-        l1_ll1 = l1_arr * (l1_arr + 1)  # (n_l1,)
-        l2_ll2 = l2_grid * (l2_grid + 1)  # (n_l2,)
-        geom = l1_ll1[:, None] - l2_ll2[None, :]  # (n_l1, n_l2)
+        # Smith's three-term geometric factor
+        l_E_ll = l_E_arr * (l_E_arr + 1)
+        l_B_ll = l_B_grid * (l_B_grid + 1)
+        L_LL = L * (L + 1)
+        geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
 
-        # Prefactor: sqrt((2l1+1)(2l2+1)(2L+1) / (8pi))
-        # The 8pi (not 16pi) accounts for the factor of 2 from the
-        # parity decomposition F^{-} = (alpha - beta) where alpha-beta = 2(l1_l1-l2_l2).
-        prefactor = np.sqrt((2 * l1_arr + 1)[:, None]
-                            * (2 * l2_grid + 1)[None, :]
-                            * (2 * L + 1) / (8.0 * np.pi))
+        prefactor = np.sqrt((2 * l_E_arr + 1)[:, None]
+                            * (2 * l_B_grid + 1)[None, :]
+                            * (2 * L + 1) / (16.0 * np.pi))
 
-        # F^{-}(l1,l2,L) = prefactor × w3j × geom
-        F_minus_sq = (prefactor * w3j * geom) ** 2
+        # Parity-odd mask
+        parity_sum = (l_E_arr.astype(int)[:, None]
+                      + l_B_grid.astype(int)[None, :] + L)
+        odd_mask = (parity_sum % 2 == 1).astype(float)
 
-        # Spectrum weights
-        ee_unl_sq = cl_ee_unl[l_min:l_max + 1] ** 2  # (n_l1,)
-        ee_tot = cl_ee_tot[l_min:l_max + 1]           # (n_l1,)
+        f_eb_sq = (prefactor * w3j * geom) ** 2 * odd_mask
 
-        # 1/C_BB at l2 values
-        l2_int = l2_grid.astype(int)
-        valid_l2 = (l2_int >= 0) & (l2_int < len(cl_bb_tot))
-        inv_bb = np.zeros(len(l2_grid))
-        inv_bb[valid_l2] = np.where(
-            cl_bb_tot[l2_int[valid_l2]] > 0,
-            1.0 / cl_bb_tot[l2_int[valid_l2]],
-            0.0)
-
-        # N_0^{-1}(L) = 1/(2L+1) × sum_{l1} (ee_unl^2/ee_tot) × sum_{l2} F^2/bb_tot
+        # Spectrum weights: C_EE^2 / C_EE_tot (indexed by l_E)
+        ee_unl_sq = cl_ee_unl[l_min:l_max + 1] ** 2
+        ee_tot = cl_ee_tot[l_min:l_max + 1]
         safe_ee_tot = np.where(ee_tot > 0, ee_tot, 1.0)
-        l1_weight = np.where(ee_tot > 0, ee_unl_sq / safe_ee_tot, 0.0)
+        l_E_weight = np.where(ee_tot > 0, ee_unl_sq / safe_ee_tot, 0.0)
 
-        l2_sum = F_minus_sq @ inv_bb  # (n_l1,)
-        n0_inv_samples[i_L] = np.sum(l1_weight * l2_sum) / (2 * L + 1)
+        # 1/C_BB (indexed by l_B)
+        inv_bb = _fullsky_inv_spectrum(cl_bb_tot, l_B_grid)
+
+        l_B_sum = f_eb_sq @ inv_bb  # (n_l_E,)
+        n0_inv_samples[i_L] = np.sum(l_E_weight * l_B_sum) / (2 * L + 1)
 
     # Interpolate N_0^{-1} to the requested L grid (log-space for smoothness)
     log_n0_inv = np.log(np.maximum(n0_inv_samples, 1e-300))
@@ -580,34 +569,51 @@ def _fullsky_L_samples(Ls_np: np.ndarray) -> np.ndarray:
     ]).clip(L_min, L_max).astype(int))
 
 
-def _fullsky_spin2_coupling(L: int, l1_arr: np.ndarray):
-    """Compute spin-2 coupling for fixed L and array of l1 values.
+def _fullsky_spin2_coupling(L: int, l_E_arr: np.ndarray):
+    """Full-sky spin-2 lensing coupling |f^{EB}|^2 for fixed L.
 
-    Returns (l2_grid, F_minus_sq, F_plus_sq):
-        F^{-2}(l1,l2,L): parity-odd coupling squared (EB, TB)
-        F^{+2}(l1,l2,L): parity-even coupling squared (EE)
+    Implements Smith et al. (2012) Eq. 6-7 coupling via cyclic 3j identity:
+        (l_B, l_E, L; 2, -2, 0) = (l_E, L, l_B; -2, 0, 2)
+
+    This allows efficient vectorized computation: recurse on l_B (column)
+    with l_E (row) as the input array.
+
+    Args:
+        L:        Fixed lensing multipole.
+        l_E_arr:  Array of l values (rows; E-mode side for EB/TB).
+
+    Returns (l_B_grid, f_odd_sq, f_even_sq):
+        l_B_grid:      1-D array of l_B values (columns).
+        f_odd_sq[i,j]: Parity-odd |f|^2 at (l_E[i], l_B[j], L). For EB/TB.
+        f_even_sq[i,j]: Parity-even |f|^2.  For EE.
     """
     from augr.wigner import wigner3j_vectorized
 
-    l2_grid, w3j = wigner3j_vectorized(L, l1_arr, m1=2, m2=-2)
+    # Cyclic: (l_B, l_E, L; 2,-2,0) = (l_E, L, l_B; -2, 0, 2)
+    l_B_grid, w3j = wigner3j_vectorized(L, l_E_arr, m1=-2, m2=0)
 
-    l1_ll1 = l1_arr * (l1_arr + 1)
-    l2_ll2 = l2_grid * (l2_grid + 1)
+    l_E_ll = l_E_arr * (l_E_arr + 1)
+    l_B_ll = l_B_grid * (l_B_grid + 1)
     L_LL = L * (L + 1)
 
-    # Common prefactor: sqrt[(2l1+1)(2l2+1)(2L+1)/(8π)]
-    pf = np.sqrt((2 * l1_arr + 1)[:, None]
-                 * (2 * l2_grid + 1)[None, :]
-                 * (2 * L + 1) / (8.0 * np.pi))
+    # Smith's three-term geometric factor
+    geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
 
-    # F^{-}: parity-odd (EB, TB), geometric = l1(l1+1) - l2(l2+1)
-    geom_minus = l1_ll1[:, None] - l2_ll2[None, :]
-    F_minus_sq = (pf * w3j * geom_minus) ** 2
+    # Prefactor: sqrt[(2l_E+1)(2l_B+1)(2L+1)/(16π)]
+    pf = np.sqrt((2 * l_E_arr + 1)[:, None]
+                 * (2 * l_B_grid + 1)[None, :]
+                 * (2 * L + 1) / (16.0 * np.pi))
 
-    # F^{+}: parity-even (EE), geometric = L(L+1)
-    F_plus_sq = (pf * w3j * L_LL) ** 2
+    # Parity masks: EB/TB use odd l_E+l_B+L, EE uses even
+    parity_sum = (l_E_arr.astype(int)[:, None]
+                  + l_B_grid.astype(int)[None, :] + L)
+    odd_mask = (parity_sum % 2 == 1).astype(float)
 
-    return l2_grid, F_minus_sq, F_plus_sq
+    coupling_sq = (pf * w3j * geom) ** 2
+    f_odd_sq = coupling_sq * odd_mask
+    f_even_sq = coupling_sq * (1.0 - odd_mask)
+
+    return l_B_grid, f_odd_sq, f_even_sq
 
 
 def _fullsky_inv_spectrum(cl_tot: np.ndarray, l2_grid: np.ndarray) -> np.ndarray:
@@ -621,26 +627,26 @@ def _fullsky_inv_spectrum(cl_tot: np.ndarray, l2_grid: np.ndarray) -> np.ndarray
 
 
 def _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max):
-    """Full-sky N_0^{TB}: same coupling as EB, but C^{TE} response / C^{TT} filter."""
+    """Full-sky N_0^{TB}: same parity-odd coupling as EB, but C^{TE}/C^{TT} weights."""
     cl_tt_tot = np.asarray(spectra.cl_tt_len + nl_tt)
     cl_bb_tot = np.asarray(spectra.cl_bb_len + nl_bb)
     cl_te_unl = np.asarray(spectra.cl_te_unl)
 
     Ls_np = np.asarray(Ls)
-    l1_arr = np.arange(l_min, l_max + 1, dtype=float)
+    l_E_arr = np.arange(l_min, l_max + 1, dtype=float)
     L_samples = _fullsky_L_samples(Ls_np)
     n0_inv_samples = np.zeros(len(L_samples))
 
     for i_L, L in enumerate(L_samples):
-        l2_grid, F_minus_sq, _ = _fullsky_spin2_coupling(int(L), l1_arr)
-        inv_bb = _fullsky_inv_spectrum(cl_bb_tot, l2_grid)
+        l_B_grid, f_odd_sq, _ = _fullsky_spin2_coupling(int(L), l_E_arr)
+        inv_bb = _fullsky_inv_spectrum(cl_bb_tot, l_B_grid)
 
         te_unl_sq = cl_te_unl[l_min:l_max + 1] ** 2
         tt_tot = cl_tt_tot[l_min:l_max + 1]
         safe_tt = np.where(tt_tot > 0, tt_tot, 1.0)
         l1_weight = np.where(tt_tot > 0, te_unl_sq / safe_tt, 0.0)
 
-        l2_sum = F_minus_sq @ inv_bb
+        l2_sum = f_odd_sq @ inv_bb
         n0_inv_samples[i_L] = np.sum(l1_weight * l2_sum) / (2 * L + 1)
 
     log_n0_inv = np.log(np.maximum(n0_inv_samples, 1e-300))
@@ -703,7 +709,13 @@ def _compute_n0_tt_fullsky(Ls, spectra, nl_tt, l_min, l_max):
 
 
 def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
-    """Full-sky N_0^{EE} using parity-even F^{+} coupling."""
+    """Full-sky N_0^{EE} using parity-even spin-2 coupling.
+
+    The EE response uses [C_EE(l1)×α1 + C_EE(l2)×α2] where
+    α1 = [L(L+1)+l1(l1+1)-l2(l2+1)]/2 (full-sky analog of L·l1).
+    """
+    from augr.wigner import wigner3j_vectorized
+
     cl_ee_tot = np.asarray(spectra.cl_ee_len + nl_ee)
     cl_ee_unl = np.asarray(spectra.cl_ee_unl)
 
@@ -713,27 +725,48 @@ def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
     n0_inv_samples = np.zeros(len(L_samples))
 
     for i_L, L in enumerate(L_samples):
-        l2_grid, _, F_plus_sq = _fullsky_spin2_coupling(int(L), l1_arr)
+        L = int(L)
+        L_LL = L * (L + 1)
 
-        inv_ee = _fullsky_inv_spectrum(cl_ee_tot, l2_grid)
+        # Cyclic: (l1, l2, L; 2,-2,0) = (l2, L, l1; -2, 0, 2)
+        l2_grid, w3j = wigner3j_vectorized(L, l1_arr, m1=-2, m2=0)
 
-        # Response: [C_EE(l1) + C_EE(l2)] × F^{+}
-        # f^2 = [C_EE(l1) + C_EE(l2)]^2 × F_plus_sq
+        l1_ll1 = l1_arr * (l1_arr + 1)
+        l2_ll2 = l2_grid * (l2_grid + 1)
+
+        # Full-sky geometric factors (analog of L·l in flat-sky)
+        alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
+        alpha2 = (L_LL + l2_ll2[None, :] - l1_ll1[:, None]) / 2.0
+
+        pf = np.sqrt((2 * l1_arr + 1)[:, None]
+                     * (2 * l2_grid + 1)[None, :]
+                     * (2 * L + 1) / (16.0 * np.pi))
+
+        # Even parity mask
+        parity_sum = (l1_arr.astype(int)[:, None]
+                      + l2_grid.astype(int)[None, :] + L)
+        even_mask = (parity_sum % 2 == 0).astype(float)
+
+        # EE spectra at l2 positions
         l2_int = l2_grid.astype(int)
         valid = (l2_int >= l_min) & (l2_int < len(cl_ee_unl))
         ee_at_l2 = np.zeros(len(l2_grid))
         ee_at_l2[valid] = cl_ee_unl[l2_int[valid]]
 
-        ee_l1 = cl_ee_unl[l_min:l_max + 1]  # (n_l1,)
-        ee_sum_sq = (ee_l1[:, None] + ee_at_l2[None, :]) ** 2
+        ee_l1 = cl_ee_unl[l_min:l_max + 1]
 
+        # Response: [C_EE(l1)×α1 + C_EE(l2)×α2] (full-sky analog of flat-sky EE)
+        f_sq = (ee_l1[:, None] * alpha1 + ee_at_l2[None, :] * alpha2) ** 2 \
+               * pf**2 * w3j**2 * even_mask
+
+        # Filter: 1 / (2 × C_EE_tot(l1) × C_EE_tot(l2))
         ee_tot = cl_ee_tot[l_min:l_max + 1]
         safe_ee = np.where(ee_tot > 0, ee_tot, 1.0)
         inv_ee_l1 = np.where(ee_tot > 0, 1.0 / safe_ee, 0.0)
+        inv_ee_l2 = _fullsky_inv_spectrum(cl_ee_tot, l2_grid)
 
-        # f^2/denom = ee_sum^2 × F_plus / (2 × C_EE_tot(l1) × C_EE_tot(l2))
-        integrand = ee_sum_sq * F_plus_sq * inv_ee_l1[:, None] * inv_ee[None, :] / 2.0
-        n0_inv_samples[i_L] = np.sum(integrand) / (2 * int(L) + 1)
+        integrand = f_sq * inv_ee_l1[:, None] * inv_ee_l2[None, :] / 2.0
+        n0_inv_samples[i_L] = np.sum(integrand) / (2 * L + 1)
 
     log_n0_inv = np.log(np.maximum(n0_inv_samples, 1e-300))
     n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float), log_n0_inv))
@@ -809,24 +842,26 @@ def _lensing_kernel_fullsky(ls: jnp.ndarray, Ls: jnp.ndarray,
                             spectra: LensingSpectra,
                             l_min: int = 2,
                             l_max: int = 3000) -> jnp.ndarray:
-    """Full-sky lensing kernel K(l, L) using Wigner 3j coupling.
+    """Full-sky lensing kernel K(l, L) using Smith et al. (2012) coupling.
 
     C_l^{BB,lens} = Σ_L K(l,L) C_L^{φφ}
 
-    K(l, L) = Σ_{l'} C_{l'}^{EE,unl} × |F^{-}(l, l', L)|^2 / (2l+1)
+    K(l_B, L) = 1/(2l_B+1) × Σ_{l_E, odd} C_{l_E}^{EE,unl}
+                × |f^{EB}(l_B, l_E, L)|^2
 
-    where F^{-}(l, l', L) = sqrt[(2l+1)(2l'+1)(2L+1)/(8π)]
-                              × (l, L, l'; 2, -2, 0) × [l(l+1) - l'(l'+1)]
-
-    Validated against CAMB lensing BB to 0.01% at l=5.
+    where |f^{EB}|^2 is the Smith et al. parity-odd coupling (Eq. 6-7).
+    Computed via cyclic 3j: (l_B, l_E, L; 2,-2,0) = (l_E, L, l_B; -2, 0, 2).
     """
     from augr.wigner import wigner3j_vectorized
 
     cl_ee_unl = np.asarray(spectra.cl_ee_unl)
-    ls_np = np.asarray(ls, dtype=float)
+    ls_np = np.asarray(ls, dtype=float)  # target l_B values
     Ls_np = np.asarray(Ls, dtype=float)
     n_l = len(ls_np)
     n_L = len(Ls_np)
+
+    # l_E range for the sum
+    l_E_arr = np.arange(l_min, l_max + 1, dtype=float)
 
     # Sample L values and interpolate (kernel is smooth in L)
     L_min_int = max(2, int(Ls_np.min()))
@@ -844,30 +879,42 @@ def _lensing_kernel_fullsky(ls: jnp.ndarray, Ls: jnp.ndarray,
         if L < 2:
             continue
 
-        # Compute (l, L, l'; 2, -2, 0) for all l and all l' simultaneously
-        l2_grid, w3j = wigner3j_vectorized(L, ls_np, m1=2, m2=-2)
+        # Cyclic: (l_B, l_E, L; 2,-2,0) = (l_E, L, l_B; -2, 0, 2)
+        # Recurse on l_B with l_E as input array
+        l_B_grid, w3j = wigner3j_vectorized(L, l_E_arr, m1=-2, m2=0)
 
-        # Geometric factor: l(l+1) - l'(l'+1)
-        l_ll = ls_np * (ls_np + 1)       # (n_l,)
-        lp_llp = l2_grid * (l2_grid + 1)  # (n_l2,)
-        geom = l_ll[:, None] - lp_llp[None, :]  # (n_l, n_l2)
+        # Smith's geometric factor and prefactor
+        l_E_ll = l_E_arr * (l_E_arr + 1)
+        l_B_ll = l_B_grid * (l_B_grid + 1)
+        L_LL = L * (L + 1)
+        geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
 
-        # Prefactor: sqrt[(2l+1)(2l'+1)(2L+1)/(8π)]
-        pf = np.sqrt((2 * ls_np + 1)[:, None]
-                     * (2 * l2_grid + 1)[None, :]
-                     * (2 * L + 1) / (8.0 * np.pi))
+        pf = np.sqrt((2 * l_E_arr + 1)[:, None]
+                     * (2 * l_B_grid + 1)[None, :]
+                     * (2 * L + 1) / (16.0 * np.pi))
 
-        F_minus_sq = (pf * w3j * geom) ** 2
+        # Parity-odd mask
+        parity_sum = (l_E_arr.astype(int)[:, None]
+                      + l_B_grid.astype(int)[None, :] + L)
+        odd_mask = (parity_sum % 2 == 1).astype(float)
 
-        # C_EE at l' values
-        l2_int = l2_grid.astype(int)
-        valid = (l2_int >= l_min) & (l2_int < len(cl_ee_unl))
-        ee = np.zeros(len(l2_grid))
-        ee[valid] = cl_ee_unl[l2_int[valid]]
+        f_eb_sq = (pf * w3j * geom) ** 2 * odd_mask  # (n_l_E, n_l_B)
 
-        # K(l, L) = Σ_{l'} C_EE × F^{-2} / (2l+1)
+        # C_EE weights (indexed by l_E)
+        l_E_int = l_E_arr.astype(int)
+        valid_E = (l_E_int >= l_min) & (l_E_int < len(cl_ee_unl))
+        ee = np.zeros(len(l_E_arr))
+        ee[valid_E] = cl_ee_unl[l_E_int[valid_E]]
+
+        # For each target l_B, extract from l_B_grid and sum over l_E
+        l_B_grid_int = l_B_grid.astype(int)
         for i_l in range(n_l):
-            K_samples[i_l, i_L] = np.sum(ee * F_minus_sq[i_l, :]) / (2 * ls_np[i_l] + 1)
+            l_B_target = int(ls_np[i_l])
+            idx = np.where(l_B_grid_int == l_B_target)[0]
+            if len(idx) == 0:
+                continue
+            j = idx[0]
+            K_samples[i_l, i_L] = np.sum(ee * f_eb_sq[:, j]) / (2 * ls_np[i_l] + 1)
 
     # Interpolate K to the requested L grid (per-l, log-space)
     K = np.zeros((n_l, n_L))
