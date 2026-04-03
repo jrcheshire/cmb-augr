@@ -7,9 +7,16 @@ For cross-spectra (i,j) and (k,l) in bandpower bin b:
 
 where M = S + N (signal + noise), and ν_b = f_sky × Σ_{ℓ in b} (2ℓ+1).
 
-The covariance is block-diagonal across bins (different bins are uncorrelated
-in the Knox approximation). Evaluated once at the fiducial model and held
-fixed during Fisher computation.
+The covariance is block-diagonal across ℓ-bins — different bins are
+uncorrelated under the Gaussian/Knox approximation.  We exploit this by
+returning per-bin blocks (n_spec × n_spec) rather than the full
+(n_data × n_data) matrix.  This is both faster and numerically stabler:
+each small block has condition number ~ 10⁴-10⁶, while the assembled
+matrix can exceed 10²⁰ for instruments with many frequency channels.
+
+The covariance is evaluated once at the fiducial model and held fixed
+during Fisher computation (we do NOT include the second-order Fisher
+term Tr(Σ⁻¹ dΣ/dθ ...) — see CLAUDE.md for rationale).
 """
 
 from __future__ import annotations

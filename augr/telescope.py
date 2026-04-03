@@ -354,7 +354,10 @@ def to_instrument(design: TelescopeDesign) -> Instrument:
         a_cell = hex_cell_area(d_horn)
         a_alloc = pg.area_fraction * a_fp
         n_pixels = count_pixels(a_alloc, a_cell, fp.packing_efficiency)
-        n_det = 2 * n_pixels  # 2 polarizations per horn per band
+        # Each horn has 2 orthogonal polarization detectors per band.
+        # Dichroic pixels (multiple bands per horn) share the same horn
+        # but have independent detector pairs, so n_det is per-band.
+        n_det = 2 * n_pixels
 
         for band in pg.bands:
             fwhm = beam_fwhm_arcmin(

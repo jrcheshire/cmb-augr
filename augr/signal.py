@@ -3,7 +3,8 @@ signal.py — Total signal model and JAX-autodiff Jacobian.
 
 Combines CMB BB spectra and foreground spectra into a data vector μ(θ)
 of binned bandpowers across all unique frequency cross-spectra, and
-computes ∂μ/∂θ exactly via jax.jacfwd.
+computes ∂μ/∂θ exactly via jax.jacfwd (forward-mode autodiff, optimal
+since n_params ~ 10 << n_data ~ hundreds).
 
 Data vector ordering:
     [(ν₁×ν₁, b₁), ..., (ν₁×ν₁, bN), (ν₁×ν₂, b₁), ..., (νM×νM, bN)]
@@ -11,8 +12,13 @@ Data vector ordering:
 where (νᵢ×νⱼ) runs over unique pairs with i ≤ j, and bₖ runs over
 bandpower bins.
 
-Parameter vector ordering:
+Parameter vector ordering (standard mode):
     [r, A_lens, <foreground parameters in model order>]
+
+In delensed mode, A_lens is replaced by a precomputed residual lensing
+BB spectrum from the iterative QE delensing procedure (see delensing.py),
+and the parameter vector becomes:
+    [r, <foreground parameters in model order>]
 """
 
 from __future__ import annotations
