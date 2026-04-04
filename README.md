@@ -146,6 +146,32 @@ The `telescope.py` module derives a complete `Instrument` from physical specific
 
 **Moment expansion (Chluba+ 2017):** Extends the Gaussian model with second-order terms capturing spatial variation of spectral parameters (variance of beta_d, T_d, beta_s, c_s, and their cross-moments). 17 free parameters. Reduces exactly to the Gaussian model when all moment amplitudes are zero.
 
+## Delensing
+
+The `delensing.py` module computes self-consistent iterative QE delensing, replacing the external A_lens parameter with a derived residual lensing spectrum:
+
+1. Compute the minimum-variance QE reconstruction noise N_0(L) from all 5 estimators (TT, TE, EE, EB, TB)
+2. Compute the Wiener-filtered residual lensing potential: C_L^{phi,res} = C_L^{phi} N_0 / (C_L^{phi} + N_0)
+3. Compute the residual BB via the lensing kernel: C_l^{BB,res} = K(l,L) @ C_L^{phi,res}
+4. Update the BB in the EB/TB filter denominators and iterate until converged
+
+Two modes are available:
+
+- **Flat-sky** (`fullsky=False`): Gauss-Legendre quadrature over the azimuthal angle. Fast (~2 min for 5 iterations at l_max=3000).
+- **Full-sky** (`fullsky=True`) [EXPERIMENTAL]: Wigner 3j coupling via Schulten-Gordon backward recursion, vectorized over l1 for fixed L with log-spaced L sampling.
+
+```python
+from augr.delensing import load_lensing_spectra, iterate_delensing
+from augr.instrument import combined_noise_nl
+
+spec = load_lensing_spectra()
+nl_bb = combined_noise_nl(inst, spec.ells, "BB")
+nl_ee, nl_tt = nl_bb, combined_noise_nl(inst, spec.ells, "TT")
+
+result = iterate_delensing(spec, nl_tt, nl_ee, nl_bb, fullsky=True, n_iter=5)
+# result.A_lens_eff ~ 0.29 for probe-class, result.cl_bb_res for Fisher input
+```
+
 ## Gradient-based instrument optimization
 
 The `optimize.py` module provides a fully differentiable path from instrument parameters to σ(r), enabling gradient-based optimization via `jax.grad`:
@@ -182,32 +208,6 @@ Two tiers are available:
 - **Achieved-performance noise mode**: option to rescale from measured detector performance rather than computing from first principles.
 - **Structured assumption output**: machine-readable (JSON/YAML) provenance records for every forecast, extending `FisherForecast.summary()`.
 - **Full-sky N_0 cross-validation**: compare against plancklens/lenspyx for absolute normalization of the lensing reconstruction noise.
-
-## Delensing
-
-The `delensing.py` module computes self-consistent iterative QE delensing, replacing the external A_lens parameter with a derived residual lensing spectrum:
-
-1. Compute the minimum-variance QE reconstruction noise N_0(L) from all 5 estimators (TT, TE, EE, EB, TB)
-2. Compute the Wiener-filtered residual lensing potential: C_L^{phi,res} = C_L^{phi} N_0 / (C_L^{phi} + N_0)
-3. Compute the residual BB via the lensing kernel: C_l^{BB,res} = K(l,L) @ C_L^{phi,res}
-4. Update the BB in the EB/TB filter denominators and iterate until converged
-
-Two modes are available:
-
-- **Flat-sky** (`fullsky=False`): Gauss-Legendre quadrature over the azimuthal angle. Fast (~2 min for 5 iterations at l_max=3000).
-- **Full-sky** (`fullsky=True`) [EXPERIMENTAL]: Wigner 3j coupling via Schulten-Gordon backward recursion, vectorized over l1 for fixed L with log-spaced L sampling.
-
-```python
-from augr.delensing import load_lensing_spectra, iterate_delensing
-from augr.instrument import combined_noise_nl
-
-spec = load_lensing_spectra()
-nl_bb = combined_noise_nl(inst, spec.ells, "BB")
-nl_ee, nl_tt = nl_bb, combined_noise_nl(inst, spec.ells, "TT")
-
-result = iterate_delensing(spec, nl_tt, nl_ee, nl_bb, fullsky=True, n_iter=5)
-# result.A_lens_eff ~ 0.29 for probe-class, result.cl_bb_res for Fisher input
-```
 
 ## References
 
