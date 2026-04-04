@@ -23,7 +23,7 @@ An "`augr`" `conda` environment is included with the needed dependencies: `conda
 
 ```bash
 make install   # create conda env + pip install -e .
-make test      # run 236 tests
+make test      # run 251 tests
 ```
 
 ```python
@@ -96,6 +96,9 @@ augr/
   wigner.py        Wigner 3j symbols: closed-form (0,0,0) via log-gamma,
                    Schulten-Gordon backward recursion for spin-2, vectorized
                    over l1 for fixed L
+  optimize.py      Differentiable sigma(r) for gradient-based instrument
+                   optimization: channel-level (Tier 1) and telescope
+                   design-level (Tier 2) via jax.grad
   units.py         Physical constants, RJ/CMB unit conversions, dust and
                    synchrotron SEDs and their log-derivatives
   multipatch.py    Multi-patch Fisher with shared spectral indices,
@@ -108,14 +111,14 @@ scripts/
   validate_pico.py     Validation against PICO published sigma(r) targets
   plot_figure5.py      Reproduction of BICEP/Keck Figure 5 time evolution
 
-tests/              236 tests covering all modules
+tests/              251 tests covering all modules
 data/               CAMB template spectra (tensor r=1, lensing, unlensed TT/EE/TE/BB, phi-phi)
 plots/              Output from explore_designs.py
 ```
 
 ## Design principles
 
-- **JAX throughout** for exact autodiff (Jacobians via `jax.jacfwd`) and JIT compilation.
+- **JAX throughout** for exact autodiff (Jacobians via `jax.jacfwd`), JIT compilation, and differentiable instrument optimization via `jax.grad`.
 - **Physics-based noise** from first principles (photon NEP, optical loading, feedhorn packing). Adding a mode to rescale from achieved performance is a potential future item.
 - **Extensible foreground models** via a structural `Protocol` type. Any class with `parameter_names` and `cl_bb(nu_i, nu_j, ells, params)` works.
 - **Frozen dataclasses** for all specifications (immutable, hashable, safe to pass across threads -- see example in `scripts/explore_designs.py`).
@@ -143,9 +146,38 @@ The `telescope.py` module derives a complete `Instrument` from physical specific
 
 **Moment expansion (Chluba+ 2017):** Extends the Gaussian model with second-order terms capturing spatial variation of spectral parameters (variance of beta_d, T_d, beta_s, c_s, and their cross-moments). 17 free parameters. Reduces exactly to the Gaussian model when all moment amplitudes are zero.
 
+## Gradient-based instrument optimization
+
+The `optimize.py` module provides a fully differentiable path from instrument parameters to σ(r), enabling gradient-based optimization via `jax.grad`:
+
+```python
+import jax
+from augr.optimize import make_optimization_context, sigma_r_from_channels
+from augr.telescope import probe_design, to_instrument
+from augr.foregrounds import GaussianForegroundModel
+from augr.spectra import CMBSpectra
+from augr.config import FIDUCIAL_BK15
+
+inst = to_instrument(probe_design())
+ctx = make_optimization_context(
+    inst, GaussianForegroundModel(), CMBSpectra(), dict(FIDUCIAL_BK15),
+    priors={"beta_dust": 0.11, "beta_sync": 0.3},
+    fixed_params=["T_dust", "Delta_dust"],
+)
+
+# Gradient of sigma(r) w.r.t. detector counts per channel
+grad_fn = jax.grad(sigma_r_from_channels, argnums=0)
+d_sigma_d_ndet = grad_fn(ctx.n_det, ctx.net, ctx.beam, ctx.eta, ctx)
+# All negative: more detectors in any channel reduces sigma(r)
+```
+
+Two tiers are available:
+
+- **Tier 1** (`sigma_r_from_channels`): optimize detector counts, NETs, and beam sizes directly as continuous floats.
+- **Tier 2** (`sigma_r_from_design`): optimize telescope geometry (aperture, f-number, focal plane diameter, area fractions) and derive channel parameters via the physics.
+
 ## TODO
 
-- **Differentiable instrument optimization**: relax discrete quantities (floor in detector counting) to enable JAX gradients d(sigma(r))/d(design params) for continuous optimization of area fractions, efficiency, etc.
 - **Scale-dependent moment expansion**: make omega parameters functions of ell to capture the angular-scale dependence of foreground SED variation.
 - **Achieved-performance noise mode**: option to rescale from measured detector performance rather than computing from first principles.
 - **Structured assumption output**: machine-readable (JSON/YAML) provenance records for every forecast, extending `FisherForecast.summary()`.
