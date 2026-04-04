@@ -200,6 +200,55 @@ def noise_nl_temperature(channel: Channel,
     return noise_nl(channel, ells, mission_years, f_sky) / 2.0
 
 
+# -----------------------------------------------------------------------
+# Functional noise interface (for differentiable optimization)
+# -----------------------------------------------------------------------
+
+def white_noise_power_continuous(
+    net_per_detector: jnp.ndarray,
+    n_detectors: jnp.ndarray,
+    eta_total: jnp.ndarray,
+    mission_years: float,
+    f_sky: float,
+) -> jnp.ndarray:
+    """White noise power from raw JAX scalars (no Channel object).
+
+    Same formula as white_noise_power(), but accepts raw values so that
+    JAX can trace through the computation for gradient-based optimization.
+    """
+    t_obs = mission_years * SECONDS_PER_YEAR
+    net_pol_sq = (net_per_detector * jnp.sqrt(2.0)) ** 2
+    omega_survey = 4.0 * jnp.pi * f_sky
+    return net_pol_sq * omega_survey / (n_detectors * eta_total * t_obs)
+
+
+def noise_nl_continuous(
+    net_per_detector: jnp.ndarray,
+    n_detectors: jnp.ndarray,
+    beam_fwhm_arcmin: jnp.ndarray,
+    eta_total: jnp.ndarray,
+    ells: jnp.ndarray,
+    mission_years: float,
+    f_sky: float,
+    knee_ell: jnp.ndarray = 0.0,
+    alpha_knee: jnp.ndarray = 1.0,
+) -> jnp.ndarray:
+    """Noise N_ℓ^BB from raw JAX scalars (no Channel object).
+
+    Same formula as noise_nl(), but accepts raw values for differentiable
+    optimization. All scalar arguments can be JAX-traced.
+    """
+    w_inv = white_noise_power_continuous(
+        net_per_detector, n_detectors, eta_total, mission_years, f_sky)
+    bl = beam_bl(ells, beam_fwhm_arcmin)
+    one_over_f = jnp.where(
+        (knee_ell > 0) & (ells > 0),
+        (knee_ell / jnp.maximum(ells, 1.0)) ** alpha_knee,
+        0.0,
+    )
+    return w_inv / bl**2 * (1.0 + one_over_f)
+
+
 def combined_noise_nl(instrument: Instrument,
                       ells: jnp.ndarray,
                       spectrum: str = "BB") -> jnp.ndarray:

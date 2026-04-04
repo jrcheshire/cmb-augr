@@ -22,6 +22,7 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
+import jax.numpy as jnp
 
 from augr.instrument import Channel, Instrument, ScalarEfficiency
 from augr.units import H_PLANCK, K_BOLTZMANN, C_LIGHT, T_CMB
@@ -226,6 +227,60 @@ def count_pixels(fp_area: float, cell_area: float,
         raise ValueError(f"cell_area must be positive, got {cell_area}")
     n = packing_efficiency * fp_area / cell_area
     return max(0, int(math.floor(n)))
+
+
+def count_pixels_continuous(fp_area: jnp.ndarray, cell_area: jnp.ndarray,
+                            packing_efficiency: float) -> jnp.ndarray:
+    """Continuous relaxation of count_pixels for gradient-based optimization.
+
+    Returns the real-valued pixel count without floor(), so that JAX can
+    differentiate through the focal plane packing. Round to integer after
+    optimization to get the physical instrument.
+    """
+    return jnp.maximum(0.0, packing_efficiency * fp_area / cell_area)
+
+
+def photon_noise_net_jax(
+    nu_ghz: jnp.ndarray,
+    fractional_bandwidth: float = 0.25,
+    T_cmb: float = T_CMB,
+    T_telescope: float = 4.0,
+    emissivity: float = 0.01,
+    eta_optical: float = 0.35,
+    n_quad: int = 512,
+) -> jnp.ndarray:
+    """JAX-traceable photon-noise NET [μK√s].
+
+    Same physics as photon_noise_net() but uses jnp instead of np, enabling
+    differentiation w.r.t. telescope thermal/optical parameters.
+    """
+    nu_center_hz = nu_ghz * 1e9
+    delta_nu_hz = fractional_bandwidth * nu_center_hz
+    nu_lo = nu_center_hz - delta_nu_hz / 2.0
+    nu_hi = nu_center_hz + delta_nu_hz / 2.0
+    nu = jnp.linspace(nu_lo, nu_hi, n_quad)
+
+    h = H_PLANCK
+    k = K_BOLTZMANN
+
+    x_cmb = h * nu / (k * T_cmb)
+    n_cmb = 1.0 / (jnp.exp(x_cmb) - 1.0)
+
+    x_tel = h * nu / (k * T_telescope)
+    n_tel = 1.0 / (jnp.exp(x_tel) - 1.0)
+
+    n_total = eta_optical * n_cmb + emissivity * n_tel
+
+    integrand_nep2 = 2.0 * h**2 * nu**2 * n_total * (1.0 + n_total)
+    nep_squared = 2.0 * jnp.trapezoid(integrand_nep2, nu)
+
+    ex_cmb = jnp.exp(x_cmb)
+    dndt_cmb = (h * nu / (k * T_cmb**2)) * ex_cmb / (ex_cmb - 1.0)**2
+    integrand_dpdt = 2.0 * h * nu * dndt_cmb * eta_optical
+    dpdt = jnp.trapezoid(integrand_dpdt, nu)
+
+    net_K = jnp.sqrt(nep_squared) / jnp.abs(dpdt)
+    return net_K * 1e6
 
 
 # ---------------------------------------------------------------------------
