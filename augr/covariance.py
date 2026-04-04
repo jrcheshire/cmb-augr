@@ -163,3 +163,65 @@ def bandpower_covariance_blocks(signal_model: SignalModel,
 
     # Transpose to (n_bins, n_spec, n_spec)
     return cov_blocks.transpose(2, 0, 1)
+
+
+def bandpower_covariance_blocks_from_noise(
+    signal_model: SignalModel,
+    noise_nls: jnp.ndarray,
+    f_sky: float,
+    fiducial_params: jnp.ndarray,
+) -> jnp.ndarray:
+    """Per-bin Knox covariance from pre-computed noise arrays.
+
+    Like bandpower_covariance_blocks(), but takes a (n_chan, n_ells) noise
+    array instead of an Instrument object. This allows JAX to trace through
+    the noise computation for gradient-based instrument optimization.
+
+    Args:
+        signal_model:    Defines binning, freq pairs, and signal model.
+        noise_nls:       Pre-computed noise N_ℓ per channel, shape
+                         (n_chan, n_ells) where n_ells = len(signal_model.ells).
+        f_sky:           Sky fraction (for effective mode count).
+        fiducial_params: Flat parameter array at which to evaluate the
+                         signal part of M = S + N.
+
+    Returns:
+        Per-bin covariance blocks, shape (n_bins, n_spec, n_spec).
+    """
+    n_chan = noise_nls.shape[0]
+    n_bins = signal_model.n_bins
+    ells = signal_model.ells
+    W = signal_model._bin_matrix
+
+    cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
+    fg_params = signal_model.fg_params_from(fiducial_params)
+
+    # Build M = S + N: (n_chan, n_chan, n_bins)
+    M = jnp.zeros((n_chan, n_chan, n_bins))
+    for i in range(n_chan):
+        for j in range(i, n_chan):
+            nu_i = signal_model._freqs[i]
+            nu_j = signal_model._freqs[j]
+            cl_fg = signal_model._fg_model.cl_bb(nu_i, nu_j, ells, fg_params)
+            bp = W @ (cl_cmb + cl_fg)
+            M = M.at[i, j, :].set(bp)
+            if i != j:
+                M = M.at[j, i, :].set(bp)
+
+    # Add noise on diagonal (from pre-computed array)
+    for i in range(n_chan):
+        M = M.at[i, i, :].add(W @ noise_nls[i])
+
+    # Knox formula
+    nu = _nu_b(signal_model._bin_edges, f_sky)
+    pairs = signal_model.freq_pairs
+    i_arr = jnp.array([p[0] for p in pairs])
+    j_arr = jnp.array([p[1] for p in pairs])
+
+    M_ik = M[i_arr[:, None], i_arr[None, :], :]
+    M_jl = M[j_arr[:, None], j_arr[None, :], :]
+    M_il = M[i_arr[:, None], j_arr[None, :], :]
+    M_jk = M[j_arr[:, None], i_arr[None, :], :]
+
+    cov_blocks = (M_ik * M_jl + M_il * M_jk) / nu[None, None, :]
+    return cov_blocks.transpose(2, 0, 1)
