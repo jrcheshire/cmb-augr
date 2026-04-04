@@ -124,6 +124,24 @@ plots/              Output from explore_designs.py
 - **Frozen dataclasses** for all specifications (immutable, hashable, safe to pass across threads -- see example in `scripts/explore_designs.py`).
 - **Realistic telescope and survey efficiency factors**: detector yield, survey efficiency, data loss, and more. For the telescope module, floor-based pixel counting, packing efficiency, and optical efficiency. Defaults are conservative, but optimistic "idealized" presets are available for comparison.
 
+## Performance
+
+All times on a single machine (Ryzen 9 5900X, 32 GB). First call includes JAX JIT compilation; subsequent calls reuse cached traces.
+
+| Operation | First call | Cached |
+|-----------|-----------|--------|
+| FisherForecast (probe, 6-band Gaussian) | ~4 s | **70 ms** |
+| FisherForecast (PICO, 17-band Gaussian) | ~15 s | **1.1 s** |
+| FisherForecast (probe, 6-band Moment 17-param) | ~5 s | **130 ms** |
+| MultiPatchFisher (probe, 3-patch Gaussian) | — | **7 s** |
+| MultiPatchFisher (probe, 3-patch Moment) | — | **16 s** |
+| `iterate_delensing` (flat-sky, 5 iter, l_max=3000) | ~2 min | ~25 s |
+| `iterate_delensing` (full-sky Wigner 3j, 5 iter) | — | ~10 min |
+| `sigma_r_from_channels` forward pass | ~4 s | **90 ms** |
+| `jax.grad(sigma_r)` w.r.t. (n_det, NET, beam) | ~20 s | **470 ms** |
+
+Scaling: Fisher cost grows as O(n_chan^2) in the Jacobian (n_chan^2 cross-spectra) and O(n_spec^3) per ell-bin in the covariance eigendecomposition. Going from 6 to 17 bands increases the number of cross-spectra from 21 to 153, accounting for the ~15x increase. Multi-patch scales linearly in the number of patches (independent per-patch Fishers). The gradient adds ~5x overhead vs the forward pass.
+
 ## Telescope design module
 
 The `telescope.py` module derives a complete `Instrument` from physical specifications:
@@ -206,7 +224,6 @@ Two tiers are available:
 
 - **Scale-dependent moment expansion**: make omega parameters functions of ell to capture the angular-scale dependence of foreground SED variation.
 - **Achieved-performance noise mode**: option to rescale from measured detector performance rather than computing from first principles.
-- **Structured assumption output**: machine-readable (JSON/YAML) provenance records for every forecast, extending `FisherForecast.summary()`.
 - **Full-sky N_0 cross-validation**: compare against plancklens/lenspyx for absolute normalization of the lensing reconstruction noise.
 
 ## References
