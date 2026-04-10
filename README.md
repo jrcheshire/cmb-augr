@@ -232,7 +232,7 @@ Two tiers are available:
 - BICEP2/Keck 2018 (arXiv:1810.05216) -- BK15 foreground model and parameters
 - Chluba et al. 2017 (arXiv:1701.00274) -- Moment expansion for foreground complexity
 - Hanany et al. 2019 (arXiv:1902.10541) -- PICO probe study report
-- Puglisi et al. 2025 (arXiv:2502.20452) -- PanEx PySM3 foreground models
+- PanEx Group et al. 2025 (arXiv:2502.20452) -- PanEx PySM3 foreground models
 - Bianchini et al. 2025 (ApJ 993:105) -- Foreground pipeline comparison (from CMB-S4 effort)
 - Hu & Okamoto 2002 (arXiv:astro-ph/0111606) -- Quadratic estimator lensing reconstruction
 - Okamoto & Hu 2003 (PRD 67, 083002) -- Full-sky QE formalism
