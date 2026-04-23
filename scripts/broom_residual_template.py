@@ -303,6 +303,28 @@ def _spectra_block(mask_type: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def run_all_sims(config: Configs) -> None:
+    # TODO(multiprocess): this loop is embarrassingly parallel -- each
+    # iteration is a self-contained (get_input_data -> component_separation
+    # -> estimate_residuals) chain with per-sim filenames so there is no
+    # write contention. BROOM's own `parallelize` config flag is read in
+    # broom.configurations but otherwise unreferenced ("Not implemented yet"
+    # per the demo config), so we would need to wrap it ourselves with
+    # multiprocessing.Pool.
+    # Gotchas for a future implementation:
+    #   - Pin BLAS to one thread per worker (OMP_NUM_THREADS=1 /
+    #     MKL_NUM_THREADS=1 / OPENBLAS_NUM_THREADS=1 set before Pool
+    #     spawns) -- otherwise BLAS threads fight each other. Currently
+    #     nsims=20 saturates ~3 cores; pinning + Pool(n=8..12) should
+    #     give near-linear speedup.
+    #   - The `config.compsep_residuals = _compsep_residuals_block()`
+    #     line below mutates shared state as a BROOM workaround, so
+    #     each worker needs its own Configs instance (fork-safe copy
+    #     or per-worker construction).
+    #   - compute_all_spectra / _compute_spectra below also loop over
+    #     sims internally; parallelize there too for consistency.
+    # Deferred until we move beyond ~20-sim exploratory runs; at nsims=100
+    # (Carones baseline) this is the difference between ~25 min serial
+    # and ~3 min parallel.
     for nsim in range(config.nsim_start, config.nsim_start + config.nsims):
         tag = _format_nsim(nsim)
         print(f"\n=== sim {tag} ===")
