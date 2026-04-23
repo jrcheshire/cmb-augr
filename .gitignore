@@ -5,3 +5,4 @@ __pycache__/
 .ipynb_checkpoints/
 scripts/_broom_scratch/
 plots/
+data/broom_outputs/
