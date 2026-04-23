@@ -162,19 +162,38 @@ class SignalModel:
                  window: str = "tophat",
                  use_jit: bool = True,
                  delensed_bb: jnp.ndarray | None = None,
-                 delensed_bb_ells: jnp.ndarray | None = None):
+                 delensed_bb_ells: jnp.ndarray | None = None,
+                 residual_template_cl: jnp.ndarray | None = None,
+                 residual_template_ells: jnp.ndarray | None = None):
         self._instrument = instrument
         self._fg_model = foreground_model
         self._cmb = cmb_spectra
 
         # Delensed mode: precomputed residual lensing BB replaces A_lens
         self._delensed = delensed_bb is not None
+
+        # Slice bounds for the foreground-parameter block within the full
+        # flat parameter vector. Using explicit (start, end) avoids relying
+        # on "everything after r/A_lens" and lets extra trailing params
+        # (e.g. A_res from a residual template) coexist cleanly.
+        n_fg = len(foreground_model.parameter_names)
+        self._fg_start = 1 if self._delensed else 2
+        self._fg_end = self._fg_start + n_fg
+
         if self._delensed:
-            # Parameter names: [r, <foreground params>] — no A_lens
-            self._param_names = ["r"] + foreground_model.parameter_names
+            base_names = ["r"] + list(foreground_model.parameter_names)
         else:
-            # Parameter names: [r, A_lens, <foreground params>]
-            self._param_names = ["r", "A_lens"] + foreground_model.parameter_names
+            base_names = ["r", "A_lens"] + list(foreground_model.parameter_names)
+
+        # Residual-template mode: optional additive post-CompSep residual
+        # with amplitude A_res appended to the parameter vector.
+        self._residual_template = residual_template_cl is not None
+        if self._residual_template:
+            self._a_res_idx = len(base_names)
+            self._param_names = base_names + ["A_res"]
+        else:
+            self._a_res_idx = None
+            self._param_names = base_names
 
         # Frequency pairs: unique (i ≤ j), stored as (channel_index, channel_index)
         n_chan = len(instrument.channels)
@@ -199,6 +218,21 @@ class SignalModel:
                 left=0.0, right=0.0)
         else:
             self._delensed_bb = None
+
+        # Pre-interpolate residual template onto our ell grid (not JAX-traced).
+        # The template represents the MC-averaged post-CompSep foreground
+        # residual C_ell^BB; A_res scales it as a nuisance amplitude.
+        if self._residual_template:
+            if residual_template_ells is None:
+                raise ValueError(
+                    "residual_template_cl requires residual_template_ells.")
+            self._residual_template_cl = jnp.interp(
+                self._ells,
+                jnp.asarray(residual_template_ells, dtype=float),
+                jnp.asarray(residual_template_cl, dtype=float),
+                left=0.0, right=0.0)
+        else:
+            self._residual_template_cl = None
 
         # Binning
         bin_edges = _make_bin_edges(ell_min, ell_max,
@@ -263,7 +297,9 @@ class SignalModel:
 
         Args:
             params: Flat JAX array of length n_params.
-                    Order: [r, A_lens, <foreground params>].
+                    Order: [r, (A_lens), <foreground params>, (A_res)].
+                    A_lens is present only in non-delensed mode; A_res is
+                    present only when a residual template is attached.
 
         Returns:
             Flat JAX array of length n_data = n_spectra × n_bins.
@@ -271,14 +307,22 @@ class SignalModel:
         """
         r = params[0]
         if self._delensed:
-            fg_params = params[1:]
             # CMB BB = r × tensor + precomputed residual lensing
             cl_cmb = (r * self._cmb.cl_tensor_r1(self._ells)
                       + self._delensed_bb)
         else:
             A_lens = params[1]
-            fg_params = params[2:]
             cl_cmb = self._cmb.cl_bb(self._ells, r, A_lens)
+
+        fg_params = params[self._fg_start:self._fg_end]
+
+        # Precompute the residual-template contribution (auto-spectra only).
+        # Post-component-separation the residual lives in the single
+        # cleaned map, so it only enters the i==j auto-BB blocks.
+        if self._residual_template:
+            cl_residual = params[self._a_res_idx] * self._residual_template_cl
+        else:
+            cl_residual = None
 
         # Build bandpowers for each frequency pair
         bandpowers = []
@@ -287,6 +331,8 @@ class SignalModel:
             nu_j = self._freqs[j_ch]
             cl_fg = self._fg_model.cl_bb(nu_i, nu_j, self._ells, fg_params)
             cl_total = cl_cmb + cl_fg
+            if cl_residual is not None and i_ch == j_ch:
+                cl_total = cl_total + cl_residual
             bp = self._bin_matrix @ cl_total    # (n_bins,)
             bandpowers.append(bp)
 
@@ -323,11 +369,12 @@ class SignalModel:
             return self._cmb.cl_bb(self._ells, r, A_lens)
 
     def fg_params_from(self, params: jnp.ndarray) -> jnp.ndarray:
-        """Extract foreground parameters from the full parameter vector."""
-        if self._delensed:
-            return params[1:]
-        else:
-            return params[2:]
+        """Extract foreground parameters from the full parameter vector.
+
+        Slices exactly the foreground-parameter block, so trailing
+        parameters (e.g. A_res) are not accidentally included.
+        """
+        return params[self._fg_start:self._fg_end]
 
     # ------------------------------------------------------------------
     # Convenience: indexing into the data vector

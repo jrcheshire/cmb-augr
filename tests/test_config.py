@@ -13,9 +13,10 @@ from augr.foregrounds import GaussianForegroundModel
 
 
 def test_fiducial_has_all_params():
-    """FIDUCIAL_BK15 contains exactly the GaussianForegroundModel params + r + A_lens."""
+    """FIDUCIAL_BK15 contains the GaussianForegroundModel params + r + A_lens
+    + the residual-template amplitude A_res."""
     fg_names = GaussianForegroundModel().parameter_names
-    expected = {"r", "A_lens"} | set(fg_names)
+    expected = {"r", "A_lens", "A_res"} | set(fg_names)
     assert set(FIDUCIAL_BK15.keys()) == expected
 
 
@@ -23,9 +24,15 @@ def test_fiducial_r_zero():
     assert FIDUCIAL_BK15["r"] == 0.0
 
 
+def test_fiducial_a_res_unity():
+    """A_res = 1 at fiducial (template is the truth)."""
+    assert FIDUCIAL_BK15["A_res"] == 1.0
+
+
 def test_default_priors_keys():
     assert "beta_dust" in DEFAULT_PRIORS
     assert "beta_sync" in DEFAULT_PRIORS
+    assert "A_res" in DEFAULT_PRIORS
 
 
 def test_default_fixed():

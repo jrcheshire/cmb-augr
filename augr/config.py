@@ -34,6 +34,7 @@ FIDUCIAL_BK15: dict[str, float] = {
     "alpha_sync": -0.6,    # sync ℓ-dependence power law
     "epsilon":     0.0,    # dust–sync correlation ([-1, 1])
     "Delta_dust":  0.0,    # dust frequency decorrelation strength
+    "A_res":       1.0,    # residual-template amplitude (post-CompSep)
 }
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,10 @@ FIDUCIAL_BK15: dict[str, float] = {
 DEFAULT_PRIORS: dict[str, float] = {
     "beta_dust":  0.11,   # Planck 2015 polarization (arXiv:1502.01588)
     "beta_sync":  0.3,    # WMAP/Planck synchrotron index uncertainty
+    "A_res":      0.3,    # residual-template amplitude, placeholder
+                          # (Carones 2025 uses a flat prior; 0.3 is a
+                          # conservative Gaussian default for Fisher use.
+                          # Remove from the priors dict to reproduce Carones.)
 }
 
 # Parameters commonly held fixed (not varied in Fisher matrix)
@@ -68,6 +73,7 @@ FIDUCIAL_MOMENT: dict[str, float] = {
 DEFAULT_PRIORS_MOMENT: dict[str, float] = {
     "beta_dust":  0.11,
     "beta_sync":  0.3,
+    "A_res":      0.3,   # see note in DEFAULT_PRIORS
 }
 
 DEFAULT_FIXED_MOMENT: list[str] = ["T_dust"]
