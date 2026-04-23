@@ -6,7 +6,7 @@ import pytest
 
 from augr.fisher import FisherForecast
 from augr.signal import SignalModel, flatten_params
-from augr.instrument import Channel, Instrument, ScalarEfficiency
+from augr.instrument import Channel, Instrument, ScalarEfficiency, noise_nl
 from augr.foregrounds import GaussianForegroundModel
 from augr.spectra import CMBSpectra
 
@@ -200,6 +200,53 @@ def test_fisher_times_inverse_is_identity(fisher):
     F_inv = fisher.inverse
     product = F @ F_inv
     assert jnp.allclose(product, jnp.eye(fisher.n_free), atol=1e-6)
+
+
+# -----------------------------------------------------------------------
+# External noise path (opt-in)
+# -----------------------------------------------------------------------
+
+def _analytic_noise_array(signal_model, instrument):
+    """Per-channel analytic N_ell^BB on the SignalModel ell grid, stacked."""
+    ells = signal_model.ells
+    return jnp.stack([
+        noise_nl(ch, ells, instrument.mission_duration_years, instrument.f_sky)
+        for ch in instrument.channels
+    ])
+
+
+def test_external_noise_matches_analytic(signal_model, instrument):
+    """Passing the analytic noise array via external_noise_bb matches the
+    analytic path to numerical precision."""
+    priors = {"beta_dust": 0.11, "beta_sync": 0.3}
+    fixed = ["T_dust"]
+
+    fisher_analytic = FisherForecast(
+        signal_model, instrument, FIDUCIAL,
+        priors=priors, fixed_params=fixed,
+    )
+    sigma_r_analytic = fisher_analytic.sigma("r")
+
+    nl = _analytic_noise_array(signal_model, instrument)
+    fisher_external = FisherForecast(
+        signal_model, instrument, FIDUCIAL,
+        priors=priors, fixed_params=fixed,
+        external_noise_bb=nl,
+    )
+    sigma_r_external = fisher_external.sigma("r")
+
+    assert sigma_r_external == pytest.approx(sigma_r_analytic, rel=1e-6)
+
+
+def test_external_noise_bb_shape_validation(signal_model, instrument):
+    """Wrong-shape external_noise_bb raises a ValueError."""
+    nl_bad = jnp.zeros((99, 99))
+    with pytest.raises(ValueError, match="external_noise_bb"):
+        FisherForecast(
+            signal_model, instrument, FIDUCIAL,
+            priors={}, fixed_params=["T_dust"],
+            external_noise_bb=nl_bad,
+        )
 
 
 # -----------------------------------------------------------------------

@@ -204,6 +204,46 @@ def litebird_like() -> Instrument:
     return Instrument(channels=channels, mission_duration_years=3.0, f_sky=0.7)
 
 
+def cleaned_map_instrument(f_sky: float,
+                           mission_years: float = 3.0,
+                           nu_ghz: float = 150.0) -> Instrument:
+    """Single-channel placeholder Instrument for post-CompSep forecasts.
+
+    Represents the cleaned CMB map produced by an external component-
+    separation pipeline (e.g. NILC). The Channel's frequency, NET, detector
+    count, and beam are all dummy values: in post-CompSep mode the actual
+    noise is expected to be passed via FisherForecast(external_noise_bb=...),
+    and the CMB / residual-template contributions to the Fisher are
+    evaluated on the SignalModel's internal ell grid without needing per-
+    channel SEDs (NullForegroundModel takes care of that).
+
+    The only field that meaningfully enters the Fisher is f_sky, which sets
+    the Knox mode count nu_b = (2 ell + 1) * delta_ell * f_sky. For a GAL60
+    validation run pass f_sky=0.6; for full-sky pass 1.0.
+
+    Args:
+        f_sky:         Effective sky fraction (Knox mode weighting).
+        mission_years: Nominal mission duration; dummy but must be > 0.
+        nu_ghz:        Dummy band centre; any positive value is fine.
+
+    Returns:
+        Instrument with a single Channel carrying placeholder noise
+        parameters. Use with FisherForecast(external_noise_bb=...).
+    """
+    dummy_channel = Channel(
+        nu_ghz=nu_ghz,
+        n_detectors=1,
+        net_per_detector=1.0,   # placeholder; overridden by external noise
+        beam_fwhm_arcmin=1.0,   # placeholder; spectra are beam-deconvolved
+        efficiency=_L2_EFFICIENCY,
+    )
+    return Instrument(
+        channels=(dummy_channel,),
+        mission_duration_years=mission_years,
+        f_sky=f_sky,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Ground-based efficiency defaults
 # ---------------------------------------------------------------------------

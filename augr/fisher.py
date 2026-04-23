@@ -30,7 +30,10 @@ import jax
 import jax.numpy as jnp
 
 from augr.signal import SignalModel, flatten_params
-from augr.covariance import bandpower_covariance_blocks
+from augr.covariance import (
+    bandpower_covariance_blocks,
+    bandpower_covariance_blocks_from_noise,
+)
 from augr.instrument import Instrument, white_noise_power, ARCMIN_TO_RAD
 
 
@@ -80,6 +83,14 @@ class FisherForecast:
                         Adds 1/sigma^2 to the diagonal of F.
         fixed_params:   List of parameter names to hold fixed (not varied).
                         These are excluded from the Fisher matrix.
+        external_noise_bb: Optional pre-computed noise N_ell^BB per channel,
+                        shape (n_channels, n_ells) on signal_model.ells. When
+                        provided, the analytic per-channel noise computation
+                        is bypassed and this array is used directly in the
+                        Knox covariance. Use for post-component-separation
+                        forecasts where the "channel" is a single cleaned map
+                        and the noise comes from a sim-based pipeline. The
+                        default (None) keeps the existing analytic behavior.
     """
 
     def __init__(self,
@@ -87,12 +98,24 @@ class FisherForecast:
                  instrument: Instrument,
                  fiducial_params: dict[str, float],
                  priors: dict[str, float] | None = None,
-                 fixed_params: list[str] | None = None):
+                 fixed_params: list[str] | None = None,
+                 external_noise_bb: jnp.ndarray | None = None):
         self._signal = signal_model
         self._instrument = instrument
         self._fiducial = dict(fiducial_params)
         self._priors = priors or {}
         self._fixed = set(fixed_params or [])
+
+        if external_noise_bb is not None:
+            external_noise_bb = jnp.asarray(external_noise_bb)
+            n_chan = len(instrument.channels)
+            n_ells = len(signal_model.ells)
+            if external_noise_bb.shape != (n_chan, n_ells):
+                raise ValueError(
+                    f"external_noise_bb has shape {external_noise_bb.shape}; "
+                    f"expected ({n_chan}, {n_ells}) to match the instrument "
+                    f"channel count and the SignalModel ell grid.")
+        self._external_noise_bb = external_noise_bb
 
         self._all_names = signal_model.parameter_names
         self._free_names = [n for n in self._all_names
@@ -130,9 +153,17 @@ class FisherForecast:
         """
         params = flatten_params(self._fiducial, self._all_names)
 
-        # Per-bin covariance blocks: (n_bins, n_spec, n_spec)
-        cov_blocks = bandpower_covariance_blocks(
-            self._signal, self._instrument, params)
+        # Per-bin covariance blocks: (n_bins, n_spec, n_spec).
+        # When an external noise spectrum is provided, bypass the analytic
+        # per-channel noise and feed the pre-computed N_ell directly to the
+        # Knox covariance. The f_sky factor still comes from the Instrument.
+        if self._external_noise_bb is not None:
+            cov_blocks = bandpower_covariance_blocks_from_noise(
+                self._signal, self._external_noise_bb,
+                self._instrument.f_sky, params)
+        else:
+            cov_blocks = bandpower_covariance_blocks(
+                self._signal, self._instrument, params)
 
         # Full Jacobian: (n_data, n_all_params) where n_data = n_spec * n_bins
         J_full = self._signal.jacobian(params)
