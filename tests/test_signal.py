@@ -422,3 +422,54 @@ def test_residual_template_requires_ells(simple_instrument, fg_model, cmb_spectr
             ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
             residual_template_cl=cl,
         )
+
+
+def test_residual_template_rejects_empty(simple_instrument, fg_model, cmb_spectra):
+    """An empty residual_template_cl / ells should fail loudly at init,
+    not silently register a zero-jacobian A_res column that explodes
+    inside the Fisher solve."""
+    with pytest.raises(ValueError, match="length"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+            residual_template_cl=np.array([]),
+            residual_template_ells=np.array([]),
+        )
+
+
+def test_residual_template_rejects_mismatched_shapes(
+        simple_instrument, fg_model, cmb_spectra):
+    """Mismatched ells/cl lengths fail at init with a clear message."""
+    with pytest.raises(ValueError, match="shape"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+            residual_template_cl=np.ones(10),
+            residual_template_ells=np.arange(20),
+        )
+
+
+def test_residual_template_extrapolates_nearest_neighbour(
+        simple_instrument, fg_model, cmb_spectra):
+    """Template provided with ell_min > SignalModel.ell_min must extrapolate
+    to fp[0] (not zero) at low ells.
+
+    BROOM bandpowers start at the first bin center (~ell=4 for delta_ell=5).
+    Zero-extrapolation at the reionization bump would silently null the
+    A_res constraint where sigma(r) is most sensitive for a space mission.
+    """
+    # Template provided only at ell >= 50 with a distinctive amplitude
+    ells_in = np.arange(50, 200, dtype=float)
+    amp = 7e-4
+    cl_in = np.full_like(ells_in, amp)
+
+    sm = SignalModel(
+        simple_instrument, fg_model, cmb_spectra,
+        ell_min=2, ell_max=180, delta_ell=5, ell_per_bin_below=30,
+        residual_template_cl=cl_in, residual_template_ells=ells_in,
+    )
+    # Internal interpolated template on SignalModel's ell grid
+    tmpl = np.asarray(sm._residual_template_cl)
+    # Below the input range: nearest-neighbour = fp[0] = amp
+    assert np.all(tmpl == pytest.approx(amp, rel=1e-12)), \
+        "Template should extrapolate flat (nearest-neighbour), not zero"

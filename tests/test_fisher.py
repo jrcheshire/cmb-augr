@@ -249,6 +249,22 @@ def test_external_noise_bb_shape_validation(signal_model, instrument):
         )
 
 
+def test_cleaned_map_instrument_requires_external_noise():
+    """cleaned_map_instrument without external_noise_bb must raise, not
+    silently fall through to the analytic path using dummy NET=1 uK√s."""
+    from augr.config import cleaned_map_instrument
+    from augr.foregrounds import NullForegroundModel
+
+    inst = cleaned_map_instrument(f_sky=0.6)
+    sm = SignalModel(
+        inst, NullForegroundModel(), CMBSpectra(),
+        ell_min=2, ell_max=50, delta_ell=5, ell_per_bin_below=30,
+    )
+    fiducial = {"r": 0.0, "A_lens": 1.0}
+    with pytest.raises(ValueError, match="requires_external_noise"):
+        FisherForecast(sm, inst, fiducial, priors={}, fixed_params=[])
+
+
 # -----------------------------------------------------------------------
 # Residual-template amplitude (A_res)
 # -----------------------------------------------------------------------

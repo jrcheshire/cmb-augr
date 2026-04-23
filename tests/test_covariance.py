@@ -4,7 +4,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from augr.covariance import bandpower_covariance, _nu_b, _build_M
+from augr.covariance import (
+    bandpower_covariance,
+    bandpower_covariance_blocks_from_noise,
+    _nu_b,
+    _build_M,
+)
 from augr.signal import SignalModel, flatten_params
 from augr.instrument import Channel, Instrument, ScalarEfficiency
 from augr.foregrounds import GaussianForegroundModel
@@ -162,3 +167,118 @@ def test_noise_increases_variance(signal_model, two_chan_instrument):
 
     # Auto-spectrum variance should be larger
     assert float(jnp.diag(cov_noisy).mean()) > float(jnp.diag(cov_normal).mean())
+
+
+# -----------------------------------------------------------------------
+# Residual template contributes to M = S + N on auto-blocks only
+# -----------------------------------------------------------------------
+
+# A distinctive flat template amplitude makes the expected delta easy to
+# read off: adding A_res × T_res to an auto bandpower shifts W @ (...) by
+# exactly A_res × T_res (flat templates survive the binning unchanged).
+_RES_T_AMPLITUDE = 1e-4      # uK^2
+
+
+@pytest.fixture(scope="module")
+def signal_model_with_template(two_chan_instrument):
+    """Signal model with a flat residual template, 2-channel / same binning."""
+    ells = np.arange(2, 400, dtype=float)
+    cl = np.full_like(ells, _RES_T_AMPLITUDE)
+    return SignalModel(
+        two_chan_instrument,
+        GaussianForegroundModel(),
+        CMBSpectra(),
+        ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+        residual_template_cl=cl, residual_template_ells=ells,
+    )
+
+
+def _fid_with_a_res(names, a_res):
+    return flatten_params({**FIDUCIAL, "A_res": a_res}, names)
+
+
+def test_build_M_adds_template_on_autos(signal_model_with_template,
+                                         two_chan_instrument):
+    """A_res×T_res enters M on i==j only; cross-blocks are unchanged.
+
+    This is the regression test for a bug where cmb_bb_unbinned omitted
+    A_res×T_res, so _build_M under-counted signal variance on the
+    post-CompSep auto-spectrum and produced an over-optimistic Fisher.
+    """
+    names = signal_model_with_template.parameter_names
+    p0 = _fid_with_a_res(names, 0.0)
+    p1 = _fid_with_a_res(names, 1.0)
+
+    M0 = _build_M(signal_model_with_template, two_chan_instrument, p0)
+    M1 = _build_M(signal_model_with_template, two_chan_instrument, p1)
+    dM = M1 - M0
+
+    n_chan = len(two_chan_instrument.channels)
+    for i in range(n_chan):
+        for j in range(n_chan):
+            block = dM[i, j, :]
+            if i == j:
+                # Flat template with amplitude _RES_T_AMPLITUDE, binned
+                # by a row-sum-1 tophat, equals _RES_T_AMPLITUDE per bin.
+                assert jnp.allclose(block, _RES_T_AMPLITUDE, rtol=1e-8), \
+                    f"Auto-block ({i},{j}) missing residual template"
+            else:
+                assert jnp.allclose(block, 0.0, atol=1e-14), \
+                    f"Cross-block ({i},{j}) moved with A_res (should not)"
+
+
+def test_covariance_auto_variance_scales_with_a_res(signal_model_with_template,
+                                                     two_chan_instrument):
+    """Auto-variance grows when A_res > 0 (template enters M = S + N).
+
+    Knox: Var(C_b^{ii}) = 2 (M_ii)^2 / nu_b. Adding A_res×T_res to M_ii
+    must raise the auto-spectrum variance, confirming the template
+    contributes to the covariance and not just the data vector.
+    """
+    names = signal_model_with_template.parameter_names
+    p0 = _fid_with_a_res(names, 0.0)
+    p1 = _fid_with_a_res(names, 1.0)
+
+    cov0 = bandpower_covariance(signal_model_with_template,
+                                two_chan_instrument, p0)
+    cov1 = bandpower_covariance(signal_model_with_template,
+                                two_chan_instrument, p1)
+
+    n_bins = signal_model_with_template.n_bins
+    # Spectrum 0 is (0,0), the 90×90 auto: its diagonal lives at indices [0, n_bins).
+    auto_var0 = jnp.diag(cov0)[:n_bins]
+    auto_var1 = jnp.diag(cov1)[:n_bins]
+    assert jnp.all(auto_var1 > auto_var0), \
+        "Auto-spectrum variance did not increase with A_res"
+
+
+def test_covariance_blocks_from_noise_adds_template_on_autos(
+        signal_model_with_template, two_chan_instrument):
+    """External-noise covariance path also picks up the residual template."""
+    names = signal_model_with_template.parameter_names
+    p0 = _fid_with_a_res(names, 0.0)
+    p1 = _fid_with_a_res(names, 1.0)
+
+    ells = signal_model_with_template.ells
+    n_chan = len(two_chan_instrument.channels)
+    # Use constant external noise so the only difference between cov0/cov1
+    # is the residual template on the diagonal.
+    nl = jnp.ones((n_chan, len(ells))) * 1e-5
+    f_sky = two_chan_instrument.f_sky
+
+    cov0 = bandpower_covariance_blocks_from_noise(
+        signal_model_with_template, nl, f_sky, p0)
+    cov1 = bandpower_covariance_blocks_from_noise(
+        signal_model_with_template, nl, f_sky, p1)
+    # Auto (0,0) block at spectrum index 0 (pairs are (0,0), (0,1), (1,1))
+    auto_var0 = cov0[:, 0, 0]
+    auto_var1 = cov1[:, 0, 0]
+    assert jnp.all(auto_var1 > auto_var0), \
+        "External-noise covariance did not pick up residual template"
+
+    # Cross-spectrum (0,1) is spectrum index 1: residual template must
+    # not leak into the cross-block variance.
+    cross_var0 = cov0[:, 1, 1]
+    cross_var1 = cov1[:, 1, 1]
+    assert jnp.allclose(cross_var0, cross_var1, rtol=1e-10), \
+        "Cross-spectrum variance changed with A_res (should not)"

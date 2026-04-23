@@ -115,6 +115,16 @@ class FisherForecast:
                     f"external_noise_bb has shape {external_noise_bb.shape}; "
                     f"expected ({n_chan}, {n_ells}) to match the instrument "
                     f"channel count and the SignalModel ell grid.")
+        elif getattr(instrument, "requires_external_noise", False):
+            # Presets like cleaned_map_instrument carry placeholder NET / beam
+            # values and would silently produce a nonsensical analytic Fisher
+            # if dropped into this code path without external_noise_bb.
+            raise ValueError(
+                "This instrument was constructed with "
+                "requires_external_noise=True (e.g. cleaned_map_instrument); "
+                "its Channel noise parameters are placeholders. Pass the "
+                "post-component-separation noise spectrum via "
+                "FisherForecast(external_noise_bb=...).")
         self._external_noise_bb = external_noise_bb
 
         self._all_names = signal_model.parameter_names

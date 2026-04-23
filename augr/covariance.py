@@ -54,16 +54,21 @@ def _build_M(signal_model: SignalModel,
     W = signal_model._bin_matrix          # (n_bins, n_ells)
 
     cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
+    cl_res = signal_model.residual_bb_unbinned(fiducial_params)
     fg_params = signal_model.fg_params_from(fiducial_params)
 
-    # Signal: M is symmetric, so compute only upper triangle (i ≤ j)
+    # Signal: M is symmetric, so compute only upper triangle (i ≤ j).
+    # A_res residual template is added on auto-blocks only (i == j).
     M = jnp.zeros((n_chan, n_chan, n_bins))
     for i in range(n_chan):
         for j in range(i, n_chan):
             nu_i = float(instrument.channels[i].nu_ghz)
             nu_j = float(instrument.channels[j].nu_ghz)
             cl_fg = signal_model._fg_model.cl_bb(nu_i, nu_j, ells, fg_params)
-            bp = W @ (cl_cmb + cl_fg)
+            cl_total = cl_cmb + cl_fg
+            if i == j:
+                cl_total = cl_total + cl_res
+            bp = W @ cl_total
             M = M.at[i, j, :].set(bp)
             if i != j:
                 M = M.at[j, i, :].set(bp)
@@ -194,16 +199,21 @@ def bandpower_covariance_blocks_from_noise(
     W = signal_model._bin_matrix
 
     cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
+    cl_res = signal_model.residual_bb_unbinned(fiducial_params)
     fg_params = signal_model.fg_params_from(fiducial_params)
 
-    # Build M = S + N: (n_chan, n_chan, n_bins)
+    # Build M = S + N: (n_chan, n_chan, n_bins).
+    # A_res residual template is added on auto-blocks only (i == j).
     M = jnp.zeros((n_chan, n_chan, n_bins))
     for i in range(n_chan):
         for j in range(i, n_chan):
             nu_i = signal_model._freqs[i]
             nu_j = signal_model._freqs[j]
             cl_fg = signal_model._fg_model.cl_bb(nu_i, nu_j, ells, fg_params)
-            bp = W @ (cl_cmb + cl_fg)
+            cl_total = cl_cmb + cl_fg
+            if i == j:
+                cl_total = cl_total + cl_res
+            bp = W @ cl_total
             M = M.at[i, j, :].set(bp)
             if i != j:
                 M = M.at[j, i, :].set(bp)

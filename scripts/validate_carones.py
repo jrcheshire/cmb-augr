@@ -92,10 +92,13 @@ def run_fisher_variants(tres_ells: np.ndarray, tres_bb: np.ndarray,
         delta_ell=DELTA_ELL, ell_per_bin_below=ELL_PER_BIN_BELOW,
     )
 
+    # Nearest-neighbour extrapolation (jnp.interp default) outside the
+    # BROOM bandpower range -- zero-extrapolation at ell < first bin
+    # center would silently drop noise at the reionization bump where
+    # sigma(r) is most sensitive.
     nl_interp = jnp.interp(baseline.ells,
                            jnp.asarray(nl_ells),
-                           jnp.asarray(nl_bb),
-                           left=0.0, right=0.0)
+                           jnp.asarray(nl_bb))
     external_noise_bb = nl_interp[None, :]  # (n_channels=1, n_ells)
 
     fiducial_base = {"r": 0.0, "A_lens": 1.0}
@@ -132,16 +135,22 @@ def run_fisher_variants(tres_ells: np.ndarray, tres_bb: np.ndarray,
     )
     fisher_gauss.compute()
 
-    # (r, A_res) condition-number diagnostic.
-    F = fisher_flat.fisher_matrix
+    # (r, A_res) marginalized condition-number diagnostic.
+    # Taking F[[r,A_res]][:, [r,A_res]] (the 2x2 sub-block of F) would
+    # give the *conditional* Fisher on (r, A_res) with A_lens held fixed
+    # at fiducial, and would under-flag the degeneracy that matters
+    # physically -- which is the (r, A_res) constraint *after*
+    # marginalizing over A_lens. The covariance C = F^-1 naturally
+    # marginalizes out non-selected parameters, and cond(C_sub) equals
+    # cond(F_marg_sub) (cond is invariant under inversion).
+    F = np.asarray(fisher_flat.fisher_matrix)
     names = fisher_flat.free_parameter_names
     r_idx = names.index("r")
     a_idx = names.index("A_res")
-    sub = np.array(
-        [[F[r_idx, r_idx], F[r_idx, a_idx]],
-         [F[a_idx, r_idx], F[a_idx, a_idx]]]
-    )
-    cond = np.linalg.cond(sub)
+    C = np.linalg.inv(F)
+    ix = np.array([r_idx, a_idx])
+    C_sub = C[np.ix_(ix, ix)]
+    cond = np.linalg.cond(C_sub)
 
     return {
         "sigma_r_baseline": fisher_baseline.sigma("r"),
@@ -177,7 +186,7 @@ def _print_report(tag: str, f_sky: float, nl_range: tuple[float, float],
          f"sigma={result['a_res_prior']:.2g}]  = {result['sigma_r_gauss']:.3e}"),
         f"  sigma(A_res) [flat prior]                 = {result['sigma_A_res_flat']:.3e}",
         f"  sigma(A_res) [Gaussian prior]             = {result['sigma_A_res_gauss']:.3e}",
-        f"  (r, A_res) 2x2 Fisher cond number         = {result['cond_r_Ares']:.2e}",
+        f"  (r, A_res) marginalized cond number       = {result['cond_r_Ares']:.2e}",
         "=" * 70,
     ]
     print("\n".join(lines))

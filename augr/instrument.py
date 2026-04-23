@@ -105,10 +105,18 @@ class Instrument:
         channels:               Tuple of Channel objects (immutable).
         mission_duration_years: Total mission lifetime [years].
         f_sky:                  Observed sky fraction (0 < f_sky ≤ 1).
+        requires_external_noise: If True, the Channel noise parameters are
+                                placeholders and FisherForecast MUST be
+                                supplied with external_noise_bb. Set by
+                                presets such as cleaned_map_instrument
+                                that represent a post-component-separation
+                                cleaned map whose noise comes from a
+                                sim-based pipeline rather than NET × √t_obs.
     """
     channels: tuple[Channel, ...]
     mission_duration_years: float = 5.0
     f_sky: float = 0.7
+    requires_external_noise: bool = False
 
 
 # -----------------------------------------------------------------------

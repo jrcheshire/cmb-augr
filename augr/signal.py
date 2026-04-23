@@ -222,15 +222,29 @@ class SignalModel:
         # Pre-interpolate residual template onto our ell grid (not JAX-traced).
         # The template represents the MC-averaged post-CompSep foreground
         # residual C_ell^BB; A_res scales it as a nuisance amplitude.
+        # Outside the provided ell range we use nearest-neighbour
+        # (jnp.interp default: fp[0] / fp[-1]) rather than zero. The
+        # reionization bump (ell <~ 10) typically sits below the first
+        # BROOM bandpower center, and zero-extrapolation there silently
+        # nulls the A_res constraint exactly where sigma(r) is most
+        # sensitive for a space mission.
         if self._residual_template:
             if residual_template_ells is None:
                 raise ValueError(
                     "residual_template_cl requires residual_template_ells.")
+            cl_in = jnp.asarray(residual_template_cl, dtype=float)
+            ells_in = jnp.asarray(residual_template_ells, dtype=float)
+            if cl_in.shape[0] < 2 or ells_in.shape[0] < 2:
+                raise ValueError(
+                    "residual_template_cl and residual_template_ells must "
+                    "have length >= 2 for interpolation; got "
+                    f"lengths {ells_in.shape[0]} and {cl_in.shape[0]}.")
+            if cl_in.shape != ells_in.shape:
+                raise ValueError(
+                    f"residual_template_cl shape {cl_in.shape} must match "
+                    f"residual_template_ells shape {ells_in.shape}.")
             self._residual_template_cl = jnp.interp(
-                self._ells,
-                jnp.asarray(residual_template_ells, dtype=float),
-                jnp.asarray(residual_template_cl, dtype=float),
-                left=0.0, right=0.0)
+                self._ells, ells_in, cl_in)
         else:
             self._residual_template_cl = None
 
@@ -367,6 +381,19 @@ class SignalModel:
         else:
             A_lens = params[1]
             return self._cmb.cl_bb(self._ells, r, A_lens)
+
+    def residual_bb_unbinned(self, params: jnp.ndarray) -> jnp.ndarray:
+        """A_res-scaled residual-template BB on the ell grid.
+
+        Post-component-separation, the residual lives in the single
+        cleaned map, so this contribution only enters the auto-spectrum
+        (i == j) blocks of M = S + N -- callers must apply it to the
+        diagonal only. Returns zeros when no residual template is
+        attached, so it is always safe to add.
+        """
+        if self._residual_template:
+            return params[self._a_res_idx] * self._residual_template_cl
+        return jnp.zeros_like(self._ells)
 
     def fg_params_from(self, params: jnp.ndarray) -> jnp.ndarray:
         """Extract foreground parameters from the full parameter vector.

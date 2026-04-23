@@ -241,6 +241,7 @@ def cleaned_map_instrument(f_sky: float,
         channels=(dummy_channel,),
         mission_duration_years=mission_years,
         f_sky=f_sky,
+        requires_external_noise=True,
     )
 
 
