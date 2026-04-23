@@ -7,6 +7,7 @@ import pytest
 from augr.foregrounds import (
     GaussianForegroundModel,
     MomentExpansionModel,
+    NullForegroundModel,
     ForegroundModel,
     ELL_REF,
     _dust_moment_factor,
@@ -443,3 +444,28 @@ def test_dust_moment_factor_at_ref_freq():
     factor = _dust_moment_factor(NU_DUST_REF_GHZ, NU_DUST_REF_GHZ,
                                  19.6, 1.0, 1.0, 1.0)
     assert abs(factor - 1.0) < 1e-10
+
+
+# -----------------------------------------------------------------------
+# NullForegroundModel
+# -----------------------------------------------------------------------
+
+def test_null_model_satisfies_protocol():
+    """NullForegroundModel satisfies the ForegroundModel Protocol."""
+    assert isinstance(NullForegroundModel(), ForegroundModel)
+
+
+def test_null_model_has_no_parameters():
+    """NullForegroundModel.parameter_names is an empty list."""
+    assert NullForegroundModel().parameter_names == []
+
+
+def test_null_model_returns_zero_cl():
+    """cl_bb returns zeros regardless of frequency pair or params."""
+    model = NullForegroundModel()
+    ells = jnp.arange(2, 300, dtype=jnp.float64)
+    empty_params = jnp.array([], dtype=jnp.float64)
+    for nu_i, nu_j in [(90.0, 90.0), (90.0, 150.0), (150.0, 220.0)]:
+        cl = model.cl_bb(nu_i, nu_j, ells, empty_params)
+        assert cl.shape == ells.shape
+        assert jnp.all(cl == 0.0)
