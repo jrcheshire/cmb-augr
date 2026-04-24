@@ -393,17 +393,23 @@ def compute_n0_te(Ls: jnp.ndarray,
                   fullsky: bool = False) -> jnp.ndarray:
     """N_0^{TE}(L) — QE reconstruction noise for the TE estimator.
 
-    The TE response is asymmetric (HO02 Table 1):
-      f_TE = C_TE(l₁) (L·l₁) cos(2φ) + C_TE(l₂) (L·l₂)
-    The cos(2φ) appears on the l₁ leg because deflection of the spin-2
-    E-field introduces a spin-2 angle, while deflection of T does not.
+    Follows Hu & Okamoto 2002 (astro-ph/0111606) Table 1 with α = ΘE:
+    the T-field sits at l₁ and the E-field at l₂. The response is
+      f_TE(l₁, l₂) = C_TE(l₁) (L·l₁) cos(2φ) + C_TE(l₂) (L·l₂).
+    cos(2φ) attaches to the C_TE(l₁) term because the Wick contraction
+    that generates it matches Θ(l₁) with Ẽ(-l₁); the E-field's spin-2
+    deflection kernel then brings in cos(2φ_{l₁,l₂}) at position l₁.
+    (The E-field is still what's being deflected — it's just evaluated
+    against the l₁ momentum.)
 
-    The exact filter requires a full 2×2 covariance inversion at each
-    (l₁, l₂) pair (HO02 Eq. 13). We use the standard diagonal
-    approximation with denominator C_TT(l₁)C_EE(l₂) + C_TE(l₁)C_TE(l₂),
-    which introduces ~5-10% error in N_0^{TE}. Since TE is subdominant
-    in the MV combination for low-noise experiments, the impact on
-    N_0^{MV} is ~1-2%.
+    The exact filter requires a 2×2 covariance inversion at each
+    (l₁, l₂) pair (HO02 Eq. 13). We use a diagonal approximation with
+    denominator C_TT(l₁)C_EE(l₂) + C_TE(l₁)C_TE(l₂). Unlike the full
+    HO02 denominator (always positive by Cauchy-Schwarz), this form
+    can flip sign at (l₁, l₂) where C_TE(l₁)C_TE(l₂) is negative and
+    large — hence the abs() guard in the full-sky variant. Since TE
+    contributes ~1-2% to N_0^{MV} at space-experiment noise levels,
+    the approximation is adequate.
     """
     if fullsky:
         return _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max)
