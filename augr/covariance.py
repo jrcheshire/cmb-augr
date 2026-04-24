@@ -40,32 +40,30 @@ def _nu_b(bin_edges: list[tuple[int, int]], f_sky: float) -> jnp.ndarray:
     return jnp.array(nu)
 
 
-def _build_M(signal_model: SignalModel,
-             instrument: Instrument,
-             fiducial_params: jnp.ndarray) -> jnp.ndarray:
-    """Build total M = S + N matrix at fiducial, shape (n_chan, n_chan, n_bins).
+def _build_M_signal(signal_model: SignalModel,
+                    fiducial_params: jnp.ndarray) -> jnp.ndarray:
+    """Binned signal-only block M_signal, shape (n_chan, n_chan, n_bins).
 
-    M is symmetric: M[i,j,b] = M[j,i,b].
-    Diagonal (i==i) entries include noise; off-diagonal noise is zero.
+    M_signal[i, j, b] = W_b · (C_ℓ^CMB + C_ℓ^{FG, ij} + δ_{ij} C_ℓ^{res}).
+    The residual template A_res·T_res(ℓ) enters only on i==j auto-blocks,
+    matching the post-CompSep convention that the residual lives in the
+    single cleaned map.
     """
-    n_chan = len(instrument.channels)
+    n_chan = len(signal_model.frequencies)
     n_bins = signal_model.n_bins
     ells = signal_model.ells
     W = signal_model.bin_matrix           # (n_bins, n_ells)
+    freqs = signal_model.frequencies
     fg_model = signal_model.foreground_model
 
     cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
     cl_res = signal_model.residual_bb_unbinned(fiducial_params)
     fg_params = signal_model.fg_params_from(fiducial_params)
 
-    # Signal: M is symmetric, so compute only upper triangle (i ≤ j).
-    # A_res residual template is added on auto-blocks only (i == j).
     M = jnp.zeros((n_chan, n_chan, n_bins))
     for i in range(n_chan):
         for j in range(i, n_chan):
-            nu_i = float(instrument.channels[i].nu_ghz)
-            nu_j = float(instrument.channels[j].nu_ghz)
-            cl_fg = fg_model.cl_bb(nu_i, nu_j, ells, fg_params)
+            cl_fg = fg_model.cl_bb(freqs[i], freqs[j], ells, fg_params)
             cl_total = cl_cmb + cl_fg
             if i == j:
                 cl_total = cl_total + cl_res
@@ -73,13 +71,44 @@ def _build_M(signal_model: SignalModel,
             M = M.at[i, j, :].set(bp)
             if i != j:
                 M = M.at[j, i, :].set(bp)
+    return M
 
-    # Add noise on diagonal
-    for i in range(n_chan):
-        nl_i = noise_nl(instrument.channels[i], ells,
+
+def _knox_blocks(M: jnp.ndarray,
+                 signal_model: SignalModel,
+                 f_sky: float) -> jnp.ndarray:
+    """Apply the Knox 4-point formula to M = S + N.
+
+    Returns per-bin covariance blocks of shape (n_bins, n_spec, n_spec):
+        Cov_b[s1=(i,j), s2=(k,l)] = (M_ik M_jl + M_il M_jk) / ν_b.
+    """
+    nu = _nu_b(signal_model.bin_edges, f_sky)
+    pairs = signal_model.freq_pairs
+    i_arr = jnp.array([p[0] for p in pairs])
+    j_arr = jnp.array([p[1] for p in pairs])
+    M_ik = M[i_arr[:, None], i_arr[None, :], :]
+    M_jl = M[j_arr[:, None], j_arr[None, :], :]
+    M_il = M[i_arr[:, None], j_arr[None, :], :]
+    M_jk = M[j_arr[:, None], i_arr[None, :], :]
+    cov_blocks = (M_ik * M_jl + M_il * M_jk) / nu[None, None, :]
+    return cov_blocks.transpose(2, 0, 1)
+
+
+def _build_M(signal_model: SignalModel,
+             instrument: Instrument,
+             fiducial_params: jnp.ndarray) -> jnp.ndarray:
+    """Build total M = S + N at fiducial, shape (n_chan, n_chan, n_bins).
+
+    Noise N_ℓ per channel comes from instrument.noise_nl; it is binned
+    via W and added only on the i==i diagonal.
+    """
+    M = _build_M_signal(signal_model, fiducial_params)
+    W = signal_model.bin_matrix
+    ells = signal_model.ells
+    for i, ch in enumerate(instrument.channels):
+        nl_i = noise_nl(ch, ells,
                         instrument.mission_duration_years, instrument.f_sky)
         M = M.at[i, i, :].add(W @ nl_i)
-
     return M
 
 
@@ -100,38 +129,18 @@ def bandpower_covariance(signal_model: SignalModel,
         (n_data, n_data), where n_data = n_spectra × n_bins.
         Block-diagonal over bins: Cov[s1*nb+b, s2*nb+b'] = 0 for b ≠ b'.
     """
-    n_bins  = signal_model.n_bins
-    pairs   = signal_model.freq_pairs       # list of (i, j) with i ≤ j
-    n_spec  = len(pairs)
+    n_bins = signal_model.n_bins
+    n_spec = len(signal_model.freq_pairs)
 
-    # Total M = S + N at fiducial: (n_chan, n_chan, n_bins)
-    M = _build_M(signal_model, instrument, fiducial_params)
-
-    # Effective modes per bin
-    nu = _nu_b(signal_model.bin_edges, instrument.f_sky)    # (n_bins,)
-
-    # Vectorised Knox formula
-    # For spectra s1=(i,j) and s2=(k,l):
-    #   Cov[s1, s2, b] = (M[i,k,b]*M[j,l,b] + M[i,l,b]*M[j,k,b]) / nu[b]
-    i_arr = jnp.array([p[0] for p in pairs])  # (n_spec,)
-    j_arr = jnp.array([p[1] for p in pairs])
-
-    # Each of the four M slices: shape (n_spec, n_spec, n_bins)
-    M_ik = M[i_arr[:, None], i_arr[None, :], :]
-    M_jl = M[j_arr[:, None], j_arr[None, :], :]
-    M_il = M[i_arr[:, None], j_arr[None, :], :]
-    M_jk = M[j_arr[:, None], i_arr[None, :], :]
-
-    # cov_blocks[s1, s2, b] — shape (n_spec, n_spec, n_bins)
-    cov_blocks = (M_ik * M_jl + M_il * M_jk) / nu[None, None, :]
-
-    # Assemble block-diagonal full covariance (n_data, n_data)
-    # cov_4d[s1, b1, s2, b2] = cov_blocks[s1, s2, b1] * delta(b1, b2)
-    eye_b = jnp.eye(n_bins)                                 # (n_bins, n_bins)
-    cov_4d = cov_blocks[:, :, :, None] * eye_b[None, None, :, :]
-    # cov_4d has shape (n_spec, n_spec, n_bins, n_bins)
-    # Reorder to (n_spec, n_bins, n_spec, n_bins) then flatten to (n_data, n_data)
-    cov_4d = cov_4d.transpose(0, 2, 1, 3)
+    # Per-bin blocks, then inflate to a block-diagonal (n_data, n_data).
+    blocks = bandpower_covariance_blocks(signal_model, instrument,
+                                         fiducial_params)
+    # blocks has shape (n_bins, n_spec, n_spec); reorder to
+    # (n_spec, n_bins, n_spec, n_bins) with a delta on the bin axes.
+    eye_b = jnp.eye(n_bins)
+    cov_4d = blocks.transpose(1, 0, 2)[:, :, :, None] \
+             * eye_b[None, :, None, :]
+    # cov_4d shape: (n_spec, n_bins, n_spec, n_bins)
     return cov_4d.reshape(n_spec * n_bins, n_spec * n_bins)
 
 
@@ -149,26 +158,8 @@ def bandpower_covariance_blocks(signal_model: SignalModel,
     This is the preferred interface for the Fisher computation, which
     can Cholesky-solve each block independently.
     """
-    n_bins = signal_model.n_bins
-    pairs  = signal_model.freq_pairs
-    n_spec = len(pairs)
-
-    M  = _build_M(signal_model, instrument, fiducial_params)
-    nu = _nu_b(signal_model.bin_edges, instrument.f_sky)
-
-    i_arr = jnp.array([p[0] for p in pairs])
-    j_arr = jnp.array([p[1] for p in pairs])
-
-    M_ik = M[i_arr[:, None], i_arr[None, :], :]
-    M_jl = M[j_arr[:, None], j_arr[None, :], :]
-    M_il = M[i_arr[:, None], j_arr[None, :], :]
-    M_jk = M[j_arr[:, None], i_arr[None, :], :]
-
-    # (n_spec, n_spec, n_bins)
-    cov_blocks = (M_ik * M_jl + M_il * M_jk) / nu[None, None, :]
-
-    # Transpose to (n_bins, n_spec, n_spec)
-    return cov_blocks.transpose(2, 0, 1)
+    M = _build_M(signal_model, instrument, fiducial_params)
+    return _knox_blocks(M, signal_model, instrument.f_sky)
 
 
 def bandpower_covariance_blocks_from_noise(
@@ -194,45 +185,9 @@ def bandpower_covariance_blocks_from_noise(
     Returns:
         Per-bin covariance blocks, shape (n_bins, n_spec, n_spec).
     """
-    n_chan = noise_nls.shape[0]
-    n_bins = signal_model.n_bins
-    ells = signal_model.ells
+    M = _build_M_signal(signal_model, fiducial_params)
     W = signal_model.bin_matrix
-    freqs = signal_model.frequencies
-    fg_model = signal_model.foreground_model
-
-    cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
-    cl_res = signal_model.residual_bb_unbinned(fiducial_params)
-    fg_params = signal_model.fg_params_from(fiducial_params)
-
-    # Build M = S + N: (n_chan, n_chan, n_bins).
-    # A_res residual template is added on auto-blocks only (i == j).
-    M = jnp.zeros((n_chan, n_chan, n_bins))
-    for i in range(n_chan):
-        for j in range(i, n_chan):
-            cl_fg = fg_model.cl_bb(freqs[i], freqs[j], ells, fg_params)
-            cl_total = cl_cmb + cl_fg
-            if i == j:
-                cl_total = cl_total + cl_res
-            bp = W @ cl_total
-            M = M.at[i, j, :].set(bp)
-            if i != j:
-                M = M.at[j, i, :].set(bp)
-
-    # Add noise on diagonal (from pre-computed array)
+    n_chan = noise_nls.shape[0]
     for i in range(n_chan):
         M = M.at[i, i, :].add(W @ noise_nls[i])
-
-    # Knox formula
-    nu = _nu_b(signal_model.bin_edges, f_sky)
-    pairs = signal_model.freq_pairs
-    i_arr = jnp.array([p[0] for p in pairs])
-    j_arr = jnp.array([p[1] for p in pairs])
-
-    M_ik = M[i_arr[:, None], i_arr[None, :], :]
-    M_jl = M[j_arr[:, None], j_arr[None, :], :]
-    M_il = M[i_arr[:, None], j_arr[None, :], :]
-    M_jk = M[j_arr[:, None], i_arr[None, :], :]
-
-    cov_blocks = (M_ik * M_jl + M_il * M_jk) / nu[None, None, :]
-    return cov_blocks.transpose(2, 0, 1)
+    return _knox_blocks(M, signal_model, f_sky)
