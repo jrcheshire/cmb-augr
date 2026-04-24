@@ -211,11 +211,35 @@ class SignalModel:
         ells_np = np.arange(ell_min, ell_max + 1, dtype=float)
         self._ells = jnp.array(ells_np)
 
-        # Pre-interpolate delensed BB onto our ell grid (not JAX-traced)
+        # Pre-interpolate delensed BB onto our ell grid (not JAX-traced).
+        # The supplied array must cover [ell_min, ell_max] in full;
+        # zero-extrapolation outside that range would silently null the
+        # residual lensing BB (critical at the reionization bump where
+        # sigma(r) is most sensitive for a space mission, and equally
+        # bad at high ell where the residual rises toward the lensing
+        # peak).
         if self._delensed:
-            self._delensed_bb = jnp.interp(
-                self._ells, delensed_bb_ells, delensed_bb,
-                left=0.0, right=0.0)
+            if delensed_bb_ells is None:
+                raise ValueError(
+                    "delensed_bb requires delensed_bb_ells.")
+            ells_in = jnp.asarray(delensed_bb_ells, dtype=float)
+            cl_in = jnp.asarray(delensed_bb, dtype=float)
+            if cl_in.shape != ells_in.shape:
+                raise ValueError(
+                    f"delensed_bb shape {cl_in.shape} must match "
+                    f"delensed_bb_ells shape {ells_in.shape}.")
+            if cl_in.shape[0] < 2:
+                raise ValueError(
+                    "delensed_bb and delensed_bb_ells must have length >= 2 "
+                    f"for interpolation; got length {cl_in.shape[0]}.")
+            lo, hi = float(ells_in[0]), float(ells_in[-1])
+            if lo > ell_min or hi < ell_max:
+                raise ValueError(
+                    f"delensed_bb_ells range [{lo:g}, {hi:g}] must cover the "
+                    f"SignalModel ell range [{ell_min}, {ell_max}]; "
+                    "supply a wider delensed_bb grid or narrow ell_min/"
+                    "ell_max.")
+            self._delensed_bb = jnp.interp(self._ells, ells_in, cl_in)
         else:
             self._delensed_bb = None
 
