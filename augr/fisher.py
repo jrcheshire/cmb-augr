@@ -28,6 +28,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from augr.signal import SignalModel, flatten_params
 from augr.covariance import (
@@ -295,11 +296,27 @@ class FisherForecast:
                       f"pol_eff={eff.polarization_efficiency:.2f} "
                       f"(total={eff.total:.3f})")
 
-        # ell-binning
+        # ell-binning and Knox mode count per bin
         lines.append(f"ell range:         {sig.ells[0]:.0f} - {sig.ells[-1]:.0f}")
         lines.append(f"Bandpower bins:    {sig.n_bins}")
         lines.append(f"Cross-spectra:     {len(sig.freq_pairs)} "
                       f"({len(inst.channels)} channels)")
+
+        # ν_b = f_sky × Σ_{ℓ in bin}(2ℓ+1); below ~10 the Knox Gaussian
+        # likelihood breaks down and Fisher sigma(r) is structurally
+        # narrower than a Hamimeche-Lewis or Wishart posterior.
+        nu_b = np.array([
+            inst.f_sky * (hi - lo + 1) * (lo + hi + 1)
+            for lo, hi in sig.bin_edges
+        ])
+        nu_b_min = float(nu_b.min())
+        lines.append(f"Knox modes/bin:    min={nu_b_min:.1f}, "
+                     f"median={float(np.median(nu_b)):.0f}"
+                     + (" -- WARNING: low-ell bins have < 10 modes; "
+                        "Gaussian-likelihood approximation breaks down, "
+                        "Fisher will be narrower than Hamimeche-Lewis / "
+                        "Wishart posteriors"
+                        if nu_b_min < 10 else ""))
 
         # Channel table
         lines.append("")

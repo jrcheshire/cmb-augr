@@ -351,3 +351,40 @@ def test_a_res_fixed_excluded_from_free_params(signal_model_with_template,
     )
     assert "A_res" not in fisher.free_parameter_names
     assert fisher.fisher_matrix.shape == (fisher.n_free, fisher.n_free)
+
+
+def test_summary_flags_low_mode_count_bins(instrument):
+    """When any bin has fewer than ~10 Knox modes (f_sky × (2ℓ+1) × Δℓ),
+    the Gaussian-likelihood approximation breaks down and Fisher sigma(r)
+    is structurally narrower than a Wishart posterior.  The summary
+    must flag this so absolute sigma(r) quotes are not taken at face
+    value."""
+    # ell_min=2, delta_ell=1 at the reionization bump: at ell=2 with
+    # f_sky=0.7, nu_b = 0.7 * 5 = 3.5 -- well below 10.
+    sig = SignalModel(
+        instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=2, ell_max=50, delta_ell=10, ell_per_bin_below=5,
+    )
+    ff = FisherForecast(sig, instrument, FIDUCIAL,
+                        priors={"beta_dust": 0.11, "beta_sync": 0.3},
+                        fixed_params=["T_dust"])
+    ff.compute()
+    text = ff.summary()
+    assert "Knox modes/bin" in text
+    assert "WARNING" in text
+    assert "Gaussian-likelihood approximation" in text
+
+
+def test_summary_no_warning_when_all_bins_well_sampled(instrument):
+    """No warning when every bin has >> 10 modes."""
+    sig = SignalModel(
+        instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=100, ell_max=300, delta_ell=50, ell_per_bin_below=100,
+    )
+    ff = FisherForecast(sig, instrument, FIDUCIAL,
+                        priors={"beta_dust": 0.11, "beta_sync": 0.3},
+                        fixed_params=["T_dust"])
+    ff.compute()
+    text = ff.summary()
+    assert "Knox modes/bin" in text
+    assert "WARNING" not in text
