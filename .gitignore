@@ -6,3 +6,4 @@ __pycache__/
 scripts/_broom_scratch/
 plots/
 data/broom_outputs/
+data/hit_maps/

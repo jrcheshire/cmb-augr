@@ -30,12 +30,14 @@ sims; several minutes at nside=64.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 import broom
 import healpy as hp
 import numpy as np
+import yaml
 from broom import (
     Configs,
     _compute_spectra,
@@ -44,6 +46,8 @@ from broom import (
     get_input_data,
 )
 from broom.routines import _format_nsim
+
+from augr.hit_maps import mean_pixel_rescale_factor
 
 
 # ---------------------------------------------------------------------------
@@ -134,20 +138,166 @@ def _fgres_template_noise_subpath() -> str:
             f"mexican_B{NEEDLET_WIDTH}_{merge}")
 
 
-def _output_tag(mask_type: str, nsims: int) -> str:
-    """Filename tag encoding the instrument/FG/method/mask/nsims."""
-    # Lowercase, no punctuation problematic for file systems.
-    return (f"{EXPERIMENT.lower()}_{FG_TAG}_nilc_"
-            f"{mask_type.lower()}_{nsims:03d}sims")
+def _output_tag(mask_type: str, nsims: int, hits_prefix: str | None = None,
+                knee_config: str | None = None,
+                cov_noise_debias_factor: float = 0.0) -> str:
+    """Filename tag encoding the instrument/FG/method/mask/noise/nsims.
+
+    White-noise + debias=0 tag is unchanged from the pre-noise-realism
+    behavior.  Anisotropic noise contributes `_l2`; 1/f contributes
+    `_1f`; non-zero covariance-noise debias contributes `_debX.X`.
+    """
+    parts = [EXPERIMENT.lower(), FG_TAG, "nilc", mask_type.lower()]
+    if hits_prefix is not None:
+        parts.append("l2")
+    if knee_config is not None:
+        parts.append("1f")
+    if cov_noise_debias_factor > 0.0:
+        parts.append(f"deb{cov_noise_debias_factor:g}")
+    parts.append(f"{nsims:03d}sims")
+    return "_".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Instrument override assembly (hit maps + 1/f noise)
+# ---------------------------------------------------------------------------
+
+def _experiment_channel_tags(experiment: str) -> list[str]:
+    """Channel tags from BROOM's InstrumentConfig for the given experiment.
+
+    Defers to BROOM's own tag-generation (via a throwaway Configs
+    built with all generators disabled) so the tags we use for
+    hit-map filename lookup and knee-config alignment match exactly
+    what BROOM expects downstream.  Avoids reimplementing the
+    dupe-frequency `aGHz`/`bGHz` suffix logic.
+    """
+    cfg = Configs(config={
+        "experiment": experiment,
+        "experiments_file": str(BROOM_ROOT / "utils" / "experiments.yaml"),
+        "nside": NSIDE, "nside_in": NSIDE,
+        "lmax": LMAX, "lmax_in": LMAX,
+        "foreground_models": ["d1"], "data_type": "alms",
+        "units": "uK_CMB", "coordinates": "G", "nsims": 1,
+        "generate_input_data": False, "generate_input_cmb": False,
+        "generate_input_foregrounds": False, "generate_input_noise": False,
+        "bandpass_integrate": False,
+    })
+    return list(cfg.instrument.channels_tags)
+
+
+def _load_knee_config(path: Path, channel_tags: list[str]) -> tuple[list[float], list[float]]:
+    """Load per-channel 1/f config from JSON aligned to channel order.
+
+    JSON schema: {channel_tag: {"ell_knee": float, "alpha_knee": float}}.
+    Must cover every channel -- raises ValueError on gaps.  Convention:
+    alpha_knee < 0 for 1/f that rises at low ell; BROOM applies
+    N_ell *= 1 + (ell / ell_knee)^alpha_knee.
+    """
+    raw = json.loads(Path(path).read_text())
+    missing = [t for t in channel_tags if t not in raw]
+    if missing:
+        shown = ", ".join(missing[:3])
+        extra = " ..." if len(missing) > 3 else ""
+        raise ValueError(
+            f"knee-config {path} missing entries for channels: "
+            f"[{shown}{extra}]. Provide ell_knee/alpha_knee for every "
+            "channel, or drop --knee-config entirely for white noise."
+        )
+    ell_knee = [float(raw[t]["ell_knee"]) for t in channel_tags]
+    alpha_knee = [float(raw[t]["alpha_knee"]) for t in channel_tags]
+    return ell_knee, alpha_knee
+
+
+def _build_instrument_override(
+    experiment: str,
+    hits_prefix: str | None = None,
+    knee_config_path: str | None = None,
+) -> tuple[dict, list[str]] | tuple[None, list[str]]:
+    """Build an instrument-dict override with hit-map + 1/f knobs applied.
+
+    Returns (None, channel_tags) when neither override is set -- the
+    caller should stay on the experiment-YAML path.  Returns
+    (instrument_dict, channel_tags) otherwise; the dict is ready to
+    drop into `config["instrument"]`.
+
+    Hit-map normalization: `depth_I` and `depth_P` are divided by
+    `augr.hit_maps.mean_pixel_rescale_factor(hits)` so the sky-averaged
+    pixel noise variance equals the YAML-spec value.  BROOM's
+    internal max=1 normalization then leaves the ecliptic poles
+    deeper than spec and the equator shallower.
+    """
+    yaml_path = BROOM_ROOT / "utils" / "experiments.yaml"
+    with open(yaml_path) as f:
+        yaml_data = yaml.safe_load(f)
+    if experiment not in yaml_data:
+        raise ValueError(f"experiment {experiment!r} not in {yaml_path}")
+    inst = dict(yaml_data[experiment])
+
+    tags = _experiment_channel_tags(experiment)
+
+    if hits_prefix is None and knee_config_path is None:
+        return None, tags
+
+    if hits_prefix is not None:
+        # v1: all channels share the same analytic L2 hit map (produced
+        # by make_hit_maps.py).  We read only the first channel's file
+        # to compute `k`; the uniform rescale applied to every channel's
+        # depth is only correct under that shared-map assumption.  A
+        # future per-channel (feedhorn-offset) pass would need to read
+        # each file and compute k per channel.
+        first_fits = Path(f"{hits_prefix}_{tags[0]}.fits")
+        if not first_fits.exists():
+            raise FileNotFoundError(
+                f"hit map not found: {first_fits}. "
+                "Generate first via scripts/make_hit_maps.py."
+            )
+        hits = hp.read_map(str(first_fits))
+        k = mean_pixel_rescale_factor(hits)
+        print(f"  hit-map rescale factor k = {k:.4f} "
+              f"(depth_I/P divided by k for sky-average normalization)")
+        inst["depth_I"] = [float(d) / k for d in inst["depth_I"]]
+        inst["depth_P"] = [float(d) / k for d in inst["depth_P"]]
+        inst["path_hits_maps"] = hits_prefix
+
+    if knee_config_path is not None:
+        ell_knee, alpha_knee = _load_knee_config(Path(knee_config_path), tags)
+        inst["ell_knee"] = ell_knee
+        inst["alpha_knee"] = alpha_knee
+
+    return inst, tags
 
 
 # ---------------------------------------------------------------------------
 # BROOM config assembly
 # ---------------------------------------------------------------------------
 
-def _base_config(nsims: int, mask_type: str) -> dict:
+def _input_cache_tag(has_hits: bool, has_knee: bool) -> str:
+    """Suffix for cached noise/total alms paths.
+
+    Keeps "alms" as the default so the white-noise cache directory
+    built by prior runs stays valid; hit-map and 1/f runs go to
+    separate subpaths so noise regenerates correctly.
+
+    Intentionally does NOT include `cov_noise_debias_factor`: the
+    debias setting only affects compsep weights, not the simulated
+    noise alms themselves, so the sim cache can be reused across
+    debias values (and `_output_tag` carries the `debX` suffix for
+    product-file naming).
+    """
+    parts = []
+    if has_hits:
+        parts.append("l2")
+    if has_knee:
+        parts.append("1f")
+    return "_".join(parts) if parts else "alms"
+
+
+def _base_config(nsims: int, mask_type: str,
+                 instrument_override: dict | None = None,
+                 input_cache_tag: str = "alms",
+                 cov_noise_debias_factor: float = 0.0) -> dict:
     sims = SCRATCH / "inputs" / EXPERIMENT
-    return {
+    cfg = {
         # General
         "lmin": 2,
         "lmin_in": 2,
@@ -180,13 +330,15 @@ def _base_config(nsims: int, mask_type: str) -> dict:
         "generate_input_data": True,
         "save_inputs": True,
         "pixel_window_in": False,
-        "data_path": str(sims / "total" / f"total_alms_ns{NSIDE}_lmax{LMAX}"),
+        "data_path": str(sims / "total"
+                         / f"total_{input_cache_tag}_ns{NSIDE}_lmax{LMAX}"),
         "fgds_path": str(
             sims / "foregrounds" / FG_TAG
             / f"foregrounds_alms_ns{NSIDE}_lmax{LMAX}"
         ),
         "cmb_path": str(sims / "cmb" / f"cmb_alms_ns{NSIDE}_lmax{LMAX}"),
-        "noise_path": str(sims / "noise" / f"noise_alms_ns{NSIDE}_lmax{LMAX}"),
+        "noise_path": str(sims / "noise"
+                          / f"noise_{input_cache_tag}_ns{NSIDE}_lmax{LMAX}"),
 
         # Common compsep
         "fwhm_out": FWHM_OUT,
@@ -214,18 +366,36 @@ def _base_config(nsims: int, mask_type: str) -> dict:
         # The active compsep / residual / spectra blocks are attached in
         # main() at the right phase (needed to resolve the GNILC path
         # suffix after GNILC has actually run).
-        "compsep": _compsep_blocks(),
+        "compsep": _compsep_blocks(cov_noise_debias_factor),
         "compsep_residuals": [],
         "compute_spectra": [],
     }
+    if instrument_override is not None:
+        cfg["instrument"] = instrument_override
+    return cfg
 
 
-def _compsep_blocks() -> list[dict]:
+def _compsep_blocks(debias_factor: float = 0.0) -> list[dict]:
     """Two compsep blocks: NILC on scalar B, and GNILC on QU for FG maps.
 
     GNILC hyperparameters follow Carones 2025 Sec. 3.2 (m(n_hat) + 1 modes,
     full CMB deprojection except at the lowest needlet band).
+
+    `debias_factor` broadcasts to all needlet bands for both ILC and
+    GILC `cov_noise_debias`.  Default 0.0 matches prior behavior.
+
+    `depro_cmb` and `m_bias` below are length-4 by construction of the
+    current `NEEDLET_BANDS` (5 boundaries -> 4 bands); the assert
+    guards against a latent mismatch if `NEEDLET_BANDS` is later
+    edited without updating those lists.
     """
+    n_bands = len(NEEDLET_BANDS) - 1
+    assert n_bands == 4, (
+        f"NEEDLET_BANDS implies {n_bands} bands, but `depro_cmb` and "
+        f"`m_bias` below are hardcoded for 4; update both or make them "
+        f"derive from NEEDLET_BANDS."
+    )
+    debias_list = [debias_factor] * n_bands
     return [
         {
             "method": "ilc",
@@ -237,7 +407,7 @@ def _compsep_blocks() -> list[dict]:
             "adapt_nside": True,
             "save_needlets": True,
             "save_weights": True,
-            "cov_noise_debias": [0.0, 0.0, 0.0, 0.0],
+            "cov_noise_debias": debias_list,
             "load_noise_covariance": False,
             "component_out": "cmb",
             "minimize_variance": False,
@@ -255,7 +425,7 @@ def _compsep_blocks() -> list[dict]:
             "load_nuisance_covariance": False,
             "depro_cmb": [None, 0.0, 0.0, 0.0],
             "m_bias": [0, 1, 1, 1],
-            "cov_noise_debias": [0.0, 0.0, 0.0, 0.0],
+            "cov_noise_debias": debias_list,
             "load_noise_covariance": False,
         },
     ]
@@ -405,6 +575,25 @@ def _parse_args() -> argparse.Namespace:
                    help="Skip sim generation + NILC/GNILC runs; reuse "
                         "existing products on disk (spectra will still "
                         "be recomputed).")
+    p.add_argument("--hits-prefix", type=str, default=None,
+                   help="If set, BROOM consumes per-channel hit map "
+                        "FITS at <prefix>_<channel_tag>.fits and "
+                        "per-channel depth_I/depth_P are rescaled for "
+                        "sky-average-matched normalization. Generate "
+                        "the hit maps first via scripts/make_hit_maps.py.")
+    p.add_argument("--knee-config", type=str, default=None,
+                   help="Path to a JSON file mapping channel_tag -> "
+                        "{ell_knee, alpha_knee} for per-channel 1/f "
+                        "noise. Must cover every channel. Example "
+                        "value: ell_knee=30, alpha_knee=-2 gives the "
+                        "standard knee shape rising at low ell.")
+    p.add_argument("--cov-noise-debias", type=float, default=0.0,
+                   help="Factor in [0, 1] for NILC+GNILC noise-covariance "
+                        "debias; broadcast to all needlet bands. 0.0 "
+                        "(default) = no debias. Non-zero is useful for "
+                        "checking whether debias helps under anisotropic / "
+                        "1/f noise where the noise covariance is no longer "
+                        "a simple diagonal.")
     return p.parse_args()
 
 
@@ -412,7 +601,26 @@ def main() -> None:
     args = _parse_args()
     SCRATCH.mkdir(parents=True, exist_ok=True)
 
-    config = Configs(config=_base_config(nsims=args.nsims, mask_type=args.mask))
+    instrument_override, _ = _build_instrument_override(
+        EXPERIMENT,
+        hits_prefix=args.hits_prefix,
+        knee_config_path=args.knee_config,
+    )
+    if args.hits_prefix:
+        print(f"Anisotropic noise: hit maps at {args.hits_prefix}_<tag>.fits")
+    if args.knee_config:
+        print(f"1/f noise: per-channel knee config from {args.knee_config}")
+
+    cache_tag = _input_cache_tag(
+        has_hits=args.hits_prefix is not None,
+        has_knee=args.knee_config is not None,
+    )
+    config = Configs(config=_base_config(
+        nsims=args.nsims, mask_type=args.mask,
+        instrument_override=instrument_override,
+        input_cache_tag=cache_tag,
+        cov_noise_debias_factor=args.cov_noise_debias,
+    ))
 
     if not args.skip_compsep:
         print(f"Phase 1: NILC + GNILC + estimate_residuals, nsims={args.nsims}")
@@ -443,7 +651,10 @@ def main() -> None:
     ell_centres = _bandpower_ell_centres(n_bins)
 
     print("\nPhase 4: write output artifacts")
-    tag = _output_tag(args.mask, args.nsims)
+    tag = _output_tag(args.mask, args.nsims,
+                      hits_prefix=args.hits_prefix,
+                      knee_config=args.knee_config,
+                      cov_noise_debias_factor=args.cov_noise_debias)
     _save_product(OUTPUTS_DIR / f"{tag}_nl_bb.npy", ell_centres, nl_mean)
     _save_product(OUTPUTS_DIR / f"{tag}_tres_bb.npy", ell_centres, tres_mean)
     _save_product(OUTPUTS_DIR / f"{tag}_fgds_bb.npy", ell_centres, fgds_mean)
