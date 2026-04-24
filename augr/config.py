@@ -22,6 +22,10 @@ from augr.instrument import Channel, Instrument, ScalarEfficiency
 # Foreground fiducial parameters
 # ---------------------------------------------------------------------------
 
+# flatten_params only reads keys that appear in SignalModel.parameter_names,
+# so A_res here is a harmless convenience for the post-CompSep workflow --
+# it is consumed only when a residual template is attached, and silently
+# ignored otherwise. Delensed mode similarly ignores A_lens.
 FIDUCIAL_BK15: dict[str, float] = {
     "r":           0.0,    # tensor-to-scalar ratio (target: r = 0)
     "A_lens":      1.0,    # lensing amplitude (1 = no delensing)
@@ -34,7 +38,7 @@ FIDUCIAL_BK15: dict[str, float] = {
     "alpha_sync": -0.6,    # sync ℓ-dependence power law
     "epsilon":     0.0,    # dust–sync correlation ([-1, 1])
     "Delta_dust":  0.0,    # dust frequency decorrelation strength
-    "A_res":       1.0,    # residual-template amplitude (post-CompSep)
+    "A_res":       1.0,    # residual-template amplitude (post-CompSep mode only)
 }
 
 # ---------------------------------------------------------------------------
@@ -164,37 +168,66 @@ def pico_like() -> Instrument:
 
 
 def litebird_like() -> Instrument:
-    """LiteBIRD-like instrument (arXiv:2202.02773, Table 1).
+    """LiteBIRD PTEP baseline (Hazumi+ 2023, arXiv:2202.02773, Table 3).
 
-    15 frequency bands from 34 to 448 GHz across three telescopes
-    (LFT 34–161 GHz, MFT 89–224 GHz, HFT 166–448 GHz).
-    Target σ(r) ≈ 0.001 from L2.
+    15 frequency bands from 40 to 402 GHz across three telescopes
+    (LFT 40-140 GHz, MFT 100-195 GHz, HFT 195-402 GHz); 4508 detectors
+    total; 3-year L2 mission; f_sky = 0.7.
 
-    NET values are approximate per-detector estimates derived from the
-    published array NETs and detector counts in Table 1.
+    PTEP Table 3 lists each frequency as one or two sub-arrays (LFT+MFT
+    or MFT+HFT at shared frequencies; LFT mixed pixel sizes at 68/78/89).
+    We expose each sub-array as its own augr Channel (22 total) so that
+    augr's Fisher machinery handles the MV combination per ℓ via the
+    cross-frequency covariance, preserving each sub-array's distinct
+    FWHM rather than collapsing to a single effective beam.  Per-sub-
+    array NET_det and FWHM come verbatim from PTEP Table 3; detector
+    counts sum to 4508 across all 22 entries.
+
+    Efficiency factors track PTEP Eq. 32: detector_yield=0.80,
+    observing_efficiency=0.85 (duty cycle), data_cut_fraction=0.95
+    (margin), cosmic_ray_deadtime=0.95, polarization_efficiency=0.90
+    (augr models finite HWP efficiency; PTEP Eq. 32 assumes 1.0 and
+    folds HWP losses into NET_det).
     """
     eff = ScalarEfficiency(
         detector_yield=0.80,
         observing_efficiency=0.85,
-        data_cut_fraction=0.90,
-        cosmic_ray_deadtime=0.97,
-        polarization_efficiency=0.90,   # HWP efficiency
+        data_cut_fraction=0.95,
+        cosmic_ray_deadtime=0.95,
+        polarization_efficiency=0.90,
     )
-    # (nu_ghz, n_det, NET [μK√s], FWHM [arcmin])
+    # (nu_ghz, n_det, NET_det [μK√s], FWHM [arcmin])
+    # Values verbatim from Hazumi+ 2023 Table 3; bands 4-9 and 11 are
+    # split into their contributing sub-arrays.
     _bands = [
-        ( 34.0,  48,  59.3, 69.3),
-        ( 46.0,  24,  37.9, 51.3),
-        ( 78.0,  48,  19.6, 29.9),
-        ( 89.0,  24,  19.0, 28.0),  # MFT overlap
-        (100.0,  48,  15.5, 24.7),
-        (119.0,  24,  16.2, 22.0),  # MFT overlap
-        (140.0,  48,  13.8, 18.0),
-        (166.0,  24,  15.5, 17.9),  # HFT overlap
-        (195.0,  24,  19.1, 15.0),
-        (235.0,  24,  31.3, 12.4),
-        (280.0,  24,  75.0, 10.4),
-        (337.0,  24, 196.0,  8.7),
-        (402.0,  24, 607.0,  7.2),
+        # --- LFT only, single-pixel bands ---
+        ( 40.0,   48, 114.63, 70.5),   # LFT
+        ( 50.0,   24,  72.48, 58.5),   # LFT
+        ( 60.0,   48,  65.28, 51.1),   # LFT
+        # --- LFT mixed-pixel bands (16mm + 32mm sub-arrays) ---
+        ( 68.0,  144, 105.64, 41.6),   # LFT 16mm
+        ( 68.0,   24,  68.81, 47.1),   # LFT 32mm
+        ( 78.0,  144,  82.51, 36.9),   # LFT 16mm
+        ( 78.0,   48,  58.61, 43.8),   # LFT 32mm
+        ( 89.0,  144,  65.18, 33.0),   # LFT 16mm
+        ( 89.0,   24,  62.33, 41.5),   # LFT 32mm
+        # --- LFT + MFT overlaps ---
+        (100.0,  144,  54.88, 30.2),   # LFT
+        (100.0,  366,  71.70, 37.8),   # MFT
+        (119.0,  144,  40.78, 26.3),   # LFT
+        (119.0,  488,  55.65, 33.6),   # MFT
+        (140.0,  144,  38.44, 23.7),   # LFT
+        (140.0,  366,  54.00, 30.8),   # MFT
+        # --- MFT only ---
+        (166.0,  488,  54.37, 28.9),
+        # --- MFT + HFT overlap ---
+        (195.0,  366,  59.61, 28.0),   # MFT
+        (195.0,  254,  73.96, 28.6),   # HFT
+        # --- HFT only ---
+        (235.0,  254,  76.06, 24.7),
+        (280.0,  254,  97.26, 22.5),
+        (337.0,  254, 154.64, 20.9),
+        (402.0,  338, 385.69, 17.9),
     ]
     channels = tuple(
         Channel(nu_ghz=nu, n_detectors=nd, net_per_detector=net,

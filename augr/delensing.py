@@ -393,17 +393,23 @@ def compute_n0_te(Ls: jnp.ndarray,
                   fullsky: bool = False) -> jnp.ndarray:
     """N_0^{TE}(L) — QE reconstruction noise for the TE estimator.
 
-    The TE response is asymmetric (HO02 Table 1):
-      f_TE = C_TE(l₁) (L·l₁) cos(2φ) + C_TE(l₂) (L·l₂)
-    The cos(2φ) appears on the l₁ leg because deflection of the spin-2
-    E-field introduces a spin-2 angle, while deflection of T does not.
+    Follows Hu & Okamoto 2002 (astro-ph/0111606) Table 1 with α = ΘE:
+    the T-field sits at l₁ and the E-field at l₂. The response is
+      f_TE(l₁, l₂) = C_TE(l₁) (L·l₁) cos(2φ) + C_TE(l₂) (L·l₂).
+    cos(2φ) attaches to the C_TE(l₁) term because the Wick contraction
+    that generates it matches Θ(l₁) with Ẽ(-l₁); the E-field's spin-2
+    deflection kernel then brings in cos(2φ_{l₁,l₂}) at position l₁.
+    (The E-field is still what's being deflected — it's just evaluated
+    against the l₁ momentum.)
 
-    The exact filter requires a full 2×2 covariance inversion at each
-    (l₁, l₂) pair (HO02 Eq. 13). We use the standard diagonal
-    approximation with denominator C_TT(l₁)C_EE(l₂) + C_TE(l₁)C_TE(l₂),
-    which introduces ~5-10% error in N_0^{TE}. Since TE is subdominant
-    in the MV combination for low-noise experiments, the impact on
-    N_0^{MV} is ~1-2%.
+    The exact filter requires a 2×2 covariance inversion at each
+    (l₁, l₂) pair (HO02 Eq. 13). We use a diagonal approximation with
+    denominator C_TT(l₁)C_EE(l₂) + C_TE(l₁)C_TE(l₂). Unlike the full
+    HO02 denominator (always positive by Cauchy-Schwarz), this form
+    can flip sign at (l₁, l₂) where C_TE(l₁)C_TE(l₂) is negative and
+    large — hence the abs() guard in the full-sky variant. Since TE
+    contributes ~1-2% to N_0^{MV} at space-experiment noise levels,
+    the approximation is adequate.
     """
     if fullsky:
         return _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max)
@@ -837,7 +843,9 @@ def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max):
 def _lensing_kernel_fullsky(ls: jnp.ndarray, Ls: jnp.ndarray,
                             spectra: LensingSpectra,
                             l_min: int = 2,
-                            l_max: int = 3000) -> jnp.ndarray:
+                            l_max: int = 3000,
+                            *,
+                            w_ee: jnp.ndarray | None = None) -> jnp.ndarray:
     """Full-sky lensing kernel K(l, L) using Smith et al. (2012) coupling.
 
     C_l^{BB,lens} = Σ_L K(l,L) C_L^{φφ}
@@ -847,10 +855,15 @@ def _lensing_kernel_fullsky(ls: jnp.ndarray, Ls: jnp.ndarray,
 
     where |f^{EB}|^2 is the Smith et al. parity-odd coupling (Eq. 6-7).
     Computed via cyclic 3j: (l_B, l_E, L; 2,-2,0) = (l_E, L, l_B; -2, 0, 2).
+
+    If w_ee is provided, C_EE is multiplied by W_EE(ℓ_E) inside the sum --
+    needed for the exact Smith+ Eq. 12 residual BB (see residual_cl_bb).
     """
     from augr.wigner import wigner3j_vectorized
 
     cl_ee_unl = np.asarray(spectra.cl_ee_unl)
+    if w_ee is not None:
+        cl_ee_unl = cl_ee_unl * np.asarray(w_ee)
     ls_np = np.asarray(ls, dtype=float)  # target l_B values
     Ls_np = np.asarray(Ls, dtype=float)
     n_l = len(ls_np)
@@ -928,7 +941,9 @@ def lensing_kernel(ls: jnp.ndarray, Ls: jnp.ndarray,
                    l_min: int = 2,
                    l_max: int = 3000,
                    n_phi: int = 128,
-                   fullsky: bool = False) -> jnp.ndarray:
+                   fullsky: bool = False,
+                   *,
+                   w_ee: jnp.ndarray | None = None) -> jnp.ndarray:
     """Lensing kernel K(l, L) such that C_l^{BB,lens} = Σ_L K(l,L) C_L^{φφ}.
 
     The kernel encodes how lensing power at multipole L generates B-mode
@@ -952,15 +967,23 @@ def lensing_kernel(ls: jnp.ndarray, Ls: jnp.ndarray,
         l_max:   Maximum ell for internal E-mode sum.
         n_phi:   GL quadrature nodes (flat-sky only).
         fullsky: Use Wigner 3j coupling instead of flat-sky.
+        w_ee:    Optional E-mode Wiener filter W_EE(ℓ_E) = C_EE/(C_EE+N_EE),
+                 indexed on the same grid as spectra.cl_ee_unl.  When
+                 provided, the kernel integrand carries an extra factor
+                 W_EE(ℓ_E) on top of C_EE(ℓ_E) -- needed for the exact
+                 Smith+ 2012 Eq. 12 residual BB when the E map is not
+                 signal-dominated (see residual_cl_bb).
 
     Returns:
         K: array of shape (n_l, n_L).
     """
     if fullsky:
-        return _lensing_kernel_fullsky(ls, Ls, spectra, l_min, l_max)
+        return _lensing_kernel_fullsky(ls, Ls, spectra, l_min, l_max,
+                                        w_ee=w_ee)
 
     phi, w_phi = _gl_nodes(n_phi)
     cl_ee_unl = spectra.cl_ee_unl
+    cl_ee_weighted = cl_ee_unl if w_ee is None else cl_ee_unl * w_ee
 
     # Flat-sky lensing BB at first order in the gradient expansion:
     #   C_l^{BB} = ∫ d²L/(2π)² C_L^{φφ} C_{|l-L|}^{EE,unl}
@@ -992,10 +1015,10 @@ def lensing_kernel(ls: jnp.ndarray, Ls: jnp.ndarray,
         phi_lmL = jnp.arctan2(lmL_y, lmL_x)
         sin2phi = jnp.sin(2.0 * phi_lmL)
 
-        # C_{|l-L|}^{EE,unl}
-        cl_ee_at_lmL = _interp_at(cl_ee_unl, lmL_mag)
+        # C_{|l-L|}^{EE,unl} × W_EE(|l-L|) if w_ee was provided
+        cl_ee_at_lmL = _interp_at(cl_ee_weighted, lmL_mag)
 
-        # Integrand: C_EE × (L·(l-L))² × sin²(2φ) × L / (2π)²
+        # Integrand: C_EE [× W_EE] × (L·(l-L))² × sin²(2φ) × L / (2π)²
         integrand = cl_ee_at_lmL * LdotlmL**2 * sin2phi**2
 
         # Integrate over ψ with GL weights, factor of L/(2π)²
@@ -1017,21 +1040,25 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
                    l_min: int = 2,
                    l_max: int = 3000,
                    n_phi: int = 128,
-                   fullsky: bool = False) -> jnp.ndarray:
+                   fullsky: bool = False,
+                   *,
+                   nl_ee: jnp.ndarray | None = None) -> jnp.ndarray:
     """Residual lensing BB after QE delensing (Smith et al. 2012, Eq. 12).
 
-    C_l^{BB,res} = Σ_L K(l,L) × C_L^{φφ,res}
+    The full Smith+ 2012 formula is
+        C_l^{BB,res} ∝ ∫ [1 - W_EE(ℓ_E) W_φφ(L)] C_EE(ℓ_E) C_φφ(L) × (kernel)
+    with W_EE(ℓ) = C_EE / (C_EE + N_EE) and W_φφ(L) = C_φφ / (C_φφ + N_0).
+    This factors as
+        C_l^{BB,res} = K @ [C_φφ (1 - W_φφ)] + (K - K_WEE) @ [C_φφ W_φφ]
+    where K is the standard kernel and K_WEE carries an extra W_EE(ℓ_E)
+    factor inside the C_EE integrand.  The first term is the "simple"
+    W_EE=1 approximation; the second is the correction that becomes
+    non-negligible when the E map is not signal-dominated.
 
-    where C_L^{φφ,res} = C_L^{φφ} × N_0(L) / (C_L^{φφ} + N_0(L))
-    is the unsubtracted lensing potential power after Wiener filtering.
-
-    This is an approximation to the full Smith et al. Eq. 12, which has
-    an additional E-mode Wiener filter factor:
-      C_res_exact ∝ C_EE C_φφ [1 - W_EE × W_φφ]
-    where W_EE = C_EE / (C_EE + N_EE).  We set W_EE = 1, which is
-    excellent for space missions (C_EE/N_EE ~ 500 at ℓ = 1000, so
-    W_EE > 0.998) but would underestimate the residual for high-noise
-    ground-based experiments.
+    When nl_ee is None we use the W_EE=1 simplification
+        C_l^{BB,res} = K @ [C_φφ N_0 / (C_φφ + N_0)]
+    which is fine for space missions (C_EE/N_EE ~ 10²-10³ at the
+    lensing peak) but optimistic for ground experiments.
 
     Args:
         ls:      BB multipoles to compute residual at.
@@ -1039,18 +1066,30 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
         spectra: LensingSpectra.
         n0_mv:   MV reconstruction noise N_0(L), same length as Ls.
         l_min, l_max, n_phi: passed to lensing_kernel().
+        nl_ee:   EE noise spectrum on the same ℓ grid as spectra.cl_ee_unl.
+                 If provided, the exact Eq. 12 form is used; if None, the
+                 W_EE=1 approximation.
 
     Returns:
         C_l^{BB,res} at each l in ls.
     """
+    cl_pp_at_L = _interp_at(spectra.cl_pp, Ls)
+    w_pp = cl_pp_at_L / (cl_pp_at_L + n0_mv)
+    cl_pp_res = cl_pp_at_L * (1.0 - w_pp)           # = C_φφ N_0 / (C_φφ + N_0)
+
     K = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi, fullsky=fullsky)
 
-    # Residual φφ: Wiener filter complement
-    cl_pp_at_L = _interp_at(spectra.cl_pp, Ls)
-    cl_pp_res = cl_pp_at_L * n0_mv / (cl_pp_at_L + n0_mv)
+    if nl_ee is None:
+        return K @ cl_pp_res
 
-    # Matrix-vector product: sum over L
-    return K @ cl_pp_res
+    # Exact Smith+ 2012 Eq. 12: build K_WEE with the extra W_EE(ℓ_E) factor
+    # and add the W_EE-correction term.
+    cl_ee = spectra.cl_ee_unl
+    nl_ee_arr = jnp.asarray(nl_ee)
+    w_ee = cl_ee / (cl_ee + nl_ee_arr)
+    K_wee = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
+                           fullsky=fullsky, w_ee=w_ee)
+    return K @ cl_pp_res + (K - K_wee) @ (cl_pp_at_L * w_pp)
 
 
 # -----------------------------------------------------------------------
@@ -1107,6 +1146,12 @@ def iterate_delensing(spectra: LensingSpectra,
     Only the filter denominators change between iterations — this is what
     makes the iteration converge rather than diverge.
 
+    Each iteration now builds two lensing kernels (the standard K and the
+    W_EE-weighted K_WEE for the exact Smith+ 2012 Eq. 12 residual), so
+    the per-iteration cost is ~2× the W_EE=1 version.  For fullsky=True
+    this is the dominant runtime: expect ~15-25 min for n_iter=5 on a
+    typical workstation, versus ~7-12 min pre-W_EE.
+
     Args:
         spectra:    LensingSpectra with unlensed/lensed CMB and C_L^{φφ}.
         nl_tt:      Combined TT noise, indexed by ell.
@@ -1147,16 +1192,23 @@ def iterate_delensing(spectra: LensingSpectra,
         n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb_eff,
                            l_min_qe, l_max_qe, n_phi, fullsky=fullsky)
 
-        # Compute residual BB
+        # Compute residual BB (exact Smith+ Eq. 12 with W_EE Wiener filter)
         cl_bb_res = residual_cl_bb(ls, Ls, spectra, n0,
                                    l_min_qe, l_max_qe, n_phi,
-                                   fullsky=fullsky)
+                                   fullsky=fullsky, nl_ee=nl_ee)
 
-        # Update the full-ell BB for next iteration's filters
-        # Interpolate residual back onto the full ell grid
-        cl_bb_res_full = jnp.interp(spectra.ells, ls, cl_bb_res,
-                                     left=0.0, right=cl_bb_res[-1])
-        cl_bb_current = cl_bb_res_full
+        # Interpolate residual onto the full ell grid for the next
+        # iteration's filters.  Outside the QE ls range we fall back to
+        # the full lensed BB -- i.e. "no delensing applied where we
+        # didn't reconstruct."  Flat-constant extrapolation (the prior
+        # behaviour at ell > ls[-1]) silently under-counted BB in the EB
+        # filter denominator past ls[-1], producing an artificially
+        # small N_0 and an over-optimistic residual at ell in ls.
+        cl_bb_res_interp = jnp.interp(spectra.ells, ls, cl_bb_res,
+                                       left=0.0, right=0.0)
+        in_range = (spectra.ells >= ls[0]) & (spectra.ells <= ls[-1])
+        cl_bb_current = jnp.where(in_range, cl_bb_res_interp,
+                                  spectra.cl_bb_len)
 
         if verbose:
             cl_bb_lens_at_ls = _interp_at(spectra.cl_bb_len, ls)

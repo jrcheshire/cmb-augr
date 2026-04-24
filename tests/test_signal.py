@@ -473,3 +473,32 @@ def test_residual_template_extrapolates_nearest_neighbour(
     # Below the input range: nearest-neighbour = fp[0] = amp
     assert np.all(tmpl == pytest.approx(amp, rel=1e-12)), \
         "Template should extrapolate flat (nearest-neighbour), not zero"
+
+
+def test_delensed_bb_range_must_cover_signal_model(
+        simple_instrument, fg_model, cmb_spectra):
+    """delensed_bb_ells that does not span [ell_min, ell_max] must raise.
+
+    Pre-fix this silently zero-extrapolated, nulling the reionization
+    bump or the high-ell tail where sigma(r) is most sensitive.
+    """
+    # Input covers ell=20..200 but SignalModel wants ell=2..200.
+    ells_in = np.arange(20, 201, dtype=float)
+    cl_in = np.full_like(ells_in, 1e-6)
+    with pytest.raises(ValueError, match="must cover the SignalModel ell range"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=2, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+            delensed_bb=cl_in, delensed_bb_ells=ells_in,
+        )
+
+
+def test_delensed_bb_requires_ells(simple_instrument, fg_model, cmb_spectra):
+    """Passing delensed_bb without delensed_bb_ells should error loudly."""
+    cl = np.full(200, 1e-6)
+    with pytest.raises(ValueError, match="delensed_bb_ells"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=2, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+            delensed_bb=cl,
+        )

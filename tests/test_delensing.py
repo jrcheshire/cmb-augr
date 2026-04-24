@@ -209,6 +209,49 @@ class TestResidualLimits:
         # Residual should be << full lensing
         assert float(jnp.max(res / cl_bb_camb)) < 0.01
 
+    def test_w_ee_1_matches_exact_at_signal_dominated_noise(self, spectra):
+        """W_EE=1 (nl_ee=None) should match the exact W_EE formula to high
+        precision when the E map is signal-dominated across the kernel's
+        ℓ range, since W_EE → 1."""
+        ls = jnp.arange(5, 100, dtype=float)
+        Ls = jnp.arange(2, 1001, dtype=float)
+        # Modest N_0: some delensing, not trivial residual
+        cl_pp = _interp_at(spectra.cl_pp, Ls)
+        n0 = cl_pp * 0.5
+
+        # Tiny EE noise: C_EE/N_EE ~ 10^4, W_EE ~ 1
+        nl_ee_tiny = jnp.full_like(spectra.cl_ee_unl, 1e-10)
+        res_approx = residual_cl_bb(ls, Ls, spectra, n0, l_max=1000, n_phi=64)
+        res_exact = residual_cl_bb(ls, Ls, spectra, n0, l_max=1000, n_phi=64,
+                                   nl_ee=nl_ee_tiny)
+        np.testing.assert_allclose(
+            np.asarray(res_exact), np.asarray(res_approx), rtol=1e-3,
+            err_msg="W_EE=1 approx must match exact when E is signal-dominated")
+
+    def test_w_ee_correction_is_positive_at_ground_depths(self, spectra):
+        """At ground-experiment noise levels where C_EE/N_EE drops toward 1,
+        the exact W_EE-filtered residual is LARGER than the W_EE=1 approx
+        (the delensing credit is reduced because E reconstruction is itself
+        noisy).  This is the regime where the simple approximation becomes
+        optimistic."""
+        ls = jnp.arange(5, 100, dtype=float)
+        Ls = jnp.arange(2, 1001, dtype=float)
+        cl_pp = _interp_at(spectra.cl_pp, Ls)
+        n0 = cl_pp * 0.5
+
+        # Heavy EE noise representative of a 10 uK-arcmin, 30' beam ground
+        # experiment (SPT-3G-ish pessimistic scale): N_EE large enough that
+        # W_EE drops well below 1 at the lensing peak.
+        # 10 uK-arcmin × (pi/10800)^2 in uK^2-sr ~ 8.5e-6
+        nl_ee_ground = jnp.full_like(spectra.cl_ee_unl, 5e-5)
+
+        res_approx = residual_cl_bb(ls, Ls, spectra, n0, l_max=1000, n_phi=64)
+        res_exact = residual_cl_bb(ls, Ls, spectra, n0, l_max=1000, n_phi=64,
+                                   nl_ee=nl_ee_ground)
+        # Exact residual should be strictly larger at every ℓ.
+        assert np.all(np.asarray(res_exact) > np.asarray(res_approx)), \
+            "W_EE<1 correction must make residual larger, not smaller"
+
 
 # -----------------------------------------------------------------------
 # Iterative delensing
