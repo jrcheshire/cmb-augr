@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import string
 import sys
 from pathlib import Path
 
@@ -163,22 +162,27 @@ def _output_tag(mask_type: str, nsims: int, hits_prefix: str | None = None,
 # Instrument override assembly (hit maps + 1/f noise)
 # ---------------------------------------------------------------------------
 
-def _experiment_channel_tags(experiment: str,
-                             frequencies: list[float]) -> list[str]:
-    """Reproduce BROOM's InstrumentConfig._generate_channel_tags."""
-    freqs = np.asarray(frequencies)
-    unique, counts = np.unique(freqs, return_counts=True)
-    count_map = dict(zip(unique.tolist(), counts.tolist()))
-    label_pool = {u: list(string.ascii_lowercase[:c])
-                  for u, c in zip(unique.tolist(), counts.tolist())}
-    tags: list[str] = []
-    for f in freqs:
-        f = float(f)
-        if count_map[f] == 1:
-            tags.append(f"{f}GHz")
-        else:
-            tags.append(f"{f}{label_pool[f].pop(0)}GHz")
-    return tags
+def _experiment_channel_tags(experiment: str) -> list[str]:
+    """Channel tags from BROOM's InstrumentConfig for the given experiment.
+
+    Defers to BROOM's own tag-generation (via a throwaway Configs
+    built with all generators disabled) so the tags we use for
+    hit-map filename lookup and knee-config alignment match exactly
+    what BROOM expects downstream.  Avoids reimplementing the
+    dupe-frequency `aGHz`/`bGHz` suffix logic.
+    """
+    cfg = Configs(config={
+        "experiment": experiment,
+        "experiments_file": str(BROOM_ROOT / "utils" / "experiments.yaml"),
+        "nside": NSIDE, "nside_in": NSIDE,
+        "lmax": LMAX, "lmax_in": LMAX,
+        "foreground_models": ["d1"], "data_type": "alms",
+        "units": "uK_CMB", "coordinates": "G", "nsims": 1,
+        "generate_input_data": False, "generate_input_cmb": False,
+        "generate_input_foregrounds": False, "generate_input_noise": False,
+        "bandpass_integrate": False,
+    })
+    return list(cfg.instrument.channels_tags)
 
 
 def _load_knee_config(path: Path, channel_tags: list[str]) -> tuple[list[float], list[float]]:
@@ -229,12 +233,18 @@ def _build_instrument_override(
         raise ValueError(f"experiment {experiment!r} not in {yaml_path}")
     inst = dict(yaml_data[experiment])
 
-    tags = _experiment_channel_tags(experiment, inst["frequency"])
+    tags = _experiment_channel_tags(experiment)
 
     if hits_prefix is None and knee_config_path is None:
         return None, tags
 
     if hits_prefix is not None:
+        # v1: all channels share the same analytic L2 hit map (produced
+        # by make_hit_maps.py).  We read only the first channel's file
+        # to compute `k`; the uniform rescale applied to every channel's
+        # depth is only correct under that shared-map assumption.  A
+        # future per-channel (feedhorn-offset) pass would need to read
+        # each file and compute k per channel.
         first_fits = Path(f"{hits_prefix}_{tags[0]}.fits")
         if not first_fits.exists():
             raise FileNotFoundError(
@@ -267,6 +277,12 @@ def _input_cache_tag(has_hits: bool, has_knee: bool) -> str:
     Keeps "alms" as the default so the white-noise cache directory
     built by prior runs stays valid; hit-map and 1/f runs go to
     separate subpaths so noise regenerates correctly.
+
+    Intentionally does NOT include `cov_noise_debias_factor`: the
+    debias setting only affects compsep weights, not the simulated
+    noise alms themselves, so the sim cache can be reused across
+    debias values (and `_output_tag` carries the `debX` suffix for
+    product-file naming).
     """
     parts = []
     if has_hits:
@@ -367,8 +383,19 @@ def _compsep_blocks(debias_factor: float = 0.0) -> list[dict]:
 
     `debias_factor` broadcasts to all needlet bands for both ILC and
     GILC `cov_noise_debias`.  Default 0.0 matches prior behavior.
+
+    `depro_cmb` and `m_bias` below are length-4 by construction of the
+    current `NEEDLET_BANDS` (5 boundaries -> 4 bands); the assert
+    guards against a latent mismatch if `NEEDLET_BANDS` is later
+    edited without updating those lists.
     """
-    debias_list = [debias_factor] * (len(NEEDLET_BANDS) - 1)
+    n_bands = len(NEEDLET_BANDS) - 1
+    assert n_bands == 4, (
+        f"NEEDLET_BANDS implies {n_bands} bands, but `depro_cmb` and "
+        f"`m_bias` below are hardcoded for 4; update both or make them "
+        f"derive from NEEDLET_BANDS."
+    )
+    debias_list = [debias_factor] * n_bands
     return [
         {
             "method": "ilc",

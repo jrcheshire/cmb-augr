@@ -52,16 +52,22 @@ def l2_hit_map(
       theta_ecl ~ |beta - alpha| where overlapping circles
       concentrate. The real DF ring has angular size ~300 deg^2;
       this model smooths it into the envelope.
-    * The unobservable cap at theta_ecl < |beta - alpha| is the
-      "inner unobserved region inside the DF" that Maris flags as
-      the main disadvantage of Planck's nominal scan. Precessed SSs
-      shrink it by bringing beta close to alpha. For the defaults
-      here (alpha=50, beta=45) the cap is |ecl_lat| > 85 -- about
-      0.8% of the sky -- so negligible. For extreme cases (alpha
-      much larger than beta, like Planck nominal with alpha=85,
-      beta=0) the cap becomes most of the sky and this model
-      breaks down; those regimes would need to fold in the
-      year-long anti-sun sweep explicitly.
+    * The zero-fill region at theta_ecl < |beta - alpha| is a
+      *single-precession-cycle* envelope artifact: over a full
+      year the anti-sun direction sweeps the ecliptic and real
+      annual coverage extends further toward the pole than the
+      envelope suggests. For the defaults (alpha=50, beta=45)
+      the envelope cap is |ecl_lat| > 85 (~0.8% of the sky) but
+      the annual coverage actually reaches the pole at very low
+      exposure. For alpha much larger than beta (Planck nominal,
+      alpha=85 beta=0) the single-cycle envelope collapses to a
+      single ring while the annual coverage is |ecl_lat| <= 85;
+      the envelope model is inappropriate for that regime and
+      a proper simulator would fold in the anti-sun sweep.
+      Maris Sec. 2 ("Polar Holes and Deep Fields") discusses the
+      same effect from the real-mission side: the nominal SS
+      leaves an unobserved cap inside the polar DF ring, which
+      the precessed SS mitigates by raising beta.
     * Per-detector feedhorn offsets shift each channel's DF ring
       location by ~1 degree (Maris Sec. 2). This function returns
       one common map for all channels; see the `feedhorn_offsets`
@@ -71,8 +77,11 @@ def l2_hit_map(
     Example (alpha, beta) pairs:
         (50, 45)  - LiteBIRD-like (augr default); ~3x deeper at poles.
         (65, 30)  - wider precession cone; fuller mid-latitude band.
-        (85, 7.5) - Planck precessed nominal-SS; near-great-circle
-                    scanning with small precession (Maris Sec. 2).
+        (85, 7.5) - Planck-like precessed SS (Maris Sec. 2: boresight
+                    at 85 deg from spin axis, small precession up to
+                    10 deg).  Note: Planck's *nominal* SS with
+                    beta=0 is NOT captured by this model -- see caveat
+                    on annual anti-sun motion below.
 
     Args:
         nside: HEALPix nside (power of 2).
@@ -113,12 +122,19 @@ def mean_pixel_rescale_factor(hits: np.ndarray) -> float:
     """Depth rescale factor for sky-average-matched noise normalization.
 
     BROOM normalizes an input hit map internally to max=1 and applies
-    pixel noise variance V(p) = sigma^2 / h_norm(p). With a raw L2
-    hit map this means spec `depth_P` = noise at the best pixel
-    (ecliptic pole). Dividing `depth_P` by the factor returned here
-    rescales sigma so the *sky-average* surveyed-pixel variance
-    equals the spec, with the polar DFs correspondingly deeper and
-    the ecliptic equator shallower:
+    pixel noise variance V(p) = sigma^2 / h_norm(p). Without a
+    rescale, spec `depth_P` describes the best pixel (ecliptic pole);
+    dividing `depth_P` by the factor returned here makes `depth_P`
+    describe the *sky-average* surveyed pixel, with the polar DFs
+    correspondingly deeper and the ecliptic equator shallower.
+
+    Which convention matches an instrument spec is a calibration
+    choice -- LiteBIRD PTEP Table 3 quotes sky-effective sensitivity,
+    so the sky-average convention is the faithful one here; other
+    specs may quote peak-pixel or something else.  Changing
+    convention is ~k^2 on per-pixel noise variance (k ~ 3 for the
+    L2 defaults), so it's worth being explicit in whatever the
+    consuming spec documents.
 
         V_avg = sigma^2 * max(H) * mean_surveyed(1/H)
               = sigma^2 * k
