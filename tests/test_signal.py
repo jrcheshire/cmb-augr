@@ -13,7 +13,7 @@ from augr.signal import (
     _build_bin_matrix,
 )
 from augr.instrument import Channel, Instrument, ScalarEfficiency
-from augr.foregrounds import GaussianForegroundModel
+from augr.foregrounds import GaussianForegroundModel, NullForegroundModel
 from augr.spectra import CMBSpectra
 
 
@@ -278,3 +278,198 @@ def test_spectrum_slice(signal_model):
     sl = signal_model.spectrum_slice(0, 1)
     assert sl.start == signal_model.n_bins  # second spectrum
     assert sl.stop == 2 * signal_model.n_bins
+
+
+# -----------------------------------------------------------------------
+# Null foreground model plumbed through SignalModel
+# -----------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def null_signal_model(simple_instrument, cmb_spectra):
+    """SignalModel with NullForegroundModel (post-CompSep-style use)."""
+    return SignalModel(
+        simple_instrument, NullForegroundModel(), cmb_spectra,
+        ell_min=20, ell_max=200, delta_ell=35,
+        ell_per_bin_below=30, window="tophat",
+    )
+
+
+def test_null_model_parameter_names(null_signal_model):
+    """With NullForegroundModel, parameters are exactly [r, A_lens]."""
+    assert null_signal_model.parameter_names == ["r", "A_lens"]
+
+
+def test_null_model_fg_contribution_zero(null_signal_model,
+                                         simple_instrument, cmb_spectra):
+    """Data vector equals the CMB-only binned bandpower (foregrounds are zero)."""
+    params = jnp.array([0.01, 1.0])  # r, A_lens
+    mu = null_signal_model.data_vector(params)
+    # CMB-only bandpower: all cross-spectra must be identical
+    n_bins = null_signal_model.n_bins
+    ref = mu[:n_bins]
+    for s in range(1, null_signal_model.n_spectra):
+        assert jnp.allclose(ref, mu[s * n_bins:(s + 1) * n_bins], rtol=1e-8)
+
+
+# -----------------------------------------------------------------------
+# Residual template (A_res) plumbing
+# -----------------------------------------------------------------------
+
+# Flat residual template, distinctive amplitude so it's easy to see.
+RESIDUAL_TEMPLATE_AMPLITUDE = 1e-4     # uK^2
+
+
+@pytest.fixture(scope="module")
+def residual_template():
+    """(ells, cl) pair for a flat residual-template spectrum."""
+    ells = np.arange(2, 400, dtype=float)
+    cl = np.full_like(ells, RESIDUAL_TEMPLATE_AMPLITUDE)
+    return ells, cl
+
+
+@pytest.fixture(scope="module")
+def signal_model_with_template(simple_instrument, fg_model, cmb_spectra,
+                               residual_template):
+    """SignalModel with a residual-template amplitude A_res appended."""
+    ells, cl = residual_template
+    return SignalModel(
+        simple_instrument, fg_model, cmb_spectra,
+        ell_min=20, ell_max=200, delta_ell=35,
+        ell_per_bin_below=30, window="tophat",
+        residual_template_cl=cl, residual_template_ells=ells,
+    )
+
+
+def _fiducial_with_a_res(names, a_res_value):
+    """Build a flat param array from FIDUCIAL_DICT extended with A_res."""
+    extended = dict(FIDUCIAL_DICT)
+    extended["A_res"] = a_res_value
+    return flatten_params(extended, names)
+
+
+def test_a_res_appended_to_parameter_names(signal_model_with_template,
+                                           fg_model):
+    """Residual template appends A_res after the fg params."""
+    names = signal_model_with_template.parameter_names
+    expected = ["r", "A_lens"] + list(fg_model.parameter_names) + ["A_res"]
+    assert names == expected
+
+
+def test_fg_params_from_excludes_a_res(signal_model_with_template, fg_model):
+    """fg_params_from returns exactly the fg block, not A_res at the tail."""
+    names = signal_model_with_template.parameter_names
+    params = _fiducial_with_a_res(names, 1.0)
+    fg = signal_model_with_template.fg_params_from(params)
+    assert fg.shape == (len(fg_model.parameter_names),)
+
+
+def test_a_res_zero_matches_no_template(signal_model, signal_model_with_template):
+    """A_res = 0 reproduces the no-template data vector exactly."""
+    names_plain = signal_model.parameter_names
+    names_tmpl = signal_model_with_template.parameter_names
+    mu_plain = signal_model.data_vector(
+        flatten_params(FIDUCIAL_DICT, names_plain))
+    mu_tmpl = signal_model_with_template.data_vector(
+        _fiducial_with_a_res(names_tmpl, 0.0))
+    assert jnp.allclose(mu_plain, mu_tmpl, rtol=1e-10, atol=1e-14)
+
+
+def test_a_res_affects_only_auto_spectra(signal_model_with_template):
+    """Increasing A_res moves only the i==j (auto) bandpowers."""
+    names = signal_model_with_template.parameter_names
+    mu_0 = signal_model_with_template.data_vector(
+        _fiducial_with_a_res(names, 0.0))
+    mu_1 = signal_model_with_template.data_vector(
+        _fiducial_with_a_res(names, 1.0))
+    delta = mu_1 - mu_0
+
+    n_bins = signal_model_with_template.n_bins
+    for idx, (i_ch, j_ch) in enumerate(signal_model_with_template.freq_pairs):
+        block = delta[idx * n_bins:(idx + 1) * n_bins]
+        if i_ch == j_ch:
+            # Auto: template was added. Shape matches the flat amplitude.
+            expected = RESIDUAL_TEMPLATE_AMPLITUDE * jnp.ones(n_bins)
+            assert jnp.allclose(block, expected, rtol=1e-8)
+        else:
+            # Cross: residual absent, block should not have moved.
+            assert jnp.allclose(block, 0.0, atol=1e-14)
+
+
+def test_jacobian_a_res_column(signal_model_with_template):
+    """dD/dA_res equals the binned template on auto blocks, zero elsewhere."""
+    names = signal_model_with_template.parameter_names
+    params = _fiducial_with_a_res(names, 1.0)
+    J = signal_model_with_template.jacobian(params)
+    a_res_idx = names.index("A_res")
+    col = J[:, a_res_idx]
+
+    n_bins = signal_model_with_template.n_bins
+    for idx, (i_ch, j_ch) in enumerate(signal_model_with_template.freq_pairs):
+        block = col[idx * n_bins:(idx + 1) * n_bins]
+        if i_ch == j_ch:
+            expected = RESIDUAL_TEMPLATE_AMPLITUDE * jnp.ones(n_bins)
+            assert jnp.allclose(block, expected, rtol=1e-8)
+        else:
+            assert jnp.allclose(block, 0.0, atol=1e-14)
+
+
+def test_residual_template_requires_ells(simple_instrument, fg_model, cmb_spectra):
+    """Passing residual_template_cl without ells should error loudly."""
+    cl = np.full(100, 1e-4)
+    with pytest.raises(ValueError, match="residual_template_ells"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+            residual_template_cl=cl,
+        )
+
+
+def test_residual_template_rejects_empty(simple_instrument, fg_model, cmb_spectra):
+    """An empty residual_template_cl / ells should fail loudly at init,
+    not silently register a zero-jacobian A_res column that explodes
+    inside the Fisher solve."""
+    with pytest.raises(ValueError, match="length"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+            residual_template_cl=np.array([]),
+            residual_template_ells=np.array([]),
+        )
+
+
+def test_residual_template_rejects_mismatched_shapes(
+        simple_instrument, fg_model, cmb_spectra):
+    """Mismatched ells/cl lengths fail at init with a clear message."""
+    with pytest.raises(ValueError, match="shape"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+            residual_template_cl=np.ones(10),
+            residual_template_ells=np.arange(20),
+        )
+
+
+def test_residual_template_extrapolates_nearest_neighbour(
+        simple_instrument, fg_model, cmb_spectra):
+    """Template provided with ell_min > SignalModel.ell_min must extrapolate
+    to fp[0] (not zero) at low ells.
+
+    BROOM bandpowers start at the first bin center (~ell=4 for delta_ell=5).
+    Zero-extrapolation at the reionization bump would silently null the
+    A_res constraint where sigma(r) is most sensitive for a space mission.
+    """
+    # Template provided only at ell >= 50 with a distinctive amplitude
+    ells_in = np.arange(50, 200, dtype=float)
+    amp = 7e-4
+    cl_in = np.full_like(ells_in, amp)
+
+    sm = SignalModel(
+        simple_instrument, fg_model, cmb_spectra,
+        ell_min=2, ell_max=180, delta_ell=5, ell_per_bin_below=30,
+        residual_template_cl=cl_in, residual_template_ells=ells_in,
+    )
+    # Internal interpolated template on SignalModel's ell grid
+    tmpl = np.asarray(sm._residual_template_cl)
+    # Below the input range: nearest-neighbour = fp[0] = amp
+    assert np.all(tmpl == pytest.approx(amp, rel=1e-12)), \
+        "Template should extrapolate flat (nearest-neighbour), not zero"

@@ -8,14 +8,16 @@ from augr.config import (
     simple_probe,
     pico_like,
     litebird_like,
+    cleaned_map_instrument,
 )
 from augr.foregrounds import GaussianForegroundModel
 
 
 def test_fiducial_has_all_params():
-    """FIDUCIAL_BK15 contains exactly the GaussianForegroundModel params + r + A_lens."""
+    """FIDUCIAL_BK15 contains the GaussianForegroundModel params + r + A_lens
+    + the residual-template amplitude A_res."""
     fg_names = GaussianForegroundModel().parameter_names
-    expected = {"r", "A_lens"} | set(fg_names)
+    expected = {"r", "A_lens", "A_res"} | set(fg_names)
     assert set(FIDUCIAL_BK15.keys()) == expected
 
 
@@ -23,9 +25,15 @@ def test_fiducial_r_zero():
     assert FIDUCIAL_BK15["r"] == 0.0
 
 
+def test_fiducial_a_res_unity():
+    """A_res = 1 at fiducial (template is the truth)."""
+    assert FIDUCIAL_BK15["A_res"] == 1.0
+
+
 def test_default_priors_keys():
     assert "beta_dust" in DEFAULT_PRIORS
     assert "beta_sync" in DEFAULT_PRIORS
+    assert "A_res" in DEFAULT_PRIORS
 
 
 def test_default_fixed():
@@ -72,3 +80,30 @@ def test_all_channels_positive_net():
                 assert ch.net_per_detector > 0
             assert ch.n_detectors > 0
             assert ch.beam_fwhm_arcmin > 0
+
+
+# ---------------------------------------------------------------------------
+# cleaned_map_instrument (post-CompSep placeholder)
+# ---------------------------------------------------------------------------
+
+def test_cleaned_map_instrument_single_channel():
+    """Post-CompSep placeholder has exactly one dummy channel."""
+    inst = cleaned_map_instrument(f_sky=0.6)
+    assert len(inst.channels) == 1
+    assert inst.f_sky == 0.6
+
+
+def test_cleaned_map_instrument_fsky_propagates():
+    """f_sky is the meaningful knob on this preset."""
+    for fs in [0.4, 0.6, 1.0]:
+        assert cleaned_map_instrument(f_sky=fs).f_sky == fs
+
+
+def test_cleaned_map_instrument_channel_fields_valid():
+    """Dummy channel has sane (positive) values so the dataclass validates."""
+    inst = cleaned_map_instrument(f_sky=0.6)
+    ch = inst.channels[0]
+    assert ch.n_detectors > 0
+    assert ch.net_per_detector > 0
+    assert ch.beam_fwhm_arcmin > 0
+    assert ch.nu_ghz > 0

@@ -63,6 +63,36 @@ class ForegroundModel(Protocol):
 
 
 # -----------------------------------------------------------------------
+# Null model (post-component-separation use)
+# -----------------------------------------------------------------------
+
+class NullForegroundModel:
+    """Zero-contribution foreground model.
+
+    For post-component-separation forecasts where foregrounds have been
+    removed by an external pipeline (e.g. NILC) and the leftover residual
+    is modelled via a separate additive template on the signal side. This
+    class satisfies the ForegroundModel Protocol with an empty parameter
+    list and a constant zero BB spectrum, so the multifrequency FG
+    machinery cleanly sits out while the rest of SignalModel / Fisher runs
+    unchanged.
+    """
+
+    _PARAM_NAMES: list[str] = []
+
+    @property
+    def parameter_names(self) -> list[str]:
+        return []
+
+    def cl_bb(self,
+              nu_i: float,
+              nu_j: float,
+              ells: jnp.ndarray,
+              params: jnp.ndarray) -> jnp.ndarray:
+        return jnp.zeros_like(ells, dtype=jnp.float64)
+
+
+# -----------------------------------------------------------------------
 # Gaussian parametric model (BK18-style)
 # -----------------------------------------------------------------------
 

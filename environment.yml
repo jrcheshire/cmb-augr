@@ -11,6 +11,8 @@ dependencies:
       - scipy
       - matplotlib
       - pytest
+      - pywigxjpf  # exact Wigner 3j for delensing validation tests
+      - cmbroom    # BROOM component-separation pipeline (residual templates, NILC/GNILC)
       - camb  # only needed to regenerate data/ templates via generate_camb_templates.py
       - jupyterlab
       - ipykernel
