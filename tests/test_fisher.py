@@ -397,20 +397,25 @@ def test_summary_reports_condition_number(fisher):
     assert "cond(F)" in text
 
 
-def test_summary_flags_degenerate_fisher(signal_model, instrument):
-    """When the Fisher is near-singular (all foreground params free with
-    no priors, on a modest-channel-count instrument), cond(F) should
-    exceed 1e14 and the summary should flag it.  If it doesn't, we've
-    accidentally made the fixture too well-conditioned -- adjust until
-    the test genuinely exercises the warning path."""
-    # All parameters free, no priors, single fixed T_dust.  With a
-    # 3-channel instrument at low ell_max this is close to degenerate.
-    ff = FisherForecast(signal_model, instrument, FIDUCIAL,
-                        priors={}, fixed_params=["T_dust"])
+def test_summary_flags_degenerate_fisher():
+    """A single-channel Fisher with all FG parameters free is genuinely
+    degenerate: one frequency cannot simultaneously constrain multiple
+    SEDs.  cond(F) is effectively infinite and the summary must flag it."""
+    eff = ScalarEfficiency(1.0, 1.0, 1.0, 1.0, 1.0)
+    inst = Instrument(
+        channels=(Channel(150.0, 1000, 300.0, 20.0, efficiency=eff),),
+        mission_duration_years=5.0, f_sky=0.7,
+    )
+    sig = SignalModel(
+        inst, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+    )
+    ff = FisherForecast(sig, inst, FIDUCIAL, priors={}, fixed_params=["T_dust"])
     ff.compute()
+    cond_val = float(jnp.linalg.cond(ff.fisher_matrix))
+    assert cond_val > 1e14, (
+        f"fixture should be degenerate but cond(F) = {cond_val:.2e}; "
+        "the warning path is not actually being exercised.")
     text = ff.summary()
     assert "cond(F)" in text
-    cond_val = float(jnp.linalg.cond(ff.fisher_matrix))
-    if cond_val > 1e14:
-        assert "WARNING: near-degenerate" in text
-    # else: fixture is unexpectedly well-conditioned; skip strict assertion
+    assert "WARNING: near-degenerate" in text

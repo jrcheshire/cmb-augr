@@ -336,8 +336,8 @@ class SignalModel:
         return self._bin_matrix
 
     @property
-    def bin_edges(self) -> np.ndarray:
-        """Bandpower bin edges (low, high) in multipoles, shape (n_bins, 2)."""
+    def bin_edges(self) -> list[tuple[int, int]]:
+        """Bandpower bin edges as a list of (lo, hi) multipole pairs."""
         return self._bin_edges
 
     @property
@@ -346,7 +346,7 @@ class SignalModel:
         return self._freqs
 
     @property
-    def foreground_model(self):
+    def foreground_model(self) -> ForegroundModel:
         """The ForegroundModel used to build the data vector."""
         return self._fg_model
 

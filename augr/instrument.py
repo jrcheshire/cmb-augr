@@ -180,6 +180,14 @@ def deconvolve_noise_bb(noise_convolved: jnp.ndarray,
     spectra; use this helper only when you are sure the input is still
     beam-convolved.
 
+    **Numerical range caveat**: B_ℓ² falls off like exp(-ℓ²σ_beam²), so
+    it drops below float64 precision (~1e-300) at ℓ ~ 20/σ_beam ~
+    (20·√(8 ln 2) · 10800/π) / FWHM_arcmin ~ 180 / (FWHM/5'). For a 30'
+    beam the safe range is roughly ℓ ≲ 900; for a 70' LFT beam it is
+    roughly ℓ ≲ 400.  Division above those ranges silently produces
+    astronomical or infinite values.  Restrict the input to a sane ℓ
+    range before calling, or clip the output.
+
     Args:
         noise_convolved: Beam-convolved noise spectrum on the given ell
                          grid, shape (n_ells,) or (n_chan, n_ells).

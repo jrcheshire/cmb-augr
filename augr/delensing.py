@@ -1146,6 +1146,12 @@ def iterate_delensing(spectra: LensingSpectra,
     Only the filter denominators change between iterations — this is what
     makes the iteration converge rather than diverge.
 
+    Each iteration now builds two lensing kernels (the standard K and the
+    W_EE-weighted K_WEE for the exact Smith+ 2012 Eq. 12 residual), so
+    the per-iteration cost is ~2× the W_EE=1 version.  For fullsky=True
+    this is the dominant runtime: expect ~15-25 min for n_iter=5 on a
+    typical workstation, versus ~7-12 min pre-W_EE.
+
     Args:
         spectra:    LensingSpectra with unlensed/lensed CMB and C_L^{φφ}.
         nl_tt:      Combined TT noise, indexed by ell.
