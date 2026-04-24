@@ -10,6 +10,7 @@ from augr.instrument import (
     Instrument,
     white_noise_power,
     beam_bl,
+    deconvolve_noise_bb,
     noise_nl,
     noise_nl_matrix,
     SECONDS_PER_YEAR,
@@ -150,6 +151,31 @@ def test_beam_sigma_value():
     fwhm_rad = 30.0 * float(ARCMIN_TO_RAD)
     sigma = fwhm_rad / np.sqrt(8.0 * np.log(2.0))
     assert abs(sigma - 3.706e-3) < 1e-5
+
+
+def test_deconvolve_noise_bb_roundtrip():
+    """Deconvolving beam-convolved noise should recover the input noise.
+
+    The map-level auto-spectrum of a beam-smoothed noise realization is
+    N_l^map = N_l^instr × B_l^2, so deconvolution divides by B_l^2.
+    """
+    ells = jnp.arange(2, 300, dtype=float)
+    n_raw = jnp.full_like(ells, 1e-6)
+    fwhm = 30.0
+    n_conv = n_raw * beam_bl(ells, fwhm) ** 2      # anafast of beam-smoothed map
+    n_back = deconvolve_noise_bb(n_conv, ells, fwhm)
+    np.testing.assert_allclose(np.asarray(n_back), np.asarray(n_raw), rtol=1e-10)
+
+
+def test_deconvolve_noise_bb_multichannel():
+    """Works on (n_chan, n_ells) arrays as well as (n_ells,)."""
+    ells = jnp.arange(2, 200, dtype=float)
+    n_raw = jnp.stack([jnp.full_like(ells, 1e-6),
+                       jnp.full_like(ells, 2e-6)])
+    fwhm = 20.0
+    n_conv = n_raw * beam_bl(ells, fwhm) ** 2
+    n_back = deconvolve_noise_bb(n_conv, ells, fwhm)
+    np.testing.assert_allclose(np.asarray(n_back), np.asarray(n_raw), rtol=1e-10)
 
 
 # -----------------------------------------------------------------------

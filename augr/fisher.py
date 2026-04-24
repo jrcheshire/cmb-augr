@@ -92,6 +92,16 @@ class FisherForecast:
                         forecasts where the "channel" is a single cleaned map
                         and the noise comes from a sim-based pipeline. The
                         default (None) keeps the existing analytic behavior.
+
+                        **IMPORTANT: external_noise_bb must be beam-
+                        deconvolved.** The signal side of the covariance
+                        uses raw C_ell (no B_ell^2 factor), so a beam-
+                        convolved noise array will make the Fisher
+                        over-optimistic at every ell where B_ell^2 < 1
+                        (factor of ~2 at ell=300 for a LiteBIRD-scale beam).
+                        If the source pipeline returned a noise auto-
+                        spectrum from a beam-smoothed map, divide by
+                        B_ell^2 first (see augr.instrument.beam_bl).
     """
 
     def __init__(self,

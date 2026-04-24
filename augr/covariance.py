@@ -178,6 +178,13 @@ def bandpower_covariance_blocks_from_noise(
         signal_model:    Defines binning, freq pairs, and signal model.
         noise_nls:       Pre-computed noise N_ℓ per channel, shape
                          (n_chan, n_ells) where n_ells = len(signal_model.ells).
+                         **MUST be beam-deconvolved**: the signal side uses
+                         raw C_ℓ with no B_ℓ² factor, so beam-convolved noise
+                         will make the Fisher over-optimistic at every ℓ
+                         where B_ℓ² < 1.  NILC / compsep outputs are
+                         naturally beam-deconvolved; raw anafast auto-
+                         spectra are not -- use deconvolve_noise_bb()
+                         below if you have the latter.
         f_sky:           Sky fraction (for effective mode count).
         fiducial_params: Flat parameter array at which to evaluate the
                          signal part of M = S + N.
