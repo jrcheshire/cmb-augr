@@ -330,7 +330,7 @@ def _base_config(nsims: int, mask_type: str,
         "generate_input_data": True,
         "save_inputs": True,
         "pixel_window_in": False,
-        "data_path": str(sims / "total"
+        "data_path": str(sims / "total" / FG_TAG
                          / f"total_{input_cache_tag}_ns{NSIDE}_lmax{LMAX}"),
         "fgds_path": str(
             sims / "foregrounds" / FG_TAG
