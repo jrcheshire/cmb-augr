@@ -1191,11 +1191,18 @@ def iterate_delensing(spectra: LensingSpectra,
                                    l_min_qe, l_max_qe, n_phi,
                                    fullsky=fullsky, nl_ee=nl_ee)
 
-        # Update the full-ell BB for next iteration's filters
-        # Interpolate residual back onto the full ell grid
-        cl_bb_res_full = jnp.interp(spectra.ells, ls, cl_bb_res,
-                                     left=0.0, right=cl_bb_res[-1])
-        cl_bb_current = cl_bb_res_full
+        # Interpolate residual onto the full ell grid for the next
+        # iteration's filters.  Outside the QE ls range we fall back to
+        # the full lensed BB -- i.e. "no delensing applied where we
+        # didn't reconstruct."  Flat-constant extrapolation (the prior
+        # behaviour at ell > ls[-1]) silently under-counted BB in the EB
+        # filter denominator past ls[-1], producing an artificially
+        # small N_0 and an over-optimistic residual at ell in ls.
+        cl_bb_res_interp = jnp.interp(spectra.ells, ls, cl_bb_res,
+                                       left=0.0, right=0.0)
+        in_range = (spectra.ells >= ls[0]) & (spectra.ells <= ls[-1])
+        cl_bb_current = jnp.where(in_range, cl_bb_res_interp,
+                                  spectra.cl_bb_len)
 
         if verbose:
             cl_bb_lens_at_ls = _interp_at(spectra.cl_bb_len, ls)
