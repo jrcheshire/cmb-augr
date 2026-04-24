@@ -281,7 +281,7 @@ class FisherForecast:
         sig = self._signal
 
         # Foreground model
-        fg_name = type(sig._fg_model).__name__
+        fg_name = type(sig.foreground_model).__name__
         lines.append(f"Foreground model:  {fg_name}")
         lines.append(f"Mission:           {inst.mission_duration_years:.1f} yr, "
                       f"f_sky = {inst.f_sky:.2f}")

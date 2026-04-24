@@ -51,7 +51,8 @@ def _build_M(signal_model: SignalModel,
     n_chan = len(instrument.channels)
     n_bins = signal_model.n_bins
     ells = signal_model.ells
-    W = signal_model._bin_matrix          # (n_bins, n_ells)
+    W = signal_model.bin_matrix           # (n_bins, n_ells)
+    fg_model = signal_model.foreground_model
 
     cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
     cl_res = signal_model.residual_bb_unbinned(fiducial_params)
@@ -64,7 +65,7 @@ def _build_M(signal_model: SignalModel,
         for j in range(i, n_chan):
             nu_i = float(instrument.channels[i].nu_ghz)
             nu_j = float(instrument.channels[j].nu_ghz)
-            cl_fg = signal_model._fg_model.cl_bb(nu_i, nu_j, ells, fg_params)
+            cl_fg = fg_model.cl_bb(nu_i, nu_j, ells, fg_params)
             cl_total = cl_cmb + cl_fg
             if i == j:
                 cl_total = cl_total + cl_res
@@ -107,7 +108,7 @@ def bandpower_covariance(signal_model: SignalModel,
     M = _build_M(signal_model, instrument, fiducial_params)
 
     # Effective modes per bin
-    nu = _nu_b(signal_model._bin_edges, instrument.f_sky)   # (n_bins,)
+    nu = _nu_b(signal_model.bin_edges, instrument.f_sky)    # (n_bins,)
 
     # Vectorised Knox formula
     # For spectra s1=(i,j) and s2=(k,l):
@@ -153,7 +154,7 @@ def bandpower_covariance_blocks(signal_model: SignalModel,
     n_spec = len(pairs)
 
     M  = _build_M(signal_model, instrument, fiducial_params)
-    nu = _nu_b(signal_model._bin_edges, instrument.f_sky)
+    nu = _nu_b(signal_model.bin_edges, instrument.f_sky)
 
     i_arr = jnp.array([p[0] for p in pairs])
     j_arr = jnp.array([p[1] for p in pairs])
@@ -196,7 +197,9 @@ def bandpower_covariance_blocks_from_noise(
     n_chan = noise_nls.shape[0]
     n_bins = signal_model.n_bins
     ells = signal_model.ells
-    W = signal_model._bin_matrix
+    W = signal_model.bin_matrix
+    freqs = signal_model.frequencies
+    fg_model = signal_model.foreground_model
 
     cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
     cl_res = signal_model.residual_bb_unbinned(fiducial_params)
@@ -207,9 +210,7 @@ def bandpower_covariance_blocks_from_noise(
     M = jnp.zeros((n_chan, n_chan, n_bins))
     for i in range(n_chan):
         for j in range(i, n_chan):
-            nu_i = signal_model._freqs[i]
-            nu_j = signal_model._freqs[j]
-            cl_fg = signal_model._fg_model.cl_bb(nu_i, nu_j, ells, fg_params)
+            cl_fg = fg_model.cl_bb(freqs[i], freqs[j], ells, fg_params)
             cl_total = cl_cmb + cl_fg
             if i == j:
                 cl_total = cl_total + cl_res
@@ -223,7 +224,7 @@ def bandpower_covariance_blocks_from_noise(
         M = M.at[i, i, :].add(W @ noise_nls[i])
 
     # Knox formula
-    nu = _nu_b(signal_model._bin_edges, f_sky)
+    nu = _nu_b(signal_model.bin_edges, f_sky)
     pairs = signal_model.freq_pairs
     i_arr = jnp.array([p[0] for p in pairs])
     j_arr = jnp.array([p[1] for p in pairs])

@@ -302,6 +302,30 @@ class SignalModel:
         """Full ℓ grid used for spectrum evaluation."""
         return self._ells
 
+    @property
+    def bin_matrix(self) -> jnp.ndarray:
+        """Bandpower-binning weight matrix W of shape (n_bins, n_ells).
+
+        Applied to a C_ℓ vector on the ``ells`` grid, W @ C yields the
+        bandpowers on the ``bin_centers`` grid.
+        """
+        return self._bin_matrix
+
+    @property
+    def bin_edges(self) -> np.ndarray:
+        """Bandpower bin edges (low, high) in multipoles, shape (n_bins, 2)."""
+        return self._bin_edges
+
+    @property
+    def frequencies(self) -> tuple[float, ...]:
+        """Channel frequencies in GHz, in the same order as freq_pairs."""
+        return self._freqs
+
+    @property
+    def foreground_model(self):
+        """The ForegroundModel used to build the data vector."""
+        return self._fg_model
+
     # ------------------------------------------------------------------
     # Data vector and Jacobian
     # ------------------------------------------------------------------
