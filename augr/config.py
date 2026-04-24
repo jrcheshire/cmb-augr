@@ -164,37 +164,56 @@ def pico_like() -> Instrument:
 
 
 def litebird_like() -> Instrument:
-    """LiteBIRD-like instrument (arXiv:2202.02773, Table 1).
+    """LiteBIRD PTEP baseline (Hazumi+ 2023, arXiv:2202.02773, Table 3).
 
-    15 frequency bands from 34 to 448 GHz across three telescopes
-    (LFT 34–161 GHz, MFT 89–224 GHz, HFT 166–448 GHz).
-    Target σ(r) ≈ 0.001 from L2.
+    15 frequency bands from 40 to 402 GHz across three telescopes
+    (LFT 40-140 GHz, MFT 100-195 GHz, HFT 195-402 GHz); 4508 detectors
+    total; 3-year L2 mission; f_sky = 0.7.
 
-    NET values are approximate per-detector estimates derived from the
-    published array NETs and detector counts in Table 1.
+    Each augr Channel represents one PTEP band. Bands covered by
+    multiple telescopes are collapsed to a single equivalent array
+    whose effective per-detector NET reproduces PTEP's combined
+    NET_arr (Eq. 31) when combined with augr's own noise formula:
+
+        NET_det_eff = NET_arr_comb * sqrt(N_total * 0.8)
+
+    where N_total is the sum of detectors across telescopes at that
+    frequency and 0.8 is PTEP's detector-yield degradation (Eq. 30).
+    Collapsing LFT+MFT (or MFT+HFT) into a single channel loses the
+    per-telescope beam distinction; we use the smaller FWHM of the
+    contributing arrays, which dominates the MV combination.
+
+    Efficiency factors track PTEP Eq. 32: detector_yield=0.80,
+    observing_efficiency=0.85 (duty cycle), data_cut_fraction=0.95
+    (margin), cosmic_ray_deadtime=0.95, polarization_efficiency=0.90
+    (augr models finite HWP efficiency; PTEP Eq. 32 assumes 1.0 and
+    folds HWP losses into NET_det).
     """
     eff = ScalarEfficiency(
         detector_yield=0.80,
         observing_efficiency=0.85,
-        data_cut_fraction=0.90,
-        cosmic_ray_deadtime=0.97,
-        polarization_efficiency=0.90,   # HWP efficiency
+        data_cut_fraction=0.95,
+        cosmic_ray_deadtime=0.95,
+        polarization_efficiency=0.90,
     )
-    # (nu_ghz, n_det, NET [μK√s], FWHM [arcmin])
+    # (nu_ghz, n_det_total, NET_det_eff [μK√s], FWHM [arcmin], note)
+    # Derived from PTEP Table 3; combined NETs verified against Eq. 30.
     _bands = [
-        ( 34.0,  48,  59.3, 69.3),
-        ( 46.0,  24,  37.9, 51.3),
-        ( 78.0,  48,  19.6, 29.9),
-        ( 89.0,  24,  19.0, 28.0),  # MFT overlap
-        (100.0,  48,  15.5, 24.7),
-        (119.0,  24,  16.2, 22.0),  # MFT overlap
-        (140.0,  48,  13.8, 18.0),
-        (166.0,  24,  15.5, 17.9),  # HFT overlap
-        (195.0,  24,  19.1, 15.0),
-        (235.0,  24,  31.3, 12.4),
-        (280.0,  24,  75.0, 10.4),
-        (337.0,  24, 196.0,  8.7),
-        (402.0,  24, 607.0,  7.2),
+        ( 40.0,   48, 114.63, 70.5),   # LFT
+        ( 50.0,   24,  72.48, 58.5),   # LFT
+        ( 60.0,   48,  65.28, 51.1),   # LFT
+        ( 68.0,  168,  96.69, 41.6),   # LFT (mixed 16/32mm pixels)
+        ( 78.0,  192,  73.99, 36.9),   # LFT (mixed pixels)
+        ( 89.0,  168,  64.69, 33.0),   # LFT (mixed pixels)
+        (100.0,  510,  65.44, 30.2),   # LFT + MFT
+        (119.0,  632,  50.82, 26.3),   # LFT + MFT
+        (140.0,  510,  47.87, 23.7),   # LFT + MFT
+        (166.0,  488,  54.37, 28.9),   # MFT
+        (195.0,  620,  64.36, 28.0),   # MFT + HFT
+        (235.0,  254,  76.06, 24.7),   # HFT
+        (280.0,  254,  97.26, 22.5),   # HFT
+        (337.0,  254, 154.64, 20.9),   # HFT
+        (402.0,  338, 385.69, 17.9),   # HFT
     ]
     channels = tuple(
         Channel(nu_ghz=nu, n_detectors=nd, net_per_detector=net,

@@ -67,8 +67,14 @@ def test_pico_frequency_range():
 
 
 def test_litebird_like_returns_instrument():
+    """Matches PTEP Table 3: 15 bands, 40 to 402 GHz, 4508 detectors."""
     inst = litebird_like()
-    assert len(inst.channels) == 13
+    assert len(inst.channels) == 15
+    freqs = sorted(ch.nu_ghz for ch in inst.channels)
+    assert freqs[0] == 40.0
+    assert freqs[-1] == 402.0
+    # PTEP Table 3 total detector count
+    assert sum(ch.n_detectors for ch in inst.channels) == 4508
 
 
 def test_all_channels_positive_net():
