@@ -228,13 +228,23 @@ class TestFiducialForPatch(unittest.TestCase):
         self.assertEqual(fid["beta_dust"], FIDUCIAL_BK15["beta_dust"])
         self.assertEqual(fid["A_lens"], FIDUCIAL_BK15["A_lens"])
 
-    def test_moment_params_scale(self):
+    def test_moment_params_stay_global(self):
+        """Per Chluba+ 2017 Eq. 8 (arXiv:1701.00274), omega_{ij} =
+        <[p_i(r) - p_i_bar][p_j(r) - p_j_bar]> is a pure central moment
+        of spectral parameters across the sky, not bundled with the
+        amplitude.  So omega_d_* and omega_s_* stay global across
+        patches -- dustier patches don't automatically have larger
+        spectral-index variance."""
+        # Use non-zero omegas so any scaling would be visible
+        base = {**FIDUCIAL_MOMENT,
+                "omega_d_beta": 0.1, "omega_d_T": 0.05, "omega_d_betaT": 0.02,
+                "omega_s_beta": 0.08, "omega_s_c": 0.04, "omega_s_betac": 0.01}
         patch = SkyPatch("dusty", 0.2, 3.0, 2.0)
-        fid = fiducial_for_patch(FIDUCIAL_MOMENT, patch)
-        self.assertAlmostEqual(fid["omega_d_beta"],
-                               FIDUCIAL_MOMENT["omega_d_beta"] * 3.0)
-        self.assertAlmostEqual(fid["omega_s_beta"],
-                               FIDUCIAL_MOMENT["omega_s_beta"] * 2.0)
+        fid = fiducial_for_patch(base, patch)
+        for key in ("omega_d_beta", "omega_d_T", "omega_d_betaT",
+                    "omega_s_beta", "omega_s_c", "omega_s_betac"):
+            self.assertEqual(fid[key], base[key],
+                             f"{key} must not be rescaled per patch")
 
 
 # ---------------------------------------------------------------------------
@@ -255,9 +265,14 @@ class TestParameterSharing(unittest.TestCase):
     def test_beta_dust_is_global(self):
         self.assertFalse(_is_per_patch("beta_dust"))
 
-    def test_moment_omega_is_per_patch(self):
-        self.assertTrue(_is_per_patch("omega_d_beta"))
-        self.assertTrue(_is_per_patch("omega_s_betac"))
+    def test_moment_omega_is_global(self):
+        """Moment-expansion omega_* params are sky-level variances of
+        spectral parameters (Chluba+ 2017 Eq. 8), not amplitudes -- so
+        they stay global across patches."""
+        for name in ("omega_d_beta", "omega_d_T", "omega_d_betaT",
+                     "omega_s_beta", "omega_s_c", "omega_s_betac"):
+            self.assertFalse(_is_per_patch(name),
+                             f"{name} should be global per Chluba+ 2017")
 
     def test_decorrelation_and_curvature_are_global(self):
         """Delta_dust, Delta_sync (decorrelation) and c_sync (spectral
@@ -495,15 +510,19 @@ class TestMultiPatchMoment(unittest.TestCase):
         self.assertAlmostEqual(sr_multi, sr_single, places=6)
 
     def test_moment_per_patch_params_counted(self):
-        """Moment model should have more per-patch params than Gaussian."""
+        """Both Gaussian and Moment models have the same per-patch params
+        (just A_dust + A_sync): the moment omega_* are sky-level
+        variances per Chluba+ 2017, so they stay global.  The moment
+        model has more *global* params than Gaussian, not more per-patch.
+        """
         sky = default_3patch_model(include_scan=False)
         mpf = MultiPatchFisher(
             self.inst, self.fg, self.cmb, sky, self.fid,
             priors=self.priors, fixed_params=self.fixed,
             signal_kwargs=self.signal_kwargs,
         )
-        # Moment has more per-patch params (omega_* etc.)
-        self.assertGreater(mpf._n_per_patch, 3)
+        # A_dust, A_sync scale per patch; everything else is global.
+        self.assertEqual(mpf._n_per_patch, 2)
 
 
 class TestMultiPatchDelensedAndResidualModes(unittest.TestCase):
