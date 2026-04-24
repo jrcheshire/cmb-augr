@@ -22,6 +22,10 @@ from augr.instrument import Channel, Instrument, ScalarEfficiency
 # Foreground fiducial parameters
 # ---------------------------------------------------------------------------
 
+# flatten_params only reads keys that appear in SignalModel.parameter_names,
+# so A_res here is a harmless convenience for the post-CompSep workflow --
+# it is consumed only when a residual template is attached, and silently
+# ignored otherwise. Delensed mode similarly ignores A_lens.
 FIDUCIAL_BK15: dict[str, float] = {
     "r":           0.0,    # tensor-to-scalar ratio (target: r = 0)
     "A_lens":      1.0,    # lensing amplitude (1 = no delensing)
@@ -34,7 +38,7 @@ FIDUCIAL_BK15: dict[str, float] = {
     "alpha_sync": -0.6,    # sync ℓ-dependence power law
     "epsilon":     0.0,    # dust–sync correlation ([-1, 1])
     "Delta_dust":  0.0,    # dust frequency decorrelation strength
-    "A_res":       1.0,    # residual-template amplitude (post-CompSep)
+    "A_res":       1.0,    # residual-template amplitude (post-CompSep mode only)
 }
 
 # ---------------------------------------------------------------------------
