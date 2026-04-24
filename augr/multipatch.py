@@ -33,19 +33,32 @@ from augr.sky_patches import SkyPatch, SkyModel
 # Parameter sharing
 # ---------------------------------------------------------------------------
 
-# Foreground parameters that are per-patch (amplitude-like)
-_AMPLITUDE_PARAMS = {"A_dust", "A_sync", "Delta_dust"}
-_MOMENT_AMPLITUDE_PARAMS = {
-    "c_sync", "Delta_sync",
-    "omega_d_beta", "omega_d_T", "omega_d_betaT",
-    "omega_s_beta", "omega_s_c", "omega_s_betac",
-}
-_DUST_MOMENT_PARAMS = {"omega_d_beta", "omega_d_T", "omega_d_betaT"}
-_SYNC_MOMENT_PARAMS = {"omega_s_beta", "omega_s_c", "omega_s_betac"}
+# Foreground parameters that are per-patch (amplitude-like).
+#
+# Only the total-power amplitudes A_dust and A_sync vary per patch; they
+# scale with the amount of emission in each region.
+#
+# Everything else is global:
+#   * Spectral indices (beta_dust, beta_sync) and temperatures (T_dust):
+#     SED properties of the emitting medium.
+#   * Decorrelation strengths (Delta_dust, Delta_sync), dimensionless
+#     and bounded in [0, 1], not amplitudes.
+#   * Synchrotron spectral curvature (c_sync), dimensionless.
+#   * Moment-expansion variance parameters (omega_d_*, omega_s_*):
+#     per Chluba+ 2017 Eq. 8 (arXiv:1701.00274), ω_{ij} is defined as
+#     the pure central moment of spectral parameters across the sky,
+#     ⟨[p_i(r) - p̄_i][p_j(r) - p̄_j]⟩, with no amplitude factor.  It is
+#     a sky-level covariance of spectral quantities, so it stays global.
+#     A user who wants to model "dustier patches also have more
+#     spectral-index variance" can override fiducial_for_patch locally;
+#     that correlation is a modelling choice, not a consequence of the
+#     moment expansion itself.
+_AMPLITUDE_PARAMS = {"A_dust", "A_sync"}
+
 
 def _is_per_patch(name: str) -> bool:
     """Check whether a foreground parameter is per-patch."""
-    return name in _AMPLITUDE_PARAMS or name in _MOMENT_AMPLITUDE_PARAMS
+    return name in _AMPLITUDE_PARAMS
 
 
 # ---------------------------------------------------------------------------
@@ -98,29 +111,16 @@ def fiducial_for_patch(base_fiducial: dict[str, float],
                        ) -> dict[str, float]:
     """Scale amplitude parameters for a sky patch.
 
-    Dust amplitudes (A_dust, dust moment params) scale by A_dust_scale.
-    Sync amplitudes (A_sync, sync moment params) scale by A_sync_scale.
-    Global parameters (r, A_lens, spectral indices) are unchanged.
+    A_dust scales by A_dust_scale; A_sync scales by A_sync_scale.  All
+    other parameters (SED shapes, spectral indices, decorrelation,
+    moment-expansion variances) are sky-level properties per Chluba+
+    2017 and stay global across patches.
     """
     fid = dict(base_fiducial)
-    # Dust amplitudes
     if "A_dust" in fid:
         fid["A_dust"] *= patch.A_dust_scale
-    if "Delta_dust" in fid:
-        fid["Delta_dust"] *= patch.A_dust_scale
-    for key in _DUST_MOMENT_PARAMS:
-        if key in fid:
-            fid[key] *= patch.A_dust_scale
-    # Sync amplitudes
     if "A_sync" in fid:
         fid["A_sync"] *= patch.A_sync_scale
-    if "Delta_sync" in fid:
-        fid["Delta_sync"] *= patch.A_sync_scale
-    if "c_sync" in fid:
-        fid["c_sync"] *= patch.A_sync_scale
-    for key in _SYNC_MOMENT_PARAMS:
-        if key in fid:
-            fid[key] *= patch.A_sync_scale
     return fid
 
 
@@ -165,9 +165,13 @@ class MultiPatchFisher:
         self._fixed = set(fixed_params or [])
         self._signal_kwargs = signal_kwargs or {}
 
-        # Determine parameter classification
-        all_names = (["r", "A_lens"]
-                     + foreground_model.parameter_names)
+        # Determine parameter classification from an actual SignalModel so
+        # we honour delensed mode (drops A_lens) and residual-template mode
+        # (adds A_res). A_res is treated as a single global parameter shared
+        # across patches — the template is a single cleaned-map product.
+        probe_signal = SignalModel(base_instrument, foreground_model,
+                                   cmb_spectra, **self._signal_kwargs)
+        all_names = list(probe_signal.parameter_names)
         self._all_names = all_names
         self._global_free = [n for n in all_names
                              if n not in self._fixed and not _is_per_patch(n)]

@@ -223,6 +223,17 @@ def sigma_r_from_channels(
 
     Returns:
         Scalar sigma(r) — marginalized Fisher constraint on r.
+
+    Note:
+        This function uses a ``jnp.linalg.solve``-based Fisher block
+        inversion (_fisher_from_blocks_solve) rather than the
+        eigendecomposition path used by ``FisherForecast.sigma``.  The
+        solve path is smoother for autodiff (no conditional zero-clipping
+        of eigenvalues) but the two can disagree by up to a few percent
+        in degenerate-cov regimes where ``FisherForecast`` would clip
+        near-zero eigenvalues.  For optimization work the solve path is
+        the one that is actually being minimized; for reporting absolute
+        sigma(r) numbers prefer ``FisherForecast.sigma``.
     """
     ells = ctx.ells
     n_chan = n_det.shape[0]
@@ -298,6 +309,12 @@ def sigma_r_from_design(
 
     Returns:
         Scalar sigma(r).
+
+    Note:
+        Delegates to sigma_r_from_channels, which uses a solve-based
+        Fisher inversion that can disagree with FisherForecast.sigma by
+        a few percent in degenerate-cov regimes.  See the note on
+        sigma_r_from_channels for details.
     """
     a_fp = jnp.pi * (fp_diameter_m / 2.0) ** 2
 

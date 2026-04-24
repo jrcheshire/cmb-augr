@@ -162,6 +162,45 @@ def beam_bl(ells: jnp.ndarray, fwhm_arcmin: float) -> jnp.ndarray:
     return jnp.exp(-ells * (ells + 1.0) * sigma_beam**2 / 2.0)
 
 
+def deconvolve_noise_bb(noise_convolved: jnp.ndarray,
+                        ells: jnp.ndarray,
+                        beam_fwhm_arcmin: float) -> jnp.ndarray:
+    """Deconvolve a Gaussian beam from a noise auto-spectrum.
+
+    Use this when you have a noise power spectrum N_ℓ measured from a
+    beam-smoothed map (e.g. an anafast auto-spectrum of a simulated noise
+    realization before beam deconvolution), and need the beam-free N_ℓ
+    for augr's FisherForecast(external_noise_bb=...) or
+    bandpower_covariance_blocks_from_noise(noise_nls=...), which both
+    assume beam-deconvolved input.
+
+        N_ℓ^{deconv} = N_ℓ^{convolved} / B_ℓ²
+
+    NILC / GNILC / compsep pipelines typically return already-deconvolved
+    spectra; use this helper only when you are sure the input is still
+    beam-convolved.
+
+    **Numerical range caveat**: B_ℓ² falls off like exp(-ℓ²σ_beam²), so
+    it drops below float64 precision (~1e-300) at ℓ ~ 20/σ_beam ~
+    (20·√(8 ln 2) · 10800/π) / FWHM_arcmin ~ 180 / (FWHM/5'). For a 30'
+    beam the safe range is roughly ℓ ≲ 900; for a 70' LFT beam it is
+    roughly ℓ ≲ 400.  Division above those ranges silently produces
+    astronomical or infinite values.  Restrict the input to a sane ℓ
+    range before calling, or clip the output.
+
+    Args:
+        noise_convolved: Beam-convolved noise spectrum on the given ell
+                         grid, shape (n_ells,) or (n_chan, n_ells).
+        ells:            Multipoles, shape (n_ells,).
+        beam_fwhm_arcmin: Beam FWHM [arcmin].
+
+    Returns:
+        Beam-deconvolved noise, same shape as noise_convolved.
+    """
+    bl2 = beam_bl(ells, beam_fwhm_arcmin) ** 2
+    return noise_convolved / bl2
+
+
 def noise_nl(channel: Channel,
              ells: jnp.ndarray,
              mission_years: float,

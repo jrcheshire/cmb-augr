@@ -28,6 +28,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from augr.signal import SignalModel, flatten_params
 from augr.covariance import (
@@ -91,6 +92,16 @@ class FisherForecast:
                         forecasts where the "channel" is a single cleaned map
                         and the noise comes from a sim-based pipeline. The
                         default (None) keeps the existing analytic behavior.
+
+                        **IMPORTANT: external_noise_bb must be beam-
+                        deconvolved.** The signal side of the covariance
+                        uses raw C_ell (no B_ell^2 factor), so a beam-
+                        convolved noise array will make the Fisher
+                        over-optimistic at every ell where B_ell^2 < 1
+                        (factor of ~2 at ell=300 for a LiteBIRD-scale beam).
+                        If the source pipeline returned a noise auto-
+                        spectrum from a beam-smoothed map, divide by
+                        B_ell^2 first (see augr.instrument.beam_bl).
     """
 
     def __init__(self,
@@ -281,7 +292,7 @@ class FisherForecast:
         sig = self._signal
 
         # Foreground model
-        fg_name = type(sig._fg_model).__name__
+        fg_name = type(sig.foreground_model).__name__
         lines.append(f"Foreground model:  {fg_name}")
         lines.append(f"Mission:           {inst.mission_duration_years:.1f} yr, "
                       f"f_sky = {inst.f_sky:.2f}")
@@ -295,11 +306,27 @@ class FisherForecast:
                       f"pol_eff={eff.polarization_efficiency:.2f} "
                       f"(total={eff.total:.3f})")
 
-        # ell-binning
+        # ell-binning and Knox mode count per bin
         lines.append(f"ell range:         {sig.ells[0]:.0f} - {sig.ells[-1]:.0f}")
         lines.append(f"Bandpower bins:    {sig.n_bins}")
         lines.append(f"Cross-spectra:     {len(sig.freq_pairs)} "
                       f"({len(inst.channels)} channels)")
+
+        # ν_b = f_sky × Σ_{ℓ in bin}(2ℓ+1); below ~10 the Knox Gaussian
+        # likelihood breaks down and Fisher sigma(r) is structurally
+        # narrower than a Hamimeche-Lewis or Wishart posterior.
+        nu_b = np.array([
+            inst.f_sky * (hi - lo + 1) * (lo + hi + 1)
+            for lo, hi in sig.bin_edges
+        ])
+        nu_b_min = float(nu_b.min())
+        lines.append(f"Knox modes/bin:    min={nu_b_min:.1f}, "
+                     f"median={float(np.median(nu_b)):.0f}"
+                     + (" -- WARNING: low-ell bins have < 10 modes; "
+                        "Gaussian-likelihood approximation breaks down, "
+                        "Fisher will be narrower than Hamimeche-Lewis / "
+                        "Wishart posteriors"
+                        if nu_b_min < 10 else ""))
 
         # Channel table
         lines.append("")
@@ -337,6 +364,23 @@ class FisherForecast:
             lines.append("")
             lines.append("Results:")
             lines.append(f"  Free parameters:  {self.n_free}")
+
+            # Fisher condition number: cond(F) > ~1e14 indicates
+            # near-degenerate parameter directions; the eigh solver
+            # clips non-positive eigenvalues silently, so the sigmas
+            # below may be dominated by numerical regularization rather
+            # than data + priors.
+            try:
+                cond_F = float(jnp.linalg.cond(self._fisher_matrix))
+                cond_line = f"  cond(F):          {cond_F:.2e}"
+                if cond_F > 1e14:
+                    cond_line += ("  -- WARNING: near-degenerate "
+                                  "parameters; eigh clipping may "
+                                  "dominate the reported sigmas")
+                lines.append(cond_line)
+            except Exception:
+                pass
+
             for p in self._free_names:
                 try:
                     s = self.sigma(p)
