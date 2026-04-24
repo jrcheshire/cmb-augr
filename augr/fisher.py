@@ -364,6 +364,23 @@ class FisherForecast:
             lines.append("")
             lines.append("Results:")
             lines.append(f"  Free parameters:  {self.n_free}")
+
+            # Fisher condition number: cond(F) > ~1e14 indicates
+            # near-degenerate parameter directions; the eigh solver
+            # clips non-positive eigenvalues silently, so the sigmas
+            # below may be dominated by numerical regularization rather
+            # than data + priors.
+            try:
+                cond_F = float(jnp.linalg.cond(self._fisher_matrix))
+                cond_line = f"  cond(F):          {cond_F:.2e}"
+                if cond_F > 1e14:
+                    cond_line += ("  -- WARNING: near-degenerate "
+                                  "parameters; eigh clipping may "
+                                  "dominate the reported sigmas")
+                lines.append(cond_line)
+            except Exception:
+                pass
+
             for p in self._free_names:
                 try:
                     s = self.sigma(p)

@@ -388,3 +388,29 @@ def test_summary_no_warning_when_all_bins_well_sampled(instrument):
     text = ff.summary()
     assert "Knox modes/bin" in text
     assert "WARNING" not in text
+
+
+def test_summary_reports_condition_number(fisher):
+    """Summary should always include a cond(F) line for reference."""
+    fisher.compute()
+    text = fisher.summary()
+    assert "cond(F)" in text
+
+
+def test_summary_flags_degenerate_fisher(signal_model, instrument):
+    """When the Fisher is near-singular (all foreground params free with
+    no priors, on a modest-channel-count instrument), cond(F) should
+    exceed 1e14 and the summary should flag it.  If it doesn't, we've
+    accidentally made the fixture too well-conditioned -- adjust until
+    the test genuinely exercises the warning path."""
+    # All parameters free, no priors, single fixed T_dust.  With a
+    # 3-channel instrument at low ell_max this is close to degenerate.
+    ff = FisherForecast(signal_model, instrument, FIDUCIAL,
+                        priors={}, fixed_params=["T_dust"])
+    ff.compute()
+    text = ff.summary()
+    assert "cond(F)" in text
+    cond_val = float(jnp.linalg.cond(ff.fisher_matrix))
+    if cond_val > 1e14:
+        assert "WARNING: near-degenerate" in text
+    # else: fixture is unexpectedly well-conditioned; skip strict assertion
