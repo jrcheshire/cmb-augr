@@ -259,6 +259,30 @@ class TestParameterSharing(unittest.TestCase):
         self.assertTrue(_is_per_patch("omega_d_beta"))
         self.assertTrue(_is_per_patch("omega_s_betac"))
 
+    def test_decorrelation_and_curvature_are_global(self):
+        """Delta_dust, Delta_sync (decorrelation) and c_sync (spectral
+        curvature) are SED-shape parameters, not amplitudes, so they
+        stay global and are not scaled per patch."""
+        self.assertFalse(_is_per_patch("Delta_dust"))
+        self.assertFalse(_is_per_patch("Delta_sync"))
+        self.assertFalse(_is_per_patch("c_sync"))
+
+    def test_fiducial_for_patch_does_not_scale_decorrelation(self):
+        """fiducial_for_patch must leave Delta_dust, Delta_sync, c_sync
+        unchanged -- scaling them by A_dust_scale / A_sync_scale could
+        push them out of their physical range."""
+        base = {
+            "A_dust": 4.7, "A_sync": 1.5,
+            "Delta_dust": 0.3, "Delta_sync": 0.2, "c_sync": -0.05,
+        }
+        patch = SkyPatch("test", f_sky=0.1, A_dust_scale=3.0, A_sync_scale=2.0)
+        fid = fiducial_for_patch(base, patch)
+        self.assertAlmostEqual(fid["A_dust"], 4.7 * 3.0)
+        self.assertAlmostEqual(fid["A_sync"], 1.5 * 2.0)
+        self.assertEqual(fid["Delta_dust"], 0.3)
+        self.assertEqual(fid["Delta_sync"], 0.2)
+        self.assertEqual(fid["c_sync"], -0.05)
+
 
 # ---------------------------------------------------------------------------
 # Multi-patch Fisher

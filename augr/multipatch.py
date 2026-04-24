@@ -33,10 +33,12 @@ from augr.sky_patches import SkyPatch, SkyModel
 # Parameter sharing
 # ---------------------------------------------------------------------------
 
-# Foreground parameters that are per-patch (amplitude-like)
-_AMPLITUDE_PARAMS = {"A_dust", "A_sync", "Delta_dust"}
+# Foreground parameters that are per-patch (amplitude-like).
+# Delta_dust, Delta_sync (decorrelation strengths, bounded in [0, 1]) and
+# c_sync (sync spectral curvature, dimensionless) are SED-shape parameters
+# -- not amplitudes -- so they stay global and are not scaled per patch.
+_AMPLITUDE_PARAMS = {"A_dust", "A_sync"}
 _MOMENT_AMPLITUDE_PARAMS = {
-    "c_sync", "Delta_sync",
     "omega_d_beta", "omega_d_T", "omega_d_betaT",
     "omega_s_beta", "omega_s_c", "omega_s_betac",
 }
@@ -98,26 +100,20 @@ def fiducial_for_patch(base_fiducial: dict[str, float],
                        ) -> dict[str, float]:
     """Scale amplitude parameters for a sky patch.
 
-    Dust amplitudes (A_dust, dust moment params) scale by A_dust_scale.
-    Sync amplitudes (A_sync, sync moment params) scale by A_sync_scale.
-    Global parameters (r, A_lens, spectral indices) are unchanged.
+    Dust amplitude (A_dust, dust moment variance params) scale by
+    A_dust_scale; sync amplitude (A_sync, sync moment variance params)
+    scale by A_sync_scale.  Decorrelation parameters (Delta_dust,
+    Delta_sync) and SED-shape parameters (spectral indices, c_sync,
+    temperatures) are sky properties, not amplitudes, and stay global.
     """
     fid = dict(base_fiducial)
-    # Dust amplitudes
     if "A_dust" in fid:
         fid["A_dust"] *= patch.A_dust_scale
-    if "Delta_dust" in fid:
-        fid["Delta_dust"] *= patch.A_dust_scale
     for key in _DUST_MOMENT_PARAMS:
         if key in fid:
             fid[key] *= patch.A_dust_scale
-    # Sync amplitudes
     if "A_sync" in fid:
         fid["A_sync"] *= patch.A_sync_scale
-    if "Delta_sync" in fid:
-        fid["Delta_sync"] *= patch.A_sync_scale
-    if "c_sync" in fid:
-        fid["c_sync"] *= patch.A_sync_scale
     for key in _SYNC_MOMENT_PARAMS:
         if key in fid:
             fid[key] *= patch.A_sync_scale
