@@ -61,6 +61,15 @@ FOREGROUND_MODELS = ("d1", "s1")
 EXPERIMENT = "LiteBIRD_PTEP"
 MASK_TYPE_DEFAULT = "GAL60"
 
+# Carones 2025 ran two PySM combinations (Sec. 3.1): a simpler d1s1 and
+# a more complex d10s5 (3D MKD dust + S-PASS-rescaled synchrotron). Both
+# values appear in Carones Table 1 -- useful comparison points across the
+# foreground-complexity axis.
+_FG_MODEL_MAP: dict[str, tuple[str, str]] = {
+    "d1s1": ("d1", "s1"),
+    "d10s5": ("d10", "s5"),
+}
+
 NEEDLET_CONFIG = [
     {"needlet_windows": "mexican"},
     {"width": 1.3},
@@ -594,12 +603,28 @@ def _parse_args() -> argparse.Namespace:
                         "checking whether debias helps under anisotropic / "
                         "1/f noise where the noise covariance is no longer "
                         "a simple diagonal.")
+    p.add_argument("--fg-model", type=str, default="d1s1",
+                   choices=sorted(_FG_MODEL_MAP),
+                   help="PySM foreground model combination. d1s1 is the "
+                        "Carones-baseline simple case; d10s5 is the more "
+                        "complex case (3D MKD dust + S-PASS-rescaled sync) "
+                        "for foreground-complexity sanity checks. Default: "
+                        "d1s1 (matches existing tags).")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
     SCRATCH.mkdir(parents=True, exist_ok=True)
+
+    # Reassign the FG-model module globals from the CLI choice. Done here
+    # (rather than threading a parameter through every helper) because the
+    # downstream path helpers (_gnilc_root_dir, _output_tag, _base_config,
+    # ...) all read FG_TAG / FOREGROUND_MODELS at module level.
+    global FOREGROUND_MODELS, FG_TAG
+    FOREGROUND_MODELS = _FG_MODEL_MAP[args.fg_model]
+    FG_TAG = args.fg_model
+    print(f"Foreground model: {args.fg_model} -> {FOREGROUND_MODELS}")
 
     instrument_override, _ = _build_instrument_override(
         EXPERIMENT,
