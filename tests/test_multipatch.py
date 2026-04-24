@@ -482,5 +482,67 @@ class TestMultiPatchMoment(unittest.TestCase):
         self.assertGreater(mpf._n_per_patch, 3)
 
 
+class TestMultiPatchDelensedAndResidualModes(unittest.TestCase):
+    """MultiPatchFisher must derive its parameter list from an actual
+    SignalModel so that delensed mode (no A_lens) and residual-template
+    mode (adds A_res) are handled correctly. Pre-fix, multipatch.py
+    hard-coded an ["r", "A_lens"] prefix and missed both cases."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cmb = CMBSpectra()
+        cls.inst = simple_probe()
+        cls.fg = GaussianForegroundModel()
+
+    def test_delensed_mode_drops_A_lens(self):
+        sky = single_patch_model(self.inst.f_sky)
+        ell_max = 300
+        n_ells = ell_max + 1
+        delensed_bb = jnp.full(n_ells, 1e-6)
+        delensed_bb_ells = jnp.arange(n_ells, dtype=float)
+        signal_kwargs = {
+            "ell_max": ell_max, "delta_ell": 35,
+            "delensed_bb": delensed_bb,
+            "delensed_bb_ells": delensed_bb_ells,
+        }
+        fid = {k: v for k, v in FIDUCIAL_BK15.items() if k != "A_lens"}
+        priors = {k: v for k, v in DEFAULT_PRIORS.items() if k != "A_lens"}
+        mpf = MultiPatchFisher(
+            self.inst, self.fg, self.cmb, sky, fid,
+            priors=priors,
+            fixed_params=list(DEFAULT_FIXED) + ["Delta_dust"],
+            signal_kwargs=signal_kwargs,
+        )
+        self.assertNotIn("A_lens", mpf._all_names)
+        self.assertNotIn("A_lens", mpf._global_free)
+        mpf.compute()
+        self.assertTrue(np.isfinite(mpf.sigma("r")))
+
+    def test_residual_template_mode_adds_A_res_global(self):
+        sky = single_patch_model(self.inst.f_sky)
+        ell_max = 300
+        n_ells = ell_max + 1
+        template = jnp.full(n_ells, 1e-6)
+        template_ells = jnp.arange(n_ells, dtype=float)
+        signal_kwargs = {
+            "ell_max": ell_max, "delta_ell": 35,
+            "residual_template_cl": template,
+            "residual_template_ells": template_ells,
+        }
+        fid = {**FIDUCIAL_BK15, "A_lens": 0.27}
+        mpf = MultiPatchFisher(
+            self.inst, self.fg, self.cmb, sky, fid,
+            priors=DEFAULT_PRIORS,
+            fixed_params=list(DEFAULT_FIXED) + ["Delta_dust"],
+            signal_kwargs=signal_kwargs,
+        )
+        self.assertIn("A_res", mpf._all_names)
+        self.assertIn("A_res", mpf._global_free)
+        self.assertNotIn("A_res", mpf._per_patch_free)
+        mpf.compute()
+        self.assertTrue(np.isfinite(mpf.sigma("r")))
+        self.assertTrue(np.isfinite(mpf.sigma("A_res")))
+
+
 if __name__ == "__main__":
     unittest.main()

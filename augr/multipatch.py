@@ -165,9 +165,13 @@ class MultiPatchFisher:
         self._fixed = set(fixed_params or [])
         self._signal_kwargs = signal_kwargs or {}
 
-        # Determine parameter classification
-        all_names = (["r", "A_lens"]
-                     + foreground_model.parameter_names)
+        # Determine parameter classification from an actual SignalModel so
+        # we honour delensed mode (drops A_lens) and residual-template mode
+        # (adds A_res). A_res is treated as a single global parameter shared
+        # across patches — the template is a single cleaned-map product.
+        probe_signal = SignalModel(base_instrument, foreground_model,
+                                   cmb_spectra, **self._signal_kwargs)
+        all_names = list(probe_signal.parameter_names)
         self._all_names = all_names
         self._global_free = [n for n in all_names
                              if n not in self._fixed and not _is_per_patch(n)]
