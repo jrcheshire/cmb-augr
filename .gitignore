@@ -7,3 +7,5 @@ scripts/_broom_scratch/
 plots/
 data/broom_outputs/
 data/hit_maps/
+data/falcons_validation/
+scripts/falcons_validation/
