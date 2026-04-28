@@ -17,21 +17,33 @@ quadrature over orbital phase space with Chebyshev singularity
 absorption; the South Pole reduces to a finite weighted sum over deck
 angles.
 
+Polarization angle on sky is RA-invariant at lat = -90 deg, so h_k for
+a single detector depends on declination, focal-plane offset, deck
+distribution, and k -- not RA. Consequence: a 2-D h_k map is constant
+along RA and varies along Dec.
+
 Convention: deck angle increases clockwise as seen on the projected
 boresight, matching the BK pipeline's ``chi2alpha.m``.
 
 Public API:
-    h_k_boresight - h_k at the boresight (focal-plane radius r = 0).
-
-Off-axis detectors and per-pixel maps over the BICEP CMB field are not
-yet implemented; only the boresight closed form is exposed.
+    h_k_boresight        - h_k at the boresight (focal-plane radius r=0).
+    h_k_offaxis          - h_k for a single off-axis detector vs. dec.
+    h_k_map_southpole    - 2-D flat-sky h_k map for one detector.
+    southpole_field_mask - boolean mask of pixels inside the BK field.
 """
 from __future__ import annotations
 
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["h_k_boresight"]
+from augr._chi2alpha import chi2alpha
+
+__all__ = [
+    "h_k_boresight",
+    "h_k_offaxis",
+    "h_k_map_southpole",
+    "southpole_field_mask",
+]
 
 
 def h_k_boresight(
@@ -77,3 +89,129 @@ def h_k_boresight(
 
     alpha_rad = jnp.deg2rad(-90.0 + chi_deg + deck)
     return jnp.sum(w * jnp.exp(-1j * k * alpha_rad)).astype(jnp.complex128)
+
+
+def _validate_k(k: int) -> None:
+    if not isinstance(k, (int, np.integer)) or k <= 0:
+        raise ValueError(f"k must be a positive integer, got {k!r}")
+
+
+def h_k_offaxis(
+    dec_deg: jnp.ndarray,
+    deck_deg: jnp.ndarray,
+    weights: jnp.ndarray | None = None,
+    r_deg: float = 0.0,
+    theta_fp_deg: float = 0.0,
+    chi_deg: float = 0.0,
+    k: int = 2,
+) -> jnp.ndarray:
+    """Year-averaged h_k for an off-axis detector at one or more declinations.
+
+    Computes alpha(dec, deck) via ``augr._chi2alpha.chi2alpha`` for each
+    (dec, deck) combination, then sums
+
+        h_k(dec) = sum_d w_d exp(-i k alpha(dec, deck=d, r, theta_fp, chi))
+
+    over the deck distribution. JAX-differentiable in all numeric arguments,
+    including ``r_deg`` and ``theta_fp_deg`` (use cases: focal-plane design
+    sensitivities, schedule optimization).
+
+    Args:
+        dec_deg: declination(s) in degrees, scalar or array. Output shape
+            matches.
+        deck_deg: 1-D array of deck angles in degrees.
+        weights: integration-time weights for ``deck_deg`` (sum normalized
+            internally). Default uniform.
+        r_deg: focal-plane angular radius of the detector (deg). r=0
+            recovers ``h_k_boresight``.
+        theta_fp_deg: focal-plane angular position of the detector (deg).
+        chi_deg: detector polarization fiducial angle (deg). Pure phase on
+            h_k.
+        k: spin order (positive integer).
+
+    Returns:
+        ``jnp.complex128`` array of shape ``dec_deg.shape``.
+    """
+    _validate_k(k)
+
+    dec = jnp.asarray(dec_deg, dtype=jnp.float64)
+    deck = jnp.asarray(deck_deg, dtype=jnp.float64)
+    if weights is None:
+        w = jnp.ones_like(deck) / deck.size
+    else:
+        w = jnp.asarray(weights, dtype=jnp.float64)
+        w = w / w.sum()
+
+    # Broadcast: dec[..., None] against deck[None, ...] -> alpha shape (..., n_deck).
+    dec_b = dec[..., None]
+    deck_b = jnp.broadcast_to(deck, dec_b.shape[:-1] + deck.shape)
+    alpha_deg = chi2alpha(
+        ra=jnp.zeros_like(dec_b),  # ra-invariant; choose any value.
+        dec=dec_b,
+        r=r_deg,
+        theta=theta_fp_deg,
+        chi=chi_deg,
+        thetaref=deck_b,
+    )
+    alpha_rad = jnp.deg2rad(alpha_deg)
+    integrand = jnp.exp(-1j * k * alpha_rad)
+    return jnp.sum(w * integrand, axis=-1).astype(jnp.complex128)
+
+
+def h_k_map_southpole(
+    ra_grid_deg: jnp.ndarray,
+    dec_grid_deg: jnp.ndarray,
+    deck_deg: jnp.ndarray,
+    weights: jnp.ndarray | None = None,
+    r_deg: float = 0.0,
+    theta_fp_deg: float = 0.0,
+    chi_deg: float = 0.0,
+    k: int = 2,
+) -> jnp.ndarray:
+    """2-D flat-sky h_k map for a single detector.
+
+    The map is RA-invariant by construction (the lat=-90 deg geometry
+    guarantees alpha(pixel, deck) does not depend on RA), so the function
+    just computes ``h_k_offaxis`` at each Dec and broadcasts across RA.
+
+    Args:
+        ra_grid_deg: 1-D array of RA pixel centers (deg).
+        dec_grid_deg: 1-D array of Dec pixel centers (deg).
+        deck_deg, weights, r_deg, theta_fp_deg, chi_deg, k: see
+            ``h_k_offaxis``.
+
+    Returns:
+        ``jnp.complex128`` array of shape ``(n_ra, n_dec)``.
+    """
+    ra = jnp.asarray(ra_grid_deg, dtype=jnp.float64)
+    h_k_dec = h_k_offaxis(
+        dec_grid_deg, deck_deg, weights=weights,
+        r_deg=r_deg, theta_fp_deg=theta_fp_deg, chi_deg=chi_deg, k=k,
+    )  # shape (n_dec,)
+    return jnp.broadcast_to(h_k_dec[None, :], (ra.shape[0],) + h_k_dec.shape).astype(jnp.complex128)
+
+
+def southpole_field_mask(
+    ra_grid_deg: jnp.ndarray,
+    dec_grid_deg: jnp.ndarray,
+    ra_min: float = -60.0,
+    ra_max: float = 60.0,
+    dec_min: float = -73.0,
+    dec_max: float = -38.0,
+) -> jnp.ndarray:
+    """Boolean field-bounds mask on a flat-sky grid.
+
+    Defaults match the BICEP CMB field. Returns shape ``(n_ra, n_dec)``,
+    ``True`` for in-field pixels.
+
+    This is the simplest sensible "hit map": a binary indicator of which
+    pixels are observed at all. A more refined hit map weighted by
+    integration time per (Az, El) is a future extension; not needed for
+    h_k since the closed form already gives the per-pixel value, but
+    useful when forming sky averages like ``<|h_k|^2>``.
+    """
+    ra = jnp.asarray(ra_grid_deg, dtype=jnp.float64)
+    dec = jnp.asarray(dec_grid_deg, dtype=jnp.float64)
+    ra_in = (ra >= ra_min) & (ra <= ra_max)
+    dec_in = (dec >= dec_min) & (dec <= dec_max)
+    return ra_in[:, None] & dec_in[None, :]

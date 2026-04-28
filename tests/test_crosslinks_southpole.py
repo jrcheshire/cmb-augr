@@ -7,7 +7,17 @@ import numpy as np
 import pytest
 
 from augr._chi2alpha import chi2alpha
-from augr.crosslinks_southpole import h_k_boresight
+from augr.crosslinks_southpole import (
+    h_k_boresight,
+    h_k_map_southpole,
+    h_k_offaxis,
+    southpole_field_mask,
+)
+
+
+# =============================================================================
+# Boresight tests (Stop 3)
+# =============================================================================
 
 
 # -- single deck: closed form match --------------------------------------------
@@ -169,3 +179,199 @@ def test_k_must_be_positive_integer():
         h_k_boresight(decks, k=-1)
     with pytest.raises(ValueError):
         h_k_boresight(decks, k=1.5)
+
+
+# =============================================================================
+# Off-axis and 2-D map tests (Stop 4)
+# =============================================================================
+
+# -- r=0 reduces to boresight -------------------------------------------------
+
+@pytest.mark.parametrize("dec", [-90.0, -73.0, -55.0, -38.0])
+@pytest.mark.parametrize("k", [1, 2, 4])
+def test_offaxis_r0_matches_boresight(dec, k):
+    """h_k_offaxis(r=0) == h_k_boresight at any declination."""
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+    chi = 11.0
+    h_off = complex(h_k_offaxis(dec, decks, chi_deg=chi, r_deg=0.0, k=k))
+    h_bs = complex(h_k_boresight(decks, chi_deg=chi, k=k))
+    assert np.isclose(h_off, h_bs, atol=1e-12)
+
+
+# -- consistency with chi2alpha applied per-deck -------------------------------
+
+def test_offaxis_consistency_with_chi2alpha():
+    """h_k_offaxis must match a manual chi2alpha-loop reconstruction."""
+    dec = -55.0
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+    chi = 17.0
+    r = 2.0
+    theta_fp = 45.0
+    k = 2
+
+    alphas = jnp.array([
+        float(chi2alpha(0.0, dec, r, theta_fp, chi, float(d))) for d in decks
+    ])
+    expected = complex(np.mean(np.exp(-1j * k * np.deg2rad(np.asarray(alphas)))))
+
+    actual = complex(h_k_offaxis(dec, decks, r_deg=r, theta_fp_deg=theta_fp,
+                                 chi_deg=chi, k=k))
+    assert np.isclose(actual, expected, atol=1e-12)
+
+
+# -- vectorization over dec ---------------------------------------------------
+
+def test_offaxis_vectorized_over_dec():
+    decs = jnp.linspace(-73.0, -38.0, 8)
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+    out = h_k_offaxis(decs, decks, r_deg=2.0, theta_fp_deg=45.0,
+                      chi_deg=11.0, k=2)
+    assert out.shape == (8,)
+    # Each element should match a scalar call at that dec.
+    for i, dec in enumerate(decs):
+        expected = complex(h_k_offaxis(float(dec), decks, r_deg=2.0,
+                                       theta_fp_deg=45.0, chi_deg=11.0, k=2))
+        assert np.isclose(complex(out[i]), expected, atol=1e-12)
+
+
+# -- continuity in r at r=0 ----------------------------------------------------
+
+def test_offaxis_continuous_at_r0():
+    """At small r, h_k_offaxis approaches the r=0 (boresight) value."""
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+    h_0 = complex(h_k_offaxis(-55.0, decks, r_deg=0.0, theta_fp_deg=45.0))
+    h_eps = complex(h_k_offaxis(-55.0, decks, r_deg=1e-5, theta_fp_deg=45.0))
+    assert np.isclose(h_0, h_eps, atol=1e-6)
+
+
+# -- 2-D map: RA-invariance ---------------------------------------------------
+
+def test_map_ra_invariance():
+    """Each row of the map (constant Dec) should be identical across RA."""
+    ra_grid = jnp.linspace(-60.0, 60.0, 12)
+    dec_grid = jnp.linspace(-73.0, -38.0, 8)
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+    m = h_k_map_southpole(ra_grid, dec_grid, decks, r_deg=2.0,
+                          theta_fp_deg=45.0, chi_deg=11.0, k=2)
+    assert m.shape == (12, 8)
+    # All rows equal the first row.
+    for i in range(m.shape[0]):
+        assert np.allclose(m[i, :], m[0, :], atol=1e-15)
+
+
+def test_map_dec_dependence_at_boresight_is_flat():
+    """At r=0 the map is constant in Dec too (boresight closed form is
+    independent of Dec)."""
+    ra_grid = jnp.linspace(-60.0, 60.0, 6)
+    dec_grid = jnp.linspace(-73.0, -38.0, 6)
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+    m = h_k_map_southpole(ra_grid, dec_grid, decks, r_deg=0.0)
+    assert np.allclose(m, m[0, 0], atol=1e-15)
+
+
+def test_map_phase_varies_with_dec_offaxis():
+    """At finite r the complex h_k varies along Dec (the off-axis effect)
+    -- in phase, not in amplitude (see test_offaxis_amplitude_invariance)."""
+    ra_grid = jnp.linspace(-60.0, 60.0, 6)
+    dec_grid = jnp.linspace(-73.0, -38.0, 6)
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+    m = h_k_map_southpole(ra_grid, dec_grid, decks, r_deg=2.0,
+                          theta_fp_deg=45.0, chi_deg=11.0, k=2)
+    # First-vs-last Dec complex values should differ.
+    assert not np.allclose(m[0, 0], m[0, -1], atol=1e-6)
+
+
+def test_offaxis_amplitude_invariance():
+    """|h_k|^2 is invariant under (r, theta_fp, dec) for a single detector.
+
+    The off-axis correction in chi2alpha is a deck-uniform shift in
+    alpha (chi2alpha's az calculation does not depend on thetaref), so
+    the off-axis h_k differs from the boresight h_k by a pure phase
+    factor. Amplitude is identical at any focal-plane offset and any
+    declination."""
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+    chi = 11.0
+    h_bs = complex(h_k_boresight(decks, chi_deg=chi, k=2))
+    amp2_bs = abs(h_bs) ** 2
+
+    # Sample a 2-D grid of (dec, r) and a couple theta_fp values.
+    for dec in (-73.0, -55.0, -38.0):
+        for r in (0.5, 2.0, 5.0):
+            for theta_fp in (0.0, 45.0, 137.0):
+                h = complex(h_k_offaxis(dec, decks, r_deg=r,
+                                        theta_fp_deg=theta_fp, chi_deg=chi, k=2))
+                assert np.isclose(abs(h) ** 2, amp2_bs, atol=1e-12), (
+                    f"dec={dec} r={r} theta_fp={theta_fp}: "
+                    f"|h|^2={abs(h)**2}, expected {amp2_bs}"
+                )
+
+
+# -- field mask shape and bounds ----------------------------------------------
+
+def test_field_mask_shape_and_defaults():
+    ra = jnp.linspace(-90.0, 90.0, 19)  # 10 deg spacing
+    dec = jnp.linspace(-90.0, 0.0, 10)  # 10 deg spacing
+    mask = southpole_field_mask(ra, dec)
+    assert mask.shape == (19, 10)
+    # Pixel at (ra=0, dec=-55): in default BK field.
+    assert bool(mask[9, 4])  # ra_index 9 = 0 deg, dec_index 4 = -50 deg
+    # Pixel at (ra=80, dec=-55): outside RA range.
+    assert not bool(mask[17, 4])
+    # Pixel at (ra=0, dec=-90): outside Dec range.
+    assert not bool(mask[9, 0])
+
+
+def test_field_mask_custom_bounds():
+    ra = jnp.array([-30.0, 0.0, 30.0])
+    dec = jnp.array([-60.0, -50.0, -40.0])
+    mask = southpole_field_mask(ra, dec,
+                                ra_min=-20.0, ra_max=20.0,
+                                dec_min=-55.0, dec_max=-45.0)
+    expected = np.array([
+        [False, False, False],   # ra=-30: out of [-20, 20]
+        [False, True,  False],   # ra=0: in. dec must be in [-55, -45]
+        [False, False, False],   # ra=30: out
+    ])
+    assert np.array_equal(np.asarray(mask), expected)
+
+
+# -- JAX differentiability through the off-axis path --------------------------
+
+def test_grad_offaxis_through_r():
+    """dh/dr should be finite and well-defined for r > 0."""
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+
+    def loss(r):
+        h = h_k_offaxis(-55.0, decks, r_deg=r, theta_fp_deg=45.0,
+                        chi_deg=0.0, k=2)
+        return jnp.real(h * jnp.conj(h))
+
+    g = jax.grad(loss)(jnp.float64(2.0))
+    assert jnp.isfinite(g)
+
+
+def test_grad_map_through_chi():
+    """Gradient through h_k_map_southpole w.r.t. chi_deg should run."""
+    ra = jnp.linspace(-60.0, 60.0, 6)
+    dec = jnp.linspace(-73.0, -38.0, 6)
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+
+    def loss(chi):
+        m = h_k_map_southpole(ra, dec, decks, r_deg=2.0, theta_fp_deg=45.0,
+                              chi_deg=chi, k=2)
+        return jnp.real(jnp.sum(m * jnp.conj(m)))
+
+    g = jax.grad(loss)(jnp.float64(11.0))
+    assert jnp.isfinite(g)
+
+
+# -- sanity: |h_k| <= 1 in the map ---------------------------------------------
+
+def test_map_modulus_bounded():
+    ra = jnp.linspace(-60.0, 60.0, 6)
+    dec = jnp.linspace(-73.0, -38.0, 6)
+    decks = jnp.array([68.0, 113.0, 248.0, 293.0])
+    for k in (1, 2, 4):
+        m = h_k_map_southpole(ra, dec, decks, r_deg=2.0, theta_fp_deg=45.0,
+                              chi_deg=11.0, k=k)
+        assert np.all(np.abs(m) <= 1.0 + 1e-12)
