@@ -43,7 +43,21 @@ __all__ = [
     "h_k_offaxis",
     "h_k_map_southpole",
     "southpole_field_mask",
+    "BA_DECK_ANGLES_8",
 ]
+
+
+# BICEP Array CMB schedule cycles through 8 deck angles at 45 deg intervals,
+# one deck per 2-day schedule, governed by ``SN mod 8`` (see e.g. the header
+# of ``~/bicepkeck/gcp/config/sch/CMB/9_baCMB_03_000.sch``). Over a 16-day
+# cycle the deck distribution is uniform 1/8 over these eight angles.
+#
+# For 8 evenly-spaced decks at 45 deg, the discrete sum
+# ``sum_n exp(-i k * 45 deg * n)`` for ``n in {0, ..., 7}`` is zero for any
+# ``k`` not a multiple of 8. So at the boresight, the BA 8-deck schedule
+# null-suppresses ``h_k`` for ``k in {1, 2, 3, 4, 5, 6, 7}`` -- every spin
+# moment in Wallis 2017's contamination list.
+BA_DECK_ANGLES_8 = (23.0, 68.0, 113.0, 158.0, 203.0, 248.0, 293.0, 338.0)
 
 
 def h_k_boresight(

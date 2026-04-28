@@ -8,11 +8,58 @@ import pytest
 
 from augr._chi2alpha import chi2alpha
 from augr.crosslinks_southpole import (
+    BA_DECK_ANGLES_8,
     h_k_boresight,
     h_k_map_southpole,
     h_k_offaxis,
     southpole_field_mask,
 )
+
+
+# -----------------------------------------------------------------------------
+# Test helpers (Stop 5 time-domain MC).
+# -----------------------------------------------------------------------------
+
+
+def _parallactic_deviation_deg(ha_deg, dec_deg, lat_deg):
+    """Deviation of the true parallactic angle from 180 deg at lat != -90 deg.
+
+    Standard formula: tan(eta) = sin(HA) cos(lat) /
+                                 (sin(lat) cos(dec) - cos(lat) sin(dec) cos(HA))
+    At lat = -90 deg exactly, eta = 180 deg everywhere (the SCP-aligned-with-
+    zenith fact from Stop 1). For lat = -90 + eps, eta wobbles around 180 deg
+    by an amount that's leading-order eps * sin(HA) / cos(dec).
+    """
+    ha = np.deg2rad(ha_deg)
+    dec = np.deg2rad(dec_deg)
+    lat = np.deg2rad(lat_deg)
+    num = np.sin(ha) * np.cos(lat)
+    den = np.sin(lat) * np.cos(dec) - np.cos(lat) * np.sin(dec) * np.cos(ha)
+    eta = np.rad2deg(np.arctan2(num, den))
+    # eta is wrapped to (-180, 180]; deviation from 180 deg:
+    return ((eta - 180.0 + 180.0) % 360.0) - 180.0
+
+
+def _hk_mc_time_domain(
+    dec_deg, deck_distribution, deck_weights, ha_window_deg,
+    r_deg, theta_fp_deg, chi_deg, lat_deg, k, n_samples, rng,
+):
+    """Empirical h_k at one pixel via time-domain (HA, deck) sampling.
+
+    At lat = -90 deg the parallactic correction is identically zero and this
+    reduces to the per-pixel deck-distribution MC of Stop 3. At
+    lat = -90 + eps the correction is included, so the closed-form-vs-MC
+    comparison probes the lat-offset bound."""
+    ha = rng.uniform(ha_window_deg[0], ha_window_deg[1], size=n_samples)
+    deck_idx = rng.choice(len(deck_distribution), p=deck_weights, size=n_samples)
+    decks = np.asarray(deck_distribution)[deck_idx]
+    alphas = np.array([
+        float(chi2alpha(0.0, dec_deg, r_deg, theta_fp_deg, chi_deg, float(d)))
+        for d in decks
+    ])
+    if lat_deg != -90.0:
+        alphas = alphas + _parallactic_deviation_deg(ha, dec_deg, lat_deg)
+    return np.mean(np.exp(-1j * k * np.deg2rad(alphas)))
 
 
 # =============================================================================
@@ -279,6 +326,117 @@ def test_map_phase_varies_with_dec_offaxis():
                           theta_fp_deg=45.0, chi_deg=11.0, k=2)
     # First-vs-last Dec complex values should differ.
     assert not np.allclose(m[0, 0], m[0, -1], atol=1e-6)
+
+
+# =============================================================================
+# Stop 5 -- BA 8-deck preset and lat-offset validation.
+# =============================================================================
+
+
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6, 7])
+def test_ba_8deck_preset_nulls_h_k(k):
+    """BA's 8-deck schedule (45 deg evenly-spaced) nulls h_k for k = 1..7.
+
+    Header of ``~/bicepkeck/gcp/config/sch/CMB/9_baCMB_03_000.sch`` documents
+    the 8-deck cycle. The discrete sum ``sum_n exp(-i k * 45 deg * n)`` over
+    n in {0..7} vanishes for any k not a multiple of 8 -- so the BA strategy
+    null-suppresses every spin moment in Wallis 2017's contamination list
+    (h_1, h_2, h_4) at the boresight, plus h_3, h_5, h_6, h_7 for free."""
+    decks = jnp.asarray(BA_DECK_ANGLES_8)
+    h = complex(h_k_boresight(decks, chi_deg=11.0, k=k))
+    assert abs(h) < 1e-12, f"k={k}: |h|={abs(h):.3e}, expected ~0"
+
+
+def test_ba_8deck_preset_nonzero_at_h8():
+    """Sanity: at k=8, all 4*alpha values land on the same angle, h_8 = 1."""
+    decks = jnp.asarray(BA_DECK_ANGLES_8)
+    h = complex(h_k_boresight(decks, chi_deg=0.0, k=8))
+    assert np.isclose(abs(h), 1.0, atol=1e-12)
+
+
+# -- time-domain MC at lat = -90 deg matches closed form -----------------------
+
+def test_mc_matches_closed_form_at_lat_minus_90():
+    """At lat = -90 deg exactly, the parallactic correction is zero and the
+    time-domain MC reduces to the deck-distribution MC; should match the
+    closed form within sampling noise."""
+    rng = np.random.default_rng(0)
+    decks = list(BA_DECK_ANGLES_8)
+    weights = [1.0 / len(decks)] * len(decks)
+    n = 200_000
+
+    # Pick k=8 so the closed form is non-zero and the MC has a target to
+    # compare against. (For k=1..7 the closed form is zero and the MC will
+    # also be ~0; the test still passes, but is less informative.)
+    h_mc = _hk_mc_time_domain(
+        dec_deg=-55.0, deck_distribution=decks, deck_weights=weights,
+        ha_window_deg=(-60.0, 60.0), r_deg=2.0, theta_fp_deg=45.0,
+        chi_deg=11.0, lat_deg=-90.0, k=8, n_samples=n, rng=rng,
+    )
+    h_closed = complex(h_k_offaxis(
+        -55.0, jnp.asarray(decks), r_deg=2.0, theta_fp_deg=45.0,
+        chi_deg=11.0, k=8,
+    ))
+    # Discrete-distribution MC sampling noise: 1/sqrt(N).
+    assert abs(h_mc - h_closed) < 5e-3, f"diff={abs(h_mc - h_closed):.3e}"
+
+
+# -- lat = -89.99 deg deviation is bounded by O(eps^2) -------------------------
+
+def test_lat_offset_correction_is_negligible():
+    """For lat = -89.99 deg (eps ~ 1.7e-4 rad), a symmetric HA scan window
+    averages the leading-order eps*sin(HA) correction to zero, leaving an
+    O(eps^2) residual -- well below MC sampling noise."""
+    rng = np.random.default_rng(0)
+    decks = list(BA_DECK_ANGLES_8)
+    weights = [1.0 / len(decks)] * len(decks)
+    n = 200_000
+
+    h_polar = _hk_mc_time_domain(
+        -55.0, decks, weights, (-60.0, 60.0),
+        r_deg=2.0, theta_fp_deg=45.0, chi_deg=11.0,
+        lat_deg=-90.0, k=8, n_samples=n, rng=rng,
+    )
+    rng2 = np.random.default_rng(0)  # match HA / deck samples for cleaner diff
+    h_mapo = _hk_mc_time_domain(
+        -55.0, decks, weights, (-60.0, 60.0),
+        r_deg=2.0, theta_fp_deg=45.0, chi_deg=11.0,
+        lat_deg=-89.99, k=8, n_samples=n, rng=rng2,
+    )
+    # Same HA samples, only the lat changes -> diff is purely the lat
+    # correction. Bound: |diff| << MC noise of either estimate.
+    diff = abs(h_polar - h_mapo)
+    assert diff < 1e-4, (
+        f"|h(-89.99) - h(-90)| = {diff:.3e}, expected << 1e-3 (MC noise)"
+    )
+
+
+# -- parallactic deviation: sanity at lat = -90 deg ----------------------------
+
+def test_parallactic_deviation_zero_at_lat_minus_90():
+    """At lat = -90 deg exactly, the deviation must be 0 at all HA, dec."""
+    has = np.array([-60.0, -10.0, 0.0, 17.0, 60.0])
+    decs = np.array([-73.0, -55.0, -38.0])
+    for ha in has:
+        for dec in decs:
+            d = _parallactic_deviation_deg(ha, dec, -90.0)
+            assert abs(d) < 1e-10, f"ha={ha} dec={dec}: deviation={d}"
+
+
+def test_parallactic_deviation_scales_with_eps():
+    """Magnitude of the deviation at small eps matches the leading-order
+    bound |eps * sin(HA) / cos(dec)|. Sign depends on the convention for
+    "polarization-angle increment direction" in chi2alpha and only flips
+    the phase of h_k coherently across all pixels -- it does not affect
+    |h_k| or the lat-offset bound."""
+    ha = 30.0
+    dec = -55.0
+    eps_deg = 0.01  # lat = -89.99
+    d = _parallactic_deviation_deg(ha, dec, -90.0 + eps_deg)
+    expected_mag = abs(np.rad2deg(np.deg2rad(eps_deg) *
+                                  np.sin(np.deg2rad(ha)) / np.cos(np.deg2rad(dec))))
+    assert np.isclose(abs(d), expected_mag, rtol=1e-2), \
+        f"got |d|={abs(d)}, expected ~{expected_mag}"
 
 
 def test_offaxis_amplitude_invariance():
