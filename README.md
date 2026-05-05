@@ -4,7 +4,7 @@
 
 Fisher-matrix forecasting for CMB B-mode polarization experiments, targeting the tensor-to-scalar ratio *r*.
 
-Built for the JPL CMB Probe 2026 study to explore how instrument design choices affect sensitivity to primordial gravitational waves in the presence of realistic Galactic foregrounds.
+`augr` translates physical instrument specifications (aperture, focal plane geometry, detector counts, NETs, beams) into a marginalized Fisher constraint on *r*, accounting for Galactic foregrounds, gravitational lensing, and frequency-by-frequency cross-spectrum information. The full pipeline is JAX-differentiable end-to-end, so instrument design parameters can be optimized via `jax.grad`.
 
 ## What it does
 
@@ -19,12 +19,14 @@ The telescope design module derives detector counts and photon-noise-limited NET
 
 ## Quick start
 
-An "`augr`" `conda` environment is included with the needed dependencies: `conda create --file environment.yaml`
+A self-contained `conda` environment is included with the needed dependencies:
 
 ```bash
-make install   # create conda env + pip install -e .
-make test      # run 251 tests
+make install   # create conda env "augr" + pip install -e .
+make test      # run the full pytest suite
 ```
+
+For a guided tour of the API, see [`notebooks/quickstart.ipynb`](notebooks/quickstart.ipynb).
 
 ```python
 from augr.telescope import probe_design, to_instrument
@@ -106,14 +108,25 @@ augr/
   sky_patches.py   Sky patch definitions and scan strategy
 
 scripts/
-  explore_designs.py   Band optimization: density scan, frequency range scan,
-                       area allocation, experiment comparison (parallelized)
-  validate_pico.py     Validation against PICO published sigma(r) targets
-  plot_figure5.py      Reproduction of BICEP/Keck Figure 5 time evolution
+  validate_pico.py             Validation against PICO published sigma(r) targets
+  validate_carones.py          Validation against Carones 2025 post-CompSep
+                               residual-template forecast (LiteBIRD-PTEP)
+  validate_bk.py               BK sigma(r) time evolution; analog of
+                               Buza 2019 thesis Fig. 7.9
+  broom_residual_template.py   End-to-end BROOM driver: NILC + GNILC +
+                               residual-template MC for an external
+                               component-separation forecast
+  make_hit_maps.py             Per-channel L2 hit map FITS writer for BROOM
+  generate_camb_templates.py   Regenerate the CAMB spectra under data/
+  southpole_derivation/        Pedagogical walkthrough of the South Pole
+                               h_k closed form
 
-tests/              251 tests covering all modules
+notebooks/
+  quickstart.ipynb     Guided tour of the API
+
+tests/              Full pytest suite covering every module
 data/               CAMB template spectra (tensor r=1, lensing, unlensed TT/EE/TE/BB, phi-phi)
-plots/              Output from explore_designs.py
+plots/              Output directory (gitignored)
 ```
 
 ## Design principles
@@ -121,7 +134,7 @@ plots/              Output from explore_designs.py
 - **JAX throughout** for exact autodiff (Jacobians via `jax.jacfwd`), JIT compilation, and differentiable instrument optimization via `jax.grad`.
 - **Physics-based noise** from first principles (photon NEP, optical loading, feedhorn packing). Adding a mode to rescale from achieved performance is a potential future item.
 - **Extensible foreground models** via a structural `Protocol` type. Any class with `parameter_names` and `cl_bb(nu_i, nu_j, ells, params)` works.
-- **Frozen dataclasses** for all specifications (immutable, hashable, safe to pass across threads -- see example in `scripts/explore_designs.py`).
+- **Frozen dataclasses** for all specifications (immutable, hashable, safe to pass across threads).
 - **Realistic telescope and survey efficiency factors**: detector yield, survey efficiency, data loss, and more. For the telescope module, floor-based pixel counting, packing efficiency, and optical efficiency. Defaults are conservative, but optimistic "idealized" presets are available for comparison.
 
 ## Performance
