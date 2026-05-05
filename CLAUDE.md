@@ -30,10 +30,11 @@ Knowing how the modules chain together matters more than any one file:
    `Channel`s: frequency, NET, beam, n_det, efficiency).
    `combined_noise_nl(inst, ells, "BB")` yields the MV-combined noise
    spectrum. Presets in `config.py`: `simple_probe`, `pico_like`,
-   `litebird_like` (22 sub-array Channels per LiteBIRD PTEP Table 3 —
-   each physical sub-array at a shared frequency is its own Channel so
-   Fisher MV-combines them correctly), `so_like`, `cmbs4_like`, plus
-   `_idealized` variants with PICO-style optics. A
+   `litebird_like` (22 sub-array Channels per the LiteBIRD PTEP
+   channel-specification table — each physical sub-array at a shared
+   frequency is its own Channel so Fisher MV-combines them
+   correctly), `so_like`, `cmbs4_like`, plus `_idealized` variants
+   with PICO-style optics. A
    `deconvolve_noise_bb(noise, ells, fwhm_arcmin)` helper is available
    for users with beam-convolved noise who need the beam-deconvolved
    form required by the external-noise Fisher path.
@@ -150,12 +151,23 @@ Knowing how the modules chain together matters more than any one file:
     exposed publicly. Pedagogical walkthrough in
     `scripts/southpole_derivation/`.
 
-**Parameter-vector convention** for the Moment model:
-`[r, A_lens, A_dust, beta_dust, alpha_dust, T_dust, A_sync, beta_sync,
-alpha_sync, Delta_dust, epsilon, omega_beta_d, omega_beta_s, omega_T,
-omega_c, omega_beta_d_beta_s, omega_beta_d_T]`
-(see `config.py` for the canonical list). The Gaussian model drops the
-seven `omega_*` / `epsilon` / `Delta_dust` moment terms.
+**Parameter-vector convention** (canonical list in `config.py`):
+
+`FIDUCIAL_BK15` (12 entries): `r, A_lens, A_dust, beta_dust, alpha_dust,
+T_dust, A_sync, beta_sync, alpha_sync, epsilon, Delta_dust, A_res`.
+
+`FIDUCIAL_MOMENT` extends `FIDUCIAL_BK15` with 8 more entries:
+`c_sync, Delta_sync, omega_d_beta, omega_d_T, omega_d_betaT,
+omega_s_beta, omega_s_c, omega_s_betac` (20 entries total).
+
+`A_res` is the post-component-separation residual-template amplitude;
+it only enters the Fisher when `SignalModel` is constructed with
+`residual_template_cl=...` (otherwise silently ignored). `A_lens`
+similarly drops out in delensed mode. The `omega_*` parameters follow
+the Chluba+ 2017 (arXiv:1701.00274) Eq. 8 sky-level central-moment
+convention; naming is `omega_<species>_<quantity>` where species is
+`d` (dust) or `s` (sync) and quantity is the spectral parameter
+(`beta`, `T`, `c`) or pair (`betaT`, `betac`).
 
 ## Conventions
 
