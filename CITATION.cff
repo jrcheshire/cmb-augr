@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+title: "augr: Fisher-matrix forecasting for CMB B-mode polarization experiments"
+abstract: >-
+  augr is a JAX-native Fisher-forecasting pipeline that translates
+  physical telescope specifications (aperture, focal plane geometry,
+  detector counts, NETs, beams) into a marginalized constraint on the
+  tensor-to-scalar ratio r. It includes pluggable foreground models
+  (Gaussian / Chluba+ 2017 moment expansion), self-consistent iterative
+  quadratic-estimator delensing, multipatch sky modelling, and
+  end-to-end differentiable instrument optimisation via jax.grad.
+type: software
+authors:
+  - family-names: Cheshire
+    given-names: Jamie
+    email: cheshire@caltech.edu
+    affiliation: California Institute of Technology / Jet Propulsion Laboratory
+repository-code: "https://github.com/jrcheshire/cmb-augr"
+url: "https://github.com/jrcheshire/cmb-augr"
+license: BSD-3-Clause
+version: 0.1.0
