@@ -29,6 +29,7 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "matplotlib>=3.7",
+    "healpy>=1.16",
 ]
 
 [project.urls]
@@ -37,8 +38,9 @@ Repository = "https://github.com/jrcheshire/cmb-augr"
 Issues = "https://github.com/jrcheshire/cmb-augr/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "pywigxjpf"]
 camb = ["camb"]
+broom = ["cmbroom", "pyyaml"]
 notebooks = ["jupyterlab", "ipykernel", "matplotlib"]
 
 [tool.setuptools.packages.find]
