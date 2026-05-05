@@ -21,7 +21,7 @@ array whose columns are (ell_center, C_ell^BB) in uK_CMB^2:
 where `tag` encodes experiment / fg_model / compsep / mask / nsims.
 
 Usage:
-    conda run -n augr python scripts/broom_residual_template.py --nsims 50
+    pixi run python scripts/broom_residual_template.py --nsims 50
 
 Note: first run populates scripts/_broom_scratch/inputs/ with PySM3-generated
 sims; several minutes at nside=64.

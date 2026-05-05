@@ -7,7 +7,7 @@ L2 hit map (envelope model from `augr.hit_maps.l2_hit_map`); per-
 channel feedhorn offsets are not modeled in v1.
 
 Usage:
-    conda run -n augr python scripts/make_hit_maps.py \\
+    pixi run python scripts/make_hit_maps.py \\
         --prefix data/hit_maps/litebird_ptep_l2 \\
         --experiment LiteBIRD_PTEP \\
         --nside 64

@@ -17,7 +17,7 @@ Diagnostics printed:
     criterion 3 of the plan).
 
 Usage:
-    conda run -n augr python scripts/validate_carones.py \\
+    pixi run python scripts/validate_carones.py \\
         --tag litebird_ptep_d1s1_nilc_gal60_020sims
 """
 

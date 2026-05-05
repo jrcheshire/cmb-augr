@@ -13,7 +13,7 @@ making the amplitude flatness vs phase variation visible. The 2-D map
 is RA-invariant, so a 1-D plot vs dec captures the full structure.
 
 Run:
-    conda run -n augr python 02_offaxis_map.py
+    pixi run python scripts/southpole_derivation/02_offaxis_map.py
 """
 from __future__ import annotations
 

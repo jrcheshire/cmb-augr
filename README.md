@@ -19,11 +19,15 @@ The telescope design module derives detector counts and photon-noise-limited NET
 
 ## Quick start
 
-A self-contained `conda` environment is included with the needed dependencies:
+The project uses [pixi](https://pixi.sh/) to manage a reproducible
+conda + pypi environment pinned via `pixi.lock`:
 
 ```bash
-make install   # create conda env "augr" + pip install -e .
-make test      # run the full pytest suite
+pixi install         # solve + install the locked environment
+pixi run test        # run the fast pytest subset
+pixi run test-all    # full suite (includes opt-in slow tests)
+pixi run validate-pico   # PICO sigma(r) cross-check
+pixi run nb          # launch jupyter lab on notebooks/
 ```
 
 For a guided tour of the API, see [`notebooks/quickstart.ipynb`](notebooks/quickstart.ipynb).

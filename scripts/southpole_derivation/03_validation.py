@@ -12,7 +12,7 @@ moments at the South Pole boresight:
   nulls k = 1..7, leaves |h_8| = 1.
 
 Run:
-    conda run -n augr python 03_validation.py
+    pixi run python scripts/southpole_derivation/03_validation.py
 """
 from __future__ import annotations
 

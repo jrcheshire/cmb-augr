@@ -12,10 +12,11 @@ analytic Jacobians via `jax.jacfwd` and a differentiable σ(r) via
 end-to-end, so design parameters can be optimized directly.
 
 ```bash
-make install                                                # conda env "augr" (Python 3.12) + pip install -e .
-make test                                                   # full pytest suite
-make validate-pico                                          # reproduce the PICO sigma(r) cross-check
-conda run -n augr python -m pytest tests/test_fisher.py -v  # single file
+pixi install                                # solve + install the locked conda + pypi env
+pixi run test                               # fast pytest subset (slow tests deselected)
+pixi run test-all                           # full pytest suite (includes slow)
+pixi run validate-pico                      # reproduce the PICO sigma(r) cross-check
+pixi run pytest tests/test_fisher.py -v     # single file
 ```
 
 ## Architecture
