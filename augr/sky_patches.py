@@ -306,7 +306,9 @@ def default_3patch_model(include_scan: bool = True) -> SkyModel:
 def default_4patch_model(include_scan: bool = True) -> SkyModel:
     """Four-patch model with finer slicing of the clean sky.
 
-    Dust amplitude scalings from Planck 2018 XXX Table 1 (approximate).
+    Dust amplitude scalings from Planck Intermediate Results XXX
+    (Planck Collaboration 2016, A&A 586, A133; arXiv:1409.5738),
+    Table 1 (approximate).
     """
     patches_no_scan = (
         SkyPatch("cleanest", f_sky=0.07, A_dust_scale=0.5,  A_sync_scale=0.8),

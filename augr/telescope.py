@@ -12,7 +12,7 @@ focal plane area is allocated among groups by user-specified fractions.
 
 References:
     - Feedhorn coupling: Griffin et al. 2002 (single-moded horns, d ~ 2Fλ)
-    - Photon NEP: Zmuidzinas 2003 (JLTP 12, 4), Richards 1994
+    - Photon NEP: Zmuidzinas 2003 (Appl. Opt. 42, 4989), Richards 1994
     - Hex packing: Conway & Sloane, "Sphere Packings" (π/2√3 ≈ 0.9069)
 """
 

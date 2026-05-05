@@ -25,7 +25,8 @@ Key references:
   - Hu & Okamoto (2002), astro-ph/0111606 — flat-sky QE formalism
   - Okamoto & Hu (2003), astro-ph/0301031 — full-sky QE formalism
   - Smith et al. (2012), 1010.0048 — residual BB, iterative delensing
-  - Trendafilova et al. (2023), 2312.02954 — CLASS_delens iteration
+  - Trendafilova, Hotinli & Meyers (2024), JCAP 06, 017; arXiv:2312.02954
+    — CLASS_delens iterative procedure
 
 All spectra in C_ell convention [μK²] for CMB, dimensionless for φφ.
 """
@@ -1135,7 +1136,7 @@ def iterate_delensing(spectra: LensingSpectra,
     the reduced BB can be fed back into the QE to get a better φ estimate,
     and so on. Converges in 3-5 iterations for typical space experiments.
 
-    Procedure (CLASS_delens-inspired, Trendafilova et al. 2023):
+    Procedure (CLASS_delens-inspired, Trendafilova, Hotinli & Meyers 2024):
       1. Start with C_l^{BB,tot} = C_l^{BB,lensed} + N_l^{BB}
       2. Compute MV N_0(L) using current C_l^{BB,tot} in EB/TB filters
       3. Compute residual C_l^{BB,res} via lensing kernel × Wiener filter

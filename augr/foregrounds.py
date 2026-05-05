@@ -103,8 +103,9 @@ ELL_REF = 80.0
 class GaussianForegroundModel:
     """Parametric dust + synchrotron + dust-sync correlation model.
 
-    This matches the BICEP/Keck BK18 foreground model (arXiv:1810.05216)
-    as implemented in Buza (2019) thesis Sec. 3.3 and 7.1.3.
+    This matches the BICEP/Keck BK15 foreground model (arXiv:1810.05216,
+    PRL 121, 221301; data through the 2015 season) as implemented in
+    Buza (2019) thesis Sec. 3.3 and 7.1.3.
 
     Power spectra (all in CMB thermodynamic μK²):
 

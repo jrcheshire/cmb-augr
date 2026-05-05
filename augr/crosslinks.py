@@ -63,7 +63,7 @@ Convention notes:
 * augr ``spin_angle_deg`` and ``precession_angle_deg`` follow the
   Wallis 2017 convention used by ``augr.hit_maps.l2_hit_map``:
   spin = boresight-to-spin half-angle, precession = spin-to-antisun
-  half-angle. **This is opposite the Takase 2024 / Falcons.jl
+  half-angle. **This is opposite the Takase 2025 / Falcons.jl
   convention, where alpha = precession opening and beta = spin
   opening.** Be careful when cross-comparing.
 * h_k = <exp(-i k psi)> with psi the crossing angle east of north.
@@ -76,8 +76,9 @@ Convention notes:
   east-of-north sign convention, take the complex conjugate.
 * The closed-form 1-D quadrature with the precession * spin Jacobian
   split appears not to be in the published CMB scan-strategy
-  literature surveyed (Wallis 2017, McCallum/Wallis 2021, Takase 2024,
-  Falcons.jl, plus pseudo-Cl asymmetric-beam stream). See
+  literature surveyed (Wallis et al. 2017, McCallum et al. 2021,
+  Takase 2025, Falcons.jl, plus the pseudo-Cl asymmetric-beam
+  stream). See
   ``scripts/falcons_validation/derivation_and_lit_search.md`` for the
   search trail before claiming novelty publicly.
 
@@ -94,7 +95,7 @@ Public API:
     h_k_map         - HEALPix complex map of h_k for given scan params.
     yearavg_h_k_1d  - Underlying 1-D h_k(theta_ecl), JAX-differentiable.
     pack_cos_sin    - Convert real (cos, sin) pair to complex h_k
-                      (Takase 2024 convention -> Wallis convention).
+                      (Takase 2025 convention -> Wallis convention).
 """
 
 from __future__ import annotations
@@ -270,7 +271,7 @@ def pack_cos_sin(
 ) -> jnp.ndarray:
     """Pack a real (cos, sin) pair into a complex h_k.
 
-    Takase 2024 (Sec. 4.2 / App. A.2) and some downstream code provide
+    Takase 2025 (Sec. 4.2 / App. A.2) and some downstream code provide
     h_k as a real-valued pair (<cos(k psi)>, <sin(k psi)>) instead of
     the complex h_k = <exp(-i k psi)>. This helper performs the
     conversion to the Wallis 2017 / Falcons.jl complex convention used
