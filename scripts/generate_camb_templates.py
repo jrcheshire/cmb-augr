@@ -16,9 +16,10 @@ Cosmology: Planck 2018 best-fit (TT+TE+EE+lowE+lensing)
   As=2.1e-9, ns=0.965
 
 Usage:
-  python -m scripts.generate_camb_templates
-  # or directly:
-  python scripts/generate_camb_templates.py
+    pixi run python scripts/generate_camb_templates.py
+
+Note: `camb` is included in the default pixi environment (via conda-forge);
+non-pixi users can install it via the `camb` extra: `pip install -e ".[camb]"`.
 """
 
 import os

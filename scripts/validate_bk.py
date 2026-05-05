@@ -11,6 +11,9 @@ calendar time as Keck Array and BICEP3 data accumulate, with two cuts:
 Red curve: raw sensitivity (no FG, A_lens=1 fixed, lensing in Knox variance).
 Gray curve: 12+-band analysis (BK + Planck + WMAP) with BK15 priors, A_lens free.
 Extends through 2018 including BICEP3 at 95 GHz.
+
+Usage:
+    pixi run python scripts/validate_bk.py
 """
 
 from pathlib import Path

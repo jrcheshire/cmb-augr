@@ -13,8 +13,8 @@ Two Fisher runs are performed:
 
 Diagnostics printed:
   - sigma(r) for baseline (no template), (1), and (2).
-  - 2x2 (r, A_res) Fisher-submatrix condition number (acceptance
-    criterion 3 of the plan).
+  - 2x2 (r, A_res) Fisher-submatrix condition number, as a
+    sanity check that the (r, A_res) sub-block is well-conditioned.
 
 Usage:
     pixi run python scripts/validate_carones.py \\

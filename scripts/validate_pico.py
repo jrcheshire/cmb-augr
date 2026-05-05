@@ -6,7 +6,7 @@ Compares σ(r) from augr against PICO's published analytic forecast results,
 carefully matching assumptions and documenting every discrepancy.
 
 PICO analytic forecast method (Sec 2.7.2):
-  - Code: Errard et al. 2016 (JCAP 03, p.052) [ref 225]
+  - Code: Errard et al. 2016, JCAP 03, 052
   - f_sky = 0.6 (cleanest 60% of sky)
   - ℓ = 2–300 (BB power spectrum)
   - r = 0 fiducial
@@ -18,7 +18,7 @@ PICO analytic forecast method (Sec 2.7.2):
   - Requirement: σ(r) = 1×10⁻⁴ for 5σ detection of r = 5×10⁻⁴
 
 Usage:
-    python scripts/validate_pico.py [--no-plots]
+    pixi run python scripts/validate_pico.py [--no-plots]
 """
 
 from __future__ import annotations
@@ -890,7 +890,7 @@ def plot_assumption_table(savefig):
 def print_header():
     print("=" * 72)
     print("PICO VALIDATION — arXiv:1902.10541")
-    print("Analytic forecast code: Errard et al. 2016 (JCAP 03, p.052)")
+    print("Analytic forecast code: Errard et al. 2016, JCAP 03, 052")
     print("=" * 72)
 
 

@@ -1,10 +1,10 @@
-"""make_hit_maps.py - generate per-channel L2 hit-map FITS files for BROOM.
+"""Generate per-channel L2 hit-map FITS files for BROOM.
 
 Writes one HEALPix FITS file per channel of the requested BROOM
 experiment, named `{prefix}_{channel_tag}.fits` to match BROOM's
 `path_hits_maps` convention. All channels share the same analytic
-L2 hit map (envelope model from `augr.hit_maps.l2_hit_map`); per-
-channel feedhorn offsets are not modeled in v1.
+L2 hit map (envelope model from `augr.hit_maps.l2_hit_map`);
+per-channel feedhorn offsets are not modeled.
 
 Usage:
     pixi run python scripts/make_hit_maps.py \\
