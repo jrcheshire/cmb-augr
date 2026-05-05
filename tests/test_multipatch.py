@@ -15,6 +15,7 @@ from augr.config import (
     FIDUCIAL_MOMENT,
     simple_probe,
 )
+from augr.crosslinks import yearavg_depth_1d
 from augr.fisher import FisherForecast
 from augr.foregrounds import GaussianForegroundModel, MomentExpansionModel
 from augr.multipatch import (
@@ -30,7 +31,6 @@ from augr.sky_patches import (
     _infer_lat_boundaries,
     default_3patch_model,
     default_4patch_model,
-    l2_scan_depth,
     patch_noise_weights,
     single_patch_model,
 )
@@ -73,29 +73,33 @@ class TestSkyPatch(unittest.TestCase):
 
 class TestScanStrategy(unittest.TestCase):
 
-    def test_poles_deeper_than_equator(self):
-        """Ecliptic poles should get more integration time.
+    def _depth_at_lat(self, ecl_lat_deg, spin=50.0, prec=45.0):
+        """Convenience wrapper: yearavg_depth_1d on ecliptic latitude (deg)."""
+        theta_ecl = np.deg2rad(90.0 - np.atleast_1d(ecl_lat_deg))
+        return float(np.array(yearavg_depth_1d(theta_ecl, spin, prec))[0])
 
-        With default alpha=50, beta=45: theta_min=5°, theta_max=95°.
-        Full-sky coverage with ~3× deeper at poles.
-        """
-        depth_pole = l2_scan_depth(np.array([85.0]))[0]
-        depth_eq = l2_scan_depth(np.array([5.0]))[0]
-        self.assertGreater(depth_pole, depth_eq)
+    def test_poles_deeper_than_equator(self):
+        """Pixels near the ecliptic pole get more integration time than
+        the equator under the LiteBIRD-like default scan."""
+        self.assertGreater(self._depth_at_lat(85.0),
+                           self._depth_at_lat(5.0))
 
     def test_symmetric(self):
-        """North and south ecliptic poles should get equal depth."""
-        d_north = l2_scan_depth(np.array([80.0]))[0]
-        d_south = l2_scan_depth(np.array([-80.0]))[0]
-        self.assertAlmostEqual(d_north, d_south, places=5)
+        """North and south ecliptic latitudes get equal depth (azimuthal
+        symmetry around the ecliptic pole)."""
+        self.assertAlmostEqual(self._depth_at_lat(80.0),
+                               self._depth_at_lat(-80.0), places=5)
 
     def test_zero_outside_range(self):
-        """Regions outside the scan cone should get zero depth."""
-        # With alpha=10, beta=20: theta_min=10°, theta_max=30°
-        # Ecliptic lat=89° → colatitude=1° < theta_min=10° → zero
-        depth = l2_scan_depth(np.array([89.0]), spin_angle_deg=10.0,
-                              precession_angle_deg=20.0)
-        self.assertEqual(depth[0], 0.0)
+        """Pixels outside the spherical-triangle support get zero depth.
+
+        With spin=10, prec=20: spin axis colatitude in [70, 110]; for
+        ecl_lat=89 (theta_ecl=1) the triangle bound requires
+        9 <= theta_S <= 11, which has empty intersection with the
+        precession band -> density = 0 by construction.
+        """
+        depth = self._depth_at_lat(89.0, spin=10.0, prec=20.0)
+        self.assertEqual(depth, 0.0)
 
 
 class TestLatBoundaries(unittest.TestCase):

@@ -104,11 +104,94 @@ import healpy as hp
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["h_k_map", "pack_cos_sin", "yearavg_h_k_1d"]
+__all__ = ["h_k_map", "pack_cos_sin", "yearavg_depth_1d", "yearavg_h_k_1d"]
 
 
 _ALLOWED_COORDS = ("G", "E", "C")
 _DEFAULT_N_QUAD = 200
+
+
+def _yearavg_quadrature_kernel(
+    theta_ecl: jnp.ndarray,
+    spin_rad: jnp.ndarray,
+    prec_rad: jnp.ndarray,
+    n_quad: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Chebyshev-substituted quadrature pieces for year-averaged scan integrals.
+
+    Computes the (theta_ecl, s)-shape arrays needed by both ``yearavg_h_k_1d``
+    (the spin coefficients) and ``yearavg_depth_1d`` (the k=0 / scan-depth
+    case). Both quantities reduce to a 1-D quadrature over the spin-axis
+    colatitude ``theta_S`` with a precession * spin Jacobian-product weight
+
+        w(theta_S) = sin(theta_S) / sqrt(D_prec * D_spin)
+
+    integrated over the support ``u = cos(theta_S) in [u_min, u_max]`` set
+    by the precession band intersected with the spherical-triangle bound.
+    The Chebyshev substitution ``u = u_m + u_a cos(s), s in (0, pi)``
+    absorbs the integrable 1/sqrt singularities at both endpoints into the
+    ``sin(s) du/ds`` factor.
+
+    Args:
+        theta_ecl: Ecliptic colatitude(s) in radians; jnp array.
+        spin_rad:  Boresight-to-spin-axis half-angle (Wallis convention)
+                   in radians.
+        prec_rad:  Spin-axis-to-antisun half-angle in radians.
+        n_quad:    Number of Chebyshev quadrature points (midpoint rule).
+
+    Returns:
+        u_a: ``(...,)`` half-width of the u-integration range
+            (``(u_max - u_min) / 2``).
+        sin_s: ``(n_quad,)`` Chebyshev ``sin(s)`` factors absorbing the
+            endpoint 1/sqrt singularities.
+        safe_sqrt: ``(..., n_quad)`` ``sqrt(D_prec * D_spin)`` floored at
+            1e-300 to guard against numerical underflow.
+        cos_A: ``(..., n_quad)`` cosine of the spherical-triangle vertex
+            angle at the boresight, clipped to [-1, 1] for arccos safety.
+        valid: ``(...,)`` bool mask; ``True`` where the support is non-
+            empty (``u_max > u_min``). Use to mask out unphysical inputs.
+    """
+    cos_te = jnp.cos(theta_ecl)
+    sin_te = jnp.sin(theta_ecl)
+    cos_b = jnp.cos(spin_rad)
+    sin_b = jnp.sin(spin_rad)
+    sin_a = jnp.sin(prec_rad)
+
+    # Support endpoints in u = cos(theta_S):
+    #   precession bound: theta_S in [pi/2 - prec, pi/2 + prec] -> u in [-sin_a, +sin_a]
+    #   triangle bound:   |theta_ecl - spin| <= theta_S <= theta_ecl + spin
+    #                     -> u in [cos(theta_ecl + spin), cos|theta_ecl - spin|]
+    u_alpha_lo = -sin_a
+    u_alpha_hi = sin_a
+    u_beta_lo = jnp.cos(theta_ecl + spin_rad)
+    u_beta_hi = jnp.cos(jnp.abs(theta_ecl - spin_rad))
+    u_min = jnp.maximum(u_alpha_lo, u_beta_lo)
+    u_max = jnp.minimum(u_alpha_hi, u_beta_hi)
+
+    u_m = 0.5 * (u_min + u_max)
+    u_a = 0.5 * (u_max - u_min)
+
+    # Midpoint sampling avoids exact s = 0, pi.
+    s = (jnp.arange(n_quad, dtype=jnp.float64) + 0.5) * jnp.pi / n_quad
+    sin_s = jnp.sin(s)
+
+    # Broadcast theta_ecl-shape to (..., n_quad) over the s axis.
+    u = u_m[..., None] + u_a[..., None] * jnp.cos(s)
+    sin_ts_sq = jnp.maximum(1.0 - u * u, 0.0)
+
+    cos_te_b = cos_te[..., None]
+    sin_te_b = sin_te[..., None]
+
+    D_prec = sin_a * sin_a - u * u
+    D_spin = sin_ts_sq * sin_b * sin_b - (cos_te_b - u * cos_b) ** 2
+
+    # cos A; clip protects arccos and the rare cos_te=0 / sin_te=0 limit.
+    cos_A = (u - cos_te_b * cos_b) / (sin_te_b * sin_b)
+    cos_A = jnp.clip(cos_A, -1.0, 1.0)
+
+    safe_sqrt = jnp.sqrt(jnp.maximum(D_prec * D_spin, 1e-300))
+    valid = u_max > u_min
+    return u_a, sin_s, safe_sqrt, cos_A, valid
 
 
 def yearavg_h_k_1d(
@@ -147,69 +230,82 @@ def yearavg_h_k_1d(
 
     spin_rad = jnp.radians(spin_angle_deg)
     prec_rad = jnp.radians(precession_angle_deg)
-
     theta_ecl = jnp.asarray(theta_ecl, dtype=jnp.float64)
 
-    cos_te = jnp.cos(theta_ecl)
-    sin_te = jnp.sin(theta_ecl)
-    cos_b = jnp.cos(spin_rad)
-    sin_b = jnp.sin(spin_rad)
-    sin_a = jnp.sin(prec_rad)
-
-    # Support endpoints in u = cos(theta_S):
-    #   precession bound: theta_S in [pi/2 - prec, pi/2 + prec] -> u in [-sin_a, +sin_a]
-    #   triangle bound:   |theta_ecl - spin| <= theta_S <= theta_ecl + spin
-    #                     -> u in [cos(theta_ecl + spin), cos|theta_ecl - spin|]
-    u_alpha_lo = -sin_a
-    u_alpha_hi = sin_a
-    u_beta_lo = jnp.cos(theta_ecl + spin_rad)
-    u_beta_hi = jnp.cos(jnp.abs(theta_ecl - spin_rad))
-    u_min = jnp.maximum(u_alpha_lo, u_beta_lo)
-    u_max = jnp.minimum(u_alpha_hi, u_beta_hi)
-
-    # Chebyshev sub: u = u_m + u_a cos(s), s in (0, pi). Both endpoint
-    # 1/sqrt singularities (whether from D_prec or D_spin) are absorbed
-    # into the sin(s) du/ds factor, leaving a smooth integrand in s.
-    u_m = 0.5 * (u_min + u_max)
-    u_a = 0.5 * (u_max - u_min)
-
-    # Midpoint sampling avoids exact s = 0, pi.
-    s = (jnp.arange(n_quad, dtype=jnp.float64) + 0.5) * jnp.pi / n_quad
-    sin_s = jnp.sin(s)
-
-    # Broadcast theta_ecl-shape to (..., n_quad) over the s axis.
-    u = u_m[..., None] + u_a[..., None] * jnp.cos(s)
-    sin_ts_sq = jnp.maximum(1.0 - u * u, 0.0)
-
-    cos_te_b = cos_te[..., None]
-    sin_te_b = sin_te[..., None]
-
-    D_prec = sin_a * sin_a - u * u
-    D_spin = sin_ts_sq * sin_b * sin_b - (cos_te_b - u * cos_b) ** 2
-
-    # cos A; clip protects arccos and the rare cos_te=0 / sin_te=0 limit.
-    cos_A = (u - cos_te_b * cos_b) / (sin_te_b * sin_b)
-    cos_A = jnp.clip(cos_A, -1.0, 1.0)
-    A = jnp.arccos(cos_A)
+    _, sin_s, safe_sqrt, cos_A, valid = _yearavg_quadrature_kernel(
+        theta_ecl, spin_rad, prec_rad, n_quad,
+    )
 
     # Numerator and denominator integrands. The leading factors that
-    # cancel between num and den (u_a, ds) are dropped. Floor on
-    # D_prec * D_spin guards against numerical underflow at the
-    # midpoints closest to the boundary; integrable singularities
-    # have already been absorbed by sin(s).
-    safe_sqrt = jnp.sqrt(jnp.maximum(D_prec * D_spin, 1e-300))
+    # cancel between num and den (u_a, ds) are dropped.
     den_int = sin_s / safe_sqrt
-    num_int = jnp.cos(k * A) * den_int
+    num_int = jnp.cos(k * jnp.arccos(cos_A)) * den_int
 
     avg_cos_kA = jnp.sum(num_int, axis=-1) / jnp.sum(den_int, axis=-1)
-
     h_k = ((1j) ** k) * avg_cos_kA
 
     # NaN out unphysical (empty-support) inputs.
-    valid = u_max > u_min
     h_k = jnp.where(valid, h_k, jnp.nan + 0j)
-
     return h_k.astype(jnp.complex128)
+
+
+def yearavg_depth_1d(
+    theta_ecl: jnp.ndarray,
+    spin_angle_deg: float = 50.0,
+    precession_angle_deg: float = 45.0,
+    n_quad: int = _DEFAULT_N_QUAD,
+) -> jnp.ndarray:
+    """Year-averaged ergodic scan depth at the given ecliptic colatitude.
+
+    The k=0 case of :func:`yearavg_h_k_1d`'s machinery: the time-per-
+    solid-angle density integrated over the spin-axis colatitude support
+    with the same precession * spin Jacobian factors. Used by
+    :func:`augr.hit_maps.l2_hit_map` (HEALPix hit maps for component-
+    separation simulators) and :func:`augr.sky_patches.patch_noise_weights`
+    (per-patch noise weighting in :class:`augr.multipatch.MultiPatchFisher`).
+
+    The density is supported on the spherical-triangle intersection of
+    the precession band ``theta_S in [pi/2 - prec, pi/2 + prec]`` with
+    the boresight cone ``theta_S in [|theta_ecl - spin|, theta_ecl + spin]``
+    in the spin-axis colatitude. Outside that intersection the function
+    returns 0 (unsurveyed pixels). The closed form has integrable
+    1/sqrt caustics at the support edges, regularized by the Chebyshev
+    quadrature.
+
+    JAX-differentiable with respect to ``theta_ecl``, ``spin_angle_deg``,
+    and ``precession_angle_deg``.
+
+    Args:
+        theta_ecl: Ecliptic colatitude(s) in radians (NOT degrees of
+            latitude). Use ``theta_ecl = pi/2 - radians(ecl_lat_deg)``
+            to convert.
+        spin_angle_deg: Boresight-to-spin-axis half-angle (Wallis
+            convention; equals beta in Takase / Falcons.jl).
+        precession_angle_deg: Spin-axis-to-antisun half-angle.
+        n_quad: Number of Chebyshev quadrature points. 200 converges to
+            ~1e-4 relative for the depth integral on standard configs.
+
+    Returns:
+        Real-valued ``jnp.float64`` array same shape as ``theta_ecl``.
+        Unnormalized (proportional to time per solid angle); rescale via
+        :func:`augr.hit_maps.mean_pixel_rescale_factor` for absolute
+        spec calibration. Pixels outside the support return 0 (in
+        contrast to ``yearavg_h_k_1d`` which returns NaN there).
+    """
+    spin_rad = jnp.radians(spin_angle_deg)
+    prec_rad = jnp.radians(precession_angle_deg)
+    theta_ecl = jnp.asarray(theta_ecl, dtype=jnp.float64)
+
+    u_a, sin_s, safe_sqrt, _, valid = _yearavg_quadrature_kernel(
+        theta_ecl, spin_rad, prec_rad, n_quad,
+    )
+
+    # Density = u_a * sum(sin_s / sqrt(D_prec * D_spin)) (the constant
+    # pi/n_quad quadrature step is dropped since the result is meant to
+    # be relative; see the function docstring).
+    den_int = sin_s / safe_sqrt
+    density = u_a * jnp.sum(den_int, axis=-1)
+    return jnp.where(valid, density, 0.0).astype(jnp.float64)
 
 
 def h_k_map(
