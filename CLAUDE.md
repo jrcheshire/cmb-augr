@@ -29,7 +29,12 @@ Knowing how the modules chain together matters more than any one file:
    `to_instrument(design)` derives a frozen `Instrument` (list of
    `Channel`s: frequency, NET, beam, n_det, efficiency).
    `combined_noise_nl(inst, ells, "BB")` yields the MV-combined noise
-   spectrum. Presets in `config.py`: `simple_probe`, `pico_like`,
+   spectrum. The default photon-noise calculation models only CMB +
+   telescope graybody emission (L2 baseline); per-band extra loading
+   (galactic foregrounds at high ν, atmosphere for ground/balloon
+   repurposings) attaches via the `extra_loading` callable on each
+   `BandSpec` and is threaded through `to_instrument` automatically.
+   Presets in `config.py`: `simple_probe`, `pico_like`,
    `litebird_like` (22 sub-array Channels per the LiteBIRD PTEP
    channel-specification table — each physical sub-array at a shared
    frequency is its own Channel so Fisher MV-combines them

@@ -186,6 +186,22 @@ The `telescope.py` module derives a complete `Instrument` from physical specific
 
 "Idealized" variants (`probe_idealized`, `flagship_idealized`) use PICO-like assumptions (f/1.42, eta=0.50, 95% observing efficiency) for direct comparison, while retaining the feedhorn pixel pitch.
 
+The default photon-noise calculation includes only the CMB and a single graybody telescope-emission term, appropriate for an L2 mission. Per-band extra optical loading (galactic foregrounds at high ν, atmospheric water/O2 emission for ground-based or balloon repurposings, etc.) can be folded in via the `extra_loading` callable on each `BandSpec`:
+
+```python
+from augr.telescope import BandSpec
+import numpy as np
+
+# Atmospheric loading: graybody at T_atm = 25 K (band-specific in practice)
+def atm_at_90(nu_hz):
+    h_over_k = 4.799e-11   # h / k_B in K·s
+    return 1.0 / (np.exp(h_over_k * nu_hz / 25.0) - 1.0)
+
+band_90 = BandSpec(nu_ghz=90.0, extra_loading=atm_at_90)
+```
+
+`to_instrument` threads each band's `extra_loading` through to `photon_noise_net`, so per-band atmospheric models attach naturally.
+
 ## Foreground models
 
 **Gaussian (BK15-style):** Dust modified blackbody + synchrotron power law, with amplitudes, spectral indices, ell-dependence slopes, dust-sync correlation, and dust frequency decorrelation. 9 free parameters.
