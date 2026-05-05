@@ -14,16 +14,19 @@ provide the name list for external bookkeeping.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 import jax.numpy as jnp
 
 from augr.units import (
-    dust_sed, sync_sed, sync_sed_curved,
-    dust_sed_deriv_beta, dust_sed_deriv_T,
-    sync_sed_deriv_beta, sync_sed_deriv_c,
+    dust_sed,
+    dust_sed_deriv_beta,
+    dust_sed_deriv_T,
+    sync_sed,
+    sync_sed_curved,
+    sync_sed_deriv_beta,
+    sync_sed_deriv_c,
 )
-
 
 # -----------------------------------------------------------------------
 # Protocol
@@ -78,7 +81,7 @@ class NullForegroundModel:
     unchanged.
     """
 
-    _PARAM_NAMES: list[str] = []
+    _PARAM_NAMES: ClassVar[list[str]] = []
 
     @property
     def parameter_names(self) -> list[str]:
@@ -136,7 +139,7 @@ class GaussianForegroundModel:
         Delta_dust  Dust frequency decorrelation strength (≥0)
     """
 
-    _PARAM_NAMES: list[str] = [
+    _PARAM_NAMES: ClassVar[list[str]] = [
         "A_dust", "beta_dust", "alpha_dust", "T_dust",
         "A_sync", "beta_sync", "alpha_sync",
         "epsilon", "Delta_dust",
@@ -290,7 +293,7 @@ class MomentExpansionModel:
         omega_s_betac   Sync β_s–c_s cross moment
     """
 
-    _PARAM_NAMES: list[str] = [
+    _PARAM_NAMES: ClassVar[list[str]] = [
         "A_dust", "beta_dust", "alpha_dust", "T_dust",
         "A_sync", "beta_sync", "alpha_sync",
         "epsilon", "Delta_dust",

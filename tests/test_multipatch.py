@@ -7,28 +7,34 @@ import jax.numpy as jnp
 import numpy as np
 
 from augr.config import (
-    DEFAULT_FIXED, DEFAULT_PRIORS,
-    DEFAULT_FIXED_MOMENT, DEFAULT_PRIORS_MOMENT,
-    FIDUCIAL_BK15, FIDUCIAL_MOMENT,
+    DEFAULT_FIXED,
+    DEFAULT_FIXED_MOMENT,
+    DEFAULT_PRIORS,
+    DEFAULT_PRIORS_MOMENT,
+    FIDUCIAL_BK15,
+    FIDUCIAL_MOMENT,
     simple_probe,
 )
-from augr.foregrounds import GaussianForegroundModel, MomentExpansionModel
 from augr.fisher import FisherForecast
-from augr.instrument import Instrument
-from augr.signal import SignalModel
-from augr.spectra import CMBSpectra
-from augr.sky_patches import (
-    SkyPatch, SkyModel,
-    single_patch_model, default_3patch_model, default_4patch_model,
-    l2_scan_depth, patch_noise_weights, _infer_lat_boundaries,
-)
+from augr.foregrounds import GaussianForegroundModel, MomentExpansionModel
 from augr.multipatch import (
     MultiPatchFisher,
-    instrument_for_patch, fiducial_for_patch,
     _is_per_patch,
+    fiducial_for_patch,
+    instrument_for_patch,
 )
-from augr.telescope import probe_design, to_instrument
-
+from augr.signal import SignalModel
+from augr.sky_patches import (
+    SkyModel,
+    SkyPatch,
+    _infer_lat_boundaries,
+    default_3patch_model,
+    default_4patch_model,
+    l2_scan_depth,
+    patch_noise_weights,
+    single_patch_model,
+)
+from augr.spectra import CMBSpectra
 
 # ---------------------------------------------------------------------------
 # Sky patches
@@ -134,7 +140,7 @@ class TestPatchNoiseWeights(unittest.TestCase):
             SkyPatch("c", 0.15, 1.0, 1.0),
         )
         weights = patch_noise_weights(patches)
-        total = sum(p.f_sky * w for p, w in zip(patches, weights))
+        total = sum(p.f_sky * w for p, w in zip(patches, weights, strict=False))
         expected = sum(p.f_sky for p in patches)
         self.assertAlmostEqual(total, expected, places=4)
 
@@ -190,7 +196,7 @@ class TestInstrumentForPatch(unittest.TestCase):
         patch = SkyPatch("test", 0.1, 1.0, 1.0, noise_weight=1.5)
         inst_p = instrument_for_patch(inst, patch, 0.7)
         expected_scale = math.sqrt(0.7 / (0.1 * 1.5))
-        for ch_orig, ch_new in zip(inst.channels, inst_p.channels):
+        for ch_orig, ch_new in zip(inst.channels, inst_p.channels, strict=False):
             self.assertAlmostEqual(
                 ch_new.net_per_detector,
                 ch_orig.net_per_detector * expected_scale,
@@ -200,7 +206,7 @@ class TestInstrumentForPatch(unittest.TestCase):
         inst = simple_probe()
         patch = SkyPatch("test", 0.2, 1.0, 1.0)
         inst_p = instrument_for_patch(inst, patch, 0.7)
-        for ch_orig, ch_new in zip(inst.channels, inst_p.channels):
+        for ch_orig, ch_new in zip(inst.channels, inst_p.channels, strict=False):
             self.assertEqual(ch_new.nu_ghz, ch_orig.nu_ghz)
             self.assertEqual(ch_new.n_detectors, ch_orig.n_detectors)
             self.assertAlmostEqual(ch_new.beam_fwhm_arcmin,
@@ -314,7 +320,7 @@ class TestMultiPatchFisher(unittest.TestCase):
         cls.fg_gauss = GaussianForegroundModel()
         cls.fid_gauss = {**FIDUCIAL_BK15, "A_lens": 0.27}
         cls.priors_gauss = dict(DEFAULT_PRIORS)
-        cls.fixed_gauss = list(DEFAULT_FIXED) + ["Delta_dust"]
+        cls.fixed_gauss = [*list(DEFAULT_FIXED), "Delta_dust"]
         cls.signal_kwargs = {"ell_max": 300, "delta_ell": 35}
 
     def test_single_patch_recovery(self):
@@ -404,7 +410,7 @@ class TestMultiPatchFisher(unittest.TestCase):
             signal_kwargs=self.signal_kwargs,
         )
         mpf_clean.compute()
-        sr_clean = mpf_clean.sigma("r")
+        mpf_clean.sigma("r")
 
         mpf_dusty = MultiPatchFisher(
             self.inst, self.fg_gauss, self.cmb, with_dusty,
@@ -553,7 +559,7 @@ class TestMultiPatchDelensedAndResidualModes(unittest.TestCase):
         mpf = MultiPatchFisher(
             self.inst, self.fg, self.cmb, sky, fid,
             priors=priors,
-            fixed_params=list(DEFAULT_FIXED) + ["Delta_dust"],
+            fixed_params=[*list(DEFAULT_FIXED), "Delta_dust"],
             signal_kwargs=signal_kwargs,
         )
         self.assertNotIn("A_lens", mpf._all_names)
@@ -576,7 +582,7 @@ class TestMultiPatchDelensedAndResidualModes(unittest.TestCase):
         mpf = MultiPatchFisher(
             self.inst, self.fg, self.cmb, sky, fid,
             priors=DEFAULT_PRIORS,
-            fixed_params=list(DEFAULT_FIXED) + ["Delta_dust"],
+            fixed_params=[*list(DEFAULT_FIXED), "Delta_dust"],
             signal_kwargs=signal_kwargs,
         )
         self.assertIn("A_res", mpf._all_names)

@@ -23,11 +23,10 @@ from itertools import combinations
 
 import jax.numpy as jnp
 
-from augr.instrument import Channel, Instrument
 from augr.fisher import FisherForecast
+from augr.instrument import Channel, Instrument
 from augr.signal import SignalModel
-from augr.sky_patches import SkyPatch, SkyModel
-
+from augr.sky_patches import SkyModel, SkyPatch
 
 # ---------------------------------------------------------------------------
 # Parameter sharing
@@ -184,7 +183,7 @@ class MultiPatchFisher:
 
         # Build combined parameter name list
         self._combined_names: list[str] = list(self._global_free)
-        for p_idx, patch in enumerate(sky_model.patches):
+        for _p_idx, patch in enumerate(sky_model.patches):
             for name in self._per_patch_free:
                 self._combined_names.append(f"{name}_{patch.name}")
 

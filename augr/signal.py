@@ -27,10 +27,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from augr.instrument import Instrument
 from augr.foregrounds import ForegroundModel
+from augr.instrument import Instrument
 from augr.spectra import CMBSpectra
-
 
 # -----------------------------------------------------------------------
 # Binning helpers (executed once at init, not during JAX tracing)
@@ -224,16 +223,16 @@ class SignalModel:
         self._fg_end = self._fg_start + n_fg
 
         if self._delensed:
-            base_names = ["r"] + list(foreground_model.parameter_names)
+            base_names = ["r", *list(foreground_model.parameter_names)]
         else:
-            base_names = ["r", "A_lens"] + list(foreground_model.parameter_names)
+            base_names = ["r", "A_lens", *list(foreground_model.parameter_names)]
 
         # Residual-template mode: optional additive post-CompSep residual
         # with amplitude A_res appended to the parameter vector.
         self._residual_template = residual_template_cl is not None
         if self._residual_template:
             self._a_res_idx = len(base_names)
-            self._param_names = base_names + ["A_res"]
+            self._param_names = [*base_names, "A_res"]
         else:
             self._a_res_idx = None
             self._param_names = base_names

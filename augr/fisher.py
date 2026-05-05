@@ -30,12 +30,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from augr.signal import SignalModel, flatten_params
 from augr.covariance import (
     bandpower_covariance_blocks,
     bandpower_covariance_blocks_from_noise,
 )
-from augr.instrument import Instrument, white_noise_power, ARCMIN_TO_RAD
+from augr.instrument import ARCMIN_TO_RAD, Instrument, white_noise_power
+from augr.signal import SignalModel, flatten_params
 
 
 @jax.jit

@@ -1,21 +1,19 @@
 """Tests for signal.py."""
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from augr.foregrounds import GaussianForegroundModel, NullForegroundModel
+from augr.instrument import Channel, Instrument, ScalarEfficiency
 from augr.signal import (
     SignalModel,
+    _build_bin_matrix,
+    _make_bin_edges,
     flatten_params,
     unflatten_params,
-    _make_bin_edges,
-    _build_bin_matrix,
 )
-from augr.instrument import Channel, Instrument, ScalarEfficiency
-from augr.foregrounds import GaussianForegroundModel, NullForegroundModel
 from augr.spectra import CMBSpectra
-
 
 # -----------------------------------------------------------------------
 # Fixtures
@@ -108,7 +106,7 @@ def test_bin_matrix_rows_normalized():
     """Each row of the bin matrix sums to 1."""
     ells = np.arange(20, 101, dtype=float)
     edges = _make_bin_edges(20, 100, 30, 35)
-    W, centers = _build_bin_matrix(ells, edges, "tophat")
+    W, _centers = _build_bin_matrix(ells, edges, "tophat")
     row_sums = jnp.sum(W, axis=1)
     assert jnp.allclose(row_sums, 1.0, atol=1e-6)
 
@@ -117,7 +115,7 @@ def test_bin_matrix_gaussian_rows_normalized():
     """Gaussian window rows also sum to 1."""
     ells = np.arange(20, 101, dtype=float)
     edges = _make_bin_edges(20, 100, 30, 35)
-    W, centers = _build_bin_matrix(ells, edges, "gaussian")
+    W, _centers = _build_bin_matrix(ells, edges, "gaussian")
     row_sums = jnp.sum(W, axis=1)
     assert jnp.allclose(row_sums, 1.0, atol=1e-6)
 
@@ -351,7 +349,7 @@ def test_a_res_appended_to_parameter_names(signal_model_with_template,
                                            fg_model):
     """Residual template appends A_res after the fg params."""
     names = signal_model_with_template.parameter_names
-    expected = ["r", "A_lens"] + list(fg_model.parameter_names) + ["A_res"]
+    expected = ["r", "A_lens", *list(fg_model.parameter_names), "A_res"]
     assert names == expected
 
 

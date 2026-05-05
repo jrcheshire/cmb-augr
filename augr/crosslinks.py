@@ -104,7 +104,7 @@ import healpy as hp
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["h_k_map", "yearavg_h_k_1d", "pack_cos_sin"]
+__all__ = ["h_k_map", "pack_cos_sin", "yearavg_h_k_1d"]
 
 
 _ALLOWED_COORDS = ("G", "E", "C")

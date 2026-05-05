@@ -5,19 +5,18 @@ import numpy as np
 import pytest
 
 from augr.instrument import (
-    ScalarEfficiency,
+    ARCMIN_TO_RAD,
+    L2_EFFICIENCY,
+    SECONDS_PER_YEAR,
     Channel,
     Instrument,
-    L2_EFFICIENCY,
-    white_noise_power,
+    ScalarEfficiency,
     beam_bl,
     deconvolve_noise_bb,
     noise_nl,
     noise_nl_matrix,
-    SECONDS_PER_YEAR,
-    ARCMIN_TO_RAD,
+    white_noise_power,
 )
-
 
 # -----------------------------------------------------------------------
 # ScalarEfficiency

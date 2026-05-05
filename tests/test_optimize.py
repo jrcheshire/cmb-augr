@@ -5,23 +5,27 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from augr.instrument import (
-    noise_nl, white_noise_power, noise_nl_continuous,
-    white_noise_power_continuous,
-)
+from augr.config import FIDUCIAL_BK15, simple_probe
 from augr.covariance import (
-    bandpower_covariance_blocks, bandpower_covariance_blocks_from_noise,
+    bandpower_covariance_blocks,
+    bandpower_covariance_blocks_from_noise,
 )
-from augr.telescope import count_pixels, count_pixels_continuous
-from augr.signal import SignalModel, flatten_params
 from augr.fisher import FisherForecast
 from augr.foregrounds import GaussianForegroundModel
-from augr.spectra import CMBSpectra
-from augr.config import simple_probe, FIDUCIAL_BK15
-from augr.optimize import (
-    make_optimization_context, sigma_r_from_channels, sigma_r_from_design,
+from augr.instrument import (
+    noise_nl,
+    noise_nl_continuous,
+    white_noise_power,
+    white_noise_power_continuous,
 )
-
+from augr.optimize import (
+    make_optimization_context,
+    sigma_r_from_channels,
+    sigma_r_from_design,
+)
+from augr.signal import SignalModel, flatten_params
+from augr.spectra import CMBSpectra
+from augr.telescope import count_pixels, count_pixels_continuous
 
 # -----------------------------------------------------------------------
 # Fixtures

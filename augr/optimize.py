@@ -38,11 +38,13 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-from augr.signal import SignalModel, flatten_params
-from augr.instrument import Instrument, noise_nl_continuous
 from augr.covariance import bandpower_covariance_blocks_from_noise
+from augr.instrument import Instrument, noise_nl_continuous
+from augr.signal import SignalModel, flatten_params
 from augr.telescope import (
-    beam_fwhm_arcmin, horn_diameter, count_pixels_continuous,
+    beam_fwhm_arcmin,
+    count_pixels_continuous,
+    horn_diameter,
 )
 
 
@@ -347,10 +349,7 @@ def sigma_r_from_design(
     beam_arr = jnp.stack(beam_list)
     net_arr = jnp.stack(net_list)
 
-    if jnp.ndim(eta_total) == 0:
-        eta_arr = jnp.full(n_det_arr.shape, eta_total)
-    else:
-        eta_arr = eta_total
+    eta_arr = jnp.full(n_det_arr.shape, eta_total) if jnp.ndim(eta_total) == 0 else eta_total
 
     return sigma_r_from_channels(
         n_det_arr, net_arr, beam_arr, eta_arr,

@@ -1,15 +1,14 @@
 """Tests for config.py."""
 
-import pytest
 from augr.config import (
-    FIDUCIAL_BK15,
+    DEFAULT_FIXED,
     DEFAULT_PRIORS,
     DEFAULT_PRIORS_POST_COMPSEP,
-    DEFAULT_FIXED,
-    simple_probe,
-    pico_like,
-    litebird_like,
+    FIDUCIAL_BK15,
     cleaned_map_instrument,
+    litebird_like,
+    pico_like,
+    simple_probe,
 )
 from augr.foregrounds import GaussianForegroundModel
 

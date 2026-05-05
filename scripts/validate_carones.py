@@ -36,7 +36,6 @@ from augr.foregrounds import NullForegroundModel
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
 
-
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------

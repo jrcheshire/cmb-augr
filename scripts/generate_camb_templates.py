@@ -23,8 +23,9 @@ non-pixi users can install it via the `camb` extra: `pip install -e ".[camb]"`.
 """
 
 import os
-import numpy as np
+
 import camb
+import numpy as np
 
 # Output to data/ relative to the repo root (parent of scripts/)
 OUTDIR = os.path.join(os.path.dirname(__file__), os.pardir, "data")

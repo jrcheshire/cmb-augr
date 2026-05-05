@@ -24,7 +24,6 @@ Downstream: pass the prefix to `broom_residual_template.py
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 import broom
@@ -33,7 +32,6 @@ import numpy as np
 from broom import Configs
 
 from augr.hit_maps import l2_hit_map
-
 
 BROOM_EXPERIMENTS_YAML = (
     Path(broom.__file__).parent / "utils" / "experiments.yaml"

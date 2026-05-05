@@ -10,9 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import healpy as hp
+import matplotlib
 import numpy as np
 from astropy.io import fits
-import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -87,7 +87,7 @@ def main() -> int:
     fig, axes = plt.subplots(len(paths), 1, figsize=(10, 5.0 * len(paths)))
     if len(paths) == 1:
         axes = [axes]
-    for ax, p in zip(axes, paths):
+    for ax, p in zip(axes, paths, strict=False):
         ax.imshow(imread(p))
         ax.set_axis_off()
     fig.suptitle(

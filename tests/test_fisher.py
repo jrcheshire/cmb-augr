@@ -5,11 +5,10 @@ import numpy as np
 import pytest
 
 from augr.fisher import FisherForecast
-from augr.signal import SignalModel, flatten_params
-from augr.instrument import Channel, Instrument, ScalarEfficiency, noise_nl
 from augr.foregrounds import GaussianForegroundModel
+from augr.instrument import Channel, Instrument, ScalarEfficiency, noise_nl
+from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
-
 
 # -----------------------------------------------------------------------
 # Fixtures

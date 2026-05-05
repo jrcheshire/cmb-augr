@@ -37,13 +37,12 @@ References:
 from __future__ import annotations
 
 from augr.instrument import (
-    Channel,
     GROUND_EFFICIENCY,
-    Instrument,
     L2_EFFICIENCY,
+    Channel,
+    Instrument,
     ScalarEfficiency,
 )
-
 
 # ---------------------------------------------------------------------------
 # Foreground fiducial parameters

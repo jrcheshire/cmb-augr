@@ -29,21 +29,25 @@ import sys
 import time
 from dataclasses import dataclass
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
-from augr.instrument import (
-    Channel, Instrument, ScalarEfficiency,
-    white_noise_power, noise_nl, ARCMIN_TO_RAD, SECONDS_PER_YEAR,
-)
-from augr.foregrounds import GaussianForegroundModel, MomentExpansionModel
-from augr.spectra import CMBSpectra
-from augr.signal import SignalModel
-from augr.fisher import FisherForecast
 from augr.config import FIDUCIAL_BK15, FIDUCIAL_MOMENT
+from augr.fisher import FisherForecast
+from augr.foregrounds import GaussianForegroundModel, MomentExpansionModel
+from augr.instrument import (
+    ARCMIN_TO_RAD,
+    SECONDS_PER_YEAR,
+    Channel,
+    Instrument,
+    ScalarEfficiency,
+    noise_nl,
+    white_noise_power,
+)
 from augr.multipatch import MultiPatchFisher
-from augr.sky_patches import SkyPatch, SkyModel
-
+from augr.signal import SignalModel
+from augr.sky_patches import SkyModel, SkyPatch
+from augr.spectra import CMBSpectra
 
 # =========================================================================
 # Section 1: Reference data from arXiv:1902.10541
@@ -284,7 +288,7 @@ def pico_sky_model(n_patches: int = 6) -> SkyModel:
             A_sync_scale=s,
             noise_weight=1.0,
         )
-        for i, (d, s) in enumerate(zip(dust_scales, sync_scales))
+        for i, (d, s) in enumerate(zip(dust_scales, sync_scales, strict=False))
     )
     return SkyModel(patches=patches,
                     description=f"PICO-like {n_patches}-patch, f_sky={PICO_FSKY}")
@@ -356,7 +360,7 @@ def run_single(case: Case) -> Result:
         # Fix all FG params at their fiducial values (do NOT zero them —
         # changing the fiducial changes the covariance and makes the
         # comparison unfair). Also fix A_lens.
-        fixed = list(fg_model.parameter_names) + ["A_lens"]
+        fixed = [*list(fg_model.parameter_names), "A_lens"]
         priors = {}
 
     # Build signal model
@@ -386,10 +390,7 @@ def run_single(case: Case) -> Result:
 
     if case.target_max is not None:
         passed_max = sigma_r < case.target_max
-        if passed is None:
-            passed = passed_max
-        else:
-            passed = passed and passed_max
+        passed = passed_max if passed is None else passed and passed_max
         if not passed_max:
             notes = f"EXCEEDS max {case.target_max:.1e}"
 
@@ -460,7 +461,7 @@ def make_plots(results: list[Result], outdir: str):
     import matplotlib
     matplotlib.use("Agg")
 
-    import matplotlib.pyplot as plt  # noqa: F811
+    import matplotlib.pyplot as plt
 
     os.makedirs(outdir, exist_ok=True)
 
@@ -577,9 +578,9 @@ def plot_sigma_r_comparison(results: list[Result], savefig):
 
 def plot_noise_spectrum(savefig):
     """Per-channel noise N_ℓ curves with PICO depth markers."""
-    import matplotlib.pyplot as plt
-    import matplotlib.colors as mcolors
     import matplotlib.cm as mcm
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
 
     inst = make_pico_from_depths(PICO_BASELINE_DEPTHS, PICO_FSKY)
     ells = np.arange(2, 301)
@@ -646,7 +647,7 @@ def _delens_worker(args):
         fixed = ["T_dust", "Delta_dust"]
         priors = {"beta_dust": 0.11, "beta_sync": 0.3}
     else:
-        fixed = list(fg_model.parameter_names) + ["A_lens"]
+        fixed = [*list(fg_model.parameter_names), "A_lens"]
         priors = {}
     inst = make_pico_from_depths(PICO_BASELINE_DEPTHS, PICO_FSKY)
     cmb = CMBSpectra()
@@ -673,7 +674,7 @@ def plot_delensing_sweep(savefig):
     # Build all jobs
     all_jobs = []
     job_map = {}  # (config_idx, A_idx) -> position in all_jobs
-    for ci, (label, marg_fg, fg_type, color, ls) in enumerate(configs):
+    for ci, (_label, marg_fg, fg_type, _color, _ls) in enumerate(configs):
         for ai, A_l in enumerate(A_lens_vals):
             job_map[(ci, ai)] = len(all_jobs)
             all_jobs.append((float(A_l), marg_fg, fg_type))
@@ -685,7 +686,7 @@ def plot_delensing_sweep(savefig):
 
     fig, ax = plt.subplots(figsize=(9, 6))
 
-    for ci, (label, marg_fg, fg_type, color, ls) in enumerate(configs):
+    for ci, (label, _marg_fg, _fg_type, color, ls) in enumerate(configs):
         sigmas = [all_sigmas[job_map[(ci, ai)]] for ai in range(len(A_lens_vals))]
         ax.semilogy(delens_fracs * 100, sigmas, color=color, linestyle=ls,
                      linewidth=2, label=label, marker="o", markersize=4)
@@ -723,6 +724,7 @@ def plot_reionization_bump(savefig):
     fixed binning, avoiding the ℓ_min-sweep bin-boundary artifacts.
     """
     import matplotlib.pyplot as plt
+
     from augr.covariance import bandpower_covariance_blocks
     from augr.fisher import flatten_params
 
@@ -833,7 +835,7 @@ def plot_reionization_bump(savefig):
     ax2.set_ylabel("% of total Fisher info on r", fontsize=12)
     ax2.set_title("Per-bin constraining power", fontsize=11)
     # Label the reionization bins
-    reion_pct = sum(f for c, f in zip(bin_centers, fisher_frac) if c < 20)
+    reion_pct = sum(f for c, f in zip(bin_centers, fisher_frac, strict=False) if c < 20)
     ax2.text(0.95, 0.95, f"ℓ < 20: {reion_pct:.0f}% of info",
              transform=ax2.transAxes, ha="right", va="top",
              fontsize=10, color="#E91E63", fontweight="bold")
@@ -960,7 +962,10 @@ class _Tee:
     """Write to both a file and the original stream."""
     def __init__(self, stream, path):
         self._stream = stream
-        self._file = open(path, "w")
+        # The file is closed via .close() at script exit; the stream-
+        # redirection lifetime spans the whole script so a `with` block
+        # isn't applicable here.
+        self._file = open(path, "w")  # noqa: SIM115
     def write(self, data):
         self._stream.write(data)
         self._file.write(data)
@@ -1054,7 +1059,7 @@ def main():
         "Moment, 3-patch",
         "Moment, 6-patch",
     ]
-    for label, (_, _, fg_type), sr in zip(labels, mp_jobs, mp_results):
+    for label, (_, _, fg_type), sr in zip(labels, mp_jobs, mp_results, strict=False):
         ref = g_73.sigma_r if fg_type == "gaussian" and g_73 else (
               m_73.sigma_r if fg_type == "moment" and m_73 else None)
         ratio_str = f"{sr/ref:.2f}×" if ref else "--"

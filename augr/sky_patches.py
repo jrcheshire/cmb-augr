@@ -17,7 +17,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -239,7 +238,7 @@ def patch_noise_weights(patches: tuple[SkyPatch, ...],
 
     # Normalize: Σ(f_sky_p × w_p) = f_sky_total
     f_sky_total = sum(p.f_sky for p in patches)
-    weighted = sum(p.f_sky * w for p, w in zip(patches, raw_weights))
+    weighted = sum(p.f_sky * w for p, w in zip(patches, raw_weights, strict=False))
     if weighted <= 0:
         return tuple(1.0 for _ in patches)
     scale = f_sky_total / weighted
@@ -294,7 +293,7 @@ def default_3patch_model(include_scan: bool = True) -> SkyModel:
         weights = patch_noise_weights(patches_no_scan)
         patches = tuple(
             SkyPatch(p.name, p.f_sky, p.A_dust_scale, p.A_sync_scale, w)
-            for p, w in zip(patches_no_scan, weights)
+            for p, w in zip(patches_no_scan, weights, strict=False)
         )
     else:
         patches = patches_no_scan
@@ -320,7 +319,7 @@ def default_4patch_model(include_scan: bool = True) -> SkyModel:
         weights = patch_noise_weights(patches_no_scan)
         patches = tuple(
             SkyPatch(p.name, p.f_sky, p.A_dust_scale, p.A_sync_scale, w)
-            for p, w in zip(patches_no_scan, weights)
+            for p, w in zip(patches_no_scan, weights, strict=False)
         )
     else:
         patches = patches_no_scan

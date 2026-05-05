@@ -9,8 +9,8 @@ from augr.telescope import (
     BandSpec,
     FocalPlaneSpec,
     PixelGroup,
-    ThermalSpec,
     TelescopeDesign,
+    ThermalSpec,
     beam_fwhm_arcmin,
     count_pixels,
     flagship_design,
@@ -21,7 +21,6 @@ from augr.telescope import (
     to_instrument,
 )
 from augr.units import H_PLANCK, K_BOLTZMANN
-
 
 # ---------------------------------------------------------------------------
 # Geometry functions
@@ -286,7 +285,8 @@ class TestDataStructures:
         threads it through to photon_noise_net so the resulting Channel
         has a higher NET than a sibling band without loading."""
         # Two-band probe with an extra-loading function on the 90 GHz band only
-        atm = lambda nu: 0.05 * np.ones_like(nu)
+        def atm(nu):
+            return 0.05 * np.ones_like(nu)
         b_loaded = BandSpec(90.0, extra_loading=atm)
         b_clean = BandSpec(90.0)
         assert b_loaded.extra_loading is atm
@@ -321,7 +321,7 @@ class TestDataStructures:
         assert len(pg.bands) == 2
 
     def test_pixelgroup_wrong_order_raises(self):
-        with pytest.raises(ValueError, match="bands\\[0\\].nu_ghz < bands\\[1\\]"):
+        with pytest.raises(ValueError, match=r"bands\[0\].nu_ghz < bands\[1\]"):
             PixelGroup(
                 bands=(BandSpec(150.0), BandSpec(90.0)),
                 area_fraction=0.5,
@@ -405,15 +405,15 @@ class TestToInstrument:
             ),
         )
         inst = to_instrument(design)
-        ch_30 = [ch for ch in inst.channels if ch.nu_ghz == 30.0][0]
-        ch_150 = [ch for ch in inst.channels if ch.nu_ghz == 150.0][0]
+        ch_30 = next(ch for ch in inst.channels if ch.nu_ghz == 30.0)
+        ch_150 = next(ch for ch in inst.channels if ch.nu_ghz == 150.0)
         assert ch_30.n_detectors < ch_150.n_detectors
         # Should scale roughly as (150/30)² = 25
         ratio = ch_150.n_detectors / ch_30.n_detectors
         assert 20.0 < ratio < 30.0
 
     def test_area_fractions_must_sum_to_one(self):
-        with pytest.raises(ValueError, match="sum to 1.0"):
+        with pytest.raises(ValueError, match=r"sum to 1\.0"):
             to_instrument(TelescopeDesign(
                 focal_plane=FocalPlaneSpec(1.5, 2.0, 0.4),
                 thermal=ThermalSpec(),
@@ -446,8 +446,8 @@ class TestToInstrument:
         probe_inst = to_instrument(probe_design())
         flagship_inst = to_instrument(flagship_design())
 
-        probe_150 = [ch for ch in probe_inst.channels if ch.nu_ghz == 150.0][0]
-        flagship_150 = [ch for ch in flagship_inst.channels if ch.nu_ghz == 150.0][0]
+        probe_150 = next(ch for ch in probe_inst.channels if ch.nu_ghz == 150.0)
+        flagship_150 = next(ch for ch in flagship_inst.channels if ch.nu_ghz == 150.0)
         assert flagship_150.n_detectors > probe_150.n_detectors
 
     def test_flagship_smaller_beams_than_probe(self):
@@ -455,8 +455,8 @@ class TestToInstrument:
         probe_inst = to_instrument(probe_design())
         flagship_inst = to_instrument(flagship_design())
 
-        probe_150 = [ch for ch in probe_inst.channels if ch.nu_ghz == 150.0][0]
-        flagship_150 = [ch for ch in flagship_inst.channels if ch.nu_ghz == 150.0][0]
+        probe_150 = next(ch for ch in probe_inst.channels if ch.nu_ghz == 150.0)
+        flagship_150 = next(ch for ch in flagship_inst.channels if ch.nu_ghz == 150.0)
         assert flagship_150.beam_fwhm_arcmin < probe_150.beam_fwhm_arcmin
         # Should be exactly half for same illumination factor
         ratio = probe_150.beam_fwhm_arcmin / flagship_150.beam_fwhm_arcmin

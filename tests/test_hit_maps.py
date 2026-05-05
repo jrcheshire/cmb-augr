@@ -101,13 +101,13 @@ class TestL2HitMap(unittest.TestCase):
         # Normalize identically to patch_noise_weights:
         #   sum(f_sky_p * w_p) = sum(f_sky_p)
         f_sky_total = sum(p.f_sky for p in patches)
-        weighted = sum(p.f_sky * w for p, w in zip(patches, raw_weights))
+        weighted = sum(p.f_sky * w for p, w in zip(patches, raw_weights, strict=False))
         scale = f_sky_total / weighted
         map_weights = tuple(w * scale for w in raw_weights)
 
         ref_weights = patch_noise_weights(patches)
 
-        for mw, rw in zip(map_weights, ref_weights):
+        for mw, rw in zip(map_weights, ref_weights, strict=False):
             np.testing.assert_allclose(mw, rw, rtol=0.05)
 
     def test_coord_invalid_raises(self):

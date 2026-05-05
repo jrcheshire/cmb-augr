@@ -35,8 +35,8 @@ sims; several minutes at nside=64.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
-import sys
 from pathlib import Path
 
 import broom
@@ -53,7 +53,6 @@ from broom import (
 from broom.routines import _format_nsim
 
 from augr.hit_maps import mean_pixel_rescale_factor
-
 
 # ---------------------------------------------------------------------------
 # Fixed configuration (constants; override via CLI where sensible)
@@ -103,7 +102,7 @@ def _needlet_merge_tag() -> str:
     """BROOM's needlet-band tag: e.g. 'j0j13_j14j16_j17j18_j19j39'."""
     bands = NEEDLET_BANDS
     return "_".join(
-        f"j{lo}j{hi - 1}" for lo, hi in zip(bands[:-1], bands[1:])
+        f"j{lo}j{hi - 1}" for lo, hi in itertools.pairwise(bands)
     )
 
 

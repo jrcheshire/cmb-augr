@@ -18,17 +18,18 @@ Usage:
 
 from pathlib import Path
 
-import numpy as np
 import matplotlib
+import numpy as np
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from augr.instrument import Channel, Instrument, ScalarEfficiency
-from augr.foregrounds import GaussianForegroundModel
-from augr.spectra import CMBSpectra
-from augr.signal import SignalModel
-from augr.fisher import FisherForecast
 from augr.config import FIDUCIAL_BK15
+from augr.fisher import FisherForecast
+from augr.foregrounds import GaussianForegroundModel
+from augr.instrument import Channel, Instrument, ScalarEfficiency
+from augr.signal import SignalModel
+from augr.spectra import CMBSpectra
 
 # ---------------------------------------------------------------------------
 # Survey parameters
@@ -107,7 +108,7 @@ FIDUCIAL_NO_FG["A_dust"] = 1e-6
 FIDUCIAL_NO_FG["A_sync"] = 1e-6
 FIDUCIAL_NO_FG["epsilon"] = 0.0
 FIDUCIAL_NO_FG["A_lens"] = 1.0
-FIXED_ALL = list(GaussianForegroundModel().parameter_names) + ["A_lens"]
+FIXED_ALL = [*list(GaussianForegroundModel().parameter_names), "A_lens"]
 
 # Gray curve priors (BK15 paper, arXiv:1810.05216)
 GRAY_PRIORS = {

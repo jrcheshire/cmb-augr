@@ -1,12 +1,20 @@
 """Tests for units.py."""
 
 import jax.numpy as jnp
-import pytest
+
 from augr.units import (
-    x_factor, rj_to_cmb, cmb_to_rj, dust_sed, sync_sed,
-    sync_sed_curved, dust_sed_deriv_beta, dust_sed_deriv_T,
-    sync_sed_deriv_beta, sync_sed_deriv_c,
-    NU_DUST_REF_GHZ, NU_SYNC_REF_GHZ,
+    NU_DUST_REF_GHZ,
+    NU_SYNC_REF_GHZ,
+    cmb_to_rj,
+    dust_sed,
+    dust_sed_deriv_beta,
+    dust_sed_deriv_T,
+    rj_to_cmb,
+    sync_sed,
+    sync_sed_curved,
+    sync_sed_deriv_beta,
+    sync_sed_deriv_c,
+    x_factor,
 )
 
 

@@ -31,6 +31,9 @@ jobs:
           pixi-version: v0.67.2
           cache: true
 
+      - name: Lint with ruff
+        run: pixi run lint
+
       - name: Run pytest (fast subset)
         if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.run_slow != 'true')
         run: pixi run test

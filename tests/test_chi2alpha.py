@@ -131,7 +131,7 @@ _MATLAB_ALPHA = [
 
 
 @pytest.mark.parametrize("case,expected",
-                         list(zip(_SPOT_CASES, _MATLAB_ALPHA)))
+                         list(zip(_SPOT_CASES, _MATLAB_ALPHA, strict=False)))
 def test_against_matlab_chi2alpha(case, expected):
     """Bit-exact match against BK's production chi2alpha.m at spot points."""
     actual = float(chi2alpha(**case))
@@ -142,20 +142,23 @@ def test_against_matlab_chi2alpha(case, expected):
 
 def test_grad_thetaref():
     """d alpha / d thetaref should be 1 (modulo wrap-discontinuity points)."""
-    f = lambda thetaref: chi2alpha(20.0, -55.0, 2.5, 37.0, 11.0, thetaref)
+    def f(thetaref):
+        return chi2alpha(20.0, -55.0, 2.5, 37.0, 11.0, thetaref)
     g = jax.grad(f)
     assert np.isclose(float(g(50.0)), 1.0, atol=1e-10)
 
 
 def test_grad_chi():
-    f = lambda chi: chi2alpha(20.0, -55.0, 2.5, 37.0, chi, 68.0)
+    def f(chi):
+        return chi2alpha(20.0, -55.0, 2.5, 37.0, chi, 68.0)
     g = jax.grad(f)
     assert np.isclose(float(g(11.0)), 1.0, atol=1e-10)
 
 
 def test_grad_dec_offaxis():
     """d alpha / d dec is non-trivial off-axis but should be finite."""
-    f = lambda dec: chi2alpha(20.0, dec, 2.5, 37.0, 11.0, 68.0)
+    def f(dec):
+        return chi2alpha(20.0, dec, 2.5, 37.0, 11.0, 68.0)
     g = jax.grad(f)
     val = float(g(-55.0))
     assert np.isfinite(val), f"got {val}"

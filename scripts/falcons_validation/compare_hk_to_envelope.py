@@ -28,11 +28,13 @@ import sys
 import warnings
 from pathlib import Path
 
-import numpy as np
 import healpy as hp
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
+import itertools
+
 import matplotlib.pyplot as plt
 from astropy.io import fits
 
@@ -121,19 +123,19 @@ def plot_panels(theta_ecl: np.ndarray, falcons: np.ndarray, pred: np.ndarray, ma
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
-        observed = (np.zeros_like(falcons.real, dtype=bool) | (np.abs(falcons) >= 0))  # always true; np.abs gives nan-safe
+        (np.zeros_like(falcons.real, dtype=bool) | (np.abs(falcons) >= 0))  # always true; np.abs gives nan-safe
         observed_full = np.isfinite(falcons.real)
         falcons_real_binmean = np.array([
             np.nanmean(falcons.real[observed_full & (theta_ecl >= lo) & (theta_ecl < hi)])
-            for lo, hi in zip(edges[:-1], edges[1:])
+            for lo, hi in itertools.pairwise(edges)
         ])
         falcons_abs_binmean = np.array([
             np.nanmean(np.abs(falcons)[observed_full & (theta_ecl >= lo) & (theta_ecl < hi)])
-            for lo, hi in zip(edges[:-1], edges[1:])
+            for lo, hi in itertools.pairwise(edges)
         ])
         pred_binmean = np.array([
             np.nanmean(pred[(theta_ecl >= lo) & (theta_ecl < hi)])
-            for lo, hi in zip(edges[:-1], edges[1:])
+            for lo, hi in itertools.pairwise(edges)
         ])
 
     ax_1d.plot(np.degrees(mids), falcons_real_binmean, "o-", ms=3, color="C0",
@@ -154,7 +156,7 @@ def plot_panels(theta_ecl: np.ndarray, falcons: np.ndarray, pred: np.ndarray, ma
 
     # --- bottom row: full-sky maps with sensible scales
     abs_falcons_max = float(np.nanpercentile(np.abs(falcons.real), 99))
-    abs_imag_max = float(np.nanpercentile(np.abs(falcons.imag), 99))
+    float(np.nanpercentile(np.abs(falcons.imag), 99))
 
     plt.axes(fig.add_subplot(gs[1, 0]))
     hp.mollview(falcons.real, hold=True, cmap="RdBu_r",
@@ -165,7 +167,7 @@ def plot_panels(theta_ecl: np.ndarray, falcons: np.ndarray, pred: np.ndarray, ma
     plt.axes(fig.add_subplot(gs[1, 1]))
     hp.mollview(pred_for_plot, hold=True, cmap="RdBu_r",
                 min=-abs_falcons_max, max=abs_falcons_max,
-                title=f"closed-form prediction (NaN = grey, formula band only)",
+                title="closed-form prediction (NaN = grey, formula band only)",
                 unit="", cbar=True, notext=True)
 
     # Diff only where prediction is defined; show actual signed error.
@@ -175,7 +177,7 @@ def plot_panels(theta_ecl: np.ndarray, falcons: np.ndarray, pred: np.ndarray, ma
     plt.axes(fig.add_subplot(gs[1, 2]))
     hp.mollview(diff_for_plot, hold=True, cmap="RdBu_r",
                 min=-diff_max, max=diff_max,
-                title=f"Re(h_falcons) − h_pred (where pred defined)",
+                title="Re(h_falcons) − h_pred (where pred defined)",
                 unit="", cbar=True, notext=True)
 
     fig.suptitle(

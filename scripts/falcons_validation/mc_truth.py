@@ -8,10 +8,12 @@ averages exp(-ikψ) per bin. Compares to (a) Falcons.jl output and (b) my
 """
 from __future__ import annotations
 
-import numpy as np
-import healpy as hp
-from astropy.io import fits
+import itertools
 from pathlib import Path
+
+import healpy as hp
+import numpy as np
+from astropy.io import fits
 
 NSIDE = 128
 ALPHA_F = np.radians(45.0)
@@ -99,7 +101,7 @@ def main():
     phi_s = rng.uniform(0, 2 * np.pi, N)
 
     print(f"Sampling N={N:,} (phi_p, phi_s) on T^2...")
-    theta_b, phi_b, psi = boresight_and_psi(phi_p, phi_s)
+    theta_b, _phi_b, psi = boresight_and_psi(phi_p, phi_s)
 
     # Bin by theta_b
     n_bins = 90
@@ -146,7 +148,7 @@ def main():
             hk = h[0].data + 1j * h[1].data
         binned = np.array([
             np.mean(hk[(pix_theta >= lo) & (pix_theta < hi)])
-            for lo, hi in zip(edges[:-1], edges[1:])
+            for lo, hi in itertools.pairwise(edges)
         ])
         h_falc[k] = binned
 

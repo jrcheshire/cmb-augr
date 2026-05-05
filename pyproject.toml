@@ -70,6 +70,7 @@ camb = "*"
 jupyterlab = "*"
 ipykernel = "*"
 ipython = "*"
+ruff = "*"
 
 [tool.pixi.pypi-dependencies]
 jax = ">=0.4"
@@ -87,3 +88,27 @@ validate-pico = "python scripts/validate_pico.py"
 validate-bk = "python scripts/validate_bk.py"
 nb = "jupyter lab notebooks/"
 ipy = "ipython"
+lint = "ruff check augr/ tests/ scripts/"
+format = "ruff format augr/ tests/ scripts/"
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "UP", "RUF", "NPY", "PD", "SIM"]
+# Allow non-snake_case variable names: physics code is unavoidably full of
+# Q, U, T, Cl, A_dust, T_dust, etc. -- single-letter or capital-letter
+# identifiers don't reflect Python style guidelines. Long lines are
+# tolerated in equation-heavy comments and docstrings. RUF001/002/003
+# would flag every Greek letter in the package as "ambiguous" (e.g.
+# ν, η, σ, ℓ, μK) -- we use Greek throughout for physics symbols by
+# design, so disable the family wholesale.
+ignore = [
+    "E501",
+    "N801", "N802", "N803", "N806",
+    "RUF001", "RUF002", "RUF003",
+]

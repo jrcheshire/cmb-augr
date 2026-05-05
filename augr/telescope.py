@@ -21,20 +21,18 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
 from augr.instrument import (
-    Channel,
     IDEALIZED_EFFICIENCY,
-    Instrument,
     L2_EFFICIENCY,
+    Channel,
+    Instrument,
     ScalarEfficiency,
 )
-from augr.units import H_PLANCK, K_BOLTZMANN, C_LIGHT, T_CMB
-
+from augr.units import C_LIGHT, H_PLANCK, K_BOLTZMANN, T_CMB
 
 # Conversion factor
 _RAD_TO_ARCMIN = 180.0 * 60.0 / math.pi
@@ -64,7 +62,7 @@ class BandSpec:
     """
     nu_ghz: float
     fractional_bandwidth: float = 0.25
-    extra_loading: Optional[Callable[[np.ndarray], np.ndarray]] = None
+    extra_loading: Callable[[np.ndarray], np.ndarray] | None = None
 
 
 @dataclass(frozen=True)
@@ -232,7 +230,7 @@ def count_pixels(fp_area: float, cell_area: float,
     if cell_area <= 0:
         raise ValueError(f"cell_area must be positive, got {cell_area}")
     n = packing_efficiency * fp_area / cell_area
-    return max(0, int(math.floor(n)))
+    return max(0, math.floor(n))
 
 
 def count_pixels_continuous(fp_area: jnp.ndarray, cell_area: jnp.ndarray,
@@ -254,7 +252,7 @@ def photon_noise_net_jax(
     emissivity: float = 0.01,
     eta_optical: float = 0.35,
     n_quad: int = 512,
-    extra_loading: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None,
+    extra_loading: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
 ) -> jnp.ndarray:
     """JAX-traceable photon-noise NET [μK√s].
 
@@ -310,7 +308,7 @@ def photon_noise_net(
     emissivity: float = 0.01,
     eta_optical: float = 0.35,
     n_quad: int = 512,
-    extra_loading: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    extra_loading: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> float:
     """Photon-noise-limited single-detector temperature NET [μK√s].
 

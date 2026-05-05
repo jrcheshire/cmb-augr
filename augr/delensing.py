@@ -36,8 +36,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 
 # Data file locations
@@ -242,7 +242,7 @@ def compute_n0_eb(Ls: jnp.ndarray,
 
     def scan_fn(integral_acc, l1):
         """Accumulate the N_0 integrand over l₁ values."""
-        l2, cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
+        l2, _cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
 
         # Response: f_EB = C_{l₁}^{EE,unl} × (L · l₁) × sin(2φ_{l₁,l₂})
         # L · l₁ = L * l₁ * cos(φ), where φ is the angle between L and l₁
@@ -295,7 +295,7 @@ def compute_n0_tb(Ls: jnp.ndarray,
     l1_vals = jnp.arange(l_min, l_max + 1, dtype=float)
 
     def scan_fn(acc, l1):
-        l2, cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
+        l2, _cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         f = _interp_at(cl_te_unl, l1) * Ldotl1 * sin2phi12
         denom = _interp_at(cl_tt_tot, l1) * _interp_at(cl_bb_tot, l2)
@@ -329,7 +329,7 @@ def compute_n0_tt(Ls: jnp.ndarray,
     l1_vals = jnp.arange(l_min, l_max + 1, dtype=float)
 
     def scan_fn(acc, l1):
-        l2, cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
+        l2, _cos2phi12, _sin2phi12 = _triangle_geometry(Ls, l1, phi)
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         # L · l₂: need cos of angle between L and l₂
         # l₂ = (L - l₁ cos φ, -l₁ sin φ), L = (L, 0)
@@ -368,7 +368,7 @@ def compute_n0_ee(Ls: jnp.ndarray,
     l1_vals = jnp.arange(l_min, l_max + 1, dtype=float)
 
     def scan_fn(acc, l1):
-        l2, cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
+        l2, cos2phi12, _sin2phi12 = _triangle_geometry(Ls, l1, phi)
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         Ldotl2 = Ls[:, None] * (Ls[:, None] - l1 * jnp.cos(phi[None, :]))
 
@@ -422,7 +422,7 @@ def compute_n0_te(Ls: jnp.ndarray,
     l1_vals = jnp.arange(l_min, l_max + 1, dtype=float)
 
     def scan_fn(acc, l1):
-        l2, cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
+        l2, cos2phi12, _sin2phi12 = _triangle_geometry(Ls, l1, phi)
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         Ldotl2 = Ls[:, None] * (Ls[:, None] - l1 * jnp.cos(phi[None, :]))
 

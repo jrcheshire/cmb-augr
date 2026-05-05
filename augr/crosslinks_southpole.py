@@ -39,11 +39,11 @@ import numpy as np
 from augr._chi2alpha import chi2alpha
 
 __all__ = [
-    "h_k_boresight",
-    "h_k_offaxis",
-    "h_k_map_southpole",
-    "southpole_field_mask",
     "BA_DECK_ANGLES_8",
+    "h_k_boresight",
+    "h_k_map_southpole",
+    "h_k_offaxis",
+    "southpole_field_mask",
 ]
 
 
@@ -202,7 +202,7 @@ def h_k_map_southpole(
         dec_grid_deg, deck_deg, weights=weights,
         r_deg=r_deg, theta_fp_deg=theta_fp_deg, chi_deg=chi_deg, k=k,
     )  # shape (n_dec,)
-    return jnp.broadcast_to(h_k_dec[None, :], (ra.shape[0],) + h_k_dec.shape).astype(jnp.complex128)
+    return jnp.broadcast_to(h_k_dec[None, :], (ra.shape[0], *h_k_dec.shape)).astype(jnp.complex128)
 
 
 def southpole_field_mask(

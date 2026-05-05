@@ -24,14 +24,18 @@ limit, where theta_S collapses to pi/2 and the integral is trivial.
 """
 from __future__ import annotations
 
-import numpy as np
-import healpy as hp
-from astropy.io import fits
-from pathlib import Path
-from scipy.integrate import quad
 import warnings
+from pathlib import Path
+
+import healpy as hp
 import matplotlib
+import numpy as np
+from astropy.io import fits
+from scipy.integrate import quad
+
 matplotlib.use("Agg")
+import itertools
+
 import matplotlib.pyplot as plt
 
 NSIDE = 128
@@ -126,11 +130,11 @@ def main():
             hk = h[0].data + 1j * h[1].data
         falcons_re[k] = np.array([
             np.mean(hk.real[(theta_ecl_pix >= lo) & (theta_ecl_pix < hi)])
-            for lo, hi in zip(edges[:-1], edges[1:])
+            for lo, hi in itertools.pairwise(edges)
         ])
         falcons_im[k] = np.array([
             np.mean(hk.imag[(theta_ecl_pix >= lo) & (theta_ecl_pix < hi)])
-            for lo, hi in zip(edges[:-1], edges[1:])
+            for lo, hi in itertools.pairwise(edges)
         ])
 
     # Stats: complex-valued comparison.
