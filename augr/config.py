@@ -4,9 +4,23 @@ config.py — Fiducial parameters, priors, and instrument presets.
 Fiducial foreground parameters match the BK15 maximum-likelihood values
 (Buza 2019 thesis, Sec. 6.3.2; BICEP2/Keck Array 2018, arXiv:1810.05216).
 
-Instrument presets are approximate representations of published experiments
-for comparison and scaling studies. Channel-level numbers are drawn from
-published sensitivity tables; efficiencies are physically motivated defaults.
+Two flavors of instrument preset live in the package, and it's worth
+knowing which is which:
+
+  - **Published-numbers presets** (this module): hand-coded ``Channel``
+    tables drawn directly from each experiment's published sensitivity
+    figures. ``pico_like``, ``litebird_like``, ``so_like``,
+    ``cmbs4_like``, and ``cleaned_map_instrument`` reproduce specific
+    public forecasts and have no physics-derived counterpart.
+    ``simple_probe`` is a small hand-tuned demo / smoke-test fixture.
+
+  - **Physics-derived designs** (``augr.telescope``): aperture, f/#,
+    focal plane geometry → ``TelescopeDesign`` →
+    ``to_instrument()`` derives NETs from ``photon_noise_net`` and
+    detector counts from feedhorn packing. ``probe_design`` /
+    ``flagship_design`` (and their ``_idealized`` variants) are the
+    starting points for design-study work where you want to vary
+    optics rather than channel-level numbers.
 
 References:
     PICO: Hanany et al. 2019 (arXiv:1902.10541), Table 4-1
@@ -92,44 +106,26 @@ DEFAULT_FIXED_MOMENT: list[str] = ["T_dust"]
 # ---------------------------------------------------------------------------
 # Instrument presets
 # ---------------------------------------------------------------------------
-#
-# TODO(cleanup, preset overlap with telescope.py):
-# Two families of "probe-class space mission" presets exist in parallel
-# and don't talk to each other:
-#
-#   - This module's ``simple_probe()``: hand-tuned 6-band Instrument
-#     with explicit (NET, beam, n_det) per channel. Loosely PICO-like
-#     at reduced channel count.
-#   - ``telescope.probe_design()``: physics-based TelescopeDesign
-#     (1.5 m, f/2, 0.4 m focal plane, 6 bands in 3 dichroic pairs)
-#     that goes through ``to_instrument()`` to derive NETs from
-#     photon_noise_net + detector counts from feedhorn packing. Has
-#     ``probe_idealized()`` / ``flagship_design()`` / ``flagship_idealized()``
-#     siblings for optics-comparison forecasts.
-#
-# They cover different band layouts and use different methodologies,
-# so they aren't strictly redundant -- but a user seeing both is
-# justifiably confused about which to use. The right resolution is
-# probably:
-#   (a) Keep the published-numbers presets here (``pico_like``,
-#       ``litebird_like``, ``so_like``, ``cmbs4_like``,
-#       ``cleaned_map_instrument``) -- these reproduce specific public
-#       forecasts and don't have a physics-derived counterpart.
-#   (b) Move ``simple_probe`` either out (let users get a probe via
-#       ``to_instrument(probe_design())``) or down-rank it to a clearly-
-#       labeled "smoke-test fixture" (small, hand-tuned for fast tests,
-#       not meant as a representative forecast).
-#   (c) Document the divide in this module's header: "physics-derived
-#       designs live in telescope.py; published-numbers presets live
-#       here".
-# ---------------------------------------------------------------------------
 
 def simple_probe() -> Instrument:
-    """Minimal 6-band space probe for quick tests and debugging.
+    """Hand-tuned 6-band space probe; demo / smoke-test fixture.
 
     Covers the foreground minimum (150 GHz) plus two dust and two sync
-    channels and one cross-check band. Sensitivity levels are loosely
-    PICO-like at reduced channel count.
+    channels and one cross-check band, with NETs / beams / detector
+    counts loosely PICO-like at reduced channel count. Used throughout
+    ``tests/`` and the introductory cells of ``notebooks/quickstart.ipynb``
+    as a small, fast Instrument that doesn't depend on any optics calc.
+
+    Despite the name, this is *not* a physics-derived probe-class design.
+    For that, build an Instrument from a ``TelescopeDesign``::
+
+        from augr.telescope import probe_design, to_instrument
+        inst = to_instrument(probe_design())
+
+    which goes through ``photon_noise_net`` and feedhorn packing. The two
+    paths are not interchangeable: ``simple_probe`` is a fixture with
+    fixed numbers, ``probe_design`` is a starting point for design-study
+    work where you want to vary aperture, f/#, focal plane size, etc.
     """
     eff = L2_EFFICIENCY
     channels = (
