@@ -4,6 +4,7 @@ import pytest
 from augr.config import (
     FIDUCIAL_BK15,
     DEFAULT_PRIORS,
+    DEFAULT_PRIORS_POST_COMPSEP,
     DEFAULT_FIXED,
     simple_probe,
     pico_like,
@@ -31,9 +32,19 @@ def test_fiducial_a_res_unity():
 
 
 def test_default_priors_keys():
+    """DEFAULT_PRIORS covers the multifrequency-FG nuisance amplitudes
+    (beta_dust, beta_sync). A_res lives in DEFAULT_PRIORS_POST_COMPSEP
+    instead, so vanilla forecasts don't carry an irrelevant prior."""
     assert "beta_dust" in DEFAULT_PRIORS
     assert "beta_sync" in DEFAULT_PRIORS
-    assert "A_res" in DEFAULT_PRIORS
+    assert "A_res" not in DEFAULT_PRIORS
+
+
+def test_default_priors_post_compsep():
+    """Post-CompSep priors carry only the residual-template amplitude.
+    Compose with DEFAULT_PRIORS for forecasts that mix component
+    separation with a multifrequency FG model."""
+    assert DEFAULT_PRIORS_POST_COMPSEP == {"A_res": 0.3}
 
 
 def test_default_fixed():

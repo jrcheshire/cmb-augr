@@ -75,15 +75,34 @@ FIDUCIAL_BK15: dict[str, float] = {
 DEFAULT_PRIORS: dict[str, float] = {
     "beta_dust":  0.11,   # Planck Collab 2016 (A&A 594, A10; arXiv:1502.01588)
     "beta_sync":  0.3,    # WMAP/Planck synchrotron index uncertainty
-    "A_res":      0.3,    # residual-template amplitude, placeholder
-                          # (Carones 2025, arXiv:2510.20785 uses a flat
-                          # prior; 0.3 is a conservative Gaussian default
-                          # for Fisher use. Remove from the priors dict
-                          # to reproduce Carones.)
 }
 
 # Parameters commonly held fixed (not varied in Fisher matrix)
 DEFAULT_FIXED: list[str] = ["T_dust"]
+
+
+# ---------------------------------------------------------------------------
+# Post-component-separation priors
+# ---------------------------------------------------------------------------
+#
+# Used together with NullForegroundModel + SignalModel(residual_template_cl=...)
+# for forecasts that consume the output of an external component-separation
+# pipeline (NILC/GNILC via BROOM, etc.). Keep separate from DEFAULT_PRIORS
+# because A_res is only a meaningful parameter when a residual template is
+# attached -- otherwise it's silently ignored and just adds noise to the
+# prior dict for vanilla forecasts.
+#
+# Compose with the multifrequency priors when running a post-CompSep forecast
+# that still uses an FG model (e.g. residual contamination on top of a
+# multi-frequency cleaning step):
+#
+#     priors = {**DEFAULT_PRIORS, **DEFAULT_PRIORS_POST_COMPSEP}
+
+DEFAULT_PRIORS_POST_COMPSEP: dict[str, float] = {
+    "A_res":      0.3,    # residual-template amplitude, conservative Gaussian.
+                          # Carones 2025 (arXiv:2510.20785) uses a flat prior;
+                          # drop A_res from the dict to reproduce Carones.
+}
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +124,6 @@ FIDUCIAL_MOMENT: dict[str, float] = {
 DEFAULT_PRIORS_MOMENT: dict[str, float] = {
     "beta_dust":  0.11,
     "beta_sync":  0.3,
-    "A_res":      0.3,   # see note in DEFAULT_PRIORS
 }
 
 DEFAULT_FIXED_MOMENT: list[str] = ["T_dust"]
