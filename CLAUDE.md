@@ -223,7 +223,8 @@ of augr's built-in multifrequency FG model), two scripts live under
 
 - `broom_residual_template.py` — BROOM driver. Runs NILC + GNILC +
   `estimate_residuals` + per-sim `anafast` across an MC loop, applies
-  the Carones 2025 Eq. 3.7 noise debiasing, and writes three
+  the Carones 2025 (arXiv:2510.20785) Eq. 3.7 noise debiasing, and
+  writes three
   `(n_bins, 2)` npy pairs (ell_center, C_ell^BB) to
   `data/broom_outputs/`: `{tag}_nl_bb.npy` (post-NILC noise),
   `{tag}_tres_bb.npy` (debiased residual template), `{tag}_fgds_bb.npy`

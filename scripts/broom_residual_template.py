@@ -1,13 +1,18 @@
 """Produce MC-averaged post-NILC noise and Eq. 3.7 residual-template
 spectra via the BROOM pipeline, ready for consumption by augr.
 
+References:
+    Carones 2025 (arXiv:2510.20785) -- the residual-template / Eq. 3.7
+        noise-debiasing methodology this driver implements.
+    Carones et al. 2026 (arXiv:2604.14088) -- the BROOM package itself.
+
 Pipeline (per simulation):
     get_input_data -> component_separation (NILC + GNILC)
                    -> estimate_residuals (GNILC maps through NILC weights)
                    -> _compute_spectra (anafast + mask)
 
-After the MC loop, the per-realization Cls are averaged and the Carones 2025
-Eq. 3.7 debiasing is applied:
+After the MC loop, the per-realization Cls are averaged and the Carones
+2025 (arXiv:2510.20785) Eq. 3.7 debiasing is applied:
 
     C_ell^{f,res} = <C_ell^{f_tilde,res}> - <C_ell^{n_tilde}>
 
@@ -61,10 +66,10 @@ FOREGROUND_MODELS = ("d1", "s1")
 EXPERIMENT = "LiteBIRD_PTEP"
 MASK_TYPE_DEFAULT = "GAL60"
 
-# Carones 2025 ran two PySM combinations (Sec. 3.1): a simpler d1s1 and
-# a more complex d10s5 (3D MKD dust + S-PASS-rescaled synchrotron). Both
-# values appear in Carones Table 1 -- useful comparison points across the
-# foreground-complexity axis.
+# Carones 2025 (arXiv:2510.20785) ran two PySM combinations (Sec. 3.1):
+# a simpler d1s1 and a more complex d10s5 (3D MKD dust + S-PASS-rescaled
+# synchrotron). Both values appear in Carones Table 1 -- useful
+# comparison points across the foreground-complexity axis.
 _FG_MODEL_MAP: dict[str, tuple[str, str]] = {
     "d1s1": ("d1", "s1"),
     "d10s5": ("d10", "s5"),
