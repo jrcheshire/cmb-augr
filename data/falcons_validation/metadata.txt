@@ -1,0 +1,13 @@
+# Falcons.jl h_k validation run
+nside           = 128
+duration_sec    = 31536000
+sampling_rate   = 1.0
+alpha_deg       = 45.0  (Falcons/Takase: precession opening, anti-sun to spin axis)
+beta_deg        = 50.0  (Falcons/Takase: spin opening, spin axis to boresight)
+prec_period_min = 192.348
+spin_period_min = 20.0
+spin_ns         = [1, 2, 4]
+coord           = E (ecliptic)
+convention      = h(n,m,psi,phi) = exp(-i (n*psi + m*phi))
+hwp_off         = true (m=0 only)
+ordering        = RING (Healpix.jl default for ang2pixRing)

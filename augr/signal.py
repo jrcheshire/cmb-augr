@@ -27,14 +27,56 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from augr.instrument import Instrument
 from augr.foregrounds import ForegroundModel
+from augr.instrument import Instrument
 from augr.spectra import CMBSpectra
-
 
 # -----------------------------------------------------------------------
 # Binning helpers (executed once at init, not during JAX tracing)
 # -----------------------------------------------------------------------
+#
+# TODO(future-direction, measured BPWFs):
+# The current binning is a synthetic top-hat / gaussian average over
+# contiguous integer (lo, hi) bin ranges. Real-world bandpower window
+# functions (BICEP/Keck releases, NaMaster output, anything from
+# bk-jax) are continuous functions of ell with mask-mode coupling,
+# beam smoothing, apodization, and transfer-function corrections
+# already baked in -- and they typically overlap between adjacent
+# bins. Three coordinated extension points to support consuming them:
+#
+# 1. SignalModel.__init__: add a ``bandpower_window`` kwarg that takes
+#    a (n_bins, n_ells) matrix directly and bypasses _make_bin_edges /
+#    _build_bin_matrix. ``bin_matrix`` is already a public typed
+#    property and ``data_vector`` just does W @ cl_total, so the
+#    forward path needs no changes; ``bin_centers`` derives from
+#    Σ ell W_b(ell) / Σ W_b(ell), and ``bin_edges`` becomes None (or
+#    derived as the FWHM support of each row).
+#
+# 2. covariance.py: generalize the Knox mode count. The current
+#    _nu_b(bin_edges, f_sky) computes f_sky × Σ_{ell ∈ bin} (2ell+1);
+#    the BPWF-aware version is Σ_ell W_b(ell)^2 (2ell+1) f_sky for the
+#    diagonal mode count, with off-diagonal coupling
+#    Σ_ell W_b(ell) W_{b'}(ell) (2ell+1) f_sky once BPWFs aren't
+#    disjoint top-hats. The bandpower covariance is no longer
+#    block-diagonal in bins -- a real change to the code path, not
+#    just a constructor swap.
+#
+# 3. Per-spectrum BPWFs: BICEP/Keck-style BPWFs are computed per
+#    cross-spectrum (i, j), not shared across frequencies. The current
+#    code applies one ``bin_matrix`` to every spectrum; the
+#    generalization is a (n_bins, n_ells, n_pairs) tensor with W[i, j]
+#    applied to spectrum (i, j).
+#
+# Sibling contract: BPWFs released by analysis pipelines almost
+# always have the beam baked in, so the noise spectrum that goes
+# alongside them should be beam-deconvolved (already a documented
+# invariant: see ``external_noise_bb`` on FisherForecast). Supplying
+# a measured BPWF without ``external_noise_bb`` is probably an error
+# and should raise.
+#
+# Motivating use case: linking augr's Fisher forecast to bk-jax's
+# real-data bandpower outputs (~/bicepkeck/bk-jax/), so we can run
+# the same forecast machinery on BK24 / BK28 bandpowers.
 
 def _make_bin_edges(ell_min: int,
                     ell_max: int,
@@ -181,16 +223,16 @@ class SignalModel:
         self._fg_end = self._fg_start + n_fg
 
         if self._delensed:
-            base_names = ["r"] + list(foreground_model.parameter_names)
+            base_names = ["r", *list(foreground_model.parameter_names)]
         else:
-            base_names = ["r", "A_lens"] + list(foreground_model.parameter_names)
+            base_names = ["r", "A_lens", *list(foreground_model.parameter_names)]
 
         # Residual-template mode: optional additive post-CompSep residual
         # with amplitude A_res appended to the parameter vector.
         self._residual_template = residual_template_cl is not None
         if self._residual_template:
             self._a_res_idx = len(base_names)
-            self._param_names = base_names + ["A_res"]
+            self._param_names = [*base_names, "A_res"]
         else:
             self._a_res_idx = None
             self._param_names = base_names

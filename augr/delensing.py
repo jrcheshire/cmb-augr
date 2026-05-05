@@ -25,7 +25,8 @@ Key references:
   - Hu & Okamoto (2002), astro-ph/0111606 — flat-sky QE formalism
   - Okamoto & Hu (2003), astro-ph/0301031 — full-sky QE formalism
   - Smith et al. (2012), 1010.0048 — residual BB, iterative delensing
-  - Trendafilova et al. (2023), 2312.02954 — CLASS_delens iteration
+  - Trendafilova, Hotinli & Meyers (2024), JCAP 06, 017; arXiv:2312.02954
+    — CLASS_delens iterative procedure
 
 All spectra in C_ell convention [μK²] for CMB, dimensionless for φφ.
 """
@@ -35,8 +36,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 
 # Data file locations
@@ -241,7 +242,7 @@ def compute_n0_eb(Ls: jnp.ndarray,
 
     def scan_fn(integral_acc, l1):
         """Accumulate the N_0 integrand over l₁ values."""
-        l2, cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
+        l2, _cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
 
         # Response: f_EB = C_{l₁}^{EE,unl} × (L · l₁) × sin(2φ_{l₁,l₂})
         # L · l₁ = L * l₁ * cos(φ), where φ is the angle between L and l₁
@@ -294,7 +295,7 @@ def compute_n0_tb(Ls: jnp.ndarray,
     l1_vals = jnp.arange(l_min, l_max + 1, dtype=float)
 
     def scan_fn(acc, l1):
-        l2, cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
+        l2, _cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         f = _interp_at(cl_te_unl, l1) * Ldotl1 * sin2phi12
         denom = _interp_at(cl_tt_tot, l1) * _interp_at(cl_bb_tot, l2)
@@ -328,7 +329,7 @@ def compute_n0_tt(Ls: jnp.ndarray,
     l1_vals = jnp.arange(l_min, l_max + 1, dtype=float)
 
     def scan_fn(acc, l1):
-        l2, cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
+        l2, _cos2phi12, _sin2phi12 = _triangle_geometry(Ls, l1, phi)
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         # L · l₂: need cos of angle between L and l₂
         # l₂ = (L - l₁ cos φ, -l₁ sin φ), L = (L, 0)
@@ -367,7 +368,7 @@ def compute_n0_ee(Ls: jnp.ndarray,
     l1_vals = jnp.arange(l_min, l_max + 1, dtype=float)
 
     def scan_fn(acc, l1):
-        l2, cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
+        l2, cos2phi12, _sin2phi12 = _triangle_geometry(Ls, l1, phi)
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         Ldotl2 = Ls[:, None] * (Ls[:, None] - l1 * jnp.cos(phi[None, :]))
 
@@ -421,7 +422,7 @@ def compute_n0_te(Ls: jnp.ndarray,
     l1_vals = jnp.arange(l_min, l_max + 1, dtype=float)
 
     def scan_fn(acc, l1):
-        l2, cos2phi12, sin2phi12 = _triangle_geometry(Ls, l1, phi)
+        l2, cos2phi12, _sin2phi12 = _triangle_geometry(Ls, l1, phi)
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         Ldotl2 = Ls[:, None] * (Ls[:, None] - l1 * jnp.cos(phi[None, :]))
 
@@ -1135,7 +1136,7 @@ def iterate_delensing(spectra: LensingSpectra,
     the reduced BB can be fed back into the QE to get a better φ estimate,
     and so on. Converges in 3-5 iterations for typical space experiments.
 
-    Procedure (CLASS_delens-inspired, Trendafilova et al. 2023):
+    Procedure (CLASS_delens-inspired, Trendafilova, Hotinli & Meyers 2024):
       1. Start with C_l^{BB,tot} = C_l^{BB,lensed} + N_l^{BB}
       2. Compute MV N_0(L) using current C_l^{BB,tot} in EB/TB filters
       3. Compute residual C_l^{BB,res} via lensing kernel × Wiener filter

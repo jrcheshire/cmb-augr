@@ -2,14 +2,15 @@
 
 import math
 
+import numpy as np
 import pytest
 
 from augr.telescope import (
     BandSpec,
     FocalPlaneSpec,
     PixelGroup,
-    ThermalSpec,
     TelescopeDesign,
+    ThermalSpec,
     beam_fwhm_arcmin,
     count_pixels,
     flagship_design,
@@ -19,7 +20,7 @@ from augr.telescope import (
     probe_design,
     to_instrument,
 )
-
+from augr.units import H_PLANCK, K_BOLTZMANN
 
 # ---------------------------------------------------------------------------
 # Geometry functions
@@ -203,6 +204,68 @@ class TestPhotonNoiseNet:
             net = photon_noise_net(nu)
             assert net > 0, f"NET at {nu} GHz = {net}"
 
+    def test_extra_loading_none_is_baseline(self):
+        """``extra_loading=None`` reproduces the prior no-extra-loading result.
+
+        Regression-proof against accidentally short-circuiting the default
+        path through the new code branch.
+        """
+        net_default = photon_noise_net(150.0)
+        net_none = photon_noise_net(150.0, extra_loading=None)
+        assert net_default == net_none
+
+    def test_extra_loading_zero_callable_is_baseline(self):
+        """A callable that returns zero occupation matches the default."""
+        net_default = photon_noise_net(150.0)
+        net_zero = photon_noise_net(
+            150.0,
+            extra_loading=lambda nu: np.zeros_like(nu),
+        )
+        # Both go through the same arithmetic; result must be identical.
+        assert abs(net_zero - net_default) < 1e-12
+
+    def test_extra_loading_monotonic(self):
+        """Increasing the extra-loading occupation must increase NET."""
+        nets = [
+            photon_noise_net(
+                150.0,
+                extra_loading=lambda nu, A=A: A * np.ones_like(nu),
+            )
+            for A in [0.0, 0.01, 0.05, 0.10]
+        ]
+        for i in range(len(nets) - 1):
+            assert nets[i + 1] > nets[i], (
+                f"NET non-monotonic in extra_loading: {nets}"
+            )
+
+    def test_extra_loading_per_band_independence(self):
+        """A loading function applied at one band is independent of others.
+
+        Important for the per-band atmospheric-loading use case: feeding
+        a different ``extra_loading`` callable per BandSpec must not
+        couple bands through any shared state.
+        """
+        # Two different per-band loading functions
+        def atm_at_90(nu):
+            # Effective T ≈ 25 K graybody, evaluated as occupation number
+            return 1.0 / (np.exp(H_PLANCK * nu / (K_BOLTZMANN * 25.0)) - 1.0)
+
+        def atm_at_150(nu):
+            # Hotter band → larger occupation
+            return 1.0 / (np.exp(H_PLANCK * nu / (K_BOLTZMANN * 40.0)) - 1.0)
+
+        net_90_with = photon_noise_net(90.0, extra_loading=atm_at_90)
+        net_90_without = photon_noise_net(90.0)
+        net_150_with = photon_noise_net(150.0, extra_loading=atm_at_150)
+        net_150_without = photon_noise_net(150.0)
+
+        # Each band increases its NET vs the no-loading baseline.
+        assert net_90_with > net_90_without
+        assert net_150_with > net_150_without
+        # Reusing the same band call without extra_loading still gives the
+        # baseline (no leakage between calls via mutable state).
+        assert photon_noise_net(90.0) == net_90_without
+
 
 # ---------------------------------------------------------------------------
 # Data structure validation
@@ -215,6 +278,36 @@ class TestDataStructures:
         b = BandSpec(150.0)
         assert b.nu_ghz == 150.0
         assert b.fractional_bandwidth == 0.25
+        assert b.extra_loading is None
+
+    def test_bandspec_with_extra_loading(self):
+        """BandSpec accepts a callable extra_loading; to_instrument
+        threads it through to photon_noise_net so the resulting Channel
+        has a higher NET than a sibling band without loading."""
+        # Two-band probe with an extra-loading function on the 90 GHz band only
+        def atm(nu):
+            return 0.05 * np.ones_like(nu)
+        b_loaded = BandSpec(90.0, extra_loading=atm)
+        b_clean = BandSpec(90.0)
+        assert b_loaded.extra_loading is atm
+        assert b_clean.extra_loading is None
+
+        # Build matched single-band probes -- only difference is the loading
+        design_loaded = TelescopeDesign(
+            focal_plane=FocalPlaneSpec(aperture_m=1.5, f_number=2.0,
+                                       fp_diameter_m=0.4),
+            thermal=ThermalSpec(),
+            pixel_groups=(PixelGroup(bands=(b_loaded,), area_fraction=1.0),),
+        )
+        design_clean = TelescopeDesign(
+            focal_plane=FocalPlaneSpec(aperture_m=1.5, f_number=2.0,
+                                       fp_diameter_m=0.4),
+            thermal=ThermalSpec(),
+            pixel_groups=(PixelGroup(bands=(b_clean,), area_fraction=1.0),),
+        )
+        net_loaded = to_instrument(design_loaded).channels[0].net_per_detector
+        net_clean = to_instrument(design_clean).channels[0].net_per_detector
+        assert net_loaded > net_clean
 
     def test_pixelgroup_single_band(self):
         pg = PixelGroup(bands=(BandSpec(150.0),), area_fraction=0.5)
@@ -228,7 +321,7 @@ class TestDataStructures:
         assert len(pg.bands) == 2
 
     def test_pixelgroup_wrong_order_raises(self):
-        with pytest.raises(ValueError, match="bands\\[0\\].nu_ghz < bands\\[1\\]"):
+        with pytest.raises(ValueError, match=r"bands\[0\].nu_ghz < bands\[1\]"):
             PixelGroup(
                 bands=(BandSpec(150.0), BandSpec(90.0)),
                 area_fraction=0.5,
@@ -312,15 +405,15 @@ class TestToInstrument:
             ),
         )
         inst = to_instrument(design)
-        ch_30 = [ch for ch in inst.channels if ch.nu_ghz == 30.0][0]
-        ch_150 = [ch for ch in inst.channels if ch.nu_ghz == 150.0][0]
+        ch_30 = next(ch for ch in inst.channels if ch.nu_ghz == 30.0)
+        ch_150 = next(ch for ch in inst.channels if ch.nu_ghz == 150.0)
         assert ch_30.n_detectors < ch_150.n_detectors
         # Should scale roughly as (150/30)² = 25
         ratio = ch_150.n_detectors / ch_30.n_detectors
         assert 20.0 < ratio < 30.0
 
     def test_area_fractions_must_sum_to_one(self):
-        with pytest.raises(ValueError, match="sum to 1.0"):
+        with pytest.raises(ValueError, match=r"sum to 1\.0"):
             to_instrument(TelescopeDesign(
                 focal_plane=FocalPlaneSpec(1.5, 2.0, 0.4),
                 thermal=ThermalSpec(),
@@ -353,8 +446,8 @@ class TestToInstrument:
         probe_inst = to_instrument(probe_design())
         flagship_inst = to_instrument(flagship_design())
 
-        probe_150 = [ch for ch in probe_inst.channels if ch.nu_ghz == 150.0][0]
-        flagship_150 = [ch for ch in flagship_inst.channels if ch.nu_ghz == 150.0][0]
+        probe_150 = next(ch for ch in probe_inst.channels if ch.nu_ghz == 150.0)
+        flagship_150 = next(ch for ch in flagship_inst.channels if ch.nu_ghz == 150.0)
         assert flagship_150.n_detectors > probe_150.n_detectors
 
     def test_flagship_smaller_beams_than_probe(self):
@@ -362,8 +455,8 @@ class TestToInstrument:
         probe_inst = to_instrument(probe_design())
         flagship_inst = to_instrument(flagship_design())
 
-        probe_150 = [ch for ch in probe_inst.channels if ch.nu_ghz == 150.0][0]
-        flagship_150 = [ch for ch in flagship_inst.channels if ch.nu_ghz == 150.0][0]
+        probe_150 = next(ch for ch in probe_inst.channels if ch.nu_ghz == 150.0)
+        flagship_150 = next(ch for ch in flagship_inst.channels if ch.nu_ghz == 150.0)
         assert flagship_150.beam_fwhm_arcmin < probe_150.beam_fwhm_arcmin
         # Should be exactly half for same illumination factor
         ratio = probe_150.beam_fwhm_arcmin / flagship_150.beam_fwhm_arcmin

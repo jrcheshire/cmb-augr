@@ -5,8 +5,8 @@ shown as a shaded arc. A representative diurnal circle (dec=-55 deg,
 elevation=55 deg) is highlighted, with a boresight star and a deck-angle
 rotation arc at the boresight.
 
-Run from the augr conda env:
-    conda run -n augr python 01_geometry_diagram.py
+Run from the augr pixi env:
+    pixi run python scripts/southpole_derivation/01_geometry_diagram.py
 """
 from __future__ import annotations
 

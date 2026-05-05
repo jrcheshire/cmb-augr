@@ -13,8 +13,9 @@ All spectra in μK² (C_ell, not D_ell).
 from __future__ import annotations
 
 import os
-import numpy as np
+
 import jax.numpy as jnp
+import numpy as np
 
 # Default data file locations (relative to this file)
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -105,7 +106,7 @@ class CMBSpectra:
                            omch2: float = 0.120,
                            tau: float = 0.054,
                            As: float = 2.1e-9,
-                           ns: float = 0.965) -> "CMBSpectra":
+                           ns: float = 0.965) -> CMBSpectra:
         """Generate templates using CAMB and write to output_dir.
 
         Requires camb to be installed. For standard use, the precomputed

@@ -5,28 +5,32 @@ import numpy as np
 import pytest
 
 from augr.instrument import (
-    ScalarEfficiency,
+    ARCMIN_TO_RAD,
+    L2_EFFICIENCY,
+    SECONDS_PER_YEAR,
     Channel,
     Instrument,
-    white_noise_power,
+    ScalarEfficiency,
     beam_bl,
     deconvolve_noise_bb,
     noise_nl,
     noise_nl_matrix,
-    SECONDS_PER_YEAR,
-    ARCMIN_TO_RAD,
+    white_noise_power,
 )
-
 
 # -----------------------------------------------------------------------
 # ScalarEfficiency
 # -----------------------------------------------------------------------
 
-def test_efficiency_default_product():
-    """Default efficiency ≈ 0.85^3 × 0.95^2 ≈ 0.554."""
+def test_efficiency_default_matches_l2():
+    """Empty-arg ``ScalarEfficiency()`` must match the public ``L2_EFFICIENCY``
+    preset, so a ``Channel`` constructed without explicit ``efficiency=``
+    silently picks up the documented L2 baseline rather than a different,
+    looser set of factors."""
     eff = ScalarEfficiency()
-    expected = 0.85 * 0.85 * 0.85 * 0.95 * 0.95
+    expected = 0.85 * 0.85 * 0.90 * 0.97 * 0.95   # L2 preset, eta_total = 0.711
     assert abs(eff.total - expected) < 1e-6
+    assert eff == L2_EFFICIENCY
 
 
 def test_efficiency_all_ones():

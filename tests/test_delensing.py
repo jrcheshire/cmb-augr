@@ -4,25 +4,20 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from augr.config import simple_probe
 from augr.delensing import (
-    LensingSpectra,
-    load_lensing_spectra,
     _gl_nodes,
-    _triangle_geometry,
     _interp_at,
+    _triangle_geometry,
     compute_n0_eb,
-    compute_n0_tt,
-    compute_n0_ee,
-    compute_n0_te,
-    compute_n0_tb,
     compute_n0_mv,
-    lensing_kernel,
-    residual_cl_bb,
+    compute_n0_tt,
     iterate_delensing,
+    lensing_kernel,
+    load_lensing_spectra,
+    residual_cl_bb,
 )
 from augr.instrument import combined_noise_nl
-from augr.config import simple_probe
-
 
 # -----------------------------------------------------------------------
 # Fixtures
@@ -87,12 +82,12 @@ class TestLensingSpectra:
 class TestHelpers:
     def test_gl_nodes_sum(self):
         """GL weights should sum to 2π."""
-        phi, w = _gl_nodes(64)
+        _phi, w = _gl_nodes(64)
         assert abs(float(jnp.sum(w)) - 2.0 * np.pi) < 1e-10
 
     def test_gl_nodes_range(self):
         """GL nodes should be in [0, 2π]."""
-        phi, w = _gl_nodes(128)
+        phi, _w = _gl_nodes(128)
         assert float(phi.min()) >= 0.0
         assert float(phi.max()) <= 2.0 * np.pi
 
@@ -100,7 +95,7 @@ class TestHelpers:
         """When φ=0 (l₁ parallel to L), l₂ = |L - l₁|."""
         L = jnp.array([100.0, 200.0])
         phi = jnp.array([0.0])
-        l2, cos2, sin2 = _triangle_geometry(L, 50.0, phi)
+        l2, _cos2, _sin2 = _triangle_geometry(L, 50.0, phi)
         np.testing.assert_allclose(l2[:, 0], [50.0, 150.0], atol=1e-10)
 
     def test_interp_out_of_range(self):
@@ -283,8 +278,9 @@ class TestIterativeDelensing:
 class TestWigner3j:
     def test_000_closed_form(self):
         """(l1 l2 L; 0 0 0) closed form matches pywigxjpf."""
-        from augr.wigner import wigner3j_000
         import pywigxjpf
+
+        from augr.wigner import wigner3j_000
         pywigxjpf.wig_table_init(2 * 3000, 9)
         pywigxjpf.wig_temp_init(2 * 3000)
 
@@ -301,8 +297,9 @@ class TestWigner3j:
 
     def test_scalar_recursion(self):
         """Backward SG recursion matches pywigxjpf for (j1,j2,j;2,-2,0)."""
-        from augr.wigner import wigner3j_recurse
         import pywigxjpf
+
+        from augr.wigner import wigner3j_recurse
         pywigxjpf.wig_table_init(2 * 3000, 9)
         pywigxjpf.wig_temp_init(2 * 3000)
 
@@ -335,8 +332,9 @@ class TestWigner3j:
 
     def test_physical_coupling(self):
         """Physical coupling (l1,l2,L;2,0,-2) = (-1)^s × (l1,L,l2;2,-2,0)."""
-        from augr.wigner import wigner3j_vectorized
         import pywigxjpf
+
+        from augr.wigner import wigner3j_vectorized
         pywigxjpf.wig_table_init(2 * 3000, 9)
         pywigxjpf.wig_temp_init(2 * 3000)
 
@@ -380,7 +378,7 @@ class TestFullSkyKernel:
         K = lensing_kernel(ls, Ls, spectra, l_max=2000, fullsky=True)
         cl_pp = jnp.array([float(spectra.cl_pp[int(L)]) for L in Ls])
         cl_bb_full = K @ cl_pp
-        cl_bb_camb = jnp.array([float(spectra.cl_bb_len[int(l)]) for l in ls])
+        cl_bb_camb = jnp.array([float(spectra.cl_bb_len[int(ell)]) for ell in ls])
         ratio = cl_bb_full / cl_bb_camb
         np.testing.assert_allclose(ratio, 1.0, atol=0.015)
 
@@ -430,9 +428,9 @@ class TestFullSkyIteration:
 class TestSignalModelIntegration:
     def test_delensed_mode_no_alens(self, spectra, noise):
         """In delensed mode, A_lens is not a parameter."""
-        from augr.spectra import CMBSpectra
         from augr.foregrounds import GaussianForegroundModel
         from augr.signal import SignalModel
+        from augr.spectra import CMBSpectra
 
         result = iterate_delensing(
             spectra, noise["tt"], noise["ee"], noise["bb"],
@@ -452,10 +450,10 @@ class TestSignalModelIntegration:
 
     def test_delensed_data_vector_shape(self, spectra, noise):
         """Data vector and Jacobian have correct shapes in delensed mode."""
-        from augr.spectra import CMBSpectra
+        from augr.config import FIDUCIAL_BK15
         from augr.foregrounds import GaussianForegroundModel
         from augr.signal import SignalModel, flatten_params
-        from augr.config import FIDUCIAL_BK15
+        from augr.spectra import CMBSpectra
 
         result = iterate_delensing(
             spectra, noise["tt"], noise["ee"], noise["bb"],

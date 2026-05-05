@@ -51,3 +51,64 @@ testpaths = ["tests"]
 markers = [
     "slow: tests that take O(minutes) — full-sky Wigner 3j delensing iterations and 200k-sample Monte Carlo crosschecks. Excluded from default CI; run with `pytest -m slow` or unfiltered.",
 ]
+
+# ---------------------------------------------------------------------------
+# pixi
+# ---------------------------------------------------------------------------
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[tool.pixi.dependencies]
+python = ">=3.12"
+numpy = ">=1.24"
+scipy = ">=1.10"
+matplotlib = ">=3.7"
+healpy = ">=1.16"
+pytest = ">=7.0"
+camb = "*"
+jupyterlab = "*"
+ipykernel = "*"
+ipython = "*"
+ruff = "*"
+
+[tool.pixi.pypi-dependencies]
+jax = ">=0.4"
+jaxlib = ">=0.4"
+pywigxjpf = "*"
+cmbroom = "*"
+pyyaml = "*"
+cmb-augr = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+test = "pytest tests/ -v -m 'not slow'"
+test-slow = "pytest tests/ -v -m slow"
+test-all = "pytest tests/ -v"
+validate-pico = "python scripts/validate_pico.py"
+validate-bk = "python scripts/validate_bk.py"
+nb = "jupyter lab notebooks/"
+ipy = "ipython"
+lint = "ruff check augr/ tests/ scripts/"
+format = "ruff format augr/ tests/ scripts/"
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "UP", "RUF", "NPY", "PD", "SIM"]
+# Allow non-snake_case variable names: physics code is unavoidably full of
+# Q, U, T, Cl, A_dust, T_dust, etc. -- single-letter or capital-letter
+# identifiers don't reflect Python style guidelines. Long lines are
+# tolerated in equation-heavy comments and docstrings. RUF001/002/003
+# would flag every Greek letter in the package as "ambiguous" (e.g.
+# ν, η, σ, ℓ, μK) -- we use Greek throughout for physics symbols by
+# design, so disable the family wholesale.
+ignore = [
+    "E501",
+    "N801", "N802", "N803", "N806",
+    "RUF001", "RUF002", "RUF003",
+]

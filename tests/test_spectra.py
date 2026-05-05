@@ -3,6 +3,7 @@
 import jax.numpy as jnp
 import numpy as np
 import pytest
+
 from augr.spectra import CMBSpectra
 
 
@@ -58,8 +59,8 @@ def test_lensing_peak_ell(spectra):
 
 def test_tensor_reion_bump(spectra):
     """Tensor BB reionization bump (ell < 15) exceeds recombination peak for r=1."""
-    ells_low = jnp.arange(2, 15)
-    ells_high = jnp.arange(50, 120)
+    jnp.arange(2, 15)
+    jnp.arange(50, 120)
     cl_tensor = spectra.cl_tensor_r1(jnp.arange(2, 301))
     reion = float(cl_tensor[:13].max())   # ell 2..14
     recomb = float(cl_tensor[48:118].max())  # ell 50..119
@@ -80,7 +81,6 @@ def test_interpolation_at_integer_ells(spectra):
     ells = jnp.array([50.0, 100.0, 150.0])
     cl_lens_interp = spectra.cl_lensing(ells)
     # Load raw data to cross-check
-    import numpy as np
     raw = np.loadtxt("data/camb_lens_nobb.dat", comments="#")
     for i, ell in enumerate([50, 100, 150]):
         raw_val = raw[raw[:, 0] == ell, 1][0]

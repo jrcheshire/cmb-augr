@@ -1,0 +1,10 @@
+# Falcons.jl h_k validation, Planck-like params
+alpha_deg       = 7.5  (Falcons/Takase: precession opening)
+beta_deg        = 85.0  (Falcons/Takase: spin opening)
+prec_period_min = 262980.0
+spin_period_min = 1.0
+nside           = 128
+duration_sec    = 94608000
+sampling_rate   = 1.0
+spin_ns         = [1, 2, 4]
+coord           = E (ecliptic)

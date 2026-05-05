@@ -15,8 +15,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import jax.numpy as jnp
 import numpy as np
 
+from augr.crosslinks import yearavg_depth_1d
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -75,64 +77,25 @@ class SkyModel:
 # ---------------------------------------------------------------------------
 # L2 scan strategy model
 # ---------------------------------------------------------------------------
+# Per-patch noise-weight machinery for symmetric galactic-latitude
+# patch decompositions. The underlying scan-depth density comes from
+# ``augr.crosslinks.yearavg_depth_1d`` (the rigorous year-averaged
+# ergodic form, k=0 case of the spin-coefficient closed form).
+#
+# Limitation: the ``patch_noise_weights`` / ``_infer_lat_boundaries``
+# / ``_galactic_to_ecliptic_lat`` helpers below bake in the assumption
+# that patches are symmetric galactic-latitude bands ordered cleanest-
+# first. The Fisher math in ``augr.multipatch`` does not require this --
+# it only consumes per-patch (f_sky, A_dust_scale, A_sync_scale,
+# noise_weight) tuples -- but the convenience helper here breaks for
+# custom masks (BICEP-field-style RA/dec patches, fuzzy apodized Planck
+# masks, ecliptic-aligned patches, deep-field-within-survey). Users
+# with custom footprints can construct ``SkyPatch`` instances with
+# ``noise_weight`` set explicitly, bypassing this helper.
 
 # Galactic-ecliptic tilt: ecliptic pole is at galactic latitude ~30°,
 # or equivalently the ecliptic plane is tilted ~60° from the galactic plane.
 _ECLIPTIC_GALACTIC_TILT_DEG = 60.19
-
-
-def l2_scan_depth(ecliptic_lat_deg: np.ndarray,
-                  spin_angle_deg: float = 50.0,
-                  precession_angle_deg: float = 45.0,
-                  ) -> np.ndarray:
-    """Relative integration time per pixel for an L2 spinning satellite.
-
-    The scan strategy has the spin axis precessing around the Sun-Earth
-    line (anti-sun direction) at angle beta from that axis.  The telescope
-    boresight is at angle alpha from the spin axis.
-
-    The boresight traces a cone of half-angle alpha around the spin axis.
-    As the spin axis precesses, the boresight sweeps out bands of the sky.
-    Pixels near the ecliptic poles (where multiple scan circles overlap)
-    get more integration time than the ecliptic equator.
-
-    Defaults: alpha=50°, beta=45° gives full-sky coverage (theta_min=5°,
-    theta_max=95°) with ~3× deeper coverage at the ecliptic poles vs
-    the equator.  These are typical of LiteBIRD-like scan strategies.
-
-    Analytic model:
-        Time per unit ecliptic latitude band ~ 1/sin(theta) where theta
-        is the colatitude from the ecliptic pole, within the observable
-        range [|beta - alpha|, beta + alpha].
-
-    Args:
-        ecliptic_lat_deg:   Ecliptic latitude(s) in degrees, [-90, 90].
-        spin_angle_deg:     Boresight angle from spin axis (alpha), degrees.
-        precession_angle_deg: Spin axis angle from anti-sun direction (beta).
-
-    Returns:
-        Relative integration time per pixel (not normalized).
-        Higher values = deeper coverage.
-    """
-    beta = np.radians(precession_angle_deg)
-    alpha = np.radians(spin_angle_deg)
-    lat = np.radians(np.asarray(ecliptic_lat_deg, dtype=float))
-    theta = np.pi / 2.0 - np.abs(lat)  # colatitude from ecliptic pole
-
-    # Observable range of colatitudes from the precession axis
-    theta_min = max(abs(beta - alpha), 1e-6)
-    theta_max = min(beta + alpha, np.pi - 1e-6)
-
-    # Time density ~ 1/sin(theta) within observable range
-    # The 1/sin comes from the scan circle spending more time per solid
-    # angle at small theta (near the poles).
-    eps = 1e-10  # avoid float boundary issues
-    depth = np.where(
-        (theta >= theta_min - eps) & (theta <= theta_max + eps),
-        1.0 / np.maximum(np.sin(theta), 1e-6),
-        0.0,
-    )
-    return depth
 
 
 def _galactic_to_ecliptic_lat(gal_lat_deg: float) -> np.ndarray:
@@ -164,8 +127,9 @@ def patch_noise_weights(patches: tuple[SkyPatch, ...],
     """Compute per-patch noise weights from the L2 scan strategy.
 
     For each patch (defined by galactic latitude range), average the
-    scan depth over the patch area, accounting for the ecliptic-galactic
-    tilt.
+    rigorous year-averaged scan-depth density (from
+    :func:`augr.crosslinks.yearavg_depth_1d`) over the patch area,
+    accounting for the ecliptic-galactic tilt.
 
     Returns normalized weights satisfying Σ(f_sky_p × w_p) = Σ(f_sky_p).
     """
@@ -179,19 +143,26 @@ def patch_noise_weights(patches: tuple[SkyPatch, ...],
         b_samples = np.linspace(b_lo, b_hi, n_lat_samples)
         depths = []
         for b in b_samples:
-            # For each galactic latitude, get ecliptic latitudes around ring
+            # For each galactic latitude, get ecliptic latitudes around
+            # ring; convert to ecliptic colatitude (theta_ecl) for the
+            # rigorous depth call.
             ecl_lats = _galactic_to_ecliptic_lat(b)
-            d = l2_scan_depth(ecl_lats, spin_angle_deg, precession_angle_deg)
-            # Also southern hemisphere
+            theta_ecl = jnp.deg2rad(90.0 - ecl_lats)
+            d = np.array(yearavg_depth_1d(
+                theta_ecl, spin_angle_deg, precession_angle_deg,
+            ))
+            # Southern hemisphere
             ecl_lats_s = _galactic_to_ecliptic_lat(-b)
-            d_s = l2_scan_depth(ecl_lats_s, spin_angle_deg,
-                                precession_angle_deg)
-            depths.append(0.5 * (np.mean(d) + np.mean(d_s)))
+            theta_ecl_s = jnp.deg2rad(90.0 - ecl_lats_s)
+            d_s = np.array(yearavg_depth_1d(
+                theta_ecl_s, spin_angle_deg, precession_angle_deg,
+            ))
+            depths.append(0.5 * (float(np.mean(d)) + float(np.mean(d_s))))
         raw_weights.append(float(np.mean(depths)))
 
     # Normalize: Σ(f_sky_p × w_p) = f_sky_total
     f_sky_total = sum(p.f_sky for p in patches)
-    weighted = sum(p.f_sky * w for p, w in zip(patches, raw_weights))
+    weighted = sum(p.f_sky * w for p, w in zip(patches, raw_weights, strict=False))
     if weighted <= 0:
         return tuple(1.0 for _ in patches)
     scale = f_sky_total / weighted
@@ -246,7 +217,7 @@ def default_3patch_model(include_scan: bool = True) -> SkyModel:
         weights = patch_noise_weights(patches_no_scan)
         patches = tuple(
             SkyPatch(p.name, p.f_sky, p.A_dust_scale, p.A_sync_scale, w)
-            for p, w in zip(patches_no_scan, weights)
+            for p, w in zip(patches_no_scan, weights, strict=False)
         )
     else:
         patches = patches_no_scan
@@ -258,7 +229,9 @@ def default_3patch_model(include_scan: bool = True) -> SkyModel:
 def default_4patch_model(include_scan: bool = True) -> SkyModel:
     """Four-patch model with finer slicing of the clean sky.
 
-    Dust amplitude scalings from Planck 2018 XXX Table 1 (approximate).
+    Dust amplitude scalings from Planck Intermediate Results XXX
+    (Planck Collaboration 2016, A&A 586, A133; arXiv:1409.5738),
+    Table 1 (approximate).
     """
     patches_no_scan = (
         SkyPatch("cleanest", f_sky=0.07, A_dust_scale=0.5,  A_sync_scale=0.8),
@@ -270,7 +243,7 @@ def default_4patch_model(include_scan: bool = True) -> SkyModel:
         weights = patch_noise_weights(patches_no_scan)
         patches = tuple(
             SkyPatch(p.name, p.f_sky, p.A_dust_scale, p.A_sync_scale, w)
-            for p, w in zip(patches_no_scan, weights)
+            for p, w in zip(patches_no_scan, weights, strict=False)
         )
     else:
         patches = patches_no_scan

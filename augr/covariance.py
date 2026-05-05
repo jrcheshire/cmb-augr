@@ -21,8 +21,8 @@ term Tr(Σ⁻¹ dΣ/dθ ...) — see CLAUDE.md for rationale).
 
 from __future__ import annotations
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
 from augr.instrument import Instrument, noise_nl
 from augr.signal import SignalModel

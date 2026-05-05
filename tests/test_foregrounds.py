@@ -5,11 +5,11 @@ import numpy as np
 import pytest
 
 from augr.foregrounds import (
+    ELL_REF,
+    ForegroundModel,
     GaussianForegroundModel,
     MomentExpansionModel,
     NullForegroundModel,
-    ForegroundModel,
-    ELL_REF,
     _dust_moment_factor,
     _sync_moment_factor,
 )

@@ -7,28 +7,34 @@ import jax.numpy as jnp
 import numpy as np
 
 from augr.config import (
-    DEFAULT_FIXED, DEFAULT_PRIORS,
-    DEFAULT_FIXED_MOMENT, DEFAULT_PRIORS_MOMENT,
-    FIDUCIAL_BK15, FIDUCIAL_MOMENT,
+    DEFAULT_FIXED,
+    DEFAULT_FIXED_MOMENT,
+    DEFAULT_PRIORS,
+    DEFAULT_PRIORS_MOMENT,
+    FIDUCIAL_BK15,
+    FIDUCIAL_MOMENT,
     simple_probe,
 )
-from augr.foregrounds import GaussianForegroundModel, MomentExpansionModel
+from augr.crosslinks import yearavg_depth_1d
 from augr.fisher import FisherForecast
-from augr.instrument import Instrument
-from augr.signal import SignalModel
-from augr.spectra import CMBSpectra
-from augr.sky_patches import (
-    SkyPatch, SkyModel,
-    single_patch_model, default_3patch_model, default_4patch_model,
-    l2_scan_depth, patch_noise_weights, _infer_lat_boundaries,
-)
+from augr.foregrounds import GaussianForegroundModel, MomentExpansionModel
 from augr.multipatch import (
     MultiPatchFisher,
-    instrument_for_patch, fiducial_for_patch,
     _is_per_patch,
+    fiducial_for_patch,
+    instrument_for_patch,
 )
-from augr.telescope import probe_design, to_instrument
-
+from augr.signal import SignalModel
+from augr.sky_patches import (
+    SkyModel,
+    SkyPatch,
+    _infer_lat_boundaries,
+    default_3patch_model,
+    default_4patch_model,
+    patch_noise_weights,
+    single_patch_model,
+)
+from augr.spectra import CMBSpectra
 
 # ---------------------------------------------------------------------------
 # Sky patches
@@ -67,29 +73,33 @@ class TestSkyPatch(unittest.TestCase):
 
 class TestScanStrategy(unittest.TestCase):
 
-    def test_poles_deeper_than_equator(self):
-        """Ecliptic poles should get more integration time.
+    def _depth_at_lat(self, ecl_lat_deg, spin=50.0, prec=45.0):
+        """Convenience wrapper: yearavg_depth_1d on ecliptic latitude (deg)."""
+        theta_ecl = np.deg2rad(90.0 - np.atleast_1d(ecl_lat_deg))
+        return float(np.array(yearavg_depth_1d(theta_ecl, spin, prec))[0])
 
-        With default alpha=50, beta=45: theta_min=5°, theta_max=95°.
-        Full-sky coverage with ~3× deeper at poles.
-        """
-        depth_pole = l2_scan_depth(np.array([85.0]))[0]
-        depth_eq = l2_scan_depth(np.array([5.0]))[0]
-        self.assertGreater(depth_pole, depth_eq)
+    def test_poles_deeper_than_equator(self):
+        """Pixels near the ecliptic pole get more integration time than
+        the equator under the LiteBIRD-like default scan."""
+        self.assertGreater(self._depth_at_lat(85.0),
+                           self._depth_at_lat(5.0))
 
     def test_symmetric(self):
-        """North and south ecliptic poles should get equal depth."""
-        d_north = l2_scan_depth(np.array([80.0]))[0]
-        d_south = l2_scan_depth(np.array([-80.0]))[0]
-        self.assertAlmostEqual(d_north, d_south, places=5)
+        """North and south ecliptic latitudes get equal depth (azimuthal
+        symmetry around the ecliptic pole)."""
+        self.assertAlmostEqual(self._depth_at_lat(80.0),
+                               self._depth_at_lat(-80.0), places=5)
 
     def test_zero_outside_range(self):
-        """Regions outside the scan cone should get zero depth."""
-        # With alpha=10, beta=20: theta_min=10°, theta_max=30°
-        # Ecliptic lat=89° → colatitude=1° < theta_min=10° → zero
-        depth = l2_scan_depth(np.array([89.0]), spin_angle_deg=10.0,
-                              precession_angle_deg=20.0)
-        self.assertEqual(depth[0], 0.0)
+        """Pixels outside the spherical-triangle support get zero depth.
+
+        With spin=10, prec=20: spin axis colatitude in [70, 110]; for
+        ecl_lat=89 (theta_ecl=1) the triangle bound requires
+        9 <= theta_S <= 11, which has empty intersection with the
+        precession band -> density = 0 by construction.
+        """
+        depth = self._depth_at_lat(89.0, spin=10.0, prec=20.0)
+        self.assertEqual(depth, 0.0)
 
 
 class TestLatBoundaries(unittest.TestCase):
@@ -134,7 +144,7 @@ class TestPatchNoiseWeights(unittest.TestCase):
             SkyPatch("c", 0.15, 1.0, 1.0),
         )
         weights = patch_noise_weights(patches)
-        total = sum(p.f_sky * w for p, w in zip(patches, weights))
+        total = sum(p.f_sky * w for p, w in zip(patches, weights, strict=False))
         expected = sum(p.f_sky for p in patches)
         self.assertAlmostEqual(total, expected, places=4)
 
@@ -190,7 +200,7 @@ class TestInstrumentForPatch(unittest.TestCase):
         patch = SkyPatch("test", 0.1, 1.0, 1.0, noise_weight=1.5)
         inst_p = instrument_for_patch(inst, patch, 0.7)
         expected_scale = math.sqrt(0.7 / (0.1 * 1.5))
-        for ch_orig, ch_new in zip(inst.channels, inst_p.channels):
+        for ch_orig, ch_new in zip(inst.channels, inst_p.channels, strict=False):
             self.assertAlmostEqual(
                 ch_new.net_per_detector,
                 ch_orig.net_per_detector * expected_scale,
@@ -200,7 +210,7 @@ class TestInstrumentForPatch(unittest.TestCase):
         inst = simple_probe()
         patch = SkyPatch("test", 0.2, 1.0, 1.0)
         inst_p = instrument_for_patch(inst, patch, 0.7)
-        for ch_orig, ch_new in zip(inst.channels, inst_p.channels):
+        for ch_orig, ch_new in zip(inst.channels, inst_p.channels, strict=False):
             self.assertEqual(ch_new.nu_ghz, ch_orig.nu_ghz)
             self.assertEqual(ch_new.n_detectors, ch_orig.n_detectors)
             self.assertAlmostEqual(ch_new.beam_fwhm_arcmin,
@@ -314,7 +324,7 @@ class TestMultiPatchFisher(unittest.TestCase):
         cls.fg_gauss = GaussianForegroundModel()
         cls.fid_gauss = {**FIDUCIAL_BK15, "A_lens": 0.27}
         cls.priors_gauss = dict(DEFAULT_PRIORS)
-        cls.fixed_gauss = list(DEFAULT_FIXED) + ["Delta_dust"]
+        cls.fixed_gauss = [*list(DEFAULT_FIXED), "Delta_dust"]
         cls.signal_kwargs = {"ell_max": 300, "delta_ell": 35}
 
     def test_single_patch_recovery(self):
@@ -404,7 +414,7 @@ class TestMultiPatchFisher(unittest.TestCase):
             signal_kwargs=self.signal_kwargs,
         )
         mpf_clean.compute()
-        sr_clean = mpf_clean.sigma("r")
+        mpf_clean.sigma("r")
 
         mpf_dusty = MultiPatchFisher(
             self.inst, self.fg_gauss, self.cmb, with_dusty,
@@ -553,7 +563,7 @@ class TestMultiPatchDelensedAndResidualModes(unittest.TestCase):
         mpf = MultiPatchFisher(
             self.inst, self.fg, self.cmb, sky, fid,
             priors=priors,
-            fixed_params=list(DEFAULT_FIXED) + ["Delta_dust"],
+            fixed_params=[*list(DEFAULT_FIXED), "Delta_dust"],
             signal_kwargs=signal_kwargs,
         )
         self.assertNotIn("A_lens", mpf._all_names)
@@ -576,7 +586,7 @@ class TestMultiPatchDelensedAndResidualModes(unittest.TestCase):
         mpf = MultiPatchFisher(
             self.inst, self.fg, self.cmb, sky, fid,
             priors=DEFAULT_PRIORS,
-            fixed_params=list(DEFAULT_FIXED) + ["Delta_dust"],
+            fixed_params=[*list(DEFAULT_FIXED), "Delta_dust"],
             signal_kwargs=signal_kwargs,
         )
         self.assertIn("A_res", mpf._all_names)

@@ -13,11 +13,11 @@ Two Fisher runs are performed:
 
 Diagnostics printed:
   - sigma(r) for baseline (no template), (1), and (2).
-  - 2x2 (r, A_res) Fisher-submatrix condition number (acceptance
-    criterion 3 of the plan).
+  - 2x2 (r, A_res) Fisher-submatrix condition number, as a
+    sanity check that the (r, A_res) sub-block is well-conditioned.
 
 Usage:
-    conda run -n augr python scripts/validate_carones.py \\
+    pixi run python scripts/validate_carones.py \\
         --tag litebird_ptep_d1s1_nilc_gal60_020sims
 """
 
@@ -30,12 +30,11 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 
-from augr.config import cleaned_map_instrument
+from augr.config import DEFAULT_PRIORS_POST_COMPSEP, cleaned_map_instrument
 from augr.fisher import FisherForecast
 from augr.foregrounds import NullForegroundModel
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
-
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -54,7 +53,7 @@ ELL_MIN = 2
 ELL_MAX = 180
 DELTA_ELL = 5
 ELL_PER_BIN_BELOW = 30
-A_RES_PRIOR_DEFAULT = 0.3  # augr's default Gaussian prior width
+A_RES_PRIOR_DEFAULT = DEFAULT_PRIORS_POST_COMPSEP["A_res"]  # augr default
 
 
 # ---------------------------------------------------------------------------

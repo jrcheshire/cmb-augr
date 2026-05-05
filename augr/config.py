@@ -4,19 +4,45 @@ config.py — Fiducial parameters, priors, and instrument presets.
 Fiducial foreground parameters match the BK15 maximum-likelihood values
 (Buza 2019 thesis, Sec. 6.3.2; BICEP2/Keck Array 2018, arXiv:1810.05216).
 
-Instrument presets are approximate representations of published experiments
-for comparison and scaling studies. Channel-level numbers are drawn from
-published sensitivity tables; efficiencies are physically motivated defaults.
+Two flavors of instrument preset live in the package, and it's worth
+knowing which is which:
+
+  - **Published-numbers presets** (this module): hand-coded ``Channel``
+    tables drawn directly from each experiment's published sensitivity
+    figures. ``pico_like``, ``litebird_like``, ``so_like``,
+    ``cmbs4_like``, and ``cleaned_map_instrument`` reproduce specific
+    public forecasts and have no physics-derived counterpart.
+    ``simple_probe`` is a small hand-tuned demo / smoke-test fixture.
+
+  - **Physics-derived designs** (``augr.telescope``): aperture, f/#,
+    focal plane geometry → ``TelescopeDesign`` →
+    ``to_instrument()`` derives NETs from ``photon_noise_net`` and
+    detector counts from feedhorn packing. ``probe_design`` /
+    ``flagship_design`` (and their ``_idealized`` variants) are the
+    starting points for design-study work where you want to vary
+    optics rather than channel-level numbers.
 
 References:
-    PICO: Hanany et al. 2019 (arXiv:1902.10541), Table 4-1
-    LiteBIRD: LiteBIRD Collaboration 2023 (arXiv:2202.02773), Table 1
+    PICO: Hanany et al. 2019, arXiv:1902.10541 (50-page mission study
+          report; the 10-page whitepaper version is arXiv:1908.07495)
+    LiteBIRD: LiteBIRD Collaboration 2023, PTEP 2023, 042F01;
+          arXiv:2202.02773
+    Planck 2015 polarization: Planck Collaboration 2016, A&A 594, A10;
+          arXiv:1502.01588
+    Simons Observatory: SO Collaboration 2019, JCAP 02, 056;
+          arXiv:1808.07445
+    CMB-S4: Abazajian et al. (CMB-S4 Collaboration) 2022, arXiv:2203.08024
 """
 
 from __future__ import annotations
 
-from augr.instrument import Channel, Instrument, ScalarEfficiency
-
+from augr.instrument import (
+    GROUND_EFFICIENCY,
+    L2_EFFICIENCY,
+    Channel,
+    Instrument,
+    ScalarEfficiency,
+)
 
 # ---------------------------------------------------------------------------
 # Foreground fiducial parameters
@@ -46,16 +72,36 @@ FIDUCIAL_BK15: dict[str, float] = {
 # ---------------------------------------------------------------------------
 
 DEFAULT_PRIORS: dict[str, float] = {
-    "beta_dust":  0.11,   # Planck 2015 polarization (arXiv:1502.01588)
+    "beta_dust":  0.11,   # Planck Collab 2016 (A&A 594, A10; arXiv:1502.01588)
     "beta_sync":  0.3,    # WMAP/Planck synchrotron index uncertainty
-    "A_res":      0.3,    # residual-template amplitude, placeholder
-                          # (Carones 2025 uses a flat prior; 0.3 is a
-                          # conservative Gaussian default for Fisher use.
-                          # Remove from the priors dict to reproduce Carones.)
 }
 
 # Parameters commonly held fixed (not varied in Fisher matrix)
 DEFAULT_FIXED: list[str] = ["T_dust"]
+
+
+# ---------------------------------------------------------------------------
+# Post-component-separation priors
+# ---------------------------------------------------------------------------
+#
+# Used together with NullForegroundModel + SignalModel(residual_template_cl=...)
+# for forecasts that consume the output of an external component-separation
+# pipeline (NILC/GNILC via BROOM, etc.). Keep separate from DEFAULT_PRIORS
+# because A_res is only a meaningful parameter when a residual template is
+# attached -- otherwise it's silently ignored and just adds noise to the
+# prior dict for vanilla forecasts.
+#
+# Compose with the multifrequency priors when running a post-CompSep forecast
+# that still uses an FG model (e.g. residual contamination on top of a
+# multi-frequency cleaning step):
+#
+#     priors = {**DEFAULT_PRIORS, **DEFAULT_PRIORS_POST_COMPSEP}
+
+DEFAULT_PRIORS_POST_COMPSEP: dict[str, float] = {
+    "A_res":      0.3,    # residual-template amplitude, conservative Gaussian.
+                          # Carones 2025 (arXiv:2510.20785) uses a flat prior;
+                          # drop A_res from the dict to reproduce Carones.
+}
 
 
 # ---------------------------------------------------------------------------
@@ -77,24 +123,9 @@ FIDUCIAL_MOMENT: dict[str, float] = {
 DEFAULT_PRIORS_MOMENT: dict[str, float] = {
     "beta_dust":  0.11,
     "beta_sync":  0.3,
-    "A_res":      0.3,   # see note in DEFAULT_PRIORS
 }
 
 DEFAULT_FIXED_MOMENT: list[str] = ["T_dust"]
-
-
-# ---------------------------------------------------------------------------
-# Space-mission efficiency defaults
-# ---------------------------------------------------------------------------
-
-# L2 space mission: high efficiency, modest cosmic-ray deadtime
-_L2_EFFICIENCY = ScalarEfficiency(
-    detector_yield=0.85,
-    observing_efficiency=0.85,
-    data_cut_fraction=0.90,
-    cosmic_ray_deadtime=0.97,   # ~3% deadtime from GCR glitches at L2
-    polarization_efficiency=0.95,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -102,13 +133,26 @@ _L2_EFFICIENCY = ScalarEfficiency(
 # ---------------------------------------------------------------------------
 
 def simple_probe() -> Instrument:
-    """Minimal 6-band space probe for quick tests and debugging.
+    """Hand-tuned 6-band space probe; demo / smoke-test fixture.
 
     Covers the foreground minimum (150 GHz) plus two dust and two sync
-    channels and one cross-check band. Sensitivity levels are loosely
-    PICO-like at reduced channel count.
+    channels and one cross-check band, with NETs / beams / detector
+    counts loosely PICO-like at reduced channel count. Used throughout
+    ``tests/`` and the introductory cells of ``notebooks/quickstart.ipynb``
+    as a small, fast Instrument that doesn't depend on any optics calc.
+
+    Despite the name, this is *not* a physics-derived probe-class design.
+    For that, build an Instrument from a ``TelescopeDesign``::
+
+        from augr.telescope import probe_design, to_instrument
+        inst = to_instrument(probe_design())
+
+    which goes through ``photon_noise_net`` and feedhorn packing. The two
+    paths are not interchangeable: ``simple_probe`` is a fixture with
+    fixed numbers, ``probe_design`` is a starting point for design-study
+    work where you want to vary aperture, f/#, focal plane size, etc.
     """
-    eff = _L2_EFFICIENCY
+    eff = L2_EFFICIENCY
     channels = (
         Channel(nu_ghz=30.0,  n_detectors=12,  net_per_detector=114.0, beam_fwhm_arcmin=38.4, efficiency=eff),
         Channel(nu_ghz=90.0,  n_detectors=48,  net_per_detector=52.0,  beam_fwhm_arcmin=12.8, efficiency=eff),
@@ -121,19 +165,22 @@ def simple_probe() -> Instrument:
 
 
 def pico_like() -> Instrument:
-    """PICO-like probe-class instrument (arXiv:1902.10541, Table 3.2).
+    """PICO-like probe-class instrument (arXiv:1902.10541).
 
     21 frequency bands from 21 to 799 GHz, 12,996 TES bolometers at 0.1 K,
     5-year L2 mission. Targets σ(r) ≈ 5×10⁻⁴ at 5σ.
 
-    NET values are CBE per-bolometer temperature NETs from Table 3.2.
-    Detector counts include both polarizations per pixel (factor of 2
-    already in N_bolo). Beam FWHM = 6.2' × (155 GHz / ν_c).
+    NET values are CBE per-bolometer temperature NETs from the PICO
+    mission study report's instrument-specifications table. Detector
+    counts include both polarizations per pixel (factor of 2 already
+    in N_bolo). Beam FWHM = 6.2' × (155 GHz / ν_c).
     PICO assumed ~95% survey efficiency and 90% detector yield from L2.
     """
-    eff = _L2_EFFICIENCY
+    eff = L2_EFFICIENCY
     # (nu_ghz, n_bolo, CBE bolo NET [μK_CMB √s], FWHM [arcmin])
-    # Source: PICO report Table 3.2 (arXiv:1902.10541, p.36)
+    # Source: PICO mission study report instrument-specs table
+    # (arXiv:1902.10541; the same table appears in the 10-page
+    # whitepaper companion arXiv:1908.07495).
     # NET is per-bolometer temperature NET; code applies √2 for polarization.
     # N_bolo = (tiles) × (pixels/tile) × 2 polarizations.
     _bands = [
@@ -168,20 +215,22 @@ def pico_like() -> Instrument:
 
 
 def litebird_like() -> Instrument:
-    """LiteBIRD PTEP baseline (Hazumi+ 2023, arXiv:2202.02773, Table 3).
+    """LiteBIRD PTEP baseline (LiteBIRD Collaboration 2023, PTEP 2023,
+    042F01; arXiv:2202.02773).
 
     15 frequency bands from 40 to 402 GHz across three telescopes
     (LFT 40-140 GHz, MFT 100-195 GHz, HFT 195-402 GHz); 4508 detectors
     total; 3-year L2 mission; f_sky = 0.7.
 
-    PTEP Table 3 lists each frequency as one or two sub-arrays (LFT+MFT
-    or MFT+HFT at shared frequencies; LFT mixed pixel sizes at 68/78/89).
-    We expose each sub-array as its own augr Channel (22 total) so that
-    augr's Fisher machinery handles the MV combination per ℓ via the
-    cross-frequency covariance, preserving each sub-array's distinct
-    FWHM rather than collapsing to a single effective beam.  Per-sub-
-    array NET_det and FWHM come verbatim from PTEP Table 3; detector
-    counts sum to 4508 across all 22 entries.
+    The PTEP paper lists each frequency as one or two sub-arrays
+    (LFT+MFT or MFT+HFT at shared frequencies; LFT mixed pixel sizes
+    at 68/78/89). We expose each sub-array as its own augr Channel
+    (22 total) so that augr's Fisher machinery handles the MV
+    combination per ℓ via the cross-frequency covariance, preserving
+    each sub-array's distinct FWHM rather than collapsing to a single
+    effective beam. Per-sub-array NET_det and FWHM come verbatim from
+    the PTEP channel-specification table; detector counts sum to 4508
+    across all 22 entries.
 
     Efficiency factors track PTEP Eq. 32: detector_yield=0.80,
     observing_efficiency=0.85 (duty cycle), data_cut_fraction=0.95
@@ -197,8 +246,9 @@ def litebird_like() -> Instrument:
         polarization_efficiency=0.90,
     )
     # (nu_ghz, n_det, NET_det [μK√s], FWHM [arcmin])
-    # Values verbatim from Hazumi+ 2023 Table 3; bands 4-9 and 11 are
-    # split into their contributing sub-arrays.
+    # Values verbatim from the LiteBIRD PTEP channel-specification
+    # table (LiteBIRD Collaboration 2023; arXiv:2202.02773); bands 4-9
+    # and 11 are split into their contributing sub-arrays.
     _bands = [
         # --- LFT only, single-pixel bands ---
         ( 40.0,   48, 114.63, 70.5),   # LFT
@@ -268,7 +318,7 @@ def cleaned_map_instrument(f_sky: float,
         n_detectors=1,
         net_per_detector=1.0,   # placeholder; overridden by external noise
         beam_fwhm_arcmin=1.0,   # placeholder; spectra are beam-deconvolved
-        efficiency=_L2_EFFICIENCY,
+        efficiency=L2_EFFICIENCY,
     )
     return Instrument(
         channels=(dummy_channel,),
@@ -278,23 +328,9 @@ def cleaned_map_instrument(f_sky: float,
     )
 
 
-# ---------------------------------------------------------------------------
-# Ground-based efficiency defaults
-# ---------------------------------------------------------------------------
-
-# Atmospheric experiments: low observing efficiency due to weather and
-# scan-strategy turnarounds; no cosmic-ray deadtime concern.
-_GROUND_EFFICIENCY = ScalarEfficiency(
-    detector_yield=0.80,
-    observing_efficiency=0.25,   # weather, turnarounds, calibration
-    data_cut_fraction=0.80,      # weather/quality cuts
-    cosmic_ray_deadtime=1.00,    # not applicable on the ground
-    polarization_efficiency=0.90,
-)
-
-
 def so_like() -> Instrument:
-    """SO LAT-like ground-based wide survey (arXiv:1808.07445, Table 2 baseline).
+    """SO LAT-like ground-based wide survey (SO Collaboration 2019,
+    JCAP 02, 056; arXiv:1808.07445, baseline).
 
     6 frequency bands from 27–280 GHz, ~21k TES bolometers, 5-year survey
     over f_sky=0.4. NET values are tuned to reproduce the SO baseline map
@@ -306,7 +342,7 @@ def so_like() -> Instrument:
         - Effective ground ℓ_min is ~30 after common-mode filtering.
         - No frequency coverage above 280 GHz (atmosphere opaque).
     """
-    eff = _GROUND_EFFICIENCY
+    eff = GROUND_EFFICIENCY
     # (nu_ghz, n_det, NET [μK√s], FWHM [arcmin])
     # FWHM scaled as 1.4' × (145/ν) for a ~6 m aperture (SO LAT).
     _bands = [
@@ -326,7 +362,8 @@ def so_like() -> Instrument:
 
 
 def cmbs4_like() -> Instrument:
-    """CMB-S4-like ground-based wide survey (arXiv:2203.08024, CDT report).
+    """CMB-S4-like ground-based wide survey (Abazajian et al. 2022,
+    arXiv:2203.08024).
 
     7 frequency bands from 30–270 GHz, ~343k TES bolometers, 7-year survey
     over f_sky=0.4. NET values reproduce approximate CMB-S4 wide-survey target
@@ -338,7 +375,7 @@ def cmbs4_like() -> Instrument:
         - Deep delensing patch (f_sky~0.03, ~0.5 μK-arcmin at 150 GHz) not
           modelled here; this is the wide-survey configuration only.
     """
-    eff = _GROUND_EFFICIENCY
+    eff = GROUND_EFFICIENCY
     # (nu_ghz, n_det, NET [μK√s], FWHM [arcmin])
     # FWHM scaled as 1.5' × (150/ν) for a ~6 m aperture.
     _bands = [

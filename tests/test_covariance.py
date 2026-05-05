@@ -5,16 +5,15 @@ import numpy as np
 import pytest
 
 from augr.covariance import (
+    _build_M,
+    _nu_b,
     bandpower_covariance,
     bandpower_covariance_blocks_from_noise,
-    _nu_b,
-    _build_M,
 )
-from augr.signal import SignalModel, flatten_params
-from augr.instrument import Channel, Instrument, ScalarEfficiency
 from augr.foregrounds import GaussianForegroundModel
+from augr.instrument import Channel, Instrument, ScalarEfficiency
+from augr.signal import SignalModel, flatten_params
 from augr.spectra import CMBSpectra
-
 
 # -----------------------------------------------------------------------
 # Fixtures

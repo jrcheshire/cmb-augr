@@ -12,7 +12,7 @@ moments at the South Pole boresight:
   nulls k = 1..7, leaves |h_8| = 1.
 
 Run:
-    conda run -n augr python 03_validation.py
+    pixi run python scripts/southpole_derivation/03_validation.py
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def main() -> None:
     bar_w = 0.2
     offsets = np.linspace(-1.5 * bar_w, 1.5 * bar_w, len(SCHEDULES))
 
-    for off, (label, (decks, color)) in zip(offsets, SCHEDULES.items()):
+    for off, (label, (decks, color)) in zip(offsets, SCHEDULES.items(), strict=False):
         amps = np.array([
             abs(complex(h_k_boresight(decks, chi_deg=0.0, k=int(k)))) ** 2
             for k in K_VALUES

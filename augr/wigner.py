@@ -31,7 +31,6 @@ from __future__ import annotations
 import numpy as np
 from scipy.special import gammaln
 
-
 # -----------------------------------------------------------------------
 # (l1 l2 L; 0 0 0) — closed-form via log-gamma
 # -----------------------------------------------------------------------
@@ -313,10 +312,7 @@ def wigner3j_vectorized(L: int, l1_array: np.ndarray,
     L_f = float(L)
 
     l2_min = max(l2_min_global, abs(m3))
-    if l2_max_global is None:
-        l2_max = int(np.max(l1)) + L
-    else:
-        l2_max = l2_max_global
+    l2_max = int(np.max(l1)) + L if l2_max_global is None else l2_max_global
     n_l2 = l2_max - l2_min + 1
 
     if n_l2 <= 0:

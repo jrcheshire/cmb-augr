@@ -12,34 +12,27 @@ focal plane area is allocated among groups by user-specified fractions.
 
 References:
     - Feedhorn coupling: Griffin et al. 2002 (single-moded horns, d ~ 2Fλ)
-    - Photon NEP: Zmuidzinas 2003 (JLTP 12, 4), Richards 1994
+    - Photon NEP: Zmuidzinas 2003 (Appl. Opt. 42, 4989), Richards 1994
     - Hex packing: Conway & Sloane, "Sphere Packings" (π/2√3 ≈ 0.9069)
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
-from augr.instrument import Channel, Instrument, ScalarEfficiency
-from augr.units import H_PLANCK, K_BOLTZMANN, C_LIGHT, T_CMB
-
-
-# ---------------------------------------------------------------------------
-# Default L2 efficiency (imported here to avoid circular dependency issues
-# if config.py ever imports telescope.py)
-# ---------------------------------------------------------------------------
-
-_L2_EFFICIENCY = ScalarEfficiency(
-    detector_yield=0.85,
-    observing_efficiency=0.85,
-    data_cut_fraction=0.90,
-    cosmic_ray_deadtime=0.97,
-    polarization_efficiency=0.95,
+from augr.instrument import (
+    IDEALIZED_EFFICIENCY,
+    L2_EFFICIENCY,
+    Channel,
+    Instrument,
+    ScalarEfficiency,
 )
+from augr.units import C_LIGHT, H_PLANCK, K_BOLTZMANN, T_CMB
 
 # Conversion factor
 _RAD_TO_ARCMIN = 180.0 * 60.0 / math.pi
@@ -56,9 +49,20 @@ class BandSpec:
     Attributes:
         nu_ghz: Band center frequency [GHz].
         fractional_bandwidth: Δν/ν (default 0.25, typical for feedhorns).
+        extra_loading: Optional callable ``n_extra(nu_hz) -> occupation``
+            adding sky-side optical loading beyond the CMB term in
+            ``photon_noise_net``. Treated identically to ``n_cmb`` (gets
+            multiplied by ``eta_optical``). Use cases include atmospheric
+            loading for ground-based / balloon repurposings (different
+            T_atm per band), galactic-foreground loading at the high end
+            of submillimetre bands where dust overtakes the CMB Wien
+            tail, etc. The callable must accept and return ``np.ndarray``
+            of frequencies in Hz; for use through ``photon_noise_net_jax``
+            it must additionally be ``jnp``-traceable.
     """
     nu_ghz: float
     fractional_bandwidth: float = 0.25
+    extra_loading: Callable[[np.ndarray], np.ndarray] | None = None
 
 
 @dataclass(frozen=True)
@@ -148,7 +152,7 @@ class TelescopeDesign:
     pixel_groups: tuple[PixelGroup, ...]
     mission_duration_years: float = 5.0
     f_sky: float = 0.7
-    efficiency: ScalarEfficiency = field(default_factory=lambda: _L2_EFFICIENCY)
+    efficiency: ScalarEfficiency = L2_EFFICIENCY
     knee_ell: float = 0.0
     alpha_knee: float = 1.0
 
@@ -226,7 +230,7 @@ def count_pixels(fp_area: float, cell_area: float,
     if cell_area <= 0:
         raise ValueError(f"cell_area must be positive, got {cell_area}")
     n = packing_efficiency * fp_area / cell_area
-    return max(0, int(math.floor(n)))
+    return max(0, math.floor(n))
 
 
 def count_pixels_continuous(fp_area: jnp.ndarray, cell_area: jnp.ndarray,
@@ -248,14 +252,15 @@ def photon_noise_net_jax(
     emissivity: float = 0.01,
     eta_optical: float = 0.35,
     n_quad: int = 512,
+    extra_loading: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
 ) -> jnp.ndarray:
     """JAX-traceable photon-noise NET [μK√s].
 
     Same physics as photon_noise_net() but uses jnp instead of np, enabling
-    differentiation w.r.t. telescope thermal/optical parameters. See
-    photon_noise_net() for the full docstring, including the list of
-    loading sources omitted from n_total (galactic foregrounds,
-    atmosphere, zodi).
+    differentiation w.r.t. telescope thermal/optical parameters. The
+    optional ``extra_loading`` callable must be jnp-traceable for autodiff
+    to work end-to-end. See photon_noise_net() for the full docstring,
+    including how ``extra_loading`` enters n_total.
     """
     nu_center_hz = nu_ghz * 1e9
     delta_nu_hz = fractional_bandwidth * nu_center_hz
@@ -272,9 +277,12 @@ def photon_noise_net_jax(
     x_tel = h * nu / (k * T_telescope)
     n_tel = 1.0 / (jnp.exp(x_tel) - 1.0)
 
-    # TODO(extend): see photon_noise_net() — needs an extra_loading term
-    # for galactic-FG / atmospheric repurposings.
-    n_total = eta_optical * n_cmb + emissivity * n_tel
+    # Sky-side occupation: CMB + optional caller-supplied extra loading
+    # (galactic foregrounds, atmosphere, etc.). Both are multiplied by
+    # eta_optical because they sit in front of the warm optics. The
+    # telescope's own emission term gets `emissivity` instead.
+    sky_occ = n_cmb if extra_loading is None else n_cmb + extra_loading(nu)
+    n_total = eta_optical * sky_occ + emissivity * n_tel
 
     integrand_nep2 = 2.0 * h**2 * nu**2 * n_total * (1.0 + n_total)
     nep_squared = 2.0 * jnp.trapezoid(integrand_nep2, nu)
@@ -300,6 +308,7 @@ def photon_noise_net(
     emissivity: float = 0.01,
     eta_optical: float = 0.35,
     n_quad: int = 512,
+    extra_loading: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> float:
     """Photon-noise-limited single-detector temperature NET [μK√s].
 
@@ -309,16 +318,21 @@ def photon_noise_net(
     Includes both shot noise and wave bunching (full Bose-Einstein statistics):
         NEP² = 2 ∫ 2h²ν² n(1+n) dν
 
-    where n is the total occupation number from CMB + telescope emission,
-    and the ν² (rather than ν⁴) comes from the single-mode AΩ = (c/ν)².
+    where n is the total occupation number from CMB + telescope emission
+    (plus any caller-supplied ``extra_loading``), and the ν² (rather than
+    ν⁴) comes from the single-mode AΩ = (c/ν)².
 
     The returned NET is the single-detector, single-polarization, temperature
     NET in CMB thermodynamic units, matching the Channel.net_per_detector
     convention. The √2 polarization factor is applied downstream in
     white_noise_power().
 
-    Loading sources NOT included in n_total
+    Loading sources NOT included by default
     ---------------------------------------
+    Out of the box, ``n_total`` only includes the CMB and the telescope
+    self-emission term. The following are ignored unless explicitly
+    folded in via the ``extra_loading`` argument:
+
     - **Galactic foregrounds** (diffuse dust + synchrotron). At ν ≲ 300 GHz
       and high galactic latitude these contribute brightness temperatures
       orders of magnitude below CMB+telescope, so the omission costs ≪1 %
@@ -327,12 +341,10 @@ def photon_noise_net(
       Wien tail) and at low galactic latitude.
     - **Atmospheric loading.** Zero by assumption — this routine bakes in
       an L2 orbit. Re-using it for a ground-based or balloon concept
-      requires adding water-vapour and O2 loading.
+      requires supplying ``extra_loading`` with the appropriate per-band
+      water-vapour / O2 emission, since T_atm depends strongly on band.
     - **Zodiacal light, Earth/Moon limb sidelobe pickup.** Sub-percent for
       typical L2 sun-shielded geometries; ignored.
-
-    See the TODO at the n_total assignment in the body for how to extend
-    n_total = η_opt n_cmb + ε n_tel with an explicit extra-loading term.
 
     Args:
         nu_ghz: Band center frequency [GHz].
@@ -342,6 +354,12 @@ def photon_noise_net(
         emissivity: Effective telescope emissivity.
         eta_optical: End-to-end optical efficiency (sky to detector).
         n_quad: Number of quadrature points for integration.
+        extra_loading: Optional callable ``n_extra(nu_hz) -> occupation``
+            adding sky-side optical loading beyond the CMB term.
+            Evaluated on the band-integration grid (length ``n_quad``,
+            in Hz) and added to ``n_cmb`` before multiplication by
+            ``eta_optical``. Default ``None`` reproduces the no-extra-
+            loading L2 baseline.
 
     Returns:
         NET in μK√s.
@@ -362,15 +380,12 @@ def photon_noise_net(
     x_tel = h * nu / (k * T_telescope)
     n_tel = 1.0 / (np.exp(x_tel) - 1.0)
 
-    # Total occupation number seen by the detector
-    # CMB couples through full optical efficiency; telescope emits with
-    # emissivity epsilon (seen by detector through remaining optics).
-    # TODO(extend): add an `extra_loading` term (Bose-Einstein occupation
-    # number, or a per-frequency lookup) so callers can fold in galactic
-    # foreground loading at high ν / low galactic latitude, atmospheric
-    # loading for ground/balloon repurposings, etc. See the "Loading
-    # sources NOT included" block in the docstring above.
-    n_total = eta_optical * n_cmb + emissivity * n_tel
+    # Sky-side occupation: CMB + optional caller-supplied extra loading
+    # (galactic foregrounds, atmosphere, etc.). Both are multiplied by
+    # eta_optical because they sit in front of the warm optics. The
+    # telescope's own emission term gets `emissivity` instead.
+    sky_occ = n_cmb if extra_loading is None else n_cmb + extra_loading(nu)
+    n_total = eta_optical * sky_occ + emissivity * n_tel
 
     # Photon NEP² (single spatial mode: AΩ = λ² = (c/ν)²)
     # NEP² = 2 × ∫ (AΩ/c²) × 2h²ν⁴ × n(1+n) dν
@@ -452,6 +467,7 @@ def to_instrument(design: TelescopeDesign) -> Instrument:
                 T_telescope=th.T_telescope_K,
                 emissivity=th.emissivity,
                 eta_optical=th.eta_optical,
+                extra_loading=band.extra_loading,
             )
             channels.append(Channel(
                 nu_ghz=band.nu_ghz,
@@ -556,14 +572,6 @@ def flagship_design() -> TelescopeDesign:
 # This means ~4x fewer pixels per unit FP area at the same f/#.
 # ---------------------------------------------------------------------------
 
-_IDEALIZED_EFFICIENCY = ScalarEfficiency(
-    detector_yield=0.85,
-    observing_efficiency=0.95,   # PICO assumption
-    data_cut_fraction=0.90,
-    cosmic_ray_deadtime=0.97,
-    polarization_efficiency=0.95,
-)
-
 _IDEALIZED_THERMAL = ThermalSpec(
     T_telescope_K=4.5,     # PICO secondary reflector temperature
     emissivity=0.01,
@@ -617,7 +625,7 @@ def probe_idealized() -> TelescopeDesign:
         ),
         thermal=_IDEALIZED_THERMAL,
         pixel_groups=pixel_groups,
-        efficiency=_IDEALIZED_EFFICIENCY,
+        efficiency=IDEALIZED_EFFICIENCY,
     )
 
 
@@ -670,5 +678,5 @@ def flagship_idealized() -> TelescopeDesign:
         ),
         thermal=_IDEALIZED_THERMAL,
         pixel_groups=pixel_groups,
-        efficiency=_IDEALIZED_EFFICIENCY,
+        efficiency=IDEALIZED_EFFICIENCY,
     )
