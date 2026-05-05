@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Plot sub-annual σ(r) time evolution vs Figure 5 of 2018 BICEP/Keck MSIP proposal.
+BK validation: BICEP/Keck σ(r) time evolution, 2013–2019.
 
-Two panels:
+Public-readable analog of Buza 2019 thesis Figure 7.9: σ(r) projection vs
+calendar time as Keck Array and BICEP3 data accumulate, with two cuts:
+
   Top:    Map depths (μK-arcmin) by frequency
   Bottom: σ(r) — red dashed (raw) and gray solid (FG marginalized)
 
@@ -294,7 +296,7 @@ if m220.any():
                       label="220 GHz (Keck)")
 
 ax_depth.set_ylabel("Map depth [μK-arcmin]", fontsize=11)
-ax_depth.set_title("Figure 5 comparison: BICEP/Keck σ(r) time evolution\n"
+ax_depth.set_title("BICEP/Keck σ(r) time evolution\n"
                    f"(Knox formula, ext. reobs. penalty {REOBS_DEPTH_PENALTY:.1f}×)",
                    fontsize=10)
 ax_depth.legend(fontsize=7.5, loc="lower left", ncol=2)
@@ -309,18 +311,18 @@ mask = np.isfinite(gray_vals)
 ax_sr.semilogy(t_grid[mask], gray_vals[mask], color="gray", linestyle="-", linewidth=1.8,
                label="With FG marg. (BK + ext, priors)")
 
-# Published results as "x" markers
-# Raw sensitivity targets from Figure 5:
+# Published-analog targets as "x" markers (cf. Buza 2019 thesis Fig. 7.9).
+# Raw sensitivity targets:
 pub_raw_t = [2014.0, 2015.0, 2016.0]
 pub_raw_sr = [0.007, 0.005, 0.004]
 ax_sr.plot(pub_raw_t, pub_raw_sr, 'rx', ms=10, mew=2.0, zorder=5,
-           label="Fig. 5 raw targets")
+           label="Published raw targets")
 
 # Gray curve published values:
 pub_gray_t = [2015.0, 2016.0]
 pub_gray_sr = [0.024, 0.020]
 ax_sr.plot(pub_gray_t, pub_gray_sr, 'kx', ms=10, mew=2.0, zorder=5,
-           label="Fig. 5 gray targets")
+           label="Published gray targets")
 
 # BK18 published result (full analysis, arXiv:2110.00483)
 ax_sr.plot([2019.0], [0.009], 'kx', ms=10, mew=2.0, zorder=5)
