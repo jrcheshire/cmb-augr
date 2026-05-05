@@ -246,13 +246,13 @@ Two tiers are available:
 ## References
 
 - Buza 2019, PhD thesis (Harvard) -- Fisher formalism, BICEP/Keck forecasting
-- BICEP2/Keck 2018 (arXiv:1810.05216) -- BK15 foreground model and parameters
+- BICEP2/Keck 2018, PRL 121, 221301 (arXiv:1810.05216) -- BK15 foreground model and parameters (data through the 2015 season)
 - Chluba et al. 2017 (arXiv:1701.00274) -- Moment expansion for foreground complexity
-- Hanany et al. 2019 (arXiv:1902.10541) -- PICO probe study report
-- PanEx Group et al. 2025 (arXiv:2502.20452) -- PanEx PySM3 foreground models
-- Bianchini et al. 2025 (ApJ 993:105) -- Foreground pipeline comparison (from CMB-S4 effort)
+- Hanany et al. 2019 (arXiv:1902.10541) -- PICO probe study report (50-page mission study; the 10-page whitepaper companion is arXiv:1908.07495)
+- Pan-Experiment Galactic Science Group (Borrill et al.) 2025 (arXiv:2502.20452) -- PySM3 foreground models
+- Bianchini et al. 2025 (arXiv:2502.04300) -- CMB-S4 foreground-cleaning pipeline comparison
 - Hu & Okamoto 2002 (arXiv:astro-ph/0111606) -- Quadratic estimator lensing reconstruction
 - Okamoto & Hu 2003 (PRD 67, 083002) -- Full-sky QE formalism
 - Smith et al. 2012 (arXiv:1010.0048) -- Residual BB after delensing
 - Maniyar et al. 2021 (arXiv:2101.12193) -- Full-sky N_0 formulas
-- Trendafilova, Meyers et al. 2023 (arXiv:2312.02954) -- CLASS_delens iterative delensing
+- Trendafilova, Hotinli & Meyers 2024, JCAP 06, 017 (arXiv:2312.02954) -- CLASS_delens iterative delensing
