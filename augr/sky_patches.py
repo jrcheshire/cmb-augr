@@ -104,13 +104,24 @@ class SkyModel:
 #    Users with custom footprints can construct ``SkyPatch`` instances
 #    with ``noise_weight`` set explicitly, but lose the helper.
 #
+# 3. ``l2_scan_depth`` itself probably belongs elsewhere. This module is
+#    about patch decomposition (``SkyPatch``, ``SkyModel``,
+#    ``patch_noise_weights``); the L2 envelope physics is a separate
+#    concern that ``hit_maps.l2_hit_map`` already imports from here, and
+#    that ``crosslinks.yearavg_h_k_1d`` / ``crosslinks.h_k_map`` provide
+#    the rigorous year-averaged ergodic version of (k=0 is the depth;
+#    k>=1 are the spin moments). The natural consolidation is to retire
+#    ``l2_scan_depth`` in favor of the crosslinks-derived form, and keep
+#    only the patch-decomposition machinery here.
+#
 # Unified cleanup: factor the per-patch depth integral into a general
 # layer that takes a HEALPix mask (or an explicit ecliptic-latitude
-# weight distribution) and returns the average ``l2_scan_depth`` (or its
-# ergodic-year-averaged replacement) over that footprint. Then keep the
-# gal-lat preset wrapper as a thin convenience that builds the ecl-lat
-# distribution from a (b_lo, b_hi) band via ``_galactic_to_ecliptic_lat``.
-# Same change unblocks both items above; both touch the same code path.
+# weight distribution) and returns the average scan depth over that
+# footprint, computed against the rigorous (crosslinks-derived) density.
+# Then keep the gal-lat preset wrapper as a thin convenience that builds
+# the ecl-lat distribution from a (b_lo, b_hi) band via
+# ``_galactic_to_ecliptic_lat``. The same change unblocks all three
+# items above; they all touch the same code path.
 # ---------------------------------------------------------------------------
 
 # Galactic-ecliptic tilt: ecliptic pole is at galactic latitude ~30°,

@@ -24,6 +24,14 @@ import numpy as np
 
 from augr.sky_patches import l2_scan_depth
 
+# TODO(future-direction): l2_scan_depth currently lives in sky_patches.py
+# for historical reasons but conceptually belongs alongside l2_hit_map
+# (both are L2 envelope physics, not patch-decomposition machinery).
+# The right end-state retires both functions in favor of the rigorous
+# year-averaged ergodic form already provided by augr.crosslinks
+# (yearavg_h_k_1d / h_k_map, k=0 case for the depth). See the unified
+# scan-strategy-weighting cleanup TODO at the head of sky_patches.py.
+
 __all__ = ["l2_hit_map", "mean_pixel_rescale_factor"]
 
 
