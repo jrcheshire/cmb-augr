@@ -252,7 +252,10 @@ def photon_noise_net_jax(
     """JAX-traceable photon-noise NET [μK√s].
 
     Same physics as photon_noise_net() but uses jnp instead of np, enabling
-    differentiation w.r.t. telescope thermal/optical parameters.
+    differentiation w.r.t. telescope thermal/optical parameters. See
+    photon_noise_net() for the full docstring, including the list of
+    loading sources omitted from n_total (galactic foregrounds,
+    atmosphere, zodi).
     """
     nu_center_hz = nu_ghz * 1e9
     delta_nu_hz = fractional_bandwidth * nu_center_hz
@@ -269,6 +272,8 @@ def photon_noise_net_jax(
     x_tel = h * nu / (k * T_telescope)
     n_tel = 1.0 / (jnp.exp(x_tel) - 1.0)
 
+    # TODO(extend): see photon_noise_net() — needs an extra_loading term
+    # for galactic-FG / atmospheric repurposings.
     n_total = eta_optical * n_cmb + emissivity * n_tel
 
     integrand_nep2 = 2.0 * h**2 * nu**2 * n_total * (1.0 + n_total)
@@ -312,6 +317,23 @@ def photon_noise_net(
     convention. The √2 polarization factor is applied downstream in
     white_noise_power().
 
+    Loading sources NOT included in n_total
+    ---------------------------------------
+    - **Galactic foregrounds** (diffuse dust + synchrotron). At ν ≲ 300 GHz
+      and high galactic latitude these contribute brightness temperatures
+      orders of magnitude below CMB+telescope, so the omission costs ≪1 %
+      on NET. Breaks down at the high end of the probe-class submillimetre
+      band (≳ 600 GHz, where dust's modified blackbody overtakes the CMB
+      Wien tail) and at low galactic latitude.
+    - **Atmospheric loading.** Zero by assumption — this routine bakes in
+      an L2 orbit. Re-using it for a ground-based or balloon concept
+      requires adding water-vapour and O2 loading.
+    - **Zodiacal light, Earth/Moon limb sidelobe pickup.** Sub-percent for
+      typical L2 sun-shielded geometries; ignored.
+
+    See the TODO at the n_total assignment in the body for how to extend
+    n_total = η_opt n_cmb + ε n_tel with an explicit extra-loading term.
+
     Args:
         nu_ghz: Band center frequency [GHz].
         fractional_bandwidth: Δν/ν (default 0.25).
@@ -343,6 +365,11 @@ def photon_noise_net(
     # Total occupation number seen by the detector
     # CMB couples through full optical efficiency; telescope emits with
     # emissivity epsilon (seen by detector through remaining optics).
+    # TODO(extend): add an `extra_loading` term (Bose-Einstein occupation
+    # number, or a per-frequency lookup) so callers can fold in galactic
+    # foreground loading at high ν / low galactic latitude, atmospheric
+    # loading for ground/balloon repurposings, etc. See the "Loading
+    # sources NOT included" block in the docstring above.
     n_total = eta_optical * n_cmb + emissivity * n_tel
 
     # Photon NEP² (single spatial mode: AΩ = λ² = (c/ν)²)
