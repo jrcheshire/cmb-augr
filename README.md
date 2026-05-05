@@ -10,10 +10,11 @@ Fisher-matrix forecasting for CMB B-mode polarization experiments, targeting the
 
 Given an instrument specification (frequency bands, detector counts, noise levels, beam sizes, integration time), `augr` computes the marginalized Fisher constraint on *r* after accounting for:
 
-- **Foreground contamination** from polarized dust and synchrotron, modeled as either a simple Gaussian (BK15-style, 9 parameters) or a moment expansion (17 parameters) that captures SED spatial variation and frequency decorrelation
+- **Foreground contamination** from polarized dust and synchrotron, modeled as either a simple Gaussian (BK15-style, 9 parameters) or a moment expansion (17 parameters) that captures SED spatial variation and frequency decorrelation. A no-op model is also provided for forecasts on maps that have already been component-separated by an external pipeline.
 - **Gravitational lensing** B-modes, either parameterized by A_lens or self-consistently delensed via iterative quadratic-estimator lensing reconstruction (flat-sky or full-sky Wigner 3j)
 - **Priors** on foreground spectral indices from Planck/WMAP
 - **Bandpower covariance** via the Knox formula across all frequency cross-spectra
+- **Multi-patch likelihoods** with shared spectral indices and per-patch amplitudes, for sky regions of differing foreground complexity
 
 The telescope design module derives detector counts and photon-noise-limited NETs from physical specifications (aperture, f-number, focal plane size, feedhorn packing), enabling systematic optimization of band layout and focal plane area allocation.
 
@@ -88,11 +89,15 @@ augr/
   telescope.py     Physical telescope model: derives beams, detector counts,
                    and photon-noise NETs from aperture, focal plane, and
                    feedhorn geometry; supports dichroic pixel groups
-  foregrounds.py   GaussianForegroundModel (9 params, BK15-style) and
-                   MomentExpansionModel (17 params, Chluba+ 2017)
+  foregrounds.py   GaussianForegroundModel (9 params, BK15-style),
+                   MomentExpansionModel (17 params, Chluba+ 2017),
+                   and NullForegroundModel for post-component-separation
+                   forecasts
   spectra.py       CMB BB power spectra from CAMB templates (tensor + lensing)
   signal.py        SignalModel: assembles the binned cross-frequency data
-                   vector and computes the Jacobian via jax.jacfwd
+                   vector and computes the Jacobian via jax.jacfwd; supports
+                   an optional residual-template amplitude (A_res) for the
+                   post-component-separation mode
   covariance.py    Bandpower covariance matrix (Knox formula)
   fisher.py        Fisher information matrix, marginalized and conditional
                    constraints; Cholesky solver with eigendecomposition fallback
@@ -107,9 +112,15 @@ augr/
                    design-level (Tier 2) via jax.grad
   units.py         Physical constants, RJ/CMB unit conversions, dust and
                    synchrotron SEDs and their log-derivatives
-  multipatch.py    Multi-patch Fisher with shared spectral indices,
-                   per-patch amplitudes, L2 scan strategy model
-  sky_patches.py   Sky patch definitions and scan strategy
+  multipatch.py    Multi-patch Fisher with shared spectral indices and
+                   per-patch amplitudes
+  sky_patches.py   Sky-patch definitions and the L2 scan-depth envelope
+  hit_maps.py      HEALPix L2 hit-map generator (1/sin(theta) envelope) for
+                   feeding component-separation simulators
+  crosslinks.py    Year-averaged ergodic spin coefficients h_k for L2
+                   scan strategies; load-bearing for differential-systematic
+                   propagation à la Wallis et al. 2017
+  crosslinks_southpole.py   South Pole / BICEP-Array companion to crosslinks.py
 
 scripts/
   validate_pico.py             Validation against PICO published sigma(r) targets
@@ -181,6 +192,35 @@ The `telescope.py` module derives a complete `Instrument` from physical specific
 
 **Moment expansion (Chluba+ 2017):** Extends the Gaussian model with second-order terms capturing spatial variation of spectral parameters (variance of beta_d, T_d, beta_s, c_s, and their cross-moments). 17 free parameters. Reduces exactly to the Gaussian model when all moment amplitudes are zero.
 
+**Null model:** No-op (zero `cl_bb`) for forecasts on maps that have already been cleaned by an external component-separation pipeline. Pair with `SignalModel(..., residual_template_cl=...)` to fit `r` against a cleaned-map noise spectrum plus a template-amplitude nuisance `A_res`; see the **Post-component-separation forecasts** section below.
+
+Custom models satisfy a structural `Protocol`: any class with `parameter_names` and `cl_bb(nu_i, nu_j, ells, params)` works.
+
+## Multi-patch Fisher
+
+For sky decompositions where different regions have different foreground complexity, `multipatch.py` runs an independent Fisher per patch and combines them with shared spectral indices and per-patch amplitudes:
+
+```python
+from augr.multipatch import MultiPatchFisher
+from augr.foregrounds import GaussianForegroundModel
+from augr.spectra import CMBSpectra
+from augr.sky_patches import default_3patch_model
+from augr.config import simple_probe, FIDUCIAL_BK15, DEFAULT_PRIORS, DEFAULT_FIXED
+
+mp = MultiPatchFisher(
+    simple_probe(),
+    GaussianForegroundModel(),
+    CMBSpectra(),
+    default_3patch_model(),
+    dict(FIDUCIAL_BK15),
+    priors=DEFAULT_PRIORS,
+    fixed_params=DEFAULT_FIXED,
+)
+print(f"sigma(r) = {mp.sigma('r'):.2e}")
+```
+
+Only `A_dust` and `A_sync` scale per patch; SED-shape parameters (`beta_*`, `T_dust`), decorrelation strengths (`Delta_*`), and moment-expansion variance terms (`omega_*`) are global. Cost scales linearly in the number of patches (independent per-patch Fishers, no MCMC).
+
 ## Delensing
 
 The `delensing.py` module computes self-consistent iterative QE delensing, replacing the external A_lens parameter with a derived residual lensing spectrum:
@@ -206,6 +246,16 @@ nl_ee, nl_tt = nl_bb, combined_noise_nl(inst, spec.ells, "TT")
 result = iterate_delensing(spec, nl_tt, nl_ee, nl_bb, fullsky=True, n_iter=5)
 # result.A_lens_eff ~ 0.29 for probe-class, result.cl_bb_res for Fisher input
 ```
+
+## Scan strategy
+
+Two complementary tools for L2-orbit scan-strategy modeling, both differentiable under `jax.grad`:
+
+- **`augr.hit_maps.l2_hit_map(nside, alpha, beta, coord)`** — HEALPix relative-exposure map for an L2 satellite with boresight scanning at `alpha` from the spin axis and spin axis precessing at `beta` from anti-sun. Used as input for component-separation simulators that scale pixel noise by `1 / sqrt(N_hit)` (BROOM, etc.). Envelope-only model (no Deep-Field ring; see in-module docstring for caveats and the regime of validity).
+
+- **`augr.crosslinks.h_k_map(nside, spin_angle_deg, precession_angle_deg, k, coord)`** — year-averaged ergodic spin coefficient `h_k = <e^{-i k psi}>` over the same scan geometry. Closed-form 1-D quadrature; load-bearing for differential-systematic propagation à la Wallis et al. 2017 (B-mode bias from differential gain, pointing, and ellipticity in terms of `|h_1|`, `|h_2|`, `|h_4|`).
+
+A South Pole / ground-based companion in `crosslinks_southpole.py` provides the same `h_k` machinery for discrete-deck scan strategies, validated bit-exact against BICEP/Keck's `chi2alpha` polarization-angle convention. See `scripts/southpole_derivation/` for a pedagogical walkthrough.
 
 ## Gradient-based instrument optimization
 
@@ -237,11 +287,26 @@ Two tiers are available:
 - **Tier 1** (`sigma_r_from_channels`): optimize detector counts, NETs, and beam sizes directly as continuous floats.
 - **Tier 2** (`sigma_r_from_design`): optimize telescope geometry (aperture, f-number, focal plane diameter, area fractions) and derive channel parameters via the physics.
 
+## Post-component-separation forecasts
+
+When the foregrounds have been removed by an external component-separation pipeline (e.g. NILC + GNILC via [BROOM](https://github.com/alecarones/broom)), `augr` can consume the cleaned map and residual-template spectra directly, replacing the analytic multifrequency model with measured inputs:
+
+- `config.cleaned_map_instrument(f_sky)` — single-channel placeholder Instrument; only `f_sky` enters the Knox mode count.
+- `foregrounds.NullForegroundModel` — drop-in for the multifrequency model; satisfies the same Protocol with empty `parameter_names`.
+- `signal.SignalModel(..., residual_template_cl=..., residual_template_ells=...)` — appends an `A_res` nuisance amplitude with shape from the supplied residual template.
+- `fisher.FisherForecast(..., external_noise_bb=...)` — opt-in flag for routing through a beam-deconvolved noise spectrum from the component-separation pipeline; raises if `cleaned_map_instrument` is used without this kwarg.
+
+Production scripts:
+
+- `scripts/broom_residual_template.py` — BROOM driver: NILC + GNILC + per-sim `anafast` across an MC loop; writes the post-NILC noise spectrum and the Carones 2025 (arXiv:2510.20785) Eq. 3.7 debiased residual template.
+- `scripts/validate_carones.py` — augr consumer: loads the BROOM outputs, runs Fisher variants (no template / flat `A_res` prior / Gaussian `A_res` prior), prints σ(r) plus a 2×2 (r, A_res) Fisher condition-number diagnostic.
+
 ## TODO
 
 - **Scale-dependent moment expansion**: make omega parameters functions of ell to capture the angular-scale dependence of foreground SED variation.
 - **Achieved-performance noise mode**: option to rescale from measured detector performance rather than computing from first principles.
 - **Full-sky N_0 cross-validation**: compare against plancklens/lenspyx for absolute normalization of the lensing reconstruction noise.
+- **Scan-strategy systematics propagation**: connect the `crosslinks` `h_k` maps to a forecast bias on σ(r), in the spirit of Wallis 2017 / Leloup 2024.
 
 ## References
 
