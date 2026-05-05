@@ -19,27 +19,20 @@ References:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import jax.numpy as jnp
 
-from augr.instrument import Channel, Instrument, ScalarEfficiency
+from augr.instrument import (
+    Channel,
+    IDEALIZED_EFFICIENCY,
+    Instrument,
+    L2_EFFICIENCY,
+    ScalarEfficiency,
+)
 from augr.units import H_PLANCK, K_BOLTZMANN, C_LIGHT, T_CMB
 
-
-# ---------------------------------------------------------------------------
-# Default L2 efficiency (imported here to avoid circular dependency issues
-# if config.py ever imports telescope.py)
-# ---------------------------------------------------------------------------
-
-_L2_EFFICIENCY = ScalarEfficiency(
-    detector_yield=0.85,
-    observing_efficiency=0.85,
-    data_cut_fraction=0.90,
-    cosmic_ray_deadtime=0.97,
-    polarization_efficiency=0.95,
-)
 
 # Conversion factor
 _RAD_TO_ARCMIN = 180.0 * 60.0 / math.pi
@@ -148,7 +141,7 @@ class TelescopeDesign:
     pixel_groups: tuple[PixelGroup, ...]
     mission_duration_years: float = 5.0
     f_sky: float = 0.7
-    efficiency: ScalarEfficiency = field(default_factory=lambda: _L2_EFFICIENCY)
+    efficiency: ScalarEfficiency = L2_EFFICIENCY
     knee_ell: float = 0.0
     alpha_knee: float = 1.0
 
@@ -556,14 +549,6 @@ def flagship_design() -> TelescopeDesign:
 # This means ~4x fewer pixels per unit FP area at the same f/#.
 # ---------------------------------------------------------------------------
 
-_IDEALIZED_EFFICIENCY = ScalarEfficiency(
-    detector_yield=0.85,
-    observing_efficiency=0.95,   # PICO assumption
-    data_cut_fraction=0.90,
-    cosmic_ray_deadtime=0.97,
-    polarization_efficiency=0.95,
-)
-
 _IDEALIZED_THERMAL = ThermalSpec(
     T_telescope_K=4.5,     # PICO secondary reflector temperature
     emissivity=0.01,
@@ -617,7 +602,7 @@ def probe_idealized() -> TelescopeDesign:
         ),
         thermal=_IDEALIZED_THERMAL,
         pixel_groups=pixel_groups,
-        efficiency=_IDEALIZED_EFFICIENCY,
+        efficiency=IDEALIZED_EFFICIENCY,
     )
 
 
@@ -670,5 +655,5 @@ def flagship_idealized() -> TelescopeDesign:
         ),
         thermal=_IDEALIZED_THERMAL,
         pixel_groups=pixel_groups,
-        efficiency=_IDEALIZED_EFFICIENCY,
+        efficiency=IDEALIZED_EFFICIENCY,
     )

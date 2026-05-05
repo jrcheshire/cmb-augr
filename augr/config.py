@@ -15,7 +15,13 @@ References:
 
 from __future__ import annotations
 
-from augr.instrument import Channel, Instrument, ScalarEfficiency
+from augr.instrument import (
+    Channel,
+    GROUND_EFFICIENCY,
+    Instrument,
+    L2_EFFICIENCY,
+    ScalarEfficiency,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -84,39 +90,6 @@ DEFAULT_FIXED_MOMENT: list[str] = ["T_dust"]
 
 
 # ---------------------------------------------------------------------------
-# Space-mission efficiency defaults
-# ---------------------------------------------------------------------------
-#
-# TODO(cleanup, L2_EFFICIENCY redundancy):
-# This constant is also defined identically in ``telescope.py`` (with a
-# stale comment claiming the duplication avoids a circular dependency
-# that doesn't actually exist today), and ``instrument.ScalarEfficiency``
-# carries dataclass defaults that disagree with both:
-#
-#   instrument.ScalarEfficiency()      → eta_total = 0.654  (0.85, 0.85, 0.85, 0.95, 0.95)
-#   _L2_EFFICIENCY (here + telescope)  → eta_total = 0.711  (0.85, 0.85, 0.90, 0.97, 0.95)
-#
-# Anyone constructing ``Channel(...)`` without an explicit ``efficiency=``
-# silently gets the more pessimistic dataclass-default values, ~8% off.
-# Right fix: a single canonical ``L2_EFFICIENCY`` (no underscore --
-# promote to public preset) in ``instrument.py`` next to ``ScalarEfficiency``,
-# imported from there in both ``config.py`` and ``telescope.py``; drop
-# dataclass defaults to force explicit construction; update tests
-# accordingly. Small mechanical refactor (~30 lines across three
-# files), out of scope for this cleanup-pass commit but flagged here.
-# ---------------------------------------------------------------------------
-
-# L2 space mission: high efficiency, modest cosmic-ray deadtime
-_L2_EFFICIENCY = ScalarEfficiency(
-    detector_yield=0.85,
-    observing_efficiency=0.85,
-    data_cut_fraction=0.90,
-    cosmic_ray_deadtime=0.97,   # ~3% deadtime from GCR glitches at L2
-    polarization_efficiency=0.95,
-)
-
-
-# ---------------------------------------------------------------------------
 # Instrument presets
 # ---------------------------------------------------------------------------
 #
@@ -149,9 +122,6 @@ _L2_EFFICIENCY = ScalarEfficiency(
 #   (c) Document the divide in this module's header: "physics-derived
 #       designs live in telescope.py; published-numbers presets live
 #       here".
-#
-# Also see the related _L2_EFFICIENCY redundancy TODO -- both stem from
-# the same accreted-over-time presets-of-presets layout.
 # ---------------------------------------------------------------------------
 
 def simple_probe() -> Instrument:
@@ -161,7 +131,7 @@ def simple_probe() -> Instrument:
     channels and one cross-check band. Sensitivity levels are loosely
     PICO-like at reduced channel count.
     """
-    eff = _L2_EFFICIENCY
+    eff = L2_EFFICIENCY
     channels = (
         Channel(nu_ghz=30.0,  n_detectors=12,  net_per_detector=114.0, beam_fwhm_arcmin=38.4, efficiency=eff),
         Channel(nu_ghz=90.0,  n_detectors=48,  net_per_detector=52.0,  beam_fwhm_arcmin=12.8, efficiency=eff),
@@ -184,7 +154,7 @@ def pico_like() -> Instrument:
     already in N_bolo). Beam FWHM = 6.2' × (155 GHz / ν_c).
     PICO assumed ~95% survey efficiency and 90% detector yield from L2.
     """
-    eff = _L2_EFFICIENCY
+    eff = L2_EFFICIENCY
     # (nu_ghz, n_bolo, CBE bolo NET [μK_CMB √s], FWHM [arcmin])
     # Source: PICO report Table 3.2 (arXiv:1902.10541, p.36)
     # NET is per-bolometer temperature NET; code applies √2 for polarization.
@@ -321,7 +291,7 @@ def cleaned_map_instrument(f_sky: float,
         n_detectors=1,
         net_per_detector=1.0,   # placeholder; overridden by external noise
         beam_fwhm_arcmin=1.0,   # placeholder; spectra are beam-deconvolved
-        efficiency=_L2_EFFICIENCY,
+        efficiency=L2_EFFICIENCY,
     )
     return Instrument(
         channels=(dummy_channel,),
@@ -329,21 +299,6 @@ def cleaned_map_instrument(f_sky: float,
         f_sky=f_sky,
         requires_external_noise=True,
     )
-
-
-# ---------------------------------------------------------------------------
-# Ground-based efficiency defaults
-# ---------------------------------------------------------------------------
-
-# Atmospheric experiments: low observing efficiency due to weather and
-# scan-strategy turnarounds; no cosmic-ray deadtime concern.
-_GROUND_EFFICIENCY = ScalarEfficiency(
-    detector_yield=0.80,
-    observing_efficiency=0.25,   # weather, turnarounds, calibration
-    data_cut_fraction=0.80,      # weather/quality cuts
-    cosmic_ray_deadtime=1.00,    # not applicable on the ground
-    polarization_efficiency=0.90,
-)
 
 
 def so_like() -> Instrument:
@@ -359,7 +314,7 @@ def so_like() -> Instrument:
         - Effective ground ℓ_min is ~30 after common-mode filtering.
         - No frequency coverage above 280 GHz (atmosphere opaque).
     """
-    eff = _GROUND_EFFICIENCY
+    eff = GROUND_EFFICIENCY
     # (nu_ghz, n_det, NET [μK√s], FWHM [arcmin])
     # FWHM scaled as 1.4' × (145/ν) for a ~6 m aperture (SO LAT).
     _bands = [
@@ -391,7 +346,7 @@ def cmbs4_like() -> Instrument:
         - Deep delensing patch (f_sky~0.03, ~0.5 μK-arcmin at 150 GHz) not
           modelled here; this is the wide-survey configuration only.
     """
-    eff = _GROUND_EFFICIENCY
+    eff = GROUND_EFFICIENCY
     # (nu_ghz, n_det, NET [μK√s], FWHM [arcmin])
     # FWHM scaled as 1.5' × (150/ν) for a ~6 m aperture.
     _bands = [

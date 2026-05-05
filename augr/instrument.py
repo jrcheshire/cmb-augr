@@ -40,6 +40,10 @@ class ScalarEfficiency:
     Each factor is in [0, 1]. Their product η_total enters as an effective
     reduction in the number of detector-seconds of integration.
 
+    Field defaults match :data:`L2_EFFICIENCY` (η_total = 0.711); see the
+    module-level platform presets ``L2_EFFICIENCY`` / ``GROUND_EFFICIENCY``
+    / ``IDEALIZED_EFFICIENCY`` for the canonical platform-specific values.
+
     Attributes:
         detector_yield:         Fraction of optically-coupled detectors that work.
         observing_efficiency:   Science observing time / total mission time
@@ -53,8 +57,8 @@ class ScalarEfficiency:
     """
     detector_yield: float = 0.85
     observing_efficiency: float = 0.85
-    data_cut_fraction: float = 0.85
-    cosmic_ray_deadtime: float = 0.95
+    data_cut_fraction: float = 0.90
+    cosmic_ray_deadtime: float = 0.97
     polarization_efficiency: float = 0.95
 
     @property
@@ -65,6 +69,45 @@ class ScalarEfficiency:
                 * self.data_cut_fraction
                 * self.cosmic_ray_deadtime
                 * self.polarization_efficiency)
+
+
+# -----------------------------------------------------------------------
+# Platform-specific efficiency presets
+# -----------------------------------------------------------------------
+# Single source of truth for the standard platform efficiencies; imported
+# by config.py and telescope.py rather than redefined there.
+
+# L2 space mission baseline: high yield/uptime, modest cosmic-ray deadtime.
+# η_total = 0.711.
+L2_EFFICIENCY = ScalarEfficiency(
+    detector_yield=0.85,
+    observing_efficiency=0.85,
+    data_cut_fraction=0.90,
+    cosmic_ray_deadtime=0.97,   # ~3% deadtime from GCR glitches at L2
+    polarization_efficiency=0.95,
+)
+
+# Ground-based atmospheric experiments: low observing efficiency due to
+# weather and scan-strategy turnarounds; cosmic rays not a concern.
+# η_total = 0.137.
+GROUND_EFFICIENCY = ScalarEfficiency(
+    detector_yield=0.80,
+    observing_efficiency=0.25,   # weather, turnarounds, calibration
+    data_cut_fraction=0.80,      # weather/quality cuts
+    cosmic_ray_deadtime=1.00,    # not applicable on the ground
+    polarization_efficiency=0.90,
+)
+
+# Idealized space mission ("idealized" telescope-design variants): PICO-like
+# observing efficiency assumption; everything else matches L2.
+# η_total = 0.762.
+IDEALIZED_EFFICIENCY = ScalarEfficiency(
+    detector_yield=0.85,
+    observing_efficiency=0.95,   # PICO assumption
+    data_cut_fraction=0.90,
+    cosmic_ray_deadtime=0.97,
+    polarization_efficiency=0.95,
+)
 
 
 @dataclass(frozen=True)
@@ -94,7 +137,7 @@ class Channel:
     beam_fwhm_arcmin: float
     knee_ell: float = 0.0
     alpha_knee: float = 1.0
-    efficiency: ScalarEfficiency = ScalarEfficiency()
+    efficiency: ScalarEfficiency = L2_EFFICIENCY
 
 
 @dataclass(frozen=True)
