@@ -75,6 +75,43 @@ class SkyModel:
 # ---------------------------------------------------------------------------
 # L2 scan strategy model
 # ---------------------------------------------------------------------------
+#
+# TODO(future-direction, scan-strategy weighting):
+# Two related limitations of the current per-patch noise-weight derivation,
+# left as future work (out of scope for the post-spinout cleanup pass):
+#
+# 1. ``l2_scan_depth`` returns a 1/sin(theta) heuristic on the observable
+#    annulus [|beta - alpha|, beta + alpha], with a hard zero-fill outside.
+#    The rigorous single-precession-cycle density is
+#        t(theta) propto 1 / sqrt[ sin^2(beta) sin^2(alpha)
+#                                  - (cos theta - cos beta cos alpha)^2 ]
+#    which has caustic divergences at BOTH boundaries (not just the inner
+#    one captured by 1/sin). The proper year-averaged ergodic density —
+#    which removes the hard zero-fill (a single-precession-cycle artifact
+#    that the year-long anti-sun sweep washes out) — is exactly the k=0
+#    case of the machinery already in ``augr.crosslinks`` (1-D adaptive
+#    Chebyshev quadrature over spin-axis colatitude with the same
+#    precession x spin Jacobian factors).
+#
+# 2. ``patch_noise_weights``, ``_infer_lat_boundaries``, and
+#    ``_galactic_to_ecliptic_lat`` together bake in the assumption that
+#    patches are symmetric galactic-latitude bands ordered cleanest-first.
+#    The Fisher math in ``augr.multipatch`` does not require this — it
+#    only consumes per-patch (f_sky, A_dust_scale, A_sync_scale,
+#    noise_weight) tuples — but the convenience helper here breaks for
+#    custom masks (BICEP-field-style RA/dec patches, fuzzy apodized
+#    Planck masks, ecliptic-aligned patches, deep-field-within-survey).
+#    Users with custom footprints can construct ``SkyPatch`` instances
+#    with ``noise_weight`` set explicitly, but lose the helper.
+#
+# Unified cleanup: factor the per-patch depth integral into a general
+# layer that takes a HEALPix mask (or an explicit ecliptic-latitude
+# weight distribution) and returns the average ``l2_scan_depth`` (or its
+# ergodic-year-averaged replacement) over that footprint. Then keep the
+# gal-lat preset wrapper as a thin convenience that builds the ecl-lat
+# distribution from a (b_lo, b_hi) band via ``_galactic_to_ecliptic_lat``.
+# Same change unblocks both items above; both touch the same code path.
+# ---------------------------------------------------------------------------
 
 # Galactic-ecliptic tilt: ecliptic pole is at galactic latitude ~30°,
 # or equivalently the ecliptic plane is tilted ~60° from the galactic plane.
