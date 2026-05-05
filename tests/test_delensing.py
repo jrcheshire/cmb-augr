@@ -402,6 +402,7 @@ class TestFullSkyN0:
         assert float(n0[0]) > float(n0[1]) > float(n0[2]) > float(n0[3])
 
 
+@pytest.mark.slow
 class TestFullSkyIteration:
     def test_convergence(self, spectra, noise):
         """Full-sky iteration should converge with 0 < A_lens_eff < 1."""

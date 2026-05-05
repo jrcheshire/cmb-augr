@@ -48,3 +48,6 @@ include = ["augr*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: tests that take O(minutes) — full-sky Wigner 3j delensing iterations and 200k-sample Monte Carlo crosschecks. Excluded from default CI; run with `pytest -m slow` or unfiltered.",
+]

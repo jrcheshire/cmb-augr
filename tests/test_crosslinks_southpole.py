@@ -356,6 +356,7 @@ def test_ba_8deck_preset_nonzero_at_h8():
 
 # -- time-domain MC at lat = -90 deg matches closed form -----------------------
 
+@pytest.mark.slow
 def test_mc_matches_closed_form_at_lat_minus_90():
     """At lat = -90 deg exactly, the parallactic correction is zero and the
     time-domain MC reduces to the deck-distribution MC; should match the
@@ -383,6 +384,7 @@ def test_mc_matches_closed_form_at_lat_minus_90():
 
 # -- lat = -89.99 deg deviation is bounded by O(eps^2) -------------------------
 
+@pytest.mark.slow
 def test_lat_offset_correction_is_negligible():
     """For lat = -89.99 deg (eps ~ 1.7e-4 rad), a symmetric HA scan window
     averages the leading-order eps*sin(HA) correction to zero, leaving an
