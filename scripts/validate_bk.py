@@ -13,6 +13,8 @@ Gray curve: 12+-band analysis (BK + Planck + WMAP) with BK15 priors, A_lens free
 Extends through 2018 including BICEP3 at 95 GHz.
 """
 
+from pathlib import Path
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -347,6 +349,8 @@ ax_sr.legend(fontsize=7.5, loc="lower left")
 ax_sr.grid(True, alpha=0.3, which="both")
 
 plt.tight_layout()
-outpath = "/home/jamie/cmb/forecasting/figure5_comparison.png"
+PLOT_DIR = Path(__file__).resolve().parent.parent / "plots"
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+outpath = PLOT_DIR / "validate_bk.png"
 plt.savefig(outpath, dpi=150, bbox_inches="tight")
 print(f"\nSaved: {outpath}")
