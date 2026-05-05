@@ -86,6 +86,25 @@ DEFAULT_FIXED_MOMENT: list[str] = ["T_dust"]
 # ---------------------------------------------------------------------------
 # Space-mission efficiency defaults
 # ---------------------------------------------------------------------------
+#
+# TODO(cleanup, L2_EFFICIENCY redundancy):
+# This constant is also defined identically in ``telescope.py`` (with a
+# stale comment claiming the duplication avoids a circular dependency
+# that doesn't actually exist today), and ``instrument.ScalarEfficiency``
+# carries dataclass defaults that disagree with both:
+#
+#   instrument.ScalarEfficiency()      → eta_total = 0.654  (0.85, 0.85, 0.85, 0.95, 0.95)
+#   _L2_EFFICIENCY (here + telescope)  → eta_total = 0.711  (0.85, 0.85, 0.90, 0.97, 0.95)
+#
+# Anyone constructing ``Channel(...)`` without an explicit ``efficiency=``
+# silently gets the more pessimistic dataclass-default values, ~8% off.
+# Right fix: a single canonical ``L2_EFFICIENCY`` (no underscore --
+# promote to public preset) in ``instrument.py`` next to ``ScalarEfficiency``,
+# imported from there in both ``config.py`` and ``telescope.py``; drop
+# dataclass defaults to force explicit construction; update tests
+# accordingly. Small mechanical refactor (~30 lines across three
+# files), out of scope for this cleanup-pass commit but flagged here.
+# ---------------------------------------------------------------------------
 
 # L2 space mission: high efficiency, modest cosmic-ray deadtime
 _L2_EFFICIENCY = ScalarEfficiency(
@@ -99,6 +118,40 @@ _L2_EFFICIENCY = ScalarEfficiency(
 
 # ---------------------------------------------------------------------------
 # Instrument presets
+# ---------------------------------------------------------------------------
+#
+# TODO(cleanup, preset overlap with telescope.py):
+# Two families of "probe-class space mission" presets exist in parallel
+# and don't talk to each other:
+#
+#   - This module's ``simple_probe()``: hand-tuned 6-band Instrument
+#     with explicit (NET, beam, n_det) per channel. Loosely PICO-like
+#     at reduced channel count.
+#   - ``telescope.probe_design()``: physics-based TelescopeDesign
+#     (1.5 m, f/2, 0.4 m focal plane, 6 bands in 3 dichroic pairs)
+#     that goes through ``to_instrument()`` to derive NETs from
+#     photon_noise_net + detector counts from feedhorn packing. Has
+#     ``probe_idealized()`` / ``flagship_design()`` / ``flagship_idealized()``
+#     siblings for optics-comparison forecasts.
+#
+# They cover different band layouts and use different methodologies,
+# so they aren't strictly redundant -- but a user seeing both is
+# justifiably confused about which to use. The right resolution is
+# probably:
+#   (a) Keep the published-numbers presets here (``pico_like``,
+#       ``litebird_like``, ``so_like``, ``cmbs4_like``,
+#       ``cleaned_map_instrument``) -- these reproduce specific public
+#       forecasts and don't have a physics-derived counterpart.
+#   (b) Move ``simple_probe`` either out (let users get a probe via
+#       ``to_instrument(probe_design())``) or down-rank it to a clearly-
+#       labeled "smoke-test fixture" (small, hand-tuned for fast tests,
+#       not meant as a representative forecast).
+#   (c) Document the divide in this module's header: "physics-derived
+#       designs live in telescope.py; published-numbers presets live
+#       here".
+#
+# Also see the related _L2_EFFICIENCY redundancy TODO -- both stem from
+# the same accreted-over-time presets-of-presets layout.
 # ---------------------------------------------------------------------------
 
 def simple_probe() -> Instrument:
