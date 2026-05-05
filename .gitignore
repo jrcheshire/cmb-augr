@@ -7,5 +7,9 @@ scripts/_broom_scratch/
 plots/
 data/broom_outputs/
 data/hit_maps/
-data/falcons_validation/
-scripts/falcons_validation/
+# Track scripts/falcons_validation/ + the PNGs and metadata under
+# data/falcons_validation/, but keep the regenerable FITS / HTML out
+# of git.
+data/falcons_validation/*.fits
+data/falcons_validation/*.html
+scripts/falcons_validation/*.html
