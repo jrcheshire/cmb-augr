@@ -327,9 +327,16 @@ Production scripts:
 ## References
 
 - Buza 2019, PhD thesis (Harvard) -- Fisher formalism, BICEP/Keck forecasting
+- Errard et al. 2016, JCAP 03, 052 -- Analytic Fisher-forecast methodology used as the reference for the PICO cross-check
 - BICEP2/Keck 2018, PRL 121, 221301 (arXiv:1810.05216) -- BK15 foreground model and parameters (data through the 2015 season)
+- BICEP/Keck Collaboration 2021 (arXiv:2110.00483) -- BK18 published σ(r) constraint, used as the validation target in `scripts/validate_bk.py`
 - Chluba et al. 2017 (arXiv:1701.00274) -- Moment expansion for foreground complexity
+- Azzoni et al. 2021 -- Bandpower-level moment-expansion methodology for spatially varying SED parameters
+- Planck Collaboration 2016, A&A 594, A10 (arXiv:1502.01588) -- Dust spectral-index priors used in `DEFAULT_PRIORS`
 - Hanany et al. 2019 (arXiv:1902.10541) -- PICO probe study report (50-page mission study; the 10-page whitepaper companion is arXiv:1908.07495)
+- LiteBIRD Collaboration 2023, PTEP 2023, 042F01 (arXiv:2202.02773) -- LiteBIRD instrument preset / channel specifications
+- The Simons Observatory Collaboration 2019, JCAP 02, 056 (arXiv:1808.07445) -- Simons Observatory baseline preset
+- Abazajian et al. (CMB-S4 Collaboration) 2022 (arXiv:2203.08024) -- CMB-S4 preset and sensitivity baseline
 - Pan-Experiment Galactic Science Group (Borrill et al.) 2025 (arXiv:2502.20452) -- PySM3 foreground models
 - Bianchini et al. 2025 (arXiv:2502.04300) -- CMB-S4 foreground-cleaning pipeline comparison
 - Hu & Okamoto 2002 (arXiv:astro-ph/0111606) -- Quadratic estimator lensing reconstruction
@@ -337,3 +344,13 @@ Production scripts:
 - Smith et al. 2012 (arXiv:1010.0048) -- Residual BB after delensing
 - Maniyar et al. 2021 (arXiv:2101.12193) -- Full-sky N_0 formulas
 - Trendafilova, Hotinli & Meyers 2024, JCAP 06, 017 (arXiv:2312.02954) -- CLASS_delens iterative delensing
+- Carones et al. 2025 (arXiv:2510.20785) -- Residual-template noise debiasing (Eq. 3.7) and component-separation reference values for `scripts/validate_carones.py`
+- Carones et al. 2026 (arXiv:2604.14088) -- BROOM (NILC/GNILC) component-separation pipeline; consumed via `scripts/broom_residual_template.py`
+- Wallis et al. 2017 (arXiv:1604.02290) -- Spin-coefficient (h_k) formalism for crosslink / differential-bias contamination, Eqs. 20-22; foundational for `augr/crosslinks.py` and `augr/crosslinks_southpole.py`
+- McCallum, Wallis et al. 2021, MNRAS 501, 802 (arXiv:2008.00011) -- Crosslink-formalism literature review
+- Leloup et al. 2024 (arXiv:2312.09001) -- LiteBIRD far-sidelobe systematics framework, referenced as the right tool for sidelobe × non-uniform-FG bias propagation (out of current scope)
+- Maris et al. 2006 -- Planck scan-strategy polar-hole / Deep-Field geometry, motivating the `hit_maps.l2_hit_map` envelope
+- Griffin et al. 2002 -- Single-moded feedhorn coupling (d ~ 2Fλ), used in the telescope module focal-plane packing
+- Falcons.jl (Takase 2025, https://github.com/yusuke-takase/Falcons.jl) -- Time-domain scan-strategy simulator used as the bit-exact validation reference for `augr/crosslinks.py`
+- Lewis, Challinor & Lasenby 2000, ApJ 538, 473 (arXiv:astro-ph/9911177) -- CAMB; produces the C_ℓ templates loaded by `augr/spectra.py`
+- Alonso et al. 2019, MNRAS 484, 4127 (arXiv:1809.09603) -- NaMaster; pseudo-C_ℓ estimator and natural source of measured BPWFs consumed via `augr/bandpower_windows.py`
