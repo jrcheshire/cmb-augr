@@ -8,7 +8,6 @@ from augr.bandpower_windows import (
     load_bandpower_window_set,
 )
 
-
 # -----------------------------------------------------------------------
 # Synthetic BPWF builder (overlapping Gaussians)
 # -----------------------------------------------------------------------
@@ -217,7 +216,7 @@ def test_load_set_npz_tensor_round_trip(tmp_path):
     pairs = [(0, 0), (0, 1), (1, 1)]
     by_pair = _build_pair_dict(pairs, ells)
     n_pairs = len(pairs)
-    n_bins = list(by_pair.values())[0].shape[0]
+    n_bins = next(iter(by_pair.values())).shape[0]
     n_ells = ells.size
     window_3d = np.zeros((n_pairs, n_bins, n_ells))
     for s, p in enumerate(pairs):

@@ -452,7 +452,7 @@ def test_blocks_path_raises_on_bpwf(two_chan_instrument):
 
 def _gaussian_bpwf_rows(centers, sigmas, ells):
     rows = []
-    for c, s in zip(centers, sigmas):
+    for c, s in zip(centers, sigmas, strict=True):
         row = np.exp(-(ells - c) ** 2 / (2.0 * s ** 2))
         rows.append(row / row.sum())
     return np.array(rows)

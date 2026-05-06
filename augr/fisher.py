@@ -33,7 +33,6 @@ import numpy as np
 from augr.covariance import (
     bandpower_covariance_blocks,
     bandpower_covariance_blocks_from_noise,
-    bandpower_covariance_full,
     bandpower_covariance_full_from_noise,
 )
 from augr.instrument import ARCMIN_TO_RAD, Instrument, white_noise_power

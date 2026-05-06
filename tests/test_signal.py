@@ -509,7 +509,7 @@ def test_delensed_bb_requires_ells(simple_instrument, fg_model, cmb_spectra):
 def _gaussian_bpwf(centers, sigmas, ell_grid):
     """Synthetic overlapping Gaussian BPWFs, row-normalised to sum to 1."""
     rows = []
-    for c, s in zip(centers, sigmas):
+    for c, s in zip(centers, sigmas, strict=True):
         row = np.exp(-(ell_grid - c) ** 2 / (2.0 * s ** 2))
         rows.append(row / row.sum())
     return np.array(rows)
@@ -533,7 +533,7 @@ def test_measured_bpwf_basic(simple_instrument, fg_model, cmb_spectra):
     assert sm.n_bins == 3
     assert sm.bin_matrix.shape == (3, ells_in.size)
     # Bin centres reflect the supplied Gaussian centres to within the grid step.
-    for c_target, c_actual in zip(centers, sm.bin_centers):
+    for c_target, c_actual in zip(centers, sm.bin_centers, strict=True):
         assert abs(float(c_actual) - c_target) < 1.0
 
 
