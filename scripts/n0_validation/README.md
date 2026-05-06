@@ -153,104 +153,96 @@ What this resolves:
     full-sky formulas differ by a clean geometric factor that does
     NOT vanish at low L.
 
-New open thread: augr's full-sky path on non-constant inputs
-------------------------------------------------------------
+RESOLVED (2026-05-06, end of session): the discrepancy is a wrapper bug
+-----------------------------------------------------------------------
 
-Two distinct issues:
+What looked like a "catastrophic 8410x discrepancy at L=2 on realistic
+LiteBIRD spectra" between augr's full-sky path and plancklens was a
+bug in ``run_plancklens.py``'s ``fal`` construction. Both codes are
+correct.
 
-**Bug 1 (mild): sparse input Ls + log-interp in ``_fullsky_L_samples``.**
-``_compute_n0_*_fullsky`` computes only at ``L_samples`` (a log-spaced
-subset, ``n_sample = min(len(Ls), max(50, L_max // 20))``) and then
-``np.interp`` in log space onto the requested ``Ls``. With sparse
-input ``Ls`` the geomspace gridding is sparse too, and log-interp
-adds ~10-20% error between samples. The earlier table's "~14% spike
-at L=30" was this artefact: re-running the controlled-input test with
-a denser ``--Ls`` arg gives a smooth ratio rising from 1.001 at L=2
-to 1.87 at L=1500 (the latter is just the ``L / l_max`` boundary).
-plancklens with the same Ls and l_max=2000 sits ~1% below that
-through L=300 and converges to augr full at L=600+.
+**The wrapper bug.** ``run_plancklens.py:plancklens_n0`` builds
 
-**Bug 2 (severe, structural): non-constant cls give the constant-C
-answer at low L.** On realistic LiteBIRD-PTEP spectra at L=2:
+    fal['tt'] = _safe_inv(cl_tt_len + nl_tt)
 
-| input                                          | augr flat   | augr full   | plancklens |
-|------------------------------------------------|-------------|-------------|------------|
-| C_unl=real, C_len=real, nl=real (LB-PTEP)      | 3.87e-10    | 1.67e-07    | 1.99e-11   |
-| C_unl=real, C_len=real, nl=0                   | 4.16e-08    | 2.17e-08    | --         |
-| C_unl=10x,  C_len=real, nl=0   (scale unl)     | 4.16e-10    | 2.17e-10    | --         |
-| C_unl=real, C_len=10x,  nl=0   (scale tot)     | 4.16e-06    | 2.17e-06    | --         |
-| C0=1, nl=0                                     | 3.93e-07    | 1.74e-07    | 1.74e-07   |
-| C0=1, nl=1                                     | --          | 6.98e-07    | 6.98e-07   |
-| C0=1, nl=10                                    | --          | 2.11e-05    | 2.11e-05   |
+without zeroing the result below ``l_min``. ``augr.combined_noise_nl``
+returns ``nl_tt[0:2] = 1.5e-7`` (a small but non-zero floor at the
+monopole / dipole), and ``cl_tt_len[0:2] = 0`` from CAMB, so
+``fal[0:2] = 1 / 1.5e-7 = 6.5e6`` -- enormous. plancklens's
+``get_response`` then includes the l=0,1 modes in the QE response
+calculation, inflating ``r_gg`` at low L by ~1000x and giving a
+correspondingly tiny N_0 (since N_0 = n_gg / r_gg^2 = 1 / r_gg when
+the unbiasedness condition holds).
 
-Augr full-sky agrees with plancklens to **4 significant figures** on
-**any constant** ``(C0, nl)`` pair (rows 5-7), but on realistic
-LiteBIRD inputs (row 1) is **8410x larger** than plancklens at L=2
-and roughly equal to the constant-C answer (1.67e-07 vs 1.74e-07).
-Augr full also responds correctly to **uniform scaling** of the
-realistic spectra (rows 2-4: C cancellation behaves predictably).
-Only when the spectra are *non-constant in l* does augr full
-diverge from plancklens.
+augr's ``compute_n0_*`` enforces ``l_min=2`` via the lower bound of
+its ``l1`` sum and the ``l2_min=l_min`` argument to
+``wigner3j_000_vectorized``, so the l=0,1 modes never enter the augr
+calculation. The two codes were silently using different effective
+``l_min`` for the same input.
 
-Extending ``l_max=2000 -> 3000`` to match plancklens's lmax_ivf gives
-**identical** augr-full numbers (high-l region is killed by huge nl,
-not by the cutoff). Forcing ``l_max=3000`` does not fix it.
+The fix is one line: after building ``fal``, apply the plancklens
+convention ``fal[s][:max(1, lmin_ivf)] = 0`` (cf.
+``plancklens/n0s.py:137``). ``cls_weight`` should be similarly
+zeroed below ``lmin``, though in our case ``cl_unl[0:2]=0`` already
+masks it on that side.
 
-**Hypothesis (under investigation, 2026-05-06):** augr's full-sky
-formula uses the Smith et al. 2012 substitution
-``L.l1 -> alpha_1 = [L(L+1) + l1(l1+1) - l2(l2+1)] / 2`` to lift the
-flat-sky response into full-sky. plancklens decomposes the same QE
-in terms of spin-raising / spin-lowering operators on the legs
-(``sqrt(l(l+1))`` factors) convolved through ``uspin.wignerc``. On
-constant inputs these are mathematically equivalent (both pass).
-On non-constant inputs they may not be, if augr's "alpha
-substitution" double-counts or mis-couples the spectrum across legs
-in a way that's invisible when Cl is constant. Possible angles:
-the (alpha_1 + alpha_2) cancellation leaves the ``f^2 / C_tot^2``
-ratio geometric and ~spectrum-independent at low L — which is what
-augr full appears to be doing — while the proper spin-raised
-formulation retains a non-cancelling spectrum-shape dependence.
+**Verification.** With the lmin filter applied to plancklens at the
+LiteBIRD-PTEP fiducial config and dense input Ls covering [2, 1000]:
 
-Next steps:
+| L    | augr full   | plancklens (fixed) | ratio    |
+|------|-------------|--------------------|----------|
+| 2    | 1.6718e-07  | 1.6718e-07         | 0.999999 |
+| 5    | 5.8098e-09  | 5.8098e-09         | 1.000000 |
+| 10   | 4.2274e-10  | 4.2274e-10         | 1.000000 |
+| 20   | 2.8998e-11  | 2.8998e-11         | 1.000000 |
+| 30   | 5.9957e-12  | 5.9702e-12         | 1.004273 |
+| 1000 | 5.9014e-17  | 5.9014e-17         | 1.000000 |
 
-  1. Re-derive the full-sky TT QE response from first principles in
-     both formulations and check whether
-     ``f^TT_alpha = (Cl1 alpha1 + Cl2 alpha2) * w000 * pf`` is in
-     fact the right substitution for non-constant Cl, or whether the
-     correct full-sky form is a different (non-additive) combination
-     of spin-raised legs and the Wigner-3j coupling. References:
-     Hu & Okamoto 2002 (astro-ph/0111606) Eq. A14, A18; Smith,
-     Hanson, Challinor 2012 (arXiv:1205.0474) for the spin-2 case;
-     plancklens ``qresp.get_qes`` + ``uspin.wignerc`` for the
-     reference implementation.
-  2. Test on a *smooth-but-non-constant* C(l) (e.g. C(l) = 1 + 0.1 l)
-     to see at what amount of non-constancy augr full starts to
-     diverge — the constant-C agreement is a *measure-zero* check
-     and a slope sweep will tell us whether the bug enters at first
-     order in dC/dl or only at higher.
-  3. Once the augr full bug is understood, check whether the same
-     issue affects ``_compute_n0_ee_fullsky`` and
-     ``_compute_n0_eb_fullsky`` (the EE/EB versions use the same
-     alpha substitution).
-  4. Separately, fix Bug 1 (sparse-Ls log-interp) regardless of
-     Bug 2's resolution: it is a small but real ~10% systematic on
-     internally-sampled L bins that should not exist.
+Max ``|ratio - 1|`` over all dense Ls in [2, 1000]: **7.2e-3 (<1%).**
+augr full-sky and plancklens agree everywhere.
 
-Pre-existing flat-sky path is correct and unaffected by either bug;
-no production-path changes are required while this is open. The
-"~2.6x discrepancy at LiteBIRD-PTEP" between flat-sky augr and
-plancklens is partially geometric (flat-vs-full factor
-``(L+1)^2 / L^2``) and partially the same Bug 2 manifestation
-when looking at the post-flat-vs-full residual.
+**Conclusions on each piece:**
 
-The ``compute_n0_ee`` / ``compute_n0_eb`` polarization estimators
-were not reproduced at the same level by this test (their controlled-
-input answer needs a numerical reference because the
-``cos(2 phi_12)`` / ``sin(2 phi_12)`` factors do not collapse for
-constant C). The polarization MV ratio "0.64 -> 1.00" reported in the
-earlier ratio table is consistent with the same flat-vs-full
-geometric factor, so it is likely OK; running the analogous numerical-
-reference test for EE/EB is a small follow-up.
+  - augr **flat-sky** TT formula: correct to machine precision on
+    closed-form input (controlled-input test).
+  - augr **full-sky** TT formula: correct. The Smith-2012 substitution
+    ``L.l1 -> alpha_1 = [L(L+1) + l1(l1+1) - l2(l2+1)] / 2`` is
+    mathematically equivalent to plancklens's spin-raised /
+    Wigner-convolved formulation; both reproduce the controlled-input
+    closed forms and agree on realistic LiteBIRD-PTEP inputs to <1%.
+  - plancklens TT QE: correct.
+
+**Bug B (real but mild) remains:** ``_fullsky_L_samples`` uses
+``n_sample = min(len(Ls), max(50, L_max // 20))`` log-spaced samples
+followed by log-interp. With sparse input ``Ls`` (e.g. 7 points), the
+sample grid is sparse and log-interp adds ~10-20% error at
+intermediate L. The fix is to make ``n_sample`` ignore ``len(Ls)``
+(always use a reasonable internal grid). All references to "augr full
+~14% high at L=30..300 on the constant-C controlled input" in
+earlier session notes were this artefact.
+
+Action items
+------------
+
+  1. Fix ``scripts/n0_validation/run_plancklens.py`` to apply the
+     ``fal[s][:lmin] = 0`` convention. Re-run to regenerate
+     ``n0_reference_litebird.npz``. The re-generated reference will
+     match augr full-sky to <1% across all L in [2, lmax_ivf].
+  2. Update ``compare.py`` and the lightweight test to apply the
+     same lmin treatment, OR document that the augr-full-sky path
+     is the correct comparison (and consider deprecating the
+     flat-sky-vs-plancklens-full-sky comparison in the test, since
+     the flat-vs-full geometric factor will always make those
+     disagree at low L).
+  3. Fix Bug B in ``augr/delensing.py:_fullsky_L_samples`` (drop the
+     ``len(Ls)`` cap on ``n_sample``).
+  4. Copy the regenerated NPZ to ``data/n0_reference_litebird.npz``,
+     turn on ``TestN0AgainstPlancklens`` in the augr test suite, and
+     close out this validation.
+
+The investigation did NOT find a bug in either augr or plancklens'
+QE math. The wrapper-side discrepancies were instructive but
+ultimately fed by the missing lmin filter, not by formula error.
 
 How to reproduce
 ----------------
