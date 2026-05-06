@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "BSD-3-Clause" }
 authors = [
-    { name = "Jamie Cheshire", email = "cheshire@caltech.edu" },
+    { name = "James Cheshire", email = "cheshire@caltech.edu" },
 ]
 keywords = ["CMB", "cosmology", "Fisher", "forecasting", "B-modes", "JAX", "delensing"]
 classifiers = [
