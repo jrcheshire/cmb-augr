@@ -1273,7 +1273,7 @@ packages:
 - pypi: ./
   name: cmb-augr
   version: 0.1.0
-  sha256: fa4372c3a7e9b4a305996ab0746efbc14fd3c582fa1c33715be22b63bb625cc9
+  sha256: e74fbf7577184cd3940ce0ed7092334cf37d18a500b8994d83b412d54a7fbd82
   requires_dist:
   - jax>=0.4
   - jaxlib>=0.4
