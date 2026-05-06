@@ -221,28 +221,46 @@ intermediate L. The fix is to make ``n_sample`` ignore ``len(Ls)``
 ~14% high at L=30..300 on the constant-C controlled input" in
 earlier session notes were this artefact.
 
-Action items
-------------
+Closed out (2026-05-06)
+-----------------------
 
-  1. Fix ``scripts/n0_validation/run_plancklens.py`` to apply the
-     ``fal[s][:lmin] = 0`` convention. Re-run to regenerate
-     ``n0_reference_litebird.npz``. The re-generated reference will
-     match augr full-sky to <1% across all L in [2, lmax_ivf].
-  2. Update ``compare.py`` and the lightweight test to apply the
-     same lmin treatment, OR document that the augr-full-sky path
-     is the correct comparison (and consider deprecating the
-     flat-sky-vs-plancklens-full-sky comparison in the test, since
-     the flat-vs-full geometric factor will always make those
-     disagree at low L).
-  3. Fix Bug B in ``augr/delensing.py:_fullsky_L_samples`` (drop the
-     ``len(Ls)`` cap on ``n_sample``).
-  4. Copy the regenerated NPZ to ``data/n0_reference_litebird.npz``,
-     turn on ``TestN0AgainstPlancklens`` in the augr test suite, and
-     close out this validation.
+All four action items from the previous session were knocked out:
+
+  1. ``run_plancklens.py`` now applies the standard plancklens
+     convention ``fal[s][:l_min] = 0`` and ``cls_w[s][:l_min] = 0``
+     (cf. ``plancklens/n0s.py:137``). New CLI flag ``--l-min``
+     defaulting to 2.
+  2. ``run_plancklens.py`` now passes ``cls_w = unlensed C_l`` to
+     ``qresp.get_response``, matching augr's HO02 response convention
+     exactly. Removes the ~5-10% "lensed-vs-unlensed in response"
+     systematic that the previous comment had accepted.
+  3. ``augr/delensing.py:_fullsky_L_samples`` drops the
+     ``len(Ls)`` cap on the internal sample grid and now always
+     includes the input ``Ls`` directly, eliminating the
+     sparse-input log-interp error.
+  4. NPZ regenerated with the fixes above and copied to
+     ``data/n0_reference_litebird.npz``.
+     ``tests/test_delensing.py::TestN0AgainstPlancklens`` is now an
+     active slow test gated on TT (the only apples-to-apples
+     comparison; PP and MV differ by the diagonal-vs-joint MV
+     formulation, which is real physics, not a tolerance bug).
+
+Final agreement on TT, L in [2, 3000]:
+
+| L band         | max ``\|ratio - 1\|`` |
+|----------------|-----------------------|
+| 2 - 9          | 1.08e-6               |
+| 10 - 200       | 5.02e-8               |
+| 200 - 2000     | 2.52e-10              |
+| 2000 - 3000    | 9.42e-5               |
+
+Bulk and high-L test tolerances locked at 1e-3 (~4 orders of
+magnitude headroom on the actual numbers, just to catch regressions
+without being noisy).
 
 The investigation did NOT find a bug in either augr or plancklens'
-QE math. The wrapper-side discrepancies were instructive but
-ultimately fed by the missing lmin filter, not by formula error.
+QE math. All discrepancies traced back to mismatched conventions
+between the wrapper and plancklens's official recipe.
 
 How to reproduce
 ----------------

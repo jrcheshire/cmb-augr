@@ -87,7 +87,8 @@ def build_inputs(lmax_ivf: int):
 # 2. plancklens N_0 wrapper.
 # ---------------------------------------------------------------------
 
-def plancklens_n0(inputs: dict, Ls: np.ndarray, lmax_ivf: int) -> dict:
+def plancklens_n0(inputs: dict, Ls: np.ndarray, lmax_ivf: int,
+                  l_min: int = 2) -> dict:
     """Compute reference N_0 via the plancklens canonical recipe.
 
     Follows the construction at ``plancklens/n0s.py:380-440`` (the body
@@ -155,20 +156,42 @@ def plancklens_n0(inputs: dict, Ls: np.ndarray, lmax_ivf: int) -> dict:
         "te": inputs["cl_te_len"][:n_ells].copy(),
     }
 
+    # --- Apply plancklens's l_min convention to fal and dat_delcls. ---
+    # plancklens's official ``get_N0`` (plancklens/n0s.py:137) zeroes the
+    # filter and data spectra below l_min. WITHOUT this step, augr's tiny
+    # but non-zero noise floor at the monopole/dipole (e.g. nl_tt[0:2] =
+    # 1.5e-7) -> fal[0:2] = 6.5e6 -> the QE response is computed including
+    # the l=0,1 modes, inflating r_gg by ~1000x at low L and giving a
+    # spuriously tiny N_0 (since N_0 = 1 / r_gg in the unbiased limit).
+    # augr's compute_n0_* enforces l_min via the lower bound of its l1 sum
+    # and the wigner3j_000_vectorized l2_min argument. The two codes must
+    # use the same effective l_min for the comparison to be apples-to-
+    # apples; this loop enforces it.
+    if l_min > 0:
+        for s in fal:
+            fal[s][:l_min] = 0.0
+        for s in dat_delcls:
+            dat_delcls[s][:l_min] = 0.0
+
     # --- 3. cls_ivfs = fal . dat_delcls . fal (matrix product per ell). ---
     cls_ivfs = utils.cls_dot([fal, dat_delcls, fal], ret_dict=True)
 
-    # --- 4. cls_weights: lensed cls (matches plancklens recipe default). ---
-    # augr.delensing uses unlensed in the response (HO02 original); plancklens
-    # uses lensed (HO02 "improved" / Lewis-Pratten). The two differ by a few
-    # percent on the relevant scales -- accepted as a known systematic of the
-    # comparison rather than fought.
+    # --- 4. cls_weights: UNLENSED cls (matches augr.delensing's HO02
+    # original convention). plancklens's official recipe uses lensed cls
+    # here ("HO02 improved" / Lewis-Pratten), which differs by ~5-10% on
+    # TT at the lensing-relevant scales. We pass UNLENSED to make the
+    # augr-vs-plancklens comparison apples-to-apples; the lensed-vs-
+    # unlensed-in-response choice is a known systematic of the QE that
+    # is not the subject of this validation.
     cls_w = {
-        "tt": inputs["cl_tt_len"][:n_ells].copy(),
-        "ee": inputs["cl_ee_len"][:n_ells].copy(),
-        "bb": inputs["cl_bb_len"][:n_ells].copy(),
-        "te": inputs["cl_te_len"][:n_ells].copy(),
+        "tt": inputs["cl_tt_unl"][:n_ells].copy(),
+        "ee": inputs["cl_ee_unl"][:n_ells].copy(),
+        "bb": inputs["cl_bb_unl"][:n_ells].copy(),
+        "te": inputs["cl_te_unl"][:n_ells].copy(),
     }
+    if l_min > 0:
+        for s in cls_w:
+            cls_w[s][:l_min] = 0.0
 
     lmax_qlm = int(Ls.max())
     Ls_idx = Ls.astype(int)
@@ -231,6 +254,12 @@ def main() -> None:
         "--n-L", type=int, default=120,
         help="Number of L sample points (log-uniform between 2 and lmax_ivf).",
     )
+    parser.add_argument(
+        "--l-min", type=int, default=2,
+        help="Lower limit on the QE l1 sum. Below this, fal/cls are zeroed "
+             "(matches plancklens/n0s.py:137 and augr.compute_n0_*'s "
+             "l_min). Default 2.",
+    )
     args = parser.parse_args()
 
     print("Building inputs from augr.config.litebird_like() ...", flush=True)
@@ -242,8 +271,8 @@ def main() -> None:
     ]).clip(2, args.lmax_ivf)).astype(int)
 
     print(f"Computing plancklens N_0 at {Ls.size} L values "
-          f"(lmax_ivf={args.lmax_ivf}) ...", flush=True)
-    n0_dict = plancklens_n0(inputs, Ls, args.lmax_ivf)
+          f"(lmax_ivf={args.lmax_ivf}, l_min={args.l_min}) ...", flush=True)
+    n0_dict = plancklens_n0(inputs, Ls, args.lmax_ivf, l_min=args.l_min)
 
     payload = {
         "Ls": Ls,
@@ -253,7 +282,8 @@ def main() -> None:
             f"plancklens version: {_plancklens_version()}",
             "augr config: litebird_like() (LiteBIRD PTEP, 22 channels, 3 yr, f_sky=0.7)",
             f"lmax_ivf: {args.lmax_ivf}",
-            "convention: response uses unlensed C_l, filter uses lensed+noise; output in C_L^pp units",
+            f"l_min: {args.l_min}",
+            "convention: response uses UNLENSED C_l (cls_w, matches augr), filter uses lensed+noise; output in C_L^pp units; fal[:l_min]=0 applied (matches plancklens/n0s.py:137)",
         ], dtype=object),
     }
     np.savez(args.out, **payload)

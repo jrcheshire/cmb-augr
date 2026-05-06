@@ -15,8 +15,6 @@ from augr.delensing import (
     compute_n0_eb,
     compute_n0_ee,
     compute_n0_mv,
-    compute_n0_tb,
-    compute_n0_te,
     compute_n0_tt,
     iterate_delensing,
     lensing_kernel,
@@ -496,16 +494,25 @@ class TestSignalModelIntegration:
 # diagonal 1/Sum 1/N_0_alpha.
 # -----------------------------------------------------------------------
 
-# Tolerance constants. Final values to be set after the first plancklens
-# run produces real numbers (see scripts/n0_validation/README.md "Last
-# regen"). Until that round-trip is done, the placeholders here let the
-# class import cleanly and the per-estimator tests skip individually.
+# Tolerances for the augr full-sky vs plancklens TT comparison.
+# Locked in 2026-05-06 after the controlled-input test + regen with
+# correct lmin filter (see scripts/n0_validation/README.md "RESOLVED"
+# section). On the LiteBIRD-PTEP fiducial config the agreement is
+# ~1e-6 in the bulk and ~1e-4 at L > 2000 (where both codes feel the
+# l1+l2 boundary truncation). 1e-3 is a safe headroom that catches
+# regressions while not being noisy.
+#
+# Only TT is tested here. plancklens 'p_p' / 'p' include inter-
+# estimator cross-correlations (joint GMV); augr's MV is diagonal
+# (HO02 Eq. 22). The diagonal-vs-joint difference is real physics, not
+# a bug, and varies with the relative weight of estimators -- not
+# something to lock into a tolerance test.
 N0_REF_PATH = Path(__file__).resolve().parents[1] / "data" / "n0_reference_litebird.npz"
-TOL_FLATSKY_BULK = 0.05    # 5% in the bulk-L window; refine after first regen.
-TOL_FLATSKY_TAIL = 0.10    # looser at low/high L (mode-grid + l_max convention).
-TOL_FULLSKY_MV = 0.05      # full-sky path; ~10 min, marked slow.
+TOL_FULLSKY_TT_BULK = 1e-3   # bulk-L window
+TOL_FULLSKY_TT_TAIL = 1e-3   # high-L (l > 2000) where both feel boundary trunc
 
-L_BULK = (10, 2000)        # bulk-L window where the comparison is tight.
+L_BULK = (10, 2000)
+L_HIGH = (2001, 3000)
 
 
 def _load_reference():
@@ -546,60 +553,52 @@ def _max_rel_err_in_window(augr_n0, ref_n0, Ls, lo, hi):
     return float(rel.max())
 
 
-@pytest.mark.parametrize("estimator", ["tt", "te", "ee", "eb", "tb", "mv"])
-class TestN0AgainstPlancklensFlatSky:
-    """Per-estimator flat-sky N_0 must match plancklens within tolerance."""
+@pytest.mark.slow
+class TestN0AgainstPlancklens:
+    """Augr full-sky TT N_0 must match plancklens at LiteBIRD-PTEP.
 
-    def test_max_rel_err_in_bulk(self, estimator):
+    Full-sky augr is the apples-to-apples comparison against plancklens
+    (which is full-sky natively). The flat-sky augr path is validated
+    separately by the closed-form ``controlled_input_test.py`` and
+    cannot match a full-sky reference at low L (geometric factor).
+
+    PP and MV combinations are NOT tested: augr uses the diagonal
+    HO02 Eq.22 ``1/Sum 1/N_alpha`` while plancklens 'p_p' / 'p' include
+    inter-estimator cross-correlations (joint GMV). The diagonal
+    answer is strictly larger than the joint GMV; the size of the gap
+    is real physics, not a bug to test against.
+
+    Slow because full-sky N_0 takes ~10 minutes for ~140 Ls.
+    """
+
+    def test_tt_max_rel_err_in_bulk(self):
         ref = _load_reference()
         spectra = _make_spectra(ref)
         Ls = jnp.asarray(ref["Ls"], dtype=float)
         nl_tt = jnp.asarray(ref["nl_tt"])
-        nl_ee = jnp.asarray(ref["nl_ee"])
-        nl_bb = jnp.asarray(ref["nl_bb"])
 
-        if estimator == "tt":
-            augr_n0 = compute_n0_tt(Ls, spectra, nl_tt)
-        elif estimator == "te":
-            augr_n0 = compute_n0_te(Ls, spectra, nl_tt, nl_ee)
-        elif estimator == "ee":
-            augr_n0 = compute_n0_ee(Ls, spectra, nl_ee)
-        elif estimator == "eb":
-            augr_n0 = compute_n0_eb(Ls, spectra, nl_ee, nl_bb)
-        elif estimator == "tb":
-            augr_n0 = compute_n0_tb(Ls, spectra, nl_tt, nl_bb)
-        else:  # mv
-            augr_n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb)
-
-        ref_n0 = ref[f"n0_{estimator}"]
+        augr_n0 = compute_n0_tt(Ls, spectra, nl_tt, fullsky=True)
+        ref_n0 = ref["n0_tt"]
         Ls_np = np.asarray(Ls)
 
         err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
-        assert err_bulk <= TOL_FLATSKY_BULK, (
-            f"flat-sky N_0^{estimator.upper()}: bulk-L max-rel-err = "
-            f"{err_bulk:.4f} > {TOL_FLATSKY_BULK:.4f}"
+        assert err_bulk <= TOL_FULLSKY_TT_BULK, (
+            f"full-sky N_0^TT: bulk-L max-rel-err = "
+            f"{err_bulk:.4e} > {TOL_FULLSKY_TT_BULK:.4e}"
         )
 
-
-@pytest.mark.slow
-class TestN0AgainstPlancklensFullSky:
-    """Full-sky MV is the slow path; check only the combined estimator."""
-
-    def test_mv_max_rel_err_in_bulk(self):
+    def test_tt_max_rel_err_at_high_L(self):
         ref = _load_reference()
         spectra = _make_spectra(ref)
         Ls = jnp.asarray(ref["Ls"], dtype=float)
         nl_tt = jnp.asarray(ref["nl_tt"])
-        nl_ee = jnp.asarray(ref["nl_ee"])
-        nl_bb = jnp.asarray(ref["nl_bb"])
 
-        augr_n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb,
-                                fullsky=True)
-        ref_n0 = ref["n0_mv"]
+        augr_n0 = compute_n0_tt(Ls, spectra, nl_tt, fullsky=True)
+        ref_n0 = ref["n0_tt"]
         Ls_np = np.asarray(Ls)
 
-        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
-        assert err_bulk <= TOL_FULLSKY_MV, (
-            f"full-sky N_0^MV: bulk-L max-rel-err = "
-            f"{err_bulk:.4f} > {TOL_FULLSKY_MV:.4f}"
+        err_high = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_HIGH)
+        assert err_high <= TOL_FULLSKY_TT_TAIL, (
+            f"full-sky N_0^TT: high-L max-rel-err = "
+            f"{err_high:.4e} > {TOL_FULLSKY_TT_TAIL:.4e}"
         )

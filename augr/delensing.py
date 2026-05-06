@@ -566,13 +566,28 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
 
 
 def _fullsky_L_samples(Ls_np: np.ndarray) -> np.ndarray:
-    """Generate logarithmically-spaced L sample points for interpolation."""
+    """Generate L sample points for the full-sky N_0 evaluation.
+
+    The full-sky path computes the (l1, l2) sum at these sample L values
+    and log-interpolates onto the requested ``Ls``. To keep the interp a
+    no-op at every requested point, the requested ``Ls`` are *included*
+    in the sample grid; an internal log-spaced grid then fills in any
+    gaps so monotone interp at intermediate user-queried L values still
+    works smoothly.
+
+    A previous version capped ``n_sample`` by ``len(Ls_np)``, which
+    silently collapsed the internal grid when the user passed sparse
+    Ls (e.g. 7 points) and gave ~10-20% interp error at intermediate L.
+    The fix is to (a) drop that cap, (b) always include the input Ls in
+    the sample grid.
+    """
     L_min = max(2, int(Ls_np.min()))
     L_max = int(Ls_np.max())
-    n_sample = min(len(Ls_np), max(50, L_max // 20))
+    n_sample = max(50, L_max // 20)
     return np.unique(np.concatenate([
         np.arange(L_min, min(20, L_max + 1)),
         np.geomspace(max(20, L_min), L_max, n_sample).astype(int),
+        np.asarray(Ls_np, dtype=int),
     ]).clip(L_min, L_max).astype(int))
 
 
