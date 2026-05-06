@@ -35,48 +35,33 @@ from augr.spectra import CMBSpectra
 # Binning helpers (executed once at init, not during JAX tracing)
 # -----------------------------------------------------------------------
 #
-# TODO(future-direction, measured BPWFs):
-# The current binning is a synthetic top-hat / gaussian average over
-# contiguous integer (lo, hi) bin ranges. Real-world bandpower window
-# functions (BICEP/Keck releases, NaMaster output, anything from
-# bk-jax) are continuous functions of ell with mask-mode coupling,
-# beam smoothing, apodization, and transfer-function corrections
-# already baked in -- and they typically overlap between adjacent
-# bins. Three coordinated extension points to support consuming them:
+# Two binning paths are supported:
 #
-# 1. SignalModel.__init__: add a ``bandpower_window`` kwarg that takes
-#    a (n_bins, n_ells) matrix directly and bypasses _make_bin_edges /
-#    _build_bin_matrix. ``bin_matrix`` is already a public typed
-#    property and ``data_vector`` just does W @ cl_total, so the
-#    forward path needs no changes; ``bin_centers`` derives from
-#    Σ ell W_b(ell) / Σ W_b(ell), and ``bin_edges`` becomes None (or
-#    derived as the FWHM support of each row).
+# 1. Synthetic top-hat / Gaussian over contiguous integer (lo, hi) bin
+#    ranges -- ``_make_bin_edges`` + ``_build_bin_matrix`` below. This
+#    is the analytic-forecast default and supports the per-bin Knox
+#    block-diagonal covariance fast path in ``covariance.py``.
 #
-# 2. covariance.py: generalize the Knox mode count. The current
-#    _nu_b(bin_edges, f_sky) computes f_sky × Σ_{ell ∈ bin} (2ell+1);
-#    the BPWF-aware version is Σ_ell W_b(ell)^2 (2ell+1) f_sky for the
-#    diagonal mode count, with off-diagonal coupling
-#    Σ_ell W_b(ell) W_{b'}(ell) (2ell+1) f_sky once BPWFs aren't
-#    disjoint top-hats. The bandpower covariance is no longer
-#    block-diagonal in bins -- a real change to the code path, not
-#    just a constructor swap.
+# 2. Measured bandpower window functions (BICEP/Keck releases, NaMaster
+#    output, bk-jax outputs) -- ``_bandpower_window_to_bin_matrix``
+#    below. The user supplies a (n_bins, n_ells) matrix W with mask-mode
+#    coupling, beam smoothing, apodization, and transfer-function
+#    corrections already baked in. BPWFs typically overlap between
+#    adjacent bins, so the bandpower covariance is no longer
+#    block-diagonal: see ``covariance.bandpower_covariance_full`` for the
+#    overlap-aware Knox sum. ``FisherForecast`` dispatches to the full
+#    path automatically when ``signal_model.has_measured_bpwf`` is True.
 #
-# 3. Per-spectrum BPWFs: BICEP/Keck-style BPWFs are computed per
-#    cross-spectrum (i, j), not shared across frequencies. The current
-#    code applies one ``bin_matrix`` to every spectrum; the
-#    generalization is a (n_bins, n_ells, n_pairs) tensor with W[i, j]
-#    applied to spectrum (i, j).
+# Sibling contract: BPWFs released by analysis pipelines have the beam
+# baked in, so the noise spectrum that goes alongside them must be
+# beam-deconvolved. ``FisherForecast`` enforces this by requiring
+# ``external_noise_bb`` whenever ``has_measured_bpwf`` is True.
 #
-# Sibling contract: BPWFs released by analysis pipelines almost
-# always have the beam baked in, so the noise spectrum that goes
-# alongside them should be beam-deconvolved (already a documented
-# invariant: see ``external_noise_bb`` on FisherForecast). Supplying
-# a measured BPWF without ``external_noise_bb`` is probably an error
-# and should raise.
-#
-# Motivating use case: linking augr's Fisher forecast to bk-jax's
-# real-data bandpower outputs (~/bicepkeck/bk-jax/), so we can run
-# the same forecast machinery on BK24 / BK28 bandpowers.
+# Phase 2 (deferred): per-spectrum BPWFs. BICEP/Keck-style releases give
+# one BPWF per cross-spectrum (i, j); the current API applies one
+# ``bin_matrix`` to every spectrum. Generalizing to a (n_bins, n_ells,
+# n_pairs) tensor will require updates to ``data_vector`` and
+# ``_build_M_*``.
 
 def _make_bin_edges(ell_min: int,
                     ell_max: int,
@@ -150,6 +135,94 @@ def _build_bin_matrix(ells: np.ndarray,
     return jnp.array(W), jnp.array(centers)
 
 
+def _bandpower_window_to_bin_matrix(
+        bpwf: np.ndarray,
+        bpwf_ells: np.ndarray,
+        target_ells: np.ndarray,
+        ell_min: int,
+        ell_max: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Interpolate a measured BPWF onto target ell grid; compute bin centers.
+
+    The user-supplied BPWF is *not* re-normalised: BICEP/Keck-style
+    pipelines release windows already-normalised so that
+    <C_b> = Σ W_bℓ C_ℓ matches the bandpower estimator, and forcing
+    row-sum=1 here would corrupt that calibration.
+
+    Args:
+        bpwf:        (n_bins, n_ells_in) array of W_b(ell) values.
+        bpwf_ells:   (n_ells_in,) array of multipoles for ``bpwf``.
+                     Must be strictly increasing and cover
+                     [ell_min, ell_max].
+        target_ells: (n_ells_target,) ell grid of the SignalModel.
+        ell_min, ell_max: SignalModel ell range; used only for the
+                     coverage check.
+
+    Returns:
+        (W, centers): JAX arrays of shape (n_bins, n_ells_target) and
+        (n_bins,). ``centers[b] = Σ_ℓ ℓ W_b(ℓ) / Σ_ℓ W_b(ℓ)``; for rows
+        whose weight sums to ~zero, falls back to the |W_b| argmax to
+        keep the array finite.
+    """
+    bpwf = np.asarray(bpwf, dtype=float)
+    bpwf_ells = np.asarray(bpwf_ells, dtype=float)
+    target_ells = np.asarray(target_ells, dtype=float)
+    if bpwf.ndim != 2:
+        raise ValueError(
+            f"bandpower_window must be 2-D (n_bins, n_ells); "
+            f"got shape {bpwf.shape}.")
+    if bpwf.shape[1] != bpwf_ells.shape[0]:
+        raise ValueError(
+            f"bandpower_window has {bpwf.shape[1]} ell columns but "
+            f"bandpower_window_ells has length {bpwf_ells.shape[0]}.")
+    if bpwf_ells.shape[0] < 2:
+        raise ValueError(
+            "bandpower_window_ells must have length >= 2 for "
+            f"interpolation; got length {bpwf_ells.shape[0]}.")
+    if not np.all(np.isfinite(bpwf)):
+        raise ValueError("bandpower_window contains non-finite values.")
+    if not np.all(np.isfinite(bpwf_ells)):
+        raise ValueError("bandpower_window_ells contains non-finite values.")
+    if not np.all(np.diff(bpwf_ells) > 0):
+        raise ValueError(
+            "bandpower_window_ells must be strictly increasing.")
+    lo, hi = float(bpwf_ells[0]), float(bpwf_ells[-1])
+    # Mirror the delensed_bb invariant: zero-extrapolation at the
+    # reionization bump (or high-ell tail) would silently null the
+    # BPWF response at multipoles where sigma(r) is most sensitive
+    # for a space mission. Force the user to supply a window that
+    # spans the SignalModel range.
+    if lo > ell_min or hi < ell_max:
+        raise ValueError(
+            f"bandpower_window_ells range [{lo:g}, {hi:g}] must cover "
+            f"the SignalModel ell range [{ell_min}, {ell_max}].")
+
+    n_bins = bpwf.shape[0]
+    n_ells_target = target_ells.shape[0]
+    W_out = np.zeros((n_bins, n_ells_target))
+    for b in range(n_bins):
+        # Linear interp on the supplied grid; outside [bpwf_ells[0],
+        # bpwf_ells[-1]] zero-extrapolate (we already enforced the
+        # supplied range covers [ell_min, ell_max], so this is only
+        # exercised when target_ells extends outside that range, which
+        # shouldn't happen for a SignalModel-derived grid).
+        W_out[b] = np.interp(target_ells, bpwf_ells, bpwf[b],
+                             left=0.0, right=0.0)
+
+    centers = np.zeros(n_bins)
+    for b in range(n_bins):
+        wsum = W_out[b].sum()
+        if abs(wsum) < 1e-15:
+            # Pathological row (e.g. a BPWF whose support is entirely
+            # outside [ell_min, ell_max] after interpolation). Fall back
+            # to the |W| peak position so bin_centers stays finite; the
+            # row will contribute negligibly to the data vector anyway.
+            centers[b] = float(target_ells[int(np.argmax(np.abs(W_out[b])))])
+        else:
+            centers[b] = float((target_ells * W_out[b]).sum() / wsum)
+
+    return jnp.array(W_out), jnp.array(centers)
+
+
 # -----------------------------------------------------------------------
 # Parameter flatten / unflatten
 # -----------------------------------------------------------------------
@@ -190,6 +263,19 @@ class SignalModel:
         delta_ell:         Bin width for uniform bins above ell_per_bin_below.
         ell_per_bin_below: Per-ℓ bins for ℓ < this value (default 30).
         window:            Bin window function: 'tophat' or 'gaussian'.
+        bandpower_window:  Optional measured BPWF, shape (n_bins, n_ells).
+                           When supplied, ``ell_bins`` / ``delta_ell`` /
+                           ``ell_per_bin_below`` / ``window`` are ignored
+                           and the user-supplied W is interpolated onto
+                           the SignalModel ell grid as ``bin_matrix``.
+                           Triggers ``has_measured_bpwf=True`` so that
+                           downstream consumers (FisherForecast, the
+                           covariance routines) take the overlap-aware
+                           full-covariance path.
+        bandpower_window_ells: 1-D array of multipoles for
+                           ``bandpower_window``; must span
+                           [ell_min, ell_max]. Required when
+                           ``bandpower_window`` is supplied.
     """
 
     def __init__(self,
@@ -206,7 +292,10 @@ class SignalModel:
                  delensed_bb: jnp.ndarray | None = None,
                  delensed_bb_ells: jnp.ndarray | None = None,
                  residual_template_cl: jnp.ndarray | None = None,
-                 residual_template_ells: jnp.ndarray | None = None):
+                 residual_template_ells: jnp.ndarray | None = None,
+                 bandpower_window: np.ndarray | jnp.ndarray | None = None,
+                 bandpower_window_ells: (
+                     np.ndarray | jnp.ndarray | None) = None):
         self._instrument = instrument
         self._fg_model = foreground_model
         self._cmb = cmb_spectra
@@ -314,12 +403,30 @@ class SignalModel:
         else:
             self._residual_template_cl = None
 
-        # Binning
-        bin_edges = _make_bin_edges(ell_min, ell_max,
-                                    ell_per_bin_below, delta_ell, ell_bins)
-        self._bin_matrix, self._bin_centers = _build_bin_matrix(
-            ells_np, bin_edges, window)
-        self._bin_edges = bin_edges
+        # Binning -- two paths.
+        if (bandpower_window is None) != (bandpower_window_ells is None):
+            raise ValueError(
+                "bandpower_window and bandpower_window_ells must be "
+                "supplied together.")
+        self._has_measured_bpwf = bandpower_window is not None
+        if self._has_measured_bpwf:
+            self._bin_matrix, self._bin_centers = (
+                _bandpower_window_to_bin_matrix(
+                    np.asarray(bandpower_window),
+                    np.asarray(bandpower_window_ells),
+                    ells_np, ell_min, ell_max))
+            # bin_edges has no meaningful definition for an arbitrary BPWF
+            # (a Gaussian wing extends to infinity at any tolerance). We
+            # set None and downstream consumers gate on has_measured_bpwf
+            # before reading it.
+            self._bin_edges = None
+        else:
+            bin_edges = _make_bin_edges(ell_min, ell_max,
+                                        ell_per_bin_below, delta_ell,
+                                        ell_bins)
+            self._bin_matrix, self._bin_centers = _build_bin_matrix(
+                ells_np, bin_edges, window)
+            self._bin_edges = bin_edges
 
         # JIT-compiled Jacobian: traced once, cached for same-shape inputs.
         # data_vector itself stays un-JIT'd so jacfwd can trace through it.
@@ -378,9 +485,26 @@ class SignalModel:
         return self._bin_matrix
 
     @property
-    def bin_edges(self) -> list[tuple[int, int]]:
-        """Bandpower bin edges as a list of (lo, hi) multipole pairs."""
+    def bin_edges(self) -> list[tuple[int, int]] | None:
+        """Bandpower bin edges as a list of (lo, hi) multipole pairs.
+
+        Returns ``None`` when the bin matrix was supplied as a measured
+        BPWF, where (lo, hi) intervals are not a meaningful description
+        of the bin support. Use ``bin_centers`` for the per-bin
+        characteristic multipole and ``bin_matrix`` for the full window.
+        """
         return self._bin_edges
+
+    @property
+    def has_measured_bpwf(self) -> bool:
+        """True if ``bin_matrix`` was supplied as measured BPWFs.
+
+        Downstream consumers (``FisherForecast``, the covariance
+        routines) gate on this to take the overlap-aware full-covariance
+        path: the per-bin block-diagonal Knox approximation breaks for
+        BPWFs that overlap between adjacent bins.
+        """
+        return self._has_measured_bpwf
 
     @property
     def frequencies(self) -> tuple[float, ...]:

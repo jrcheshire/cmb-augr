@@ -33,6 +33,8 @@ import numpy as np
 from augr.covariance import (
     bandpower_covariance_blocks,
     bandpower_covariance_blocks_from_noise,
+    bandpower_covariance_full,
+    bandpower_covariance_full_from_noise,
 )
 from augr.instrument import ARCMIN_TO_RAD, Instrument, white_noise_power
 from augr.signal import SignalModel, flatten_params
@@ -71,6 +73,25 @@ def _fisher_from_blocks(J_blocks: jnp.ndarray,
     F, _ = jax.lax.scan(_one_bin, jnp.zeros((n_free, n_free)),
                          (J_blocks, cov_blocks))
     return F
+
+
+@jax.jit
+def _fisher_from_full(J: jnp.ndarray,
+                      cov: jnp.ndarray) -> jnp.ndarray:
+    """Compute F = J^T cov^-1 J for the full (n_data, n_data) covariance.
+
+    Used for the BPWF-aware path where bins couple and the per-bin
+    block-diagonal solve is unavailable. Inverts ``cov`` via
+    eigendecomposition, clipping non-positive eigenvalues to zero --
+    consistent with the per-bin path's behavior on near-degenerate
+    cross-spectra and stable when the BPWF overlap structure makes the
+    full matrix near-singular.
+    """
+    s, U = jnp.linalg.eigh(cov)
+    s_inv = jnp.where(s > 0.0, 1.0 / s, 0.0)
+    UtJ = U.T @ J
+    Wmat = jnp.sqrt(s_inv)[:, None] * UtJ
+    return Wmat.T @ Wmat
 
 
 class FisherForecast:
@@ -136,6 +157,22 @@ class FisherForecast:
                 "its Channel noise parameters are placeholders. Pass the "
                 "post-component-separation noise spectrum via "
                 "FisherForecast(external_noise_bb=...).")
+        elif signal_model.has_measured_bpwf:
+            # Measured BPWFs released by analysis pipelines have the beam
+            # transfer function baked in (the BPWF maps underlying sky C_ℓ
+            # to estimated bandpowers, not beam-convolved C_ℓ). The signal
+            # side of M = S + N here is unbeamed, so a beam-convolved
+            # analytic noise from instrument.noise_nl would be inconsistent
+            # at every ℓ where B_ℓ² < 1. Force the user to supply the
+            # beam-deconvolved noise that paired with the BPWF release.
+            raise ValueError(
+                "signal_model was constructed with a measured BPWF "
+                "(has_measured_bpwf=True); BPWFs released by analysis "
+                "pipelines have the beam baked in, so the noise spectrum "
+                "that pairs with them must be beam-deconvolved. Pass it "
+                "via FisherForecast(external_noise_bb=...). Use "
+                "augr.instrument.deconvolve_noise_bb if your noise array "
+                "is still beam-convolved.")
         self._external_noise_bb = external_noise_bb
 
         self._all_names = signal_model.parameter_names
@@ -174,34 +211,50 @@ class FisherForecast:
         """
         params = flatten_params(self._fiducial, self._all_names)
 
-        # Per-bin covariance blocks: (n_bins, n_spec, n_spec).
-        # When an external noise spectrum is provided, bypass the analytic
-        # per-channel noise and feed the pre-computed N_ell directly to the
-        # Knox covariance. The f_sky factor still comes from the Instrument.
-        if self._external_noise_bb is not None:
-            cov_blocks = bandpower_covariance_blocks_from_noise(
-                self._signal, self._external_noise_bb,
-                self._instrument.f_sky, params)
-        else:
-            cov_blocks = bandpower_covariance_blocks(
-                self._signal, self._instrument, params)
-
         # Full Jacobian: (n_data, n_all_params) where n_data = n_spec * n_bins
         J_full = self._signal.jacobian(params)
 
         # Select free parameter columns
         J = J_full[:, self._free_idx]   # (n_spec * n_bins, n_free)
 
-        # Reshape J into per-bin blocks: (n_bins, n_spec, n_free)
-        n_spec = len(self._signal.freq_pairs)
-        n_bins = self._signal.n_bins
-        # Data ordering is (spec, bin): data[s * n_bins + b]
-        # Reshape to (n_spec, n_bins, n_free) then transpose to
-        # (n_bins, n_spec, n_free)
-        J_blocks = J.reshape(n_spec, n_bins, -1).transpose(1, 0, 2)
+        # Two covariance / Fisher solve paths.
+        #
+        # BPWF mode: bins couple through Σ_ℓ W_b(ℓ) W_{b'}(ℓ) (2ℓ+1), so
+        # the per-bin block-diagonal solve is unavailable. Build the full
+        # (n_data, n_data) covariance via the per-ℓ Knox sum and do one
+        # eigh-based solve.
+        if self._signal.has_measured_bpwf:
+            # __init__ already enforced external_noise_bb is not None when
+            # has_measured_bpwf is True (the BPWF/beam-deconvolution
+            # contract).
+            cov_full = bandpower_covariance_full_from_noise(
+                self._signal, self._external_noise_bb,
+                self._instrument.f_sky, params)
+            F = _fisher_from_full(J, cov_full)
+        else:
+            # Per-bin covariance blocks: (n_bins, n_spec, n_spec).
+            # When an external noise spectrum is provided, bypass the
+            # analytic per-channel noise and feed the pre-computed N_ell
+            # directly to the Knox covariance. The f_sky factor still
+            # comes from the Instrument.
+            if self._external_noise_bb is not None:
+                cov_blocks = bandpower_covariance_blocks_from_noise(
+                    self._signal, self._external_noise_bb,
+                    self._instrument.f_sky, params)
+            else:
+                cov_blocks = bandpower_covariance_blocks(
+                    self._signal, self._instrument, params)
 
-        # F = sum_b J_b^T Sigma_b^{-1} J_b via per-bin Cholesky
-        F = _fisher_from_blocks(J_blocks, cov_blocks)
+            # Reshape J into per-bin blocks: (n_bins, n_spec, n_free)
+            n_spec = len(self._signal.freq_pairs)
+            n_bins = self._signal.n_bins
+            # Data ordering is (spec, bin): data[s * n_bins + b]
+            # Reshape to (n_spec, n_bins, n_free) then transpose to
+            # (n_bins, n_spec, n_free)
+            J_blocks = J.reshape(n_spec, n_bins, -1).transpose(1, 0, 2)
+
+            # F = sum_b J_b^T Sigma_b^{-1} J_b via per-bin Cholesky
+            F = _fisher_from_blocks(J_blocks, cov_blocks)
 
         # Add Gaussian priors
         for name, sigma_prior in self._priors.items():
@@ -312,16 +365,38 @@ class FisherForecast:
         lines.append(f"Cross-spectra:     {len(sig.freq_pairs)} "
                       f"({len(inst.channels)} channels)")
 
-        # ν_b = f_sky × Σ_{ℓ in bin}(2ℓ+1); below ~10 the Knox Gaussian
-        # likelihood breaks down and Fisher sigma(r) is structurally
-        # narrower than a Hamimeche-Lewis or Wishart posterior.
-        nu_b = np.array([
-            inst.f_sky * (hi - lo + 1) * (lo + hi + 1)
-            for lo, hi in sig.bin_edges
-        ])
+        # ν_b = effective number of independent modes per bin; below ~10
+        # the Knox Gaussian likelihood breaks down and Fisher sigma(r) is
+        # structurally narrower than a Hamimeche-Lewis or Wishart
+        # posterior. For synthetic top-hat / Gaussian binning,
+        # ν_b = f_sky × Σ_{ℓ in bin}(2ℓ+1). For measured BPWFs, the
+        # coupling-aware analogue is f_sky × Σ_ℓ W_b(ℓ)² (2ℓ+1).
+        if sig.has_measured_bpwf:
+            ells_arr = np.asarray(sig.ells)
+            W_arr = np.asarray(sig.bin_matrix)
+            nu_b = inst.f_sky * (W_arr ** 2 * (2.0 * ells_arr + 1.0)
+                                 ).sum(axis=1)
+            mode_label = "Knox modes/bin (BPWF):"
+        else:
+            nu_b = np.array([
+                inst.f_sky * (hi - lo + 1) * (lo + hi + 1)
+                for lo, hi in sig.bin_edges
+            ])
+            mode_label = "Knox modes/bin:   "
         nu_b_min = float(nu_b.min())
-        lines.append(f"Knox modes/bin:    min={nu_b_min:.1f}, "
-                     f"median={float(np.median(nu_b)):.0f}"
+        nu_b_med = float(np.median(nu_b))
+
+        def _fmt_nu(x: float) -> str:
+            # Synthetic top-hats at f_sky~0.7 give ν_b ~ 10²-10⁴; measured
+            # BPWFs at small f_sky (BK-style ~0.01) can give ν_b << 1 for
+            # bins with low row-sums. Switch to scientific below 1 so the
+            # number stays readable instead of collapsing to "0.0".
+            if abs(x) >= 1.0:
+                return f"{x:.1f}"
+            return f"{x:.2e}"
+
+        lines.append(f"{mode_label} min={_fmt_nu(nu_b_min)}, "
+                     f"median={_fmt_nu(nu_b_med)}"
                      + (" -- WARNING: low-ell bins have < 10 modes; "
                         "Gaussian-likelihood approximation breaks down, "
                         "Fisher will be narrower than Hamimeche-Lewis / "

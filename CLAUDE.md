@@ -60,15 +60,23 @@ Knowing how the modules chain together matters more than any one file:
    delensed_bb=None)` assembles the binned cross-frequency data vector
    D(params) and its Jacobian. Pass `delensed_bb=result.cl_bb_res` to
    use a self-consistent residual lensing spectrum instead of an
-   `A_lens` multiplier.
+   `A_lens` multiplier. Pass `bandpower_window=W,
+   bandpower_window_ells=...` to substitute a measured BPWF for the
+   synthetic top-hat / Gaussian binning (see "Measured bandpower window
+   functions" below).
 
 4. **`covariance.py` → `fisher.py`.** `BandpowerCovariance` is the Knox
    formula across all frequency cross-spectra.
    `FisherForecast(signal, inst, fiducial, priors=..., fixed_params=...)`
    builds F = Jᵀ C⁻¹ J per bin, adds priors on the diagonal, and
    exposes `sigma(param)` (marginalized) and conditional constraints.
-   Solver is Cholesky with an eigendecomposition fallback for
-   near-singular F.
+   Two solver paths: a per-bin block-diagonal solve (default; valid for
+   the synthetic top-hat / Gaussian binning), and a full
+   `(n_data, n_data)` solve dispatched automatically when
+   `signal_model.has_measured_bpwf` is True (BPWFs typically overlap so
+   the per-bin block structure breaks). Both use eigendecomposition
+   with non-positive-eigenvalue clipping for robustness against
+   near-singular covariances.
 
 5. **`delensing.py` + `wigner.py`.** Optional self-consistent
    iterative QE delensing replacing the `A_lens` parameter.
@@ -224,12 +232,71 @@ convention; naming is `omega_<species>_<quantity>` where species is
   auto-spectra are not. Use
   `instrument.deconvolve_noise_bb(noise, ells, fwhm_arcmin)` if you
   need to convert.
+- **Measured BPWFs imply beam-deconvolved external noise.**
+  `FisherForecast` raises `ValueError` if `signal_model.has_measured_bpwf`
+  is True and `external_noise_bb` is not supplied -- BPWFs released by
+  real-data pipelines have the beam baked in, so analytic, beam-
+  convolved noise would be inconsistent at every ℓ where `B_ℓ² < 1`.
+  This is the same family of footgun as `requires_external_noise=True`
+  on `cleaned_map_instrument`, with the trigger sitting on the signal
+  side rather than the instrument side.
 - **`optimize.sigma_r_from_*` vs `FisherForecast.sigma`.** `optimize`
   uses a gradient-smooth `solve`-based inversion;
   `FisherForecast.sigma` uses `eigh` with silent clipping of
   non-positive eigenvalues. The two can disagree by a few percent in
   degenerate-cov regimes. For reporting absolute numbers prefer
   `FisherForecast.sigma`; for autodiff use `optimize.*`.
+
+## Measured bandpower window functions
+
+The synthetic top-hat / Gaussian binning is replaced by a user-supplied
+BPWF when `SignalModel` is constructed with `bandpower_window=W` and
+`bandpower_window_ells=...`. The BPWF is a `(n_bins, n_ells)` matrix
+encoding mask-mode coupling, transfer-function corrections, and beam
+smoothing -- the kernel mapping the underlying sky `C_ℓ` to the
+bandpower estimator from a real-data analysis pipeline (BICEP/Keck
+releases, NaMaster / bk-jax outputs).
+
+What changes when BPWFs are active (`signal_model.has_measured_bpwf =
+True`):
+
+- The `bin_matrix` is the user-supplied W (interpolated onto the
+  SignalModel ℓ grid; **not** re-normalised). `bin_centers` derives from
+  `Σ_ℓ ℓ W_b(ℓ) / Σ_ℓ W_b(ℓ)`. `bin_edges` becomes `None` (the (lo, hi)
+  interval description is meaningless for an arbitrary BPWF).
+- The per-bin block-diagonal Knox approximation breaks: bins couple
+  through `Σ_ℓ W_b(ℓ) W_{b'}(ℓ) (2ℓ+1)`. `bandpower_covariance` and
+  `FisherForecast.compute()` automatically dispatch to the full-path
+  Knox sum (`bandpower_covariance_full*`); the
+  `bandpower_covariance_blocks*` entry points raise `NotImplementedError`
+  in this mode.
+- `FisherForecast` requires `external_noise_bb` whenever
+  `has_measured_bpwf` is True (BPWFs released by analysis pipelines have
+  the beam baked in; pairing them with augr's analytic, beam-convolved
+  noise would be inconsistent). Use `instrument.deconvolve_noise_bb` if
+  the available noise array is still beam-convolved.
+
+Loader: `augr.bandpower_windows.load_bandpower_window(path)` sniffs the
+file extension and returns `(ells, W)` with the augr-canonical
+`(n_bins, n_ells)` shape. Supported formats:
+
+- `.npy`: 2-D numpy array, shape `(n_ells, 1 + n_bins)`. Column 0 = ℓ;
+  columns 1..n_bins = `W_b(ℓ)`.
+- `.npz`: archive with arrays `ells` (shape `(n_ells,)`) and `window`
+  (shape `(n_bins, n_ells)`).
+- `.csv` / `.dat` / `.txt`: whitespace- or comma-delimited table, same
+  layout as `.npy`. Lines starting with `#` are treated as comments.
+
+Phase 2 (deferred): per-spectrum BPWFs. BICEP/Keck-style releases give
+one BPWF per cross-spectrum `(i, j)`; the current API applies a single
+shared `bin_matrix` to every cross-spectrum. Generalising to a
+`(n_bins, n_ells, n_pairs)` tensor requires updates to `data_vector`
+and `_build_M_*`.
+
+Motivating use case: linking augr's Fisher forecast to bk-jax's
+real-data bandpower outputs (`~/bicepkeck/bk-jax/`), so the same
+forecast machinery runs on BK24 / BK28 bandpowers.
+
 
 ## Post-component-separation forecasts (BROOM consumer mode)
 

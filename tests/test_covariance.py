@@ -8,7 +8,10 @@ from augr.covariance import (
     _build_M,
     _nu_b,
     bandpower_covariance,
+    bandpower_covariance_blocks,
     bandpower_covariance_blocks_from_noise,
+    bandpower_covariance_full,
+    bandpower_covariance_full_from_noise,
 )
 from augr.foregrounds import GaussianForegroundModel
 from augr.instrument import Channel, Instrument, ScalarEfficiency
@@ -281,3 +284,163 @@ def test_covariance_blocks_from_noise_adds_template_on_autos(
     cross_var1 = cov1[:, 1, 1]
     assert jnp.allclose(cross_var0, cross_var1, rtol=1e-10), \
         "Cross-spectrum variance changed with A_res (should not)"
+
+
+# -----------------------------------------------------------------------
+# Measured BPWF covariance path
+# -----------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def per_ell_signal_models(two_chan_instrument):
+    """Two SignalModels at delta_ell=1: one default, one BPWF=identity.
+
+    These should produce numerically identical bandpower covariances --
+    a per-ℓ disjoint-delta BPWF reduces the BPWF-aware Knox sum to the
+    same per-bin formula the fast path uses.
+    """
+    ell_min, ell_max = 30, 80
+    sm_fast = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        delta_ell=1, ell_per_bin_below=ell_min,
+    )
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    W = np.eye(ells_in.size)
+    sm_bpwf = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    return sm_fast, sm_bpwf
+
+
+def test_full_covariance_per_ell_identity_matches_fast_path(
+        per_ell_signal_models, two_chan_instrument):
+    """Identity BPWF on per-ℓ bins reproduces the fast-path covariance."""
+    sm_fast, sm_bpwf = per_ell_signal_models
+    params = flatten_params(FIDUCIAL, sm_fast.parameter_names)
+
+    cov_fast = bandpower_covariance(sm_fast, two_chan_instrument, params)
+    cov_full = bandpower_covariance_full(sm_bpwf, two_chan_instrument, params)
+    assert cov_fast.shape == cov_full.shape
+    assert jnp.allclose(cov_fast, cov_full, rtol=1e-10, atol=1e-14)
+
+
+def test_full_covariance_dispatch_via_bandpower_covariance(
+        per_ell_signal_models, two_chan_instrument):
+    """bandpower_covariance() autodetects BPWF mode and routes to full path."""
+    _sm_fast, sm_bpwf = per_ell_signal_models
+    params = flatten_params(FIDUCIAL, sm_bpwf.parameter_names)
+    cov_dispatched = bandpower_covariance(sm_bpwf, two_chan_instrument, params)
+    cov_full = bandpower_covariance_full(sm_bpwf, two_chan_instrument, params)
+    assert jnp.allclose(cov_dispatched, cov_full, rtol=1e-12)
+
+
+def test_full_covariance_symmetric_and_psd(two_chan_instrument):
+    """Full covariance from overlapping Gaussian BPWFs is symmetric and PSD."""
+    ell_min, ell_max = 20, 200
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    centers = [40.0, 70.0, 110.0, 160.0]
+    W = np.array([
+        np.exp(-(ells_in - c) ** 2 / (2.0 * 15.0 ** 2)) for c in centers
+    ])
+    W /= W.sum(axis=1, keepdims=True)
+
+    sm = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    params = flatten_params(FIDUCIAL, sm.parameter_names)
+    cov = bandpower_covariance_full(sm, two_chan_instrument, params)
+
+    n_data = sm.n_data
+    assert cov.shape == (n_data, n_data)
+    assert jnp.allclose(cov, cov.T, rtol=1e-8)
+    # PSD: smallest eigenvalue > -tol × largest.
+    eigvals = jnp.linalg.eigvalsh(cov)
+    assert float(eigvals.min()) > -1e-10 * float(eigvals.max())
+
+
+def test_full_covariance_overlapping_bins_couple(two_chan_instrument):
+    """Overlapping Gaussian BPWFs produce non-zero off-diagonal bin coupling."""
+    ell_min, ell_max = 20, 200
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    centers = [60.0, 80.0, 110.0]   # tightly packed → overlap is non-trivial
+    W = np.array([
+        np.exp(-(ells_in - c) ** 2 / (2.0 * 25.0 ** 2)) for c in centers
+    ])
+    W /= W.sum(axis=1, keepdims=True)
+
+    sm = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    params = flatten_params(FIDUCIAL, sm.parameter_names)
+    cov = bandpower_covariance_full(sm, two_chan_instrument, params)
+
+    n_bins = sm.n_bins  # 3
+    # Auto (0,0) sub-block of the covariance: spectrum index 0, 0..n_bins.
+    auto_block = cov[:n_bins, :n_bins]
+    # Diagonal entries are positive variances.
+    assert jnp.all(jnp.diag(auto_block) > 0)
+    # Off-diagonal entries (different bins) are non-zero — bins couple.
+    off_diag = auto_block - jnp.diag(jnp.diag(auto_block))
+    assert float(jnp.max(jnp.abs(off_diag))) > 0.01 * float(
+        jnp.max(jnp.diag(auto_block))), \
+        "Overlapping BPWFs should produce non-trivial bin-bin coupling"
+
+
+def test_full_covariance_from_noise_matches_instrument_path(
+        two_chan_instrument):
+    """*_full_from_noise with analytic noise matches *_full at the same fiducial."""
+    from augr.instrument import noise_nl
+
+    ell_min, ell_max = 20, 200
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    W = np.array([
+        np.exp(-(ells_in - c) ** 2 / (2.0 * 15.0 ** 2))
+        for c in [50.0, 100.0, 150.0]
+    ])
+    W /= W.sum(axis=1, keepdims=True)
+
+    sm = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    params = flatten_params(FIDUCIAL, sm.parameter_names)
+
+    cov_inst = bandpower_covariance_full(sm, two_chan_instrument, params)
+
+    # Reconstruct the analytic per-channel noise on sm.ells.
+    nl = jnp.array([
+        noise_nl(ch, sm.ells,
+                 two_chan_instrument.mission_duration_years,
+                 two_chan_instrument.f_sky)
+        for ch in two_chan_instrument.channels
+    ])
+    cov_ext = bandpower_covariance_full_from_noise(
+        sm, nl, two_chan_instrument.f_sky, params)
+    assert jnp.allclose(cov_inst, cov_ext, rtol=1e-10, atol=1e-14)
+
+
+def test_blocks_path_raises_on_bpwf(two_chan_instrument):
+    """The block path raises NotImplementedError for measured BPWFs."""
+    ell_min, ell_max = 20, 100
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    W = np.eye(ells_in.size)
+    sm = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    params = flatten_params(FIDUCIAL, sm.parameter_names)
+    with pytest.raises(NotImplementedError, match="measured BPWFs"):
+        bandpower_covariance_blocks(sm, two_chan_instrument, params)
+    n_chan = len(two_chan_instrument.channels)
+    nl = jnp.ones((n_chan, sm.ells.shape[0])) * 1e-5
+    with pytest.raises(NotImplementedError, match="measured BPWFs"):
+        bandpower_covariance_blocks_from_noise(
+            sm, nl, two_chan_instrument.f_sky, params)

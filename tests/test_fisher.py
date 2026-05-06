@@ -418,3 +418,116 @@ def test_summary_flags_degenerate_fisher():
     text = ff.summary()
     assert "cond(F)" in text
     assert "WARNING: near-degenerate" in text
+
+
+# -----------------------------------------------------------------------
+# Measured BPWF Fisher path
+# -----------------------------------------------------------------------
+
+def _per_ell_bpwf_signal_model(instrument, ell_min=30, ell_max=80):
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    W = np.eye(ells_in.size)
+    return SignalModel(
+        instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+
+
+def test_fisher_measured_bpwf_requires_external_noise(instrument):
+    """FisherForecast(BPWF SignalModel) without external_noise_bb must raise."""
+    sm = _per_ell_bpwf_signal_model(instrument)
+    with pytest.raises(ValueError, match="has_measured_bpwf"):
+        FisherForecast(sm, instrument, FIDUCIAL, fixed_params=["T_dust"])
+
+
+def test_fisher_measured_bpwf_per_ell_matches_baseline(instrument):
+    """Per-ℓ identity BPWF Fisher matches the analytic delta_ell=1 Fisher.
+
+    With the same external noise array on both sides the two paths
+    should agree to machine precision, demonstrating that the BPWF-aware
+    full-covariance solve reduces correctly to the per-bin block solve
+    for non-overlapping single-ℓ delta windows.
+    """
+    ell_min, ell_max = 30, 80
+    sm_baseline = SignalModel(
+        instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        delta_ell=1, ell_per_bin_below=ell_min,
+    )
+    sm_bpwf = _per_ell_bpwf_signal_model(instrument, ell_min, ell_max)
+
+    nl = jnp.array([
+        noise_nl(ch, sm_baseline.ells,
+                 instrument.mission_duration_years,
+                 instrument.f_sky)
+        for ch in instrument.channels
+    ])
+
+    ff_baseline = FisherForecast(
+        sm_baseline, instrument, FIDUCIAL,
+        priors={"beta_dust": 0.11, "beta_sync": 0.3},
+        fixed_params=["T_dust"],
+        external_noise_bb=nl,
+    )
+    ff_bpwf = FisherForecast(
+        sm_bpwf, instrument, FIDUCIAL,
+        priors={"beta_dust": 0.11, "beta_sync": 0.3},
+        fixed_params=["T_dust"],
+        external_noise_bb=nl,
+    )
+    F_baseline = ff_baseline.compute()
+    F_bpwf = ff_bpwf.compute()
+    assert jnp.allclose(F_baseline, F_bpwf, rtol=1e-8, atol=1e-12)
+
+
+def test_fisher_measured_bpwf_overlapping_runs(instrument):
+    """Overlapping Gaussian BPWFs produce a finite, positive σ(r)."""
+    ell_min, ell_max = 20, 200
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    centers = [40.0, 80.0, 130.0, 180.0]
+    W = np.array([
+        np.exp(-(ells_in - c) ** 2 / (2.0 * 18.0 ** 2)) for c in centers
+    ])
+    W /= W.sum(axis=1, keepdims=True)
+    sm = SignalModel(
+        instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    nl = jnp.array([
+        noise_nl(ch, sm.ells,
+                 instrument.mission_duration_years,
+                 instrument.f_sky)
+        for ch in instrument.channels
+    ])
+    ff = FisherForecast(
+        sm, instrument, FIDUCIAL,
+        priors={"beta_dust": 0.11, "beta_sync": 0.3},
+        fixed_params=["T_dust"],
+        external_noise_bb=nl,
+    )
+    ff.compute()
+    sigma_r = ff.sigma("r")
+    assert np.isfinite(sigma_r) and sigma_r > 0
+
+
+def test_fisher_summary_handles_bpwf_mode(instrument):
+    """summary() works in BPWF mode and reports the BPWF Knox-mode label."""
+    sm = _per_ell_bpwf_signal_model(instrument, ell_min=50, ell_max=120)
+    nl = jnp.array([
+        noise_nl(ch, sm.ells,
+                 instrument.mission_duration_years,
+                 instrument.f_sky)
+        for ch in instrument.channels
+    ])
+    ff = FisherForecast(
+        sm, instrument, FIDUCIAL,
+        priors={"beta_dust": 0.11, "beta_sync": 0.3},
+        fixed_params=["T_dust"],
+        external_noise_bb=nl,
+    )
+    ff.compute()
+    text = ff.summary()
+    assert "Knox modes/bin (BPWF)" in text
+    assert "cond(F)" in text

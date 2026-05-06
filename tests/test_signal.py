@@ -500,3 +500,178 @@ def test_delensed_bb_requires_ells(simple_instrument, fg_model, cmb_spectra):
             ell_min=2, ell_max=200, delta_ell=35, ell_per_bin_below=30,
             delensed_bb=cl,
         )
+
+
+# -----------------------------------------------------------------------
+# Measured bandpower window functions
+# -----------------------------------------------------------------------
+
+def _gaussian_bpwf(centers, sigmas, ell_grid):
+    """Synthetic overlapping Gaussian BPWFs, row-normalised to sum to 1."""
+    rows = []
+    for c, s in zip(centers, sigmas):
+        row = np.exp(-(ell_grid - c) ** 2 / (2.0 * s ** 2))
+        rows.append(row / row.sum())
+    return np.array(rows)
+
+
+def test_measured_bpwf_basic(simple_instrument, fg_model, cmb_spectra):
+    """SignalModel accepts a (n_bins, n_ells) BPWF and exposes the right shape."""
+    ell_min, ell_max = 20, 200
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    centers = [40.0, 80.0, 130.0]
+    W = _gaussian_bpwf(centers, [10.0, 10.0, 12.0], ells_in)
+
+    sm = SignalModel(
+        simple_instrument, fg_model, cmb_spectra,
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+
+    assert sm.has_measured_bpwf
+    assert sm.bin_edges is None
+    assert sm.n_bins == 3
+    assert sm.bin_matrix.shape == (3, ells_in.size)
+    # Bin centres reflect the supplied Gaussian centres to within the grid step.
+    for c_target, c_actual in zip(centers, sm.bin_centers):
+        assert abs(float(c_actual) - c_target) < 1.0
+
+
+def test_measured_bpwf_xor_kwargs(simple_instrument, fg_model, cmb_spectra):
+    """Supplying only one of bandpower_window / bandpower_window_ells errors."""
+    W = np.eye(10)
+    with pytest.raises(ValueError, match="must be supplied together"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=29, bandpower_window=W,
+        )
+    with pytest.raises(ValueError, match="must be supplied together"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=29,
+            bandpower_window_ells=np.arange(20, 30, dtype=float),
+        )
+
+
+def test_measured_bpwf_range_check(simple_instrument, fg_model, cmb_spectra):
+    """BPWF whose ell range does not span [ell_min, ell_max] must raise."""
+    ells_in = np.arange(50, 150, dtype=float)
+    W = np.eye(ells_in.size)
+    with pytest.raises(ValueError, match="must cover the SignalModel ell range"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=200,
+            bandpower_window=W, bandpower_window_ells=ells_in,
+        )
+
+
+def test_measured_bpwf_shape_validation(simple_instrument, fg_model, cmb_spectra):
+    """Mismatched ells/W or wrong-rank inputs raise at construction."""
+    ells_in = np.arange(20, 201, dtype=float)
+    W_wrong_cols = np.eye(50)  # n_ells = 50, doesn't match ells_in
+    with pytest.raises(ValueError, match="ell columns"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=200,
+            bandpower_window=W_wrong_cols, bandpower_window_ells=ells_in,
+        )
+
+    W_one_d = np.zeros(ells_in.size)  # 1-D — rejected
+    with pytest.raises(ValueError, match="must be 2-D"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=200,
+            bandpower_window=W_one_d, bandpower_window_ells=ells_in,
+        )
+
+
+def test_measured_bpwf_normalization_preserved(simple_instrument, fg_model,
+                                                cmb_spectra):
+    """User-supplied BPWFs are NOT auto-normalised (rows do not get
+    forced to sum to 1).
+
+    BICEP/Keck-style pipelines release windows already-normalised so
+    that <C_b> = Σ W_bℓ C_ℓ matches the bandpower estimator. Forcing
+    row-sum=1 would corrupt that calibration.
+    """
+    ells_in = np.arange(20, 201, dtype=float)
+    # Two Gaussian BPWFs scaled by 2 so the rows sum to 2, not 1.
+    rows = _gaussian_bpwf([60.0, 120.0], [15.0, 15.0], ells_in)
+    W = 2.0 * rows
+
+    sm = SignalModel(
+        simple_instrument, fg_model, cmb_spectra,
+        ell_min=20, ell_max=200,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    rowsums = np.asarray(sm.bin_matrix).sum(axis=1)
+    assert np.allclose(rowsums, 2.0, rtol=1e-8), \
+        "bin_matrix rows should not be re-normalised"
+
+
+def test_measured_bpwf_data_vector_matches_W_at_Cl(
+        simple_instrument, cmb_spectra):
+    """With NullForegroundModel + Gaussian BPWFs, data_vector reproduces
+    W @ C_ℓ^CMB exactly on every cross-spectrum (CMB is freq-independent)."""
+    ell_min, ell_max = 20, 200
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    W = _gaussian_bpwf([50.0, 100.0, 150.0], [12.0, 12.0, 12.0], ells_in)
+
+    sm = SignalModel(
+        simple_instrument, NullForegroundModel(), cmb_spectra,
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    params = jnp.array([0.01, 1.0])  # r, A_lens (no foreground params)
+    mu = sm.data_vector(params)
+
+    # All cross-spectra must be identical (pure CMB).
+    n_bins = sm.n_bins
+    ref = mu[:n_bins]
+    for s in range(1, sm.n_spectra):
+        assert jnp.allclose(ref, mu[s * n_bins:(s + 1) * n_bins], rtol=1e-8)
+    # And the reference matches W @ C_ℓ^BB on the SignalModel ell grid.
+    cl = cmb_spectra.cl_bb(sm.ells, 0.01, 1.0)
+    expected = jnp.asarray(W) @ cl
+    assert jnp.allclose(ref, expected, rtol=1e-8)
+
+
+def test_measured_bpwf_per_ell_identity_matches_default(
+        simple_instrument, fg_model, cmb_spectra):
+    """An identity BPWF on per-ℓ bins matches a delta_ell=1 default model."""
+    ell_min, ell_max = 20, 60
+    sm_default = SignalModel(
+        simple_instrument, fg_model, cmb_spectra,
+        ell_min=ell_min, ell_max=ell_max,
+        delta_ell=1, ell_per_bin_below=ell_min,
+    )
+
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    W = np.eye(ells_in.size)
+    sm_bpwf = SignalModel(
+        simple_instrument, fg_model, cmb_spectra,
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+
+    params = flatten_params(FIDUCIAL_DICT, sm_default.parameter_names)
+    mu_default = sm_default.data_vector(params)
+    mu_bpwf = sm_bpwf.data_vector(params)
+    assert jnp.allclose(mu_default, mu_bpwf, rtol=1e-10, atol=1e-14)
+
+
+def test_measured_bpwf_jacobian_shape(simple_instrument, fg_model, cmb_spectra):
+    """Jacobian of a BPWF SignalModel has shape (n_data, n_params)."""
+    ells_in = np.arange(20, 201, dtype=float)
+    W = _gaussian_bpwf([60.0, 120.0], [15.0, 15.0], ells_in)
+    sm = SignalModel(
+        simple_instrument, fg_model, cmb_spectra,
+        ell_min=20, ell_max=200,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    params = flatten_params(FIDUCIAL_DICT, sm.parameter_names)
+    J = sm.jacobian(params)
+    assert J.shape == (sm.n_data, sm.n_params)
+    # ∂μ/∂r is nonzero (tensor BB contributes through W).
+    r_idx = sm.parameter_names.index("r")
+    assert jnp.any(jnp.abs(J[:, r_idx]) > 1e-12)
