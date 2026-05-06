@@ -107,59 +107,109 @@ produce the in-tree reference.
   - plancklens version: HEAD of github.com/carronj/plancklens (editable)
   - Author: jc
 
-## Open thread: TT discrepancy (2026-05-06)
+## Status (2026-05-06, after controlled-input test)
 
-The pipeline runs end-to-end and the polarization MV agrees with augr to
-~5-25%. **TT shows a residual ~2x discrepancy at high L that is not
-yet explained.** Status table:
+The controlled-input test (`controlled_input_test.py`) feeds both codes
+``C_TT(l) = C0`` (constant), ``N_l = 0``, ``cl_*_unl = cl_*_len``. In
+that limit ``f = C0 L^2`` and ``f * F = L^4 / 2``, giving closed forms
 
-| Comparison                        | Ratio plancklens/augr (L=2..658) | Status            |
-|-----------------------------------|----------------------------------|-------------------|
-| `'p_p'` vs MV(EE,EB)              | 0.64 -> 1.00                     | OK (<25%)         |
-| `'p'`   vs full MV                | 0.06 -> 1.13                     | low-L mystery     |
-| `'ptt'` vs `compute_n0_tt`        | 0.05 -> 0.36                     | **2.6x off open** |
+    N_0^{TT, flat}(L) = 4 pi / (L^4 * S),  S = sum_{l=lmin}^{lmax} l
+    N_0^{TT, full}(L) ~ 8 pi / (L^2 (L+1)^2 * S'),
+        S' = (lmax+1)^2 - lmin^2
 
-What the investigation has ruled out:
+(the flat / full ratio at low L is ``2 (L+1)^2 / L^2 * S / S'``, or
+``(L+1)^2 / L^2`` for ``l_max >> L`` — geometry, not a bug).
 
-  - augr's flat-sky N_0 formulas are structurally correct per Maniyar
-    et al. 2021 (arXiv:2101.12193) Eq 11-12. The (1+delta_XY) factor of
-    2 in the same-field denominator matches exactly, the integration
-    measure matches Eq 4, and the response form matches Table I.
-  - Different-estimator hypothesis (HO02 vs OH03 vs GMV vs SQE):
-    Maniyar Fig 1 shows HO02-vs-OH03 agree to <0.5%, and Fig 2 shows
-    HO02/SQE/GMV all within ~10% of each other. None of these can
-    account for a 2.6x discrepancy.
-  - lensed-vs-unlensed cls in the QE response: at most a few percent
-    effect at relevant scales (and goes the wrong direction).
-  - Joint-vs-diagonal TE filter in `fal`: tested by setting
-    `fal['te'] = 0` in `run_plancklens.py`. Accounts for ~20% of the
-    TT discrepancy at most, not the dominant ~2x.
+Results at ``l_min = 2``, ``l_max = 2000``:
 
-What's still open:
+| L  | augr flat / flat ana | augr full / full ana | plancklens / full ana |
+|----|----------------------|----------------------|-----------------------|
+| 2  | 1.000000             | 1.000751             | 1.000708              |
+| 10 | 1.000000             | 1.003341             | 1.003339              |
+| 30 | 1.000000             | 1.144304             | 1.009795              |
+| 100| 1.000000             | 1.126336             | 1.033026              |
+| 300| 1.000000             | 1.241                | 1.106                 |
+| 600| 1.000000             | 1.235                | 1.235                 |
 
-  - **Hand-derivation of plancklens's `_get_nhl` + `get_response`
-    coupling at a single (L, l1, l2) point**, comparing the resulting
-    integrand against augr's `compute_n0_tt` at the same point. This
-    would localize whether the residual is in the response
-    normalization, the cls_ivfs construction, or the QE coupling
-    coefficient.
-  - **Controlled-input test**: set Cl = constant, Nl = 0 (signal-only,
-    no noise) where the analytic answer is known, and compare both
-    codes against the analytic value. Distinguishes formula bugs
-    from input-shape effects.
-  - **augr full-sky paths show low-L flat-vs-full inconsistency**
-    (TT full/flat = 432 at L=2, EE 10x, EB 1e-4) for all three
-    estimators in different directions. The 4pi/16pi prefactor
-    inconsistency between TT (1/(4pi)) and EE/EB (1/(16pi)) was
-    investigated -- changing TT to 1/(16pi) made things worse, so
-    that is NOT the right fix. Unclear what the actual full-sky bug
-    is. Convergence at very high L (~1) is the right limit, so the
-    issue is low-L specific.
+What this resolves:
 
-This investigation should resume by: (1) running
-`run_plancklens.py` to produce a reference NPZ in this directory, (2)
-running `compare.py` and `inspect_npz.py` to reproduce the diagnostic
-table above, then (3) doing the hand-derivation step. The pipeline is
-ready; the open work is the math.
+  - **augr's flat-sky ``compute_n0_tt`` is correct to machine
+    precision** on the controlled input. The TT response shape
+    (``L.l1 + L.l2 -> L^2``), the factor of 2 in the same-field
+    denominator, the ``l1 / (2 pi)^2`` integration measure, and the GL
+    phi quadrature all reproduce the closed form. The earlier "~2.6x
+    plancklens / augr_flat discrepancy at LiteBIRD-PTEP" is **NOT a
+    bug in augr's TT formula**; it is largely the
+    flat-sky-vs-full-sky geometric factor (plus interaction with the
+    LiteBIRD spectrum shape — see below).
+  - **plancklens is computing the correct full-sky N_0** to <1% on
+    the constant-C input at low L. Boundary effects from the finite
+    upper limit of the ``l1, l2`` sum dominate the residual at L >> a
+    few hundred, scaling like ``L / l_max``.
+  - The controlled-input test obsoletes the earlier "open" hypotheses
+    (HO02 vs OH03 vs GMV, lensed-vs-unlensed in response,
+    joint-vs-diagonal TE) for the flat-sky formula. None of those was
+    the dominant cause; the dominant cause is that the flat- and
+    full-sky formulas differ by a clean geometric factor that does
+    NOT vanish at low L.
 
-(Update the section above this one once the comparison is locked in.)
+New open thread: augr's full-sky path at intermediate L
+-------------------------------------------------------
+
+On the **constant-C** input augr's ``_compute_n0_tt_fullsky`` is fine
+at low L (matches plancklens to ~3 sig figs at L=2..30) but disagrees
+with the closed form by ~12-24% at L = 30..300 — and at L = 600 augr
+full and plancklens both run away in lockstep at ~+24%, which is the
+expected ``L / l_max`` boundary truncation. The augr-vs-plancklens
+disagreement at L = 30..300 is therefore real, not boundary, and
+is on **augr**'s side (plancklens stays close to the closed form
+through that range).
+
+On the **realistic LiteBIRD-PTEP** spectra ``compare.py`` reports
+``augr full-sky / plancklens`` max rel-err = **8410 at L in [2, 9]**
+and **494 at L in [10, 2000]**, converging to <2% only at L > 2000.
+This is wildly bigger than the constant-C residual; something about
+how ``_compute_n0_tt_fullsky`` handles non-constant spectra at low L
+is broken. The augr **flat-sky** path on the same realistic input
+shows max rel-err = 20 at low L, 14 at bulk L, 0.01 at high L — the
+flat-vs-full geometric factor accounts for some of the low-L gap,
+not all of it.
+
+The ``compute_n0_ee`` / ``compute_n0_eb`` polarization estimators
+were not reproduced at the same level by this test (their controlled-
+input answer needs a numerical reference because the
+``cos(2 phi_12)`` / ``sin(2 phi_12)`` factors do not collapse for
+constant C). The polarization MV ratio "0.64 -> 1.00" reported in the
+earlier ratio table is consistent with the same flat-vs-full
+geometric factor, so it is likely OK; running the analogous numerical-
+reference test for EE/EB is a small follow-up.
+
+Next steps to chase the augr full-sky bug:
+
+  1. Add an EE/EB controlled-input test using a high-precision
+     numerical reference (no closed form needed -- just integrate the
+     same flat-sky formula at very high quadrature against augr's
+     ``compute_n0_ee`` / ``compute_n0_eb``). Compare the polarization
+     MV against plancklens ``p_p``.
+  2. Diagnose ``_compute_n0_tt_fullsky``: the wigner3j_000 evaluation,
+     the alpha_1 / alpha_2 (geometric analog of L.l), the (2L+1)
+     normalization, and the spectrum lookup at l2 (note the
+     ``_fullsky_inv_spectrum`` interpolation, which uses
+     ``np.interp`` -- if the realistic LiteBIRD spectra have sharp
+     features at low l, this is a candidate for catastrophic
+     interpolation error).
+  3. Cross-check on the realistic LiteBIRD inputs whether augr full
+     stays close to ``plancklens / augr_flat -> (L+1)^2 / L^2 * 1``
+     once both bugs are fixed.
+
+How to reproduce
+----------------
+
+```bash
+# Augr-only flat-sky controlled-input test (passes in pixi env):
+pixi run python scripts/n0_validation/controlled_input_test.py
+
+# Full augr + plancklens comparison (needs the n0val conda env):
+conda run -n n0val python scripts/n0_validation/controlled_input_test.py \
+    --fullsky --plancklens
+```
