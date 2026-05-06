@@ -352,3 +352,5 @@ Production scripts:
 - Maris et al. 2006 -- Planck scan-strategy polar-hole / Deep-Field geometry, motivating the `hit_maps.l2_hit_map` envelope
 - Griffin et al. 2002 -- Single-moded feedhorn coupling (d ~ 2Fλ), used in the telescope module focal-plane packing
 - Falcons.jl (Takase 2025, https://github.com/yusuke-takase/Falcons.jl) -- Time-domain scan-strategy simulator used as the bit-exact validation reference for `augr/crosslinks.py`
+- Lewis, Challinor & Lasenby 2000, ApJ 538, 473 (arXiv:astro-ph/9911177) -- CAMB; produces the C_ℓ templates loaded by `augr/spectra.py`
+- Alonso et al. 2019, MNRAS 484, 4127 (arXiv:1809.09603) -- NaMaster; pseudo-C_ℓ estimator and natural source of measured BPWFs consumed via `augr/bandpower_windows.py`
