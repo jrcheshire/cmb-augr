@@ -223,6 +223,99 @@ def _bandpower_window_to_bin_matrix(
     return jnp.array(W_out), jnp.array(centers)
 
 
+def _pack_per_spectrum_bpwfs(
+        bpwf_by_pair: dict[tuple[int, int], np.ndarray],
+        bpwf_ells: np.ndarray,
+        target_ells: np.ndarray,
+        ell_min: int,
+        ell_max: int,
+        freq_pairs: list[tuple[int, int]]) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Pack a dict of measured BPWFs into the (n_pairs, n_bins, n_ells) tensor.
+
+    Per-spectrum BPWFs: BICEP/Keck-style multi-frequency analyses produce
+    one bandpower window per (i, j) cross-spectrum because per-channel
+    masks, transfer functions, and beam scales differ. The dict keys are
+    `(i_ch, j_ch)` channel-index tuples; either ordering `(i, j)` or
+    `(j, i)` is accepted and canonicalised to `(min, max)`.
+
+    Args:
+        bpwf_by_pair: ``{(i_ch, j_ch): W}`` with each W shape
+                      ``(n_bins, n_ells_in)``. Every pair listed in
+                      ``freq_pairs`` must be present; no extras allowed.
+        bpwf_ells:    Shared ℓ grid for every BPWF in the dict.
+        target_ells:  SignalModel ℓ grid.
+        ell_min, ell_max: SignalModel ell range.
+        freq_pairs:   Canonical (i ≤ j) pair list from SignalModel,
+                      defining the order along the leading axis of the
+                      output tensor.
+
+    Returns:
+        ``(W_3d, centers_first_pair)`` -- W_3d shape
+        ``(n_pairs, n_bins, n_ells_target)``; centers_first_pair shape
+        ``(n_bins,)`` derived from ``freq_pairs[0]`` (mode-agnostic
+        first-pair representative consumed by ``bin_centers``).
+    """
+    if not isinstance(bpwf_by_pair, dict):
+        raise TypeError(
+            f"bandpower_window must be a dict for per-spectrum mode; "
+            f"got {type(bpwf_by_pair).__name__}.")
+    if len(bpwf_by_pair) == 0:
+        raise ValueError("bandpower_window dict is empty.")
+
+    # Canonicalise keys to (min, max) and detect collisions.
+    canonical: dict[tuple[int, int], np.ndarray] = {}
+    for key, W in bpwf_by_pair.items():
+        if not (isinstance(key, tuple) and len(key) == 2
+                and all(isinstance(k, (int, np.integer)) for k in key)):
+            raise ValueError(
+                f"bandpower_window keys must be 2-tuples of channel "
+                f"indices; got {key!r}.")
+        ck = (int(min(key)), int(max(key)))
+        if ck in canonical:
+            raise ValueError(
+                f"bandpower_window has duplicate entry for pair {ck} "
+                f"(after canonicalising {key} to (min, max)).")
+        canonical[ck] = np.asarray(W)
+
+    expected = set(tuple(sorted(p)) for p in freq_pairs)
+    missing = expected - set(canonical.keys())
+    extra = set(canonical.keys()) - expected
+    if missing:
+        raise ValueError(
+            f"bandpower_window is missing entries for cross-spectra "
+            f"{sorted(missing)}. Every pair in SignalModel.freq_pairs "
+            f"must have a BPWF in per-spectrum mode.")
+    if extra:
+        raise ValueError(
+            f"bandpower_window has entries for unknown cross-spectra "
+            f"{sorted(extra)}. Channel indices must be in "
+            f"[0, n_channels).")
+
+    # Build the per-pair (n_bins, n_ells_target) blocks via the existing
+    # 2-D helper (validates shape, finiteness, range, monotonicity), then
+    # stack in freq_pairs order.
+    rows: list[jnp.ndarray] = []
+    centers_first: jnp.ndarray | None = None
+    n_bins_ref: int | None = None
+    for pair in freq_pairs:
+        ck = tuple(sorted(pair))
+        W_block, centers_block = _bandpower_window_to_bin_matrix(
+            canonical[ck], bpwf_ells, target_ells, ell_min, ell_max)
+        if n_bins_ref is None:
+            n_bins_ref = int(W_block.shape[0])
+            centers_first = centers_block
+        elif int(W_block.shape[0]) != n_bins_ref:
+            raise ValueError(
+                f"bandpower_window entries have inconsistent n_bins: "
+                f"pair {sorted(freq_pairs[0])} has {n_bins_ref} bins, "
+                f"pair {ck} has {W_block.shape[0]}. Per-spectrum BPWFs "
+                f"must share a common bandpower binning.")
+        rows.append(W_block)
+
+    W_3d = jnp.stack(rows, axis=0)
+    return W_3d, centers_first
+
+
 # -----------------------------------------------------------------------
 # Parameter flatten / unflatten
 # -----------------------------------------------------------------------
@@ -263,19 +356,36 @@ class SignalModel:
         delta_ell:         Bin width for uniform bins above ell_per_bin_below.
         ell_per_bin_below: Per-ℓ bins for ℓ < this value (default 30).
         window:            Bin window function: 'tophat' or 'gaussian'.
-        bandpower_window:  Optional measured BPWF, shape (n_bins, n_ells).
-                           When supplied, ``ell_bins`` / ``delta_ell`` /
-                           ``ell_per_bin_below`` / ``window`` are ignored
-                           and the user-supplied W is interpolated onto
-                           the SignalModel ell grid as ``bin_matrix``.
-                           Triggers ``has_measured_bpwf=True`` so that
-                           downstream consumers (FisherForecast, the
-                           covariance routines) take the overlap-aware
-                           full-covariance path.
+        bandpower_window:  Optional measured BPWF. Two modes:
+
+                           * Shared (Phase 1): a 2-D array of shape
+                             ``(n_bins, n_ells)`` applied identically
+                             to every cross-frequency spectrum.
+                           * Per-spectrum (Phase 2): a dict
+                             ``{(i_ch, j_ch): W}`` with one
+                             ``(n_bins, n_ells)`` BPWF per cross-
+                             spectrum -- captures per-channel mask /
+                             transfer-function / beam differences in
+                             multi-frequency releases (BICEP/Keck,
+                             bk-jax). Either key ordering ``(i, j)``
+                             or ``(j, i)`` is accepted; entries are
+                             canonicalised to ``(min, max)``. Every
+                             pair in ``freq_pairs`` must be supplied.
+
+                           When supplied (either mode), ``ell_bins`` /
+                           ``delta_ell`` / ``ell_per_bin_below`` /
+                           ``window`` are ignored and ``has_measured_bpwf``
+                           becomes True so that downstream consumers
+                           (FisherForecast, the covariance routines)
+                           take the overlap-aware full-covariance path.
         bandpower_window_ells: 1-D array of multipoles for
                            ``bandpower_window``; must span
                            [ell_min, ell_max]. Required when
-                           ``bandpower_window`` is supplied.
+                           ``bandpower_window`` is supplied. In
+                           per-spectrum mode this is a single shared
+                           grid for every BPWF in the dict; pre-
+                           interpolate if your sources used different
+                           grids.
     """
 
     def __init__(self,
@@ -293,7 +403,9 @@ class SignalModel:
                  delensed_bb_ells: jnp.ndarray | None = None,
                  residual_template_cl: jnp.ndarray | None = None,
                  residual_template_ells: jnp.ndarray | None = None,
-                 bandpower_window: np.ndarray | jnp.ndarray | None = None,
+                 bandpower_window: (
+                     np.ndarray | jnp.ndarray
+                     | dict[tuple[int, int], np.ndarray] | None) = None,
                  bandpower_window_ells: (
                      np.ndarray | jnp.ndarray | None) = None):
         self._instrument = instrument
@@ -403,22 +515,46 @@ class SignalModel:
         else:
             self._residual_template_cl = None
 
-        # Binning -- two paths.
+        # Binning. Three paths converge into a single internal 3-D
+        # tensor ``_bin_matrix_3d`` of shape (n_pairs, n_bins, n_ells)
+        # that the covariance / data-vector code consumes uniformly.
+        # Shared / synthetic modes also keep a 2-D ``_bin_matrix`` for
+        # backward-compat reads via the public ``bin_matrix`` property.
         if (bandpower_window is None) != (bandpower_window_ells is None):
             raise ValueError(
                 "bandpower_window and bandpower_window_ells must be "
                 "supplied together.")
         self._has_measured_bpwf = bandpower_window is not None
-        if self._has_measured_bpwf:
+        self._is_per_spectrum_bpwf = isinstance(bandpower_window, dict)
+
+        n_pairs = len(self._freq_pairs)
+        if self._is_per_spectrum_bpwf:
+            self._bin_matrix_3d, self._bin_centers = (
+                _pack_per_spectrum_bpwfs(
+                    bandpower_window,
+                    np.asarray(bandpower_window_ells),
+                    ells_np, ell_min, ell_max,
+                    self._freq_pairs))
+            # The 2-D shared bin_matrix is undefined in per-spectrum
+            # mode; access raises with a pointer to the 3-D / accessor
+            # API.
+            self._bin_matrix = None
+            self._bin_edges = None
+        elif self._has_measured_bpwf:
             self._bin_matrix, self._bin_centers = (
                 _bandpower_window_to_bin_matrix(
                     np.asarray(bandpower_window),
                     np.asarray(bandpower_window_ells),
                     ells_np, ell_min, ell_max))
-            # bin_edges has no meaningful definition for an arbitrary BPWF
-            # (a Gaussian wing extends to infinity at any tolerance). We
-            # set None and downstream consumers gate on has_measured_bpwf
-            # before reading it.
+            # broadcast_to is a view (no extra memory); JAX handles
+            # ``W_3d[s]`` indexing without materialising.
+            self._bin_matrix_3d = jnp.broadcast_to(
+                self._bin_matrix,
+                (n_pairs, *self._bin_matrix.shape))
+            # bin_edges has no meaningful definition for an arbitrary
+            # BPWF (a Gaussian wing extends to infinity at any
+            # tolerance). Downstream consumers gate on
+            # has_measured_bpwf before reading it.
             self._bin_edges = None
         else:
             bin_edges = _make_bin_edges(ell_min, ell_max,
@@ -426,6 +562,9 @@ class SignalModel:
                                         ell_bins)
             self._bin_matrix, self._bin_centers = _build_bin_matrix(
                 ells_np, bin_edges, window)
+            self._bin_matrix_3d = jnp.broadcast_to(
+                self._bin_matrix,
+                (n_pairs, *self._bin_matrix.shape))
             self._bin_edges = bin_edges
 
         # JIT-compiled Jacobian: traced once, cached for same-shape inputs.
@@ -477,12 +616,53 @@ class SignalModel:
 
     @property
     def bin_matrix(self) -> jnp.ndarray:
-        """Bandpower-binning weight matrix W of shape (n_bins, n_ells).
+        """Shared bandpower-binning weight matrix W, shape (n_bins, n_ells).
 
         Applied to a C_ℓ vector on the ``ells`` grid, W @ C yields the
-        bandpowers on the ``bin_centers`` grid.
+        bandpowers on the ``bin_centers`` grid. Available in synthetic
+        binning and shared-BPWF modes; raises in per-spectrum BPWF mode
+        (where W differs per cross-spectrum) -- use
+        ``bin_matrix_per_spectrum`` or ``bandpower_window_for(i, j)``
+        instead.
         """
+        if self._is_per_spectrum_bpwf:
+            raise ValueError(
+                "bin_matrix is not defined in per-spectrum BPWF mode "
+                "(W differs per cross-spectrum). Use "
+                "signal_model.bin_matrix_per_spectrum for the full "
+                "(n_pairs, n_bins, n_ells) tensor, or "
+                "signal_model.bandpower_window_for(i_ch, j_ch) for a "
+                "single pair.")
         return self._bin_matrix
+
+    @property
+    def bin_matrix_per_spectrum(self) -> jnp.ndarray:
+        """Per-spectrum BPWF tensor of shape (n_pairs, n_bins, n_ells).
+
+        Always defined: in synthetic and shared-BPWF modes this is a
+        broadcast view of the 2-D ``bin_matrix``; in per-spectrum BPWF
+        mode it carries one window per cross-spectrum, ordered to match
+        ``freq_pairs``.
+        """
+        return self._bin_matrix_3d
+
+    def bandpower_window_for(self, i_ch: int,
+                             j_ch: int) -> jnp.ndarray:
+        """Return the BPWF for cross-spectrum (i_ch, j_ch), shape (n_bins, n_ells).
+
+        Mode-agnostic accessor: works in synthetic, shared-BPWF, and
+        per-spectrum BPWF modes. Channel-index ordering is canonicalised
+        to ``(min, max)``.
+        """
+        a, b = sorted((int(i_ch), int(j_ch)))
+        try:
+            s = self._freq_pairs.index((a, b))
+        except ValueError as exc:
+            raise ValueError(
+                f"({i_ch}, {j_ch}) is not a valid cross-spectrum for "
+                f"this instrument; valid pairs are {self._freq_pairs}."
+            ) from exc
+        return self._bin_matrix_3d[s]
 
     @property
     def bin_edges(self) -> list[tuple[int, int]] | None:
@@ -505,6 +685,16 @@ class SignalModel:
         BPWFs that overlap between adjacent bins.
         """
         return self._has_measured_bpwf
+
+    @property
+    def is_per_spectrum_bpwf(self) -> bool:
+        """True iff a per-spectrum (dict-of-pairs) BPWF was supplied.
+
+        Implies ``has_measured_bpwf`` is also True. Steers the
+        covariance Knox sum onto the 3-D einsum that picks up
+        per-pair BPWF differences.
+        """
+        return self._is_per_spectrum_bpwf
 
     @property
     def frequencies(self) -> tuple[float, ...]:
@@ -552,16 +742,22 @@ class SignalModel:
         else:
             cl_residual = None
 
-        # Build bandpowers for each frequency pair
+        # Build bandpowers for each frequency pair. In per-spectrum BPWF
+        # mode the bin matrix differs per pair; in shared / synthetic
+        # modes ``_bin_matrix_3d`` is a broadcast view of the 2-D matrix
+        # so the same code path works without extra memory.
         bandpowers = []
-        for i_ch, j_ch in self._freq_pairs:
+        for s, (i_ch, j_ch) in enumerate(self._freq_pairs):
             nu_i = self._freqs[i_ch]
             nu_j = self._freqs[j_ch]
             cl_fg = self._fg_model.cl_bb(nu_i, nu_j, self._ells, fg_params)
             cl_total = cl_cmb + cl_fg
             if cl_residual is not None and i_ch == j_ch:
                 cl_total = cl_total + cl_residual
-            bp = self._bin_matrix @ cl_total    # (n_bins,)
+            if self._is_per_spectrum_bpwf:
+                bp = self._bin_matrix_3d[s] @ cl_total    # (n_bins,)
+            else:
+                bp = self._bin_matrix @ cl_total
             bandpowers.append(bp)
 
         return jnp.concatenate(bandpowers)

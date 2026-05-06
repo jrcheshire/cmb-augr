@@ -444,3 +444,123 @@ def test_blocks_path_raises_on_bpwf(two_chan_instrument):
     with pytest.raises(NotImplementedError, match="measured BPWFs"):
         bandpower_covariance_blocks_from_noise(
             sm, nl, two_chan_instrument.f_sky, params)
+
+
+# -----------------------------------------------------------------------
+# Per-spectrum BPWFs (Phase 2)
+# -----------------------------------------------------------------------
+
+def _gaussian_bpwf_rows(centers, sigmas, ells):
+    rows = []
+    for c, s in zip(centers, sigmas):
+        row = np.exp(-(ells - c) ** 2 / (2.0 * s ** 2))
+        rows.append(row / row.sum())
+    return np.array(rows)
+
+
+def test_per_spec_covariance_identical_rows_matches_shared(two_chan_instrument):
+    """Per-spectrum dict with all rows equal == shared-BPWF covariance.
+
+    Bit-for-bit equality validates that the new 3-D Knox einsum reduces
+    correctly to the Phase 1 2-D path when every cross-spectrum carries
+    the same BPWF.
+    """
+    ell_min, ell_max = 20, 200
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    W = _gaussian_bpwf_rows([50.0, 100.0, 150.0],
+                             [15.0, 15.0, 15.0], ells_in)
+
+    sm_shared = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    bpwf_dict = {p: W for p in sm_shared.freq_pairs}
+    sm_per = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=bpwf_dict, bandpower_window_ells=ells_in,
+    )
+    params = flatten_params(FIDUCIAL, sm_shared.parameter_names)
+
+    cov_shared = bandpower_covariance_full(sm_shared, two_chan_instrument,
+                                            params)
+    cov_per = bandpower_covariance_full(sm_per, two_chan_instrument,
+                                         params)
+    np.testing.assert_allclose(np.asarray(cov_per),
+                                np.asarray(cov_shared),
+                                rtol=1e-10, atol=1e-14)
+
+
+def test_per_spec_covariance_uses_per_pair_window(two_chan_instrument):
+    """Distinct per-pair BPWFs feed into the covariance per pair.
+
+    Construction: keep two of the three cross-spectrum BPWFs identical
+    to a baseline ``W0``; replace the third pair's BPWF with a scaled
+    version of ``W0``. The covariance auto-block for the modified pair
+    must change while the auto-block for an unchanged pair must not.
+    """
+    ell_min, ell_max = 20, 200
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    W0 = _gaussian_bpwf_rows([50.0, 100.0, 150.0],
+                              [15.0, 15.0, 15.0], ells_in)
+
+    sm_probe = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W0, bandpower_window_ells=ells_in,
+    )
+    pairs = sm_probe.freq_pairs   # [(0,0), (0,1), (1,1)]
+
+    target_pair = (1, 1)
+    untouched_pair = (0, 0)
+    bpwf_a = {p: W0 for p in pairs}
+    bpwf_b = {p: W0 for p in pairs}
+    # Boost the (1, 1) BPWF amplitude in run B; covariance scales as W^4
+    # via the einsum (W on row, W on col, both squared in auto Knox).
+    bpwf_b[target_pair] = 2.0 * W0
+
+    sm_a = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=bpwf_a, bandpower_window_ells=ells_in,
+    )
+    sm_b = SignalModel(
+        two_chan_instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=bpwf_b, bandpower_window_ells=ells_in,
+    )
+    params = flatten_params(FIDUCIAL, sm_a.parameter_names)
+
+    cov_a = bandpower_covariance_full(sm_a, two_chan_instrument, params)
+    cov_b = bandpower_covariance_full(sm_b, two_chan_instrument, params)
+
+    n_bins = sm_a.n_bins
+    s_target = pairs.index(target_pair)
+    s_other = pairs.index(untouched_pair)
+
+    target_block_a = cov_a[s_target * n_bins:(s_target + 1) * n_bins,
+                            s_target * n_bins:(s_target + 1) * n_bins]
+    target_block_b = cov_b[s_target * n_bins:(s_target + 1) * n_bins,
+                            s_target * n_bins:(s_target + 1) * n_bins]
+    other_block_a = cov_a[s_other * n_bins:(s_other + 1) * n_bins,
+                           s_other * n_bins:(s_other + 1) * n_bins]
+    other_block_b = cov_b[s_other * n_bins:(s_other + 1) * n_bins,
+                           s_other * n_bins:(s_other + 1) * n_bins]
+
+    # The (1,1) auto-block must move (atol=0 so the ratio test isn't
+    # masked by the variances being O(1e-12)); the (0,0) auto-block
+    # must not.
+    assert not jnp.allclose(target_block_a, target_block_b,
+                             rtol=1e-3, atol=0.0)
+    np.testing.assert_allclose(np.asarray(other_block_a),
+                                np.asarray(other_block_b),
+                                rtol=1e-12, atol=1e-14)
+    # Direction sanity-check: doubling W on (1,1) auto multiplies its
+    # variance by 2 × 2 = 4. The Knox einsum has two W factors (one
+    # row, one col); M itself carries no W, so the scaling is W², not
+    # W⁴.
+    np.testing.assert_allclose(np.asarray(jnp.diag(target_block_b)),
+                                4.0 * np.asarray(
+                                    jnp.diag(target_block_a)),
+                                rtol=1e-10)

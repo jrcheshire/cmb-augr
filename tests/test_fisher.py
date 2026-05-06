@@ -531,3 +531,78 @@ def test_fisher_summary_handles_bpwf_mode(instrument):
     text = ff.summary()
     assert "Knox modes/bin (BPWF)" in text
     assert "cond(F)" in text
+
+
+# -----------------------------------------------------------------------
+# Per-spectrum BPWFs (Phase 2)
+# -----------------------------------------------------------------------
+
+def test_fisher_per_spectrum_identical_rows_matches_shared(instrument):
+    """All-identical-rows dict reproduces the shared-BPWF Fisher exactly."""
+    ell_min, ell_max = 30, 80
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    W = np.eye(ells_in.size)   # per-ℓ disjoint windows
+
+    sm_shared = SignalModel(
+        instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    bpwf_dict = {p: W for p in sm_shared.freq_pairs}
+    sm_per = SignalModel(
+        instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=bpwf_dict, bandpower_window_ells=ells_in,
+    )
+
+    nl = jnp.array([
+        noise_nl(ch, sm_shared.ells,
+                 instrument.mission_duration_years,
+                 instrument.f_sky)
+        for ch in instrument.channels
+    ])
+    ff_shared = FisherForecast(
+        sm_shared, instrument, FIDUCIAL,
+        priors={"beta_dust": 0.11, "beta_sync": 0.3},
+        fixed_params=["T_dust"], external_noise_bb=nl,
+    )
+    ff_per = FisherForecast(
+        sm_per, instrument, FIDUCIAL,
+        priors={"beta_dust": 0.11, "beta_sync": 0.3},
+        fixed_params=["T_dust"], external_noise_bb=nl,
+    )
+    F_shared = ff_shared.compute()
+    F_per = ff_per.compute()
+    assert jnp.allclose(F_shared, F_per, rtol=1e-8, atol=1e-12)
+
+
+def test_fisher_summary_per_spectrum_label(instrument):
+    """summary() tags the Knox-modes line as per-spec when applicable."""
+    ell_min, ell_max = 30, 80
+    ells_in = np.arange(ell_min, ell_max + 1, dtype=float)
+    W = np.eye(ells_in.size)
+    sm_probe = SignalModel(
+        instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=W, bandpower_window_ells=ells_in,
+    )
+    bpwf_dict = {p: W for p in sm_probe.freq_pairs}
+    sm = SignalModel(
+        instrument, GaussianForegroundModel(), CMBSpectra(),
+        ell_min=ell_min, ell_max=ell_max,
+        bandpower_window=bpwf_dict, bandpower_window_ells=ells_in,
+    )
+    nl = jnp.array([
+        noise_nl(ch, sm.ells,
+                 instrument.mission_duration_years,
+                 instrument.f_sky)
+        for ch in instrument.channels
+    ])
+    ff = FisherForecast(
+        sm, instrument, FIDUCIAL,
+        priors={"beta_dust": 0.11, "beta_sync": 0.3},
+        fixed_params=["T_dust"], external_noise_bb=nl,
+    )
+    ff.compute()
+    text = ff.summary()
+    assert "per-spec, first-pair" in text

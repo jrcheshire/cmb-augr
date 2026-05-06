@@ -62,8 +62,9 @@ Knowing how the modules chain together matters more than any one file:
    use a self-consistent residual lensing spectrum instead of an
    `A_lens` multiplier. Pass `bandpower_window=W,
    bandpower_window_ells=...` to substitute a measured BPWF for the
-   synthetic top-hat / Gaussian binning (see "Measured bandpower window
-   functions" below).
+   synthetic top-hat / Gaussian binning -- either a shared 2-D matrix
+   (Phase 1) or a `{(i_ch, j_ch): W}` per-spectrum dict (Phase 2). See
+   "Measured bandpower window functions" below.
 
 4. **`covariance.py` → `fisher.py`.** `BandpowerCovariance` is the Knox
    formula across all frequency cross-spectra.
@@ -250,48 +251,82 @@ convention; naming is `omega_<species>_<quantity>` where species is
 ## Measured bandpower window functions
 
 The synthetic top-hat / Gaussian binning is replaced by a user-supplied
-BPWF when `SignalModel` is constructed with `bandpower_window=W` and
-`bandpower_window_ells=...`. The BPWF is a `(n_bins, n_ells)` matrix
-encoding mask-mode coupling, transfer-function corrections, and beam
-smoothing -- the kernel mapping the underlying sky `C_ℓ` to the
-bandpower estimator from a real-data analysis pipeline (BICEP/Keck
-releases, NaMaster / bk-jax outputs).
+BPWF when `SignalModel` is constructed with `bandpower_window=...` and
+`bandpower_window_ells=...`. The BPWF kernel encodes mask-mode coupling,
+transfer-function corrections, and beam smoothing -- the kernel mapping
+the underlying sky `C_ℓ` to the bandpower estimator from a real-data
+analysis pipeline (BICEP/Keck releases, NaMaster / bk-jax outputs).
+
+Two flavours of `bandpower_window`:
+
+* **Shared** (Phase 1): a 2-D array of shape `(n_bins, n_ells)` applied
+  identically to every cross-frequency spectrum.
+* **Per-spectrum** (Phase 2): a `dict` `{(i_ch, j_ch): W}` carrying one
+  `(n_bins, n_ells)` BPWF per cross-spectrum. Captures per-channel
+  mask, transfer-function, and beam differences that BICEP/Keck-style
+  multi-frequency releases (and bk-jax) produce. Either ordering
+  `(i, j)` or `(j, i)` is accepted; entries are canonicalised to
+  `(min, max)`. Every pair in `freq_pairs` must be supplied.
 
 What changes when BPWFs are active (`signal_model.has_measured_bpwf =
 True`):
 
-- The `bin_matrix` is the user-supplied W (interpolated onto the
-  SignalModel ℓ grid; **not** re-normalised). `bin_centers` derives from
-  `Σ_ℓ ℓ W_b(ℓ) / Σ_ℓ W_b(ℓ)`. `bin_edges` becomes `None` (the (lo, hi)
-  interval description is meaningless for an arbitrary BPWF).
+- `bin_centers` derives from `Σ_ℓ ℓ W_b(ℓ) / Σ_ℓ W_b(ℓ)`. `bin_edges`
+  becomes `None` (the (lo, hi) interval description is meaningless for
+  an arbitrary BPWF). User-supplied W is **not** re-normalised --
+  pipeline calibration is preserved.
+- In **shared** mode, `bin_matrix` is the 2-D shared W. In
+  **per-spectrum** mode, `bin_matrix` raises with a pointer to
+  `bin_matrix_per_spectrum` (3-D tensor, shape
+  `(n_pairs, n_bins, n_ells)`, ordered to match `freq_pairs`) and to
+  the mode-agnostic accessor `bandpower_window_for(i_ch, j_ch)`.
+  `is_per_spectrum_bpwf` is the public bool flag for downstream
+  dispatch.
 - The per-bin block-diagonal Knox approximation breaks: bins couple
   through `Σ_ℓ W_b(ℓ) W_{b'}(ℓ) (2ℓ+1)`. `bandpower_covariance` and
   `FisherForecast.compute()` automatically dispatch to the full-path
   Knox sum (`bandpower_covariance_full*`); the
-  `bandpower_covariance_blocks*` entry points raise `NotImplementedError`
-  in this mode.
+  `bandpower_covariance_blocks*` entry points raise
+  `NotImplementedError` in BPWF mode. The `_knox_full` einsum has two
+  branches (rank-2 shared / rank-3 per-spectrum) so JAX sees the
+  contraction structure; numerics are bit-identical to Phase 1 when a
+  per-spectrum dict has all rows equal.
 - `FisherForecast` requires `external_noise_bb` whenever
-  `has_measured_bpwf` is True (BPWFs released by analysis pipelines have
-  the beam baked in; pairing them with augr's analytic, beam-convolved
-  noise would be inconsistent). Use `instrument.deconvolve_noise_bb` if
-  the available noise array is still beam-convolved.
+  `has_measured_bpwf` is True (BPWFs released by analysis pipelines
+  have the beam baked in; pairing them with augr's analytic,
+  beam-convolved noise would be inconsistent). Use
+  `instrument.deconvolve_noise_bb` if the available noise array is
+  still beam-convolved.
+- `summary()` reports the BPWF Knox-mode count
+  `Σ_ℓ W_b(ℓ)² (2ℓ+1) f_sky` from the first cross-spectrum's window in
+  per-spectrum mode (matching the `bin_centers` first-pair convention)
+  and tags the line `(BPWF, per-spec, first-pair)`. Sub-unity values
+  are formatted in scientific notation so they don't collapse to
+  "0.0" at small `f_sky`.
 
-Loader: `augr.bandpower_windows.load_bandpower_window(path)` sniffs the
-file extension and returns `(ells, W)` with the augr-canonical
-`(n_bins, n_ells)` shape. Supported formats:
+Loaders (`augr.bandpower_windows`):
 
-- `.npy`: 2-D numpy array, shape `(n_ells, 1 + n_bins)`. Column 0 = ℓ;
-  columns 1..n_bins = `W_b(ℓ)`.
-- `.npz`: archive with arrays `ells` (shape `(n_ells,)`) and `window`
-  (shape `(n_bins, n_ells)`).
-- `.csv` / `.dat` / `.txt`: whitespace- or comma-delimited table, same
-  layout as `.npy`. Lines starting with `#` are treated as comments.
+- `load_bandpower_window(path)` -- single 2-D BPWF, shared use. Returns
+  `(ells, W)`. Sniffs:
+  - `.npy`: 2-D array `(n_ells, 1 + n_bins)`, column 0 = ℓ.
+  - `.npz`: arrays `ells` (`(n_ells,)`) and `window` (`(n_bins, n_ells)`).
+  - `.csv` / `.dat` / `.txt`: whitespace- or comma-delimited table,
+    same layout as `.npy`. Lines starting with `#` are comments.
+- `load_bandpower_window_set(spec)` -- per-spectrum dict for Phase 2.
+  Returns `(ells, dict)`. Two input shapes:
+  - **Directory / glob** of files named `bpwf_{i}_{j}.{ext}`
+    (regex `bpwf_(\d+)_(\d+)\.<ext>`); each file is parsed with the
+    single-file loader, channel indices come from the filename, and
+    pair ordering is canonicalised. Duplicate canonicals (e.g. both
+    `bpwf_0_1` and `bpwf_1_0`) raise.
+  - **Single `.npz`** with arrays `ells` (`(n_ells,)`),
+    `window` (`(n_pairs, n_bins, n_ells)`), and `freq_pairs`
+    (`(n_pairs, 2)`). bk-jax's eventual cross-pair output uses this
+    layout.
 
-Phase 2 (deferred): per-spectrum BPWFs. BICEP/Keck-style releases give
-one BPWF per cross-spectrum `(i, j)`; the current API applies a single
-shared `bin_matrix` to every cross-spectrum. Generalising to a
-`(n_bins, n_ells, n_pairs)` tensor requires updates to `data_vector`
-and `_build_M_*`.
+Phase 2.5 (deferred): asymmetric beams × non-uniform foregrounds. The
+standard BPWF formalism factorises only for isotropic beams; the right
+tool there is a Leloup-style end-to-end TOD framework, not a BPWF.
 
 Motivating use case: linking augr's Fisher forecast to bk-jax's
 real-data bandpower outputs (`~/bicepkeck/bk-jax/`), so the same

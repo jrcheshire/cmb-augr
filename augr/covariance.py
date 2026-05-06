@@ -165,8 +165,14 @@ def _knox_full(M_ell: jnp.ndarray,
     reduces exactly to the block-diagonal form returned by
     ``_knox_blocks``; for finite-width tophats the two paths agree to
     leading order in the variation of M(ℓ) across a bin.
+
+    In per-spectrum BPWF mode (``signal_model.is_per_spectrum_bpwf``),
+    each cross-spectrum carries its own BPWF and the contraction picks
+    up the per-pair window:
+
+        cov[s, b, S, c]
+            = Σ_ℓ W^{(s)}_b(ℓ) W^{(S)}_c(ℓ) knox_per_ell[s, S, ℓ].
     """
-    W = signal_model.bin_matrix
     ells = signal_model.ells
     pairs = signal_model.freq_pairs
     n_spec = len(pairs)
@@ -182,8 +188,17 @@ def _knox_full(M_ell: jnp.ndarray,
                    / ((2.0 * ells + 1.0) * f_sky)
     # shape: (n_spec, n_spec, n_ells)
 
-    # cov[s, b, S, c] = Σ_ℓ W[b, ℓ] W[c, ℓ] knox_per_ell[s, S, ℓ]
-    cov_4d = jnp.einsum('be,ce,sSe->sbSc', W, W, knox_per_ell)
+    if signal_model.is_per_spectrum_bpwf:
+        # Per-pair einsum: cov[s, b, S, c] = Σ_ℓ W3[s, b, ℓ] W3[S, c, ℓ]
+        # knox_per_ell[s, S, ℓ].
+        W3 = signal_model.bin_matrix_per_spectrum
+        cov_4d = jnp.einsum('sbe,Sce,sSe->sbSc', W3, W3, knox_per_ell)
+    else:
+        # Shared-BPWF / synthetic-binning fast path. Bit-identical to
+        # Phase 1 numerics; kept on its own branch so JAX sees the
+        # rank-2 contraction structure.
+        W = signal_model.bin_matrix
+        cov_4d = jnp.einsum('be,ce,sSe->sbSc', W, W, knox_per_ell)
     return cov_4d.reshape(n_spec * n_bins, n_spec * n_bins)
 
 

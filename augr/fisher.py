@@ -373,10 +373,16 @@ class FisherForecast:
         # coupling-aware analogue is f_sky × Σ_ℓ W_b(ℓ)² (2ℓ+1).
         if sig.has_measured_bpwf:
             ells_arr = np.asarray(sig.ells)
-            W_arr = np.asarray(sig.bin_matrix)
+            # First-pair-representative for diagnostics. In per-spectrum
+            # mode the BPWFs differ across cross-spectra; bin_centers
+            # follows the same first-pair convention so the two
+            # diagnostics agree.
+            W_arr = np.asarray(sig.bin_matrix_per_spectrum[0])
             nu_b = inst.f_sky * (W_arr ** 2 * (2.0 * ells_arr + 1.0)
                                  ).sum(axis=1)
-            mode_label = "Knox modes/bin (BPWF):"
+            mode_label = ("Knox modes/bin (BPWF, per-spec, first-pair):"
+                          if sig.is_per_spectrum_bpwf
+                          else "Knox modes/bin (BPWF):")
         else:
             nu_b = np.array([
                 inst.f_sky * (hi - lo + 1) * (lo + hi + 1)
