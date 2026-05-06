@@ -1,16 +1,22 @@
 """Tests for delensing.py — QE lensing reconstruction and residual BB."""
 
+from pathlib import Path
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from augr.config import simple_probe
 from augr.delensing import (
+    LensingSpectra,
     _gl_nodes,
     _interp_at,
     _triangle_geometry,
     compute_n0_eb,
+    compute_n0_ee,
     compute_n0_mv,
+    compute_n0_tb,
+    compute_n0_te,
     compute_n0_tt,
     iterate_delensing,
     lensing_kernel,
@@ -477,3 +483,123 @@ class TestSignalModelIntegration:
         assert J.shape == (signal.n_data, signal.n_params)
         # Jacobian should have no A_lens column
         assert J.shape[1] == signal.n_params
+
+
+# -----------------------------------------------------------------------
+# Cross-validation against plancklens (LiteBIRD-PTEP fiducial)
+#
+# Reference NPZ produced by scripts/n0_validation/run_plancklens.py;
+# regen recipe in scripts/n0_validation/README.md. The lightweight test
+# here just compares augr's compute_n0_* on the *same* nl_*/cl_* arrays
+# against the saved reference. Tolerances reflect the conventions both
+# codes use: response = unlensed C_l, filter = lensed + noise, MV =
+# diagonal 1/Sum 1/N_0_alpha.
+# -----------------------------------------------------------------------
+
+# Tolerance constants. Final values to be set after the first plancklens
+# run produces real numbers (see scripts/n0_validation/README.md "Last
+# regen"). Until that round-trip is done, the placeholders here let the
+# class import cleanly and the per-estimator tests skip individually.
+N0_REF_PATH = Path(__file__).resolve().parents[1] / "data" / "n0_reference_litebird.npz"
+TOL_FLATSKY_BULK = 0.05    # 5% in the bulk-L window; refine after first regen.
+TOL_FLATSKY_TAIL = 0.10    # looser at low/high L (mode-grid + l_max convention).
+TOL_FULLSKY_MV = 0.05      # full-sky path; ~10 min, marked slow.
+
+L_BULK = (10, 2000)        # bulk-L window where the comparison is tight.
+
+
+def _load_reference():
+    """Load the in-tree plancklens reference NPZ, or skip if absent."""
+    if not N0_REF_PATH.exists():
+        pytest.skip(
+            f"plancklens reference not found at {N0_REF_PATH.relative_to(Path.cwd())}; "
+            "run scripts/n0_validation/run_plancklens.py and copy the output to "
+            "data/n0_reference_litebird.npz to enable this test."
+        )
+    npz = np.load(N0_REF_PATH, allow_pickle=True)
+    return {k: npz[k] for k in npz.files}
+
+
+def _make_spectra(ref):
+    return LensingSpectra(
+        ells=jnp.asarray(ref["ells"]),
+        cl_tt_unl=jnp.asarray(ref["cl_tt_unl"]),
+        cl_ee_unl=jnp.asarray(ref["cl_ee_unl"]),
+        cl_bb_unl=jnp.asarray(ref["cl_bb_unl"]),
+        cl_te_unl=jnp.asarray(ref["cl_te_unl"]),
+        cl_tt_len=jnp.asarray(ref["cl_tt_len"]),
+        cl_ee_len=jnp.asarray(ref["cl_ee_len"]),
+        cl_bb_len=jnp.asarray(ref["cl_bb_len"]),
+        cl_te_len=jnp.asarray(ref["cl_te_len"]),
+        cl_pp=jnp.asarray(ref["cl_pp"]),
+    )
+
+
+def _max_rel_err_in_window(augr_n0, ref_n0, Ls, lo, hi):
+    """|augr - ref| / |ref| max over Ls in [lo, hi]."""
+    augr_n0 = np.asarray(augr_n0)
+    ref_n0 = np.asarray(ref_n0)
+    mask = (Ls >= lo) & (Ls <= hi) & np.isfinite(augr_n0) & np.isfinite(ref_n0) & (ref_n0 != 0)
+    if not mask.any():
+        return 0.0
+    rel = np.abs(augr_n0[mask] - ref_n0[mask]) / np.abs(ref_n0[mask])
+    return float(rel.max())
+
+
+@pytest.mark.parametrize("estimator", ["tt", "te", "ee", "eb", "tb", "mv"])
+class TestN0AgainstPlancklensFlatSky:
+    """Per-estimator flat-sky N_0 must match plancklens within tolerance."""
+
+    def test_max_rel_err_in_bulk(self, estimator):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_tt = jnp.asarray(ref["nl_tt"])
+        nl_ee = jnp.asarray(ref["nl_ee"])
+        nl_bb = jnp.asarray(ref["nl_bb"])
+
+        if estimator == "tt":
+            augr_n0 = compute_n0_tt(Ls, spectra, nl_tt)
+        elif estimator == "te":
+            augr_n0 = compute_n0_te(Ls, spectra, nl_tt, nl_ee)
+        elif estimator == "ee":
+            augr_n0 = compute_n0_ee(Ls, spectra, nl_ee)
+        elif estimator == "eb":
+            augr_n0 = compute_n0_eb(Ls, spectra, nl_ee, nl_bb)
+        elif estimator == "tb":
+            augr_n0 = compute_n0_tb(Ls, spectra, nl_tt, nl_bb)
+        else:  # mv
+            augr_n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb)
+
+        ref_n0 = ref[f"n0_{estimator}"]
+        Ls_np = np.asarray(Ls)
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
+        assert err_bulk <= TOL_FLATSKY_BULK, (
+            f"flat-sky N_0^{estimator.upper()}: bulk-L max-rel-err = "
+            f"{err_bulk:.4f} > {TOL_FLATSKY_BULK:.4f}"
+        )
+
+
+@pytest.mark.slow
+class TestN0AgainstPlancklensFullSky:
+    """Full-sky MV is the slow path; check only the combined estimator."""
+
+    def test_mv_max_rel_err_in_bulk(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_tt = jnp.asarray(ref["nl_tt"])
+        nl_ee = jnp.asarray(ref["nl_ee"])
+        nl_bb = jnp.asarray(ref["nl_bb"])
+
+        augr_n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb,
+                                fullsky=True)
+        ref_n0 = ref["n0_mv"]
+        Ls_np = np.asarray(Ls)
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
+        assert err_bulk <= TOL_FULLSKY_MV, (
+            f"full-sky N_0^MV: bulk-L max-rel-err = "
+            f"{err_bulk:.4f} > {TOL_FULLSKY_MV:.4f}"
+        )
