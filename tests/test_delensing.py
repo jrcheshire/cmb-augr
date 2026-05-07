@@ -606,16 +606,25 @@ class TestN0AgainstPlancklens:
 
 @pytest.mark.slow
 @pytest.mark.xfail(
-    reason="Known bug in _compute_n0_ee_fullsky: spin-2 alpha "
-           "substitution. augr uses spin-0 raising eigenvalue "
-           "sqrt(l(l+1)) for alpha = [L(L+1) + l(l+1) - l'(l'+1)] / 2, "
-           "but spin-2 fields require sqrt((l+/-2)(l-/+1)) eigenvalues "
-           "(see plancklens utils_spin.get_spin_raise/lower). The error "
-           "is invisible for constant Cl (where alpha_1 + alpha_2 = "
-           "L(L+1) is the only thing that matters) but shows up as 5-20x "
-           "deviation on realistic non-constant LiteBIRD spectra. Fix "
-           "requires re-deriving the spin-2 full-sky QE response "
-           "(HO02 Appendix A; Smith-Hanson-Lewis 2012; Lewis-Pratten 2020).",
+    reason="Known structural bug in _compute_n0_ee_fullsky. Fix #1 (drop "
+           "/2 on alpha; OkaHu 2003 Eq. 14) applied 2026-05-06: bug "
+           "reduced from 5-20x to ~1.7x in bulk-L plus L-dependent "
+           "residual. Diagnosis complete: augr implements only the "
+           "spin-RAISING branch of the lensing source action on a "
+           "spin-2 field; the spin-LOWERING branch is missing. "
+           "plancklens's get_qes('pee') yields 8 qes in two families "
+           "of 4: family A (legb.spin_ou=3, eigenvalue sqrt((l-2)(l+3))) "
+           "and family B (legb.spin_ou=-1, eigenvalue sqrt((l+2)(l-1))). "
+           "The total response is the sum of both. For TT (spin-0), "
+           "raise and lower eigenvalues both reduce to sqrt(l(l+1)), so "
+           "augr's single-bracket form gets it right. For EE/EB/TE/TB "
+           "spin-2 legs they differ and augr is missing one branch. "
+           "Proper fix: build TWO Wigner-3j tables (m=2,0,-2 for raise; "
+           "m=-2,0,2 for lower), TWO response forms with their "
+           "respective eigenvalues, and combine per nhl._get_nhl's "
+           "GG_N0 = 0.5*R_sutv + 0.5*(-1)^(to+so)*R_msmtuv pattern. "
+           "Sketch in scripts/n0_validation/derivation.md "
+           "'Resolution' section.",
     strict=True,
 )
 class TestN0EEAgainstPlancklens:
@@ -646,17 +655,18 @@ class TestN0EEAgainstPlancklens:
 
 @pytest.mark.slow
 @pytest.mark.xfail(
-    reason="Known bug in _compute_n0_eb_fullsky: at low L, augr full-sky "
-           "EB is ~10000x SMALLER than augr flat-sky EB at L=2 on the "
-           "LiteBIRD-PTEP fiducial config (4.6e-12 vs 4.0e-8). The two "
-           "agree at high L (1% at L=300; 5% at L=1000), so the bug is "
-           "low-L specific. The lensing-kernel direction (C_phi -> C_BB) "
-           "uses the same parity-odd spin-2 coupling and validates "
-           "against CAMB at <1% (TestFullSkyKernel), so the f_eb_sq "
-           "machinery works in one direction. The QE direction is "
-           "where the discrepancy lies; suspected related to the same "
-           "spin-2 alpha issue as TestN0EEAgainstPlancklens. Fix "
-           "requires the same re-derivation work.",
+    reason="Same structural bug as TestN0EEAgainstPlancklens: "
+           "_compute_n0_eb_fullsky implements only the spin-raising "
+           "branch (Wigner m=2,0,-2 with eigenvalue sqrt((l-2)(l+3))) "
+           "and is missing the spin-lowering branch (Wigner m=-2,0,2 "
+           "with eigenvalue sqrt((l+2)(l-1))). The 10000x full-vs-flat "
+           "discrepancy at L=2 is the symptom. This test target (full "
+           "vs flat at low L) is also weak -- augr's flat-sky EB at "
+           "L=2 has its own (L+1)^2/L^2 curvature issue and is not a "
+           "reliable reference. Real fix requires (a) the two-branch "
+           "rewrite of _compute_n0_eb_fullsky and (b) extending "
+           "scripts/n0_validation/run_plancklens.py to expose 'p_eb' "
+           "as a true reference. See scripts/n0_validation/derivation.md.",
     strict=True,
 )
 class TestN0EBFullSkyVsFlatSkyAtHighL:

@@ -88,6 +88,55 @@ Knowing how the modules chain together matters more than any one file:
    uses Gauss-Legendre quadrature (~2 min / 5 iter); full-sky uses
    `wigner.py` Schulten-Gordon recursion (experimental, ~10 min).
 
+   **N₀ validation status (2026-05-06).** Validated against `plancklens`
+   at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:
+   - **TT flat-sky**: machine-precision against the constant-Cℓ closed
+     form (`controlled_input_test.py`).
+   - **TT full-sky**: machine-precision against `plancklens 'ptt'`
+     (max |ratio−1| ≈ 5e-8 in bulk-L, 9e-5 at L > 2000). Locked in by
+     `tests/test_delensing.py::TestN0AgainstPlancklens`.
+   - **EE/EB flat-sky**: implicitly validated (EE matches plancklens at
+     high L to <1%; geometric flat-vs-full factor (L+1)²/L² explains
+     the low-L gap).
+   - **EE/EB full-sky**: PARTIAL FIX, RESIDUAL DOCUMENTED. As of
+     2026-05-06 the leading "/2 on α" bug is corrected (`α =
+     L(L+1)+ℓᵢ(ℓᵢ+1)−ℓⱼ(ℓⱼ+1)`, no /2; matches Okamoto-Hu 2003
+     Eq. 14). EE residual reduced from 5–20× → ~1.7× plateau in bulk-L
+     plus L-dependent drift. Remaining structural bug: augr implements
+     only the spin-RAISING branch of the lensing source action on a
+     spin-2 field; the spin-LOWERING branch is missing. plancklens's
+     `qresp.get_qes('pee', …)` yields 8 qes in two families of 4:
+     family A (`legb.spin_ou=3`, eigenvalue `√((ℓ−2)(ℓ+3))`) and
+     family B (`legb.spin_ou=−1`, eigenvalue `√((ℓ+2)(ℓ−1))`); both
+     contribute. For TT (spin-0) raise and lower eigenvalues both
+     reduce to `√(ℓ(ℓ+1))` so a single-branch formula is exact — that
+     is why TT validates. For spin-2 they differ and a single-bracket
+     formulation cannot capture the sum. Falsified hypothesis: the
+     earlier "swap `ℓ(ℓ+1)` for `(ℓ±2)(ℓ∓1)` inside one bracket" idea
+     was tested directly (5 bracket variants); all give bit-identical
+     N₀ because the constant shifts cancel in `α₁+α₂` and `α₁−α₂`.
+     The correct fix is structural: TWO Wigner-3j tables (`m=2,0,−2`
+     and `m=−2,0,2`), TWO response forms with their respective
+     eigenvalues, combined via `nhl._get_nhl`'s
+     `GG_N0 = ½ R_sutv + ½ (−1)^(to+so) R_msmtuv` pattern. Sketch in
+     `scripts/n0_validation/derivation.md`. `pytest.mark.xfail(strict=True)`
+     tracks the residual in `TestN0EEAgainstPlancklens` and
+     `TestN0EBFullSkyVsFlatSkyAtHighL`. **`iterate_delensing` defaults
+     to `fullsky=False` (flat-sky path is validated and used in
+     production forecasts); the bug only affects opt-in
+     `fullsky=True` polarization N₀, which the README labels
+     EXPERIMENTAL.** Don't switch the default until the two-branch
+     fix lands.
+
+   **plancklens-wrapper convention gotcha.** `run_plancklens.py` must
+   apply plancklens's standard `fal[s][:l_min] = 0` and
+   `cls_w[s][:l_min] = 0` (cf. `plancklens/n0s.py:137`); without it,
+   `nl_tt[0:2] = 1.5e-7` floor → `fal[0:2] = 6.5e6` pollutes
+   plancklens's QE response with monopole/dipole modes (inflates
+   `r_gg` by ~1000× at low L, gives spuriously small N_0). Apparent
+   "8000× discrepancy at L=2" earlier in the validation was this
+   wrapper bug, not augr.
+
 6. **`optimize.py`.** End-to-end differentiable σ(r).
    `make_optimization_context(...)` packs the static pieces;
    `sigma_r_from_channels(n_det, net, beam, eta, ctx)` (Tier 1) and

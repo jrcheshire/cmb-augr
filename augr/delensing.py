@@ -724,8 +724,19 @@ def _compute_n0_tt_fullsky(Ls, spectra, nl_tt, l_min, l_max):
 def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
     """Full-sky N_0^{EE} using parity-even spin-2 coupling.
 
-    The EE response uses [C_EE(l1)×α1 + C_EE(l2)×α2] where
-    α1 = [L(L+1)+l1(l1+1)-l2(l2+1)]/2 (full-sky analog of L·l1).
+    Implements Okamoto & Hu 2003 (astro-ph/0301031) Eq. 14 for the EE
+    estimator (Table I, EE row): each leg is the spin-2 building block
+
+        _2F_{l_j L l_i} = [L(L+1) + l_i(l_i+1) - l_j(l_j+1)]
+                        × sqrt[(2L+1)(2 l_i + 1)(2 l_j + 1)/(16π)]
+                        × (l_j L l_i; +2 0 -2)
+
+    so the response is f^EE(l1, l2, L)
+        = C_EE(l1) · _2F_{l2 L l1}  +  C_EE(l2) · _2F_{l1 L l2}.
+
+    The bracket factor is the same for all spins; only the Wigner-3j
+    m-values change between spin-0 and spin-2 (see OkaHu 2003 Eq. 14
+    and `scripts/n0_validation/derivation.md`).
     """
     from augr.wigner import wigner3j_vectorized
 
@@ -747,15 +758,19 @@ def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
         l1_ll1 = l1_arr * (l1_arr + 1)
         l2_ll2 = l2_grid * (l2_grid + 1)
 
-        # Full-sky geometric factors (analog of L·l in flat-sky)
-        alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
-        alpha2 = (L_LL + l2_ll2[None, :] - l1_ll1[:, None]) / 2.0
+        # OkaHu 2003 Eq. 14 spin-2 bracket. NOT divided by 2 -- the /2
+        # that appears in the spin-0 (TT, TE) paths is an artefact of
+        # combining bracket/2 with the 4π prefactor; with the 16π
+        # prefactor here the bracket itself is the right factor.
+        alpha1 = L_LL + l1_ll1[:, None] - l2_ll2[None, :]
+        alpha2 = L_LL + l2_ll2[None, :] - l1_ll1[:, None]
 
         pf = np.sqrt((2 * l1_arr + 1)[:, None]
                      * (2 * l2_grid + 1)[None, :]
                      * (2 * L + 1) / (16.0 * np.pi))
 
-        # Even parity mask
+        # Parity-even mask: per OkaHu 2003 Eq. 22 + Table I (EE row), the
+        # ε factor restricts the EE estimator to L+l1+l2 even.
         parity_sum = (l1_arr.astype(int)[:, None]
                       + l2_grid.astype(int)[None, :] + L)
         even_mask = (parity_sum % 2 == 0).astype(float)
@@ -768,7 +783,7 @@ def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
 
         ee_l1 = cl_ee_unl[l_min:l_max + 1]
 
-        # Response: [C_EE(l1)×α1 + C_EE(l2)×α2] (full-sky analog of flat-sky EE)
+        # Response: [C_EE(l1)·α1 + C_EE(l2)·α2] · pf · w_2 · ε
         f_sq = (ee_l1[:, None] * alpha1 + ee_at_l2[None, :] * alpha2) ** 2 \
                * pf**2 * w3j**2 * even_mask
 
