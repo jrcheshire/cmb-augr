@@ -23,12 +23,10 @@ Not ported (out of scope for N_0 validation):
     ('_bh_') estimators; transfer-function args.
 """
 
-# SIM118 / SIM910: "k in d.keys()" / ".get(k, None)" idioms are
-# intentionally retained for fidelity to plancklens.utils_qe /
-# utils_spin / qresp (any cosmetic divergence makes future re-syncs
-# harder to audit). E741 ambiguous-variable-name 'l' / 'I' likewise
-# matches plancklens upstream.
-# ruff: noqa: SIM118, SIM910
+# ruff: noqa: SIM118, SIM910, SIM102, I001
+# SIM118 ("k in d.keys()"), SIM910 (".get(k, None)"), and SIM102
+# (nested ifs) are intentionally retained for fidelity to plancklens
+# upstream so future re-syncs don't drift cosmetically.
 
 from __future__ import annotations
 

@@ -98,35 +98,51 @@ Knowing how the modules chain together matters more than any one file:
    - **EE/EB flat-sky**: implicitly validated (EE matches plancklens at
      high L to <1%; geometric flat-vs-full factor (L+1)²/L² explains
      the low-L gap).
-   - **EE/EB full-sky**: PARTIAL FIX, RESIDUAL DOCUMENTED. As of
-     2026-05-06 the leading "/2 on α" bug is corrected (`α =
-     L(L+1)+ℓᵢ(ℓᵢ+1)−ℓⱼ(ℓⱼ+1)`, no /2; matches Okamoto-Hu 2003
-     Eq. 14). EE residual reduced from 5–20× → ~1.7× plateau in bulk-L
-     plus L-dependent drift. Remaining structural bug: augr implements
-     only the spin-RAISING branch of the lensing source action on a
-     spin-2 field; the spin-LOWERING branch is missing. plancklens's
-     `qresp.get_qes('pee', …)` yields 8 qes in two families of 4:
-     family A (`legb.spin_ou=3`, eigenvalue `√((ℓ−2)(ℓ+3))`) and
-     family B (`legb.spin_ou=−1`, eigenvalue `√((ℓ+2)(ℓ−1))`); both
-     contribute. For TT (spin-0) raise and lower eigenvalues both
-     reduce to `√(ℓ(ℓ+1))` so a single-branch formula is exact — that
-     is why TT validates. For spin-2 they differ and a single-bracket
-     formulation cannot capture the sum. Falsified hypothesis: the
-     earlier "swap `ℓ(ℓ+1)` for `(ℓ±2)(ℓ∓1)` inside one bracket" idea
-     was tested directly (5 bracket variants); all give bit-identical
-     N₀ because the constant shifts cancel in `α₁+α₂` and `α₁−α₂`.
-     The correct fix is structural: TWO Wigner-3j tables (`m=2,0,−2`
-     and `m=−2,0,2`), TWO response forms with their respective
-     eigenvalues, combined via `nhl._get_nhl`'s
-     `GG_N0 = ½ R_sutv + ½ (−1)^(to+so) R_msmtuv` pattern. Sketch in
-     `scripts/n0_validation/derivation.md`. `pytest.mark.xfail(strict=True)`
-     tracks the residual in `TestN0EEAgainstPlancklens` and
-     `TestN0EBFullSkyVsFlatSkyAtHighL`. **`iterate_delensing` defaults
-     to `fullsky=False` (flat-sky path is validated and used in
-     production forecasts); the bug only affects opt-in
-     `fullsky=True` polarization N₀, which the README labels
-     EXPERIMENTAL.** Don't switch the default until the two-branch
-     fix lands.
+   - **EE/EB/TB full-sky**: validated against `plancklens
+     'pee' / 'p_eb' / 'p_tb'` (symmetrized parity-odd variants for
+     EB / TB) to <1e-3 in bulk-L. Locked in by
+     `tests/test_delensing.py::TestN0{EE,EB,TB}AgainstPlancklens`.
+   - **TE full-sky**: XFAIL. Two independent issues from the
+     `_sg_b` fix: (a) `_compute_n0_te_fullsky` uses spin-0 Wigner
+     on both legs but per OkaHu Table I should be spin-mixed
+     (spin-2 on E leg, spin-0 on T leg); (b) augr's TE filter
+     `C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2)` is HO02 Eq. 13's
+     diagonal approximation but `run_plancklens.py` forces
+     `fal['te']=0` giving the strict diagonal `C_TT*C_EE` instead.
+     A naive spin-2 swap on the E leg moves the residual from 130x
+     to 51x but doesn't close it (projection-sign subtleties in
+     the symmetrized 'p_te' = pte+pet). Per augr's own docstring
+     TE contributes ~1-2% to N_0^MV at space-experiment noise
+     levels; defer the full TE fix until/unless that gap matters.
+
+     The earlier "5-20x off in bulk-L" residual was a sign error in
+     `augr.wigner._sg_b` (Schulten-Gordon recursion coefficient): the
+     m_3 term had the wrong sign per SG 1975 Eq. 5, so the recursion
+     produced wrong values for any (m_1, m_2) with m_3 = -(m_1+m_2)
+     != 0. Affected every full-sky polarization path (EE, EB, TE,
+     TB N_0; the lensing kernel). TT was unaffected because it uses
+     `wigner3j_000_vectorized` (closed-form Racah path).
+     `tests/test_wigner.py` locks in the sympy-truth regression so
+     this can't reappear silently. The earlier "missing
+     spin-lowering branch" / "two-branch fix" diagnosis in
+     `scripts/n0_validation/derivation.md` was a misdiagnosis;
+     `derivation.md` rewritten with the actual fix and traceback.
+
+     **`iterate_delensing` defaults to `fullsky=False` (flat-sky
+     path is unaffected and used in production forecasts); the bug
+     only affected opt-in `fullsky=True` polarization N_0 and the
+     full-sky lensing kernel's per-cell values, neither of which any
+     production forecast consumed. The bug fix doesn't invalidate
+     any prior sigma(r) numbers.**
+
+     Foundation for any future plancklens-style GMV / iterative-N_0
+     work: numpy-only port of plancklens's QE-leg machinery
+     (`qeleg`, `qe`, `get_qes`, `qe_simplify`, `qe_proj`,
+     `get_resp_legs`, `get_covresp`, `spin_cls`, `get_spin_raise/lower`)
+     lives at `augr/_qe.py`, validated bit-for-bit by
+     `tests/test_qe.py` (43 tests, all passing under
+     PYTHONPATH=~/cmb/plancklens). Not consumed by any production
+     code today; dormant infrastructure for the GMV reach.
 
    **plancklens-wrapper convention gotcha.** `run_plancklens.py` must
    apply plancklens's standard `fal[s][:l_min] = 0` and

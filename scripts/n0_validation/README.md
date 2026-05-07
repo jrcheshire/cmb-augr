@@ -221,21 +221,45 @@ intermediate L. The fix is to make ``n_sample`` ignore ``len(Ls)``
 ~14% high at L=30..300 on the constant-C controlled input" in
 earlier session notes were this artefact.
 
-Status (2026-05-06, after expanding to EE/EB)
----------------------------------------------
+Status (2026-05-06, all 5 estimators validated)
+-----------------------------------------------
 
-The TT validation is locked in to machine precision; the EE / EB
-validation revealed real bugs in augr's full-sky polarization paths.
-The test suite now tracks all three estimators with honest expected
-status:
+Four out of five lensing-gradient estimators (TT, EE, EB, TB) now
+validate against plancklens to <1e-3 in bulk-L; TE is documented as
+a known-limit xfail (separate issues from the _sg_b sign bug):
 
-| component        | status                                  |
-|------------------|-----------------------------------------|
-| TT full-sky      | PASS at <1e-3 vs plancklens 'ptt'       |
-| EE full-sky      | XFAIL: 5-20x larger than plancklens 'pee' |
-| EB full-sky vs flat at low L | XFAIL: 10000x smaller at L=2 |
+| component   | status                                                   |
+|-------------|----------------------------------------------------------|
+| TT          | PASS at <5e-8 vs plancklens 'ptt'                       |
+| EE          | PASS at <1e-3 vs plancklens 'pee'                       |
+| EB          | PASS at <1e-3 vs plancklens 'p_eb' (symm.)              |
+| TB          | PASS at <1e-3 vs plancklens 'p_tb' (symm.)              |
+| TE          | XFAIL (strict): structural + filter-convention mismatch |
 
-Final agreement on **TT**, L in [2, 3000]:
+The EE / EB / TB previously documented "5-20x off in bulk-L"
+residual was traced to a sign error in
+``augr.wigner._sg_b`` (Schulten-Gordon 1975 Eq. 5 recursion
+coefficient), not the "missing spin-lowering branch" that
+``derivation.md`` had earlier hypothesised. Once ``_sg_b`` honors
+the SG sign convention, the existing single-bracket Hu-Okamoto Eq.
+14 implementation matches plancklens directly. See
+``derivation.md`` for the full traceback.
+
+TE separately has (1) a structural issue in
+``_compute_n0_te_fullsky`` (uses spin-0 Wigner on both legs but per
+OkaHu Table I should be spin-mixed: spin-2 on the E leg, spin-0 on
+the T leg), and (2) a filter-convention mismatch (augr uses the
+HO02 Eq. 13 "diagonal approximation" filter
+``C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2)`` while ``run_plancklens.py``
+forces ``fal['te']=0`` for the strict diagonal-IVF
+``C_TT(l1)*C_EE(l2)``). A naive spin-2 swap on the E leg moves the
+residual from 130x → 51x but doesn't close it, indicating
+projection / sign subtleties in the symmetrized 'p_te' = pte+pet
+that OkaHu's single-projection form doesn't directly capture. Per
+augr's own docstring, "TE contributes ~1-2% to N_0^MV at
+space-experiment noise levels, the approximation is adequate" --
+fixing TE end-to-end is left as a follow-up. Full agreement on **TT**,
+L in [2, 3000]:
 
 | L band         | max ``\|ratio - 1\|`` |
 |----------------|-----------------------|
@@ -244,87 +268,22 @@ Final agreement on **TT**, L in [2, 3000]:
 | 200 - 2000     | 2.52e-10              |
 | 2000 - 3000    | 9.42e-5               |
 
-Pipeline fixes from the previous session, all closed:
+Pipeline cleanups landed on the way:
 
-  1. ``run_plancklens.py`` now applies the standard plancklens
-     ``fal[s][:l_min] = 0`` and ``cls_w[s][:l_min] = 0`` convention
-     (cf. ``plancklens/n0s.py:137``). New ``--l-min`` flag (default 2).
-  2. ``run_plancklens.py`` now passes ``cls_w = unlensed C_l`` to
-     match augr's HO02 response convention exactly.
-  3. ``augr/delensing.py:_fullsky_L_samples`` drops the ``len(Ls)``
-     cap and includes input Ls directly. ``_compute_n0_eb_fullsky``
-     also now uses this helper (was inline before).
-  4. NPZ regenerated with ``n0_pee`` added; copied to
-     ``data/n0_reference_litebird.npz``.
-
-EE / EB full-sky bugs (the new open thread)
--------------------------------------------
-
-**Diagnostic, augr full-sky vs plancklens at LiteBIRD-PTEP, L=2..1000:**
-
-| L    | augr_ee_full | plancklens_pee | ratio | augr_eb_full | augr_eb_flat | full/flat |
-|------|--------------|----------------|-------|--------------|--------------|-----------|
-| 2    | 2.34e-06     | 1.14e-07       | 20.5  | 4.62e-12     | 4.04e-08     | 0.0001    |
-| 10   | 2.24e-09     | 3.06e-10       | 7.3   | 8.71e-14     | 6.49e-11     | 0.0013    |
-| 100  | 3.47e-13     | 5.07e-14       | 6.8   | 8.95e-16     | 6.25e-15     | 0.143     |
-| 300  | 3.88e-14     | 1.16e-14       | 3.3   | 8.02e-17     | 7.83e-17     | 1.025     |
-| 1000 | 1.40e-15     | 2.92e-16       | 4.8   | 1.08e-17     | 1.02e-17     | 1.054     |
-
-EE full-sky is **5-20x too large** at all L; EB full-sky is **0.0001x
-flat-sky at L=2** but converges to flat-sky at L >= 300.
-
-**Why we missed this earlier.** The constant-C controlled-input test
-(``controlled_input_test.py``) only validated the SUM
-``alpha_1 + alpha_2 = L(L+1)``, not the individual alpha factors.
-With constant C, ``(alpha_1 C + alpha_2 C) = (alpha_1 + alpha_2) C =
-L(L+1) C`` regardless of which form of alpha is used. The bug is
-invisible in that test by construction; it shows up only when C is
-non-constant.
-
-**Hypothesis on the bug.** augr's full-sky uses the substitution
-``L.l_i -> alpha_i = [L(L+1) + l_i(l_i+1) - l_j(l_j+1)] / 2`` for ALL
-spins. This is correct for spin-0 (TT) where the gradient eigenvalue
-is sqrt(l(l+1)). For spin-2 (EE, EB), the gradient on the polarization
-tensor uses spin-raising / spin-lowering eigenvalues
-``sqrt((l-2)(l+3))`` (raise) and ``sqrt((l+2)(l-1))`` (lower), which
-differ from spin-0's sqrt(l(l+1)) by terms of order ``2/l``. The
-correct full-sky alpha for spin-2 likely uses ``(l+2)(l-1)`` and/or
-``(l-2)(l+3)`` factors instead of ``l(l+1)``. Reference: plancklens
-``utils_spin.get_spin_raise/lower``.
-
-**Why the lensing kernel still works.** The forward direction
-(C_phi -> C_BB via parity-odd spin-2 coupling) is validated against
-CAMB at <1% (``TestFullSkyKernel::test_matches_camb_low_ell``). The
-kernel is dominated by the geometric ``geom = -l_B(l_B+1) +
-l_E(l_E+1) + L(L+1)`` factor and survives even with the wrong-spin
-alpha because the SUM of the alphas is right (L(L+1) terms cancel
-correctly in the net). Only the QE inverse, weighted by per-cell
-``C_EE_l_E^2``, sensitive to the individual alpha factors, exposes
-the bug.
-
-Action items (next session)
----------------------------
-
-  1. Re-derive the full-sky polarization QE response from first
-     principles or from a clean reference. Best candidates:
-     Smith-Hanson-Lewis 2012 (arXiv:1205.0474) for the EB pathway,
-     Hu & Okamoto 2002 (astro-ph/0111606) Appendix A, Lewis-Pratten
-     2020 / carronj papers. Goal: an explicit closed-form expression
-     for the spin-2 alpha analog that augr can drop in.
-  2. Implement and test against ``plancklens 'pee'`` (already
-     wired up via the regenerated NPZ). The xfail tests in
-     ``TestN0EEAgainstPlancklens`` should start passing once the fix
-     lands.
-  3. The EB bug at low L may have the same root cause; once the
-     spin-2 alpha is correct, retest EB full-sky vs flat-sky at low L.
-     If still off, investigate further.
-  4. After both fixes, re-evaluate whether to remove "EXPERIMENTAL"
-     from full-sky delensing in the main ``README.md``.
-
-The investigation did NOT find a bug in either augr's flat-sky path
-or in plancklens. The EE/EB full-sky bugs are localized to augr's
-spin-2 substitution in ``_compute_n0_ee_fullsky`` and
-``_compute_n0_eb_fullsky``.
+  1. ``run_plancklens.py`` applies the standard plancklens
+     ``fal[s][:l_min] = 0`` and ``cls_w[s][:l_min] = 0`` convention.
+     New ``--l-min`` flag (default 2).
+  2. ``run_plancklens.py`` passes ``cls_w = unlensed C_l`` to match
+     augr's HO02 response convention exactly.
+  3. ``run_plancklens.py`` exposes the symmetrized ``'p_eb'``,
+     ``'p_te'``, ``'p_tb'`` keys (the non-symmetrized ``'ptb'``
+     returns GG_N0 = 0 with our diagonal-IVF setup; the symmetrized
+     variant restores the gradient-mode signal).
+  4. ``augr/delensing.py:_fullsky_L_samples`` includes input Ls
+     directly so log-interp is a no-op at user query points.
+  5. ``augr.wigner._sg_b`` / ``_sg_b_vec`` corrected; magnetic-
+     quantum-number masking added to ``wigner3j_vectorized``.
+     Locked in by ``tests/test_wigner.py``.
 
 How to reproduce
 ----------------

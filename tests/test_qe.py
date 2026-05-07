@@ -14,13 +14,16 @@ manually in ``n0val`` to validate the port:
 
 from __future__ import annotations
 
+# ruff: noqa: I001, E402  -- importorskip must run before the
+# plancklens / augr imports, breaking ruff's import-order rule.
+
 import numpy as np
 import pytest
 
 plancklens = pytest.importorskip("plancklens")
-from plancklens import qresp as pl_qresp  # noqa: E402
+from plancklens import qresp as pl_qresp
 
-from augr import _qe as ag_qe  # noqa: E402
+from augr import _qe as ag_qe
 
 
 QE_KEYS = ("ptt", "pee", "p_eb", "p_te", "p_tb", "p_p", "p")

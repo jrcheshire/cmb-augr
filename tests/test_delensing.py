@@ -15,6 +15,8 @@ from augr.delensing import (
     compute_n0_eb,
     compute_n0_ee,
     compute_n0_mv,
+    compute_n0_tb,
+    compute_n0_te,
     compute_n0_tt,
     iterate_delensing,
     lensing_kernel,
@@ -605,35 +607,17 @@ class TestN0AgainstPlancklens:
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    reason="Known structural bug in _compute_n0_ee_fullsky. Fix #1 (drop "
-           "/2 on alpha; OkaHu 2003 Eq. 14) applied 2026-05-06: bug "
-           "reduced from 5-20x to ~1.7x in bulk-L plus L-dependent "
-           "residual. Diagnosis complete: augr implements only the "
-           "spin-RAISING branch of the lensing source action on a "
-           "spin-2 field; the spin-LOWERING branch is missing. "
-           "plancklens's get_qes('pee') yields 8 qes in two families "
-           "of 4: family A (legb.spin_ou=3, eigenvalue sqrt((l-2)(l+3))) "
-           "and family B (legb.spin_ou=-1, eigenvalue sqrt((l+2)(l-1))). "
-           "The total response is the sum of both. For TT (spin-0), "
-           "raise and lower eigenvalues both reduce to sqrt(l(l+1)), so "
-           "augr's single-bracket form gets it right. For EE/EB/TE/TB "
-           "spin-2 legs they differ and augr is missing one branch. "
-           "Proper fix: build TWO Wigner-3j tables (m=2,0,-2 for raise; "
-           "m=-2,0,2 for lower), TWO response forms with their "
-           "respective eigenvalues, and combine per nhl._get_nhl's "
-           "GG_N0 = 0.5*R_sutv + 0.5*(-1)^(to+so)*R_msmtuv pattern. "
-           "Sketch in scripts/n0_validation/derivation.md "
-           "'Resolution' section.",
-    strict=True,
-)
 class TestN0EEAgainstPlancklens:
-    """Augr full-sky EE N_0 should match plancklens 'pee' once the bug
-    in ``_compute_n0_ee_fullsky`` is fixed.
+    """Augr full-sky EE N_0 must match plancklens 'pee' to <1e-3 in bulk-L.
 
-    Currently expected to fail (5-20x off depending on L). This xfail
-    test will start passing when the spin-2 alpha substitution is
-    corrected.
+    Locks in the resolution of the previously documented "5-20x"
+    EE / EB residual: it was a sign error in the m_3 term of
+    augr.wigner._sg_b (Schulten-Gordon recursion coefficient), not
+    a missing spin-lowering branch. The earlier `derivation.md`
+    diagnosis ("two-branch fix needed") is superseded; once
+    ``_sg_b`` honors SG 1975 Eq. 5 sign convention, the existing
+    Hu-Okamoto Eq. 14 single-bracket implementation matches
+    plancklens to <1e-7 in the realistic bulk.
     """
 
     def test_ee_max_rel_err_in_bulk(self):
@@ -654,45 +638,103 @@ class TestN0EEAgainstPlancklens:
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    reason="Same structural bug as TestN0EEAgainstPlancklens: "
-           "_compute_n0_eb_fullsky implements only the spin-raising "
-           "branch (Wigner m=2,0,-2 with eigenvalue sqrt((l-2)(l+3))) "
-           "and is missing the spin-lowering branch (Wigner m=-2,0,2 "
-           "with eigenvalue sqrt((l+2)(l-1))). The 10000x full-vs-flat "
-           "discrepancy at L=2 is the symptom. This test target (full "
-           "vs flat at low L) is also weak -- augr's flat-sky EB at "
-           "L=2 has its own (L+1)^2/L^2 curvature issue and is not a "
-           "reliable reference. Real fix requires (a) the two-branch "
-           "rewrite of _compute_n0_eb_fullsky and (b) extending "
-           "scripts/n0_validation/run_plancklens.py to expose 'p_eb' "
-           "as a true reference. See scripts/n0_validation/derivation.md.",
-    strict=True,
-)
-class TestN0EBFullSkyVsFlatSkyAtHighL:
-    """Augr full-sky EB should converge to flat-sky EB at L >= 300.
+class TestN0EBAgainstPlancklens:
+    """Augr full-sky EB N_0 must match plancklens 'p_eb' (symmetrized).
 
-    At high L the geometric flat-vs-full factor (L+1)^2/L^2 -> 1, so
-    augr full and flat must agree on the EB N_0. Currently they DO
-    agree at high L (5% at L=1000), but the deeper EB bug at low L is
-    not captured by this test (we'd need an external full-sky reference
-    for low L, and plancklens 'peb' has its own convention issues with
-    cl_bb_unl=0). Tracked here as xfail until both EB and EE bugs are
-    addressed via the spin-2 re-derivation.
+    augr's ``compute_n0_eb`` weights both the EE and BB legs
+    symmetrically (Smith+ 2012 Eq. 6-7 with parity-odd coupling),
+    so the apples-to-apples plancklens reference is the symmetrized
+    'p_eb' = (peb + pbe)/2 variant exposed by ``run_plancklens.py``.
     """
 
-    def test_eb_high_L_full_matches_flat(self):
+    def test_eb_max_rel_err_in_bulk(self):
         ref = _load_reference()
         spectra = _make_spectra(ref)
         Ls = jnp.asarray(ref["Ls"], dtype=float)
         nl_ee = jnp.asarray(ref["nl_ee"])
         nl_bb = jnp.asarray(ref["nl_bb"])
 
-        flat = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, fullsky=False)
-        full = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, fullsky=True)
+        augr_n0 = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, fullsky=True)
+        ref_n0 = ref["n0_eb"]
         Ls_np = np.asarray(Ls)
-        # At low L (the bump), expect failure (~10000x mismatch at L=2).
-        err_low = _max_rel_err_in_window(full, flat, Ls_np, 2, 9)
-        assert err_low <= TOL_FULLSKY_TT_BULK, (
-            f"full-sky N_0^EB: low-L max-rel-err vs flat = {err_low:.4e}"
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
+        assert err_bulk <= TOL_FULLSKY_TT_BULK, (
+            f"full-sky N_0^EB: bulk-L max-rel-err = "
+            f"{err_bulk:.4e} > {TOL_FULLSKY_TT_BULK:.4e}"
+        )
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(
+    reason="TE full-sky has TWO compounding issues vs plancklens 'p_te' "
+           "that are independent of the _sg_b sign bug (which is fixed): "
+           "(1) STRUCTURAL: per OkaHu 2003 Table I, TE is spin-mixed "
+           "(f^TE = C^TE(l1)*_2F_{l2 L l1} + C^TE(l2)*_0F_{l1 L l2}), "
+           "but augr's _compute_n0_te_fullsky uses the spin-0 (m=0,0,0) "
+           "Wigner-3j on BOTH legs. The naive replacement of the second "
+           "term with a spin-2 kernel reduces the residual from 130x to "
+           "51x but doesn't close it, suggesting projection / sign "
+           "subtleties in the symmetrized 'p_te' = pte+pet variant that "
+           "OkaHu's single-projection Table I form doesn't capture. "
+           "(2) FILTER MISMATCH: augr uses a 'diagonal approximation' "
+           "filter `C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2)` (per its own "
+           "compute_n0_te docstring; HO02 Eq. 13 approximation), while "
+           "run_plancklens.py forces fal['te']=0 to give the strict "
+           "diagonal `C_TT*C_EE` filter. Resolving both would require "
+           "(a) re-deriving augr's TE response in the OkaHu-symmetrized "
+           "form including all projection sign factors, and (b) either "
+           "moving augr to the strict diagonal filter or moving "
+           "run_plancklens.py to joint-TE inversion. TT/EE/EB/TB all "
+           "validate to <1e-3 against plancklens with the _sg_b fix; "
+           "TE is the only outstanding mismatch and contributes ~1-2% "
+           "to N_0^MV at space-experiment noise levels (per augr's "
+           "own docstring).",
+    strict=True,
+)
+class TestN0TEAgainstPlancklens:
+    """Augr full-sky TE N_0 vs plancklens 'p_te' (symmetrized).
+
+    Currently xfail (strict): TE has structural and filter-convention
+    differences from plancklens that are independent of the _sg_b fix.
+    Tracking here so we don't lose the diagnosis.
+    """
+
+    def test_te_max_rel_err_in_bulk(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_tt = jnp.asarray(ref["nl_tt"])
+        nl_ee = jnp.asarray(ref["nl_ee"])
+
+        augr_n0 = compute_n0_te(Ls, spectra, nl_tt, nl_ee, fullsky=True)
+        ref_n0 = ref["n0_te"]
+        Ls_np = np.asarray(Ls)
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
+        assert err_bulk <= TOL_FULLSKY_TT_BULK, (
+            f"full-sky N_0^TE: bulk-L max-rel-err = "
+            f"{err_bulk:.4e} > {TOL_FULLSKY_TT_BULK:.4e}"
+        )
+
+
+@pytest.mark.slow
+class TestN0TBAgainstPlancklens:
+    """Augr full-sky TB N_0 must match plancklens 'p_tb' (symmetrized)."""
+
+    def test_tb_max_rel_err_in_bulk(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_tt = jnp.asarray(ref["nl_tt"])
+        nl_bb = jnp.asarray(ref["nl_bb"])
+
+        augr_n0 = compute_n0_tb(Ls, spectra, nl_tt, nl_bb, fullsky=True)
+        ref_n0 = ref["n0_tb"]
+        Ls_np = np.asarray(Ls)
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
+        assert err_bulk <= TOL_FULLSKY_TT_BULK, (
+            f"full-sky N_0^TB: bulk-L max-rel-err = "
+            f"{err_bulk:.4e} > {TOL_FULLSKY_TT_BULK:.4e}"
         )
