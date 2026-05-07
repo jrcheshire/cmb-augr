@@ -249,7 +249,7 @@ The `delensing.py` module computes self-consistent iterative QE delensing, repla
 Two modes are available:
 
 - **Flat-sky** (`fullsky=False`): Gauss-Legendre quadrature over the azimuthal angle. Fast (~2 min for 5 iterations at l_max=3000).
-- **Full-sky** (`fullsky=True`) [EXPERIMENTAL]: Wigner 3j coupling via Schulten-Gordon backward recursion, vectorized over l1 for fixed L with log-spaced L sampling.
+- **Full-sky** (`fullsky=True`) [EXPERIMENTAL — TT validated, EE/EB known to be off]: Wigner 3j coupling via Schulten-Gordon backward recursion, vectorized over l1 for fixed L with log-spaced L sampling. The TT path is validated against `plancklens` to <1e-3 across L in [2, 3000] (see `scripts/n0_validation/`). EE and EB full-sky paths have a known spin-2 response bug (5-20× off in EE; ~10000× off in EB at L=2) — use flat-sky for polarization estimators until fixed.
 
 ```python
 from augr.delensing import load_lensing_spectra, iterate_delensing

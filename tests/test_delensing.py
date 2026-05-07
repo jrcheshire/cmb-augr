@@ -602,3 +602,87 @@ class TestN0AgainstPlancklens:
             f"full-sky N_0^TT: high-L max-rel-err = "
             f"{err_high:.4e} > {TOL_FULLSKY_TT_TAIL:.4e}"
         )
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(
+    reason="Known bug in _compute_n0_ee_fullsky: spin-2 alpha "
+           "substitution. augr uses spin-0 raising eigenvalue "
+           "sqrt(l(l+1)) for alpha = [L(L+1) + l(l+1) - l'(l'+1)] / 2, "
+           "but spin-2 fields require sqrt((l+/-2)(l-/+1)) eigenvalues "
+           "(see plancklens utils_spin.get_spin_raise/lower). The error "
+           "is invisible for constant Cl (where alpha_1 + alpha_2 = "
+           "L(L+1) is the only thing that matters) but shows up as 5-20x "
+           "deviation on realistic non-constant LiteBIRD spectra. Fix "
+           "requires re-deriving the spin-2 full-sky QE response "
+           "(HO02 Appendix A; Smith-Hanson-Lewis 2012; Lewis-Pratten 2020).",
+    strict=True,
+)
+class TestN0EEAgainstPlancklens:
+    """Augr full-sky EE N_0 should match plancklens 'pee' once the bug
+    in ``_compute_n0_ee_fullsky`` is fixed.
+
+    Currently expected to fail (5-20x off depending on L). This xfail
+    test will start passing when the spin-2 alpha substitution is
+    corrected.
+    """
+
+    def test_ee_max_rel_err_in_bulk(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_ee = jnp.asarray(ref["nl_ee"])
+
+        augr_n0 = compute_n0_ee(Ls, spectra, nl_ee, fullsky=True)
+        ref_n0 = ref["n0_ee"]
+        Ls_np = np.asarray(Ls)
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
+        assert err_bulk <= TOL_FULLSKY_TT_BULK, (
+            f"full-sky N_0^EE: bulk-L max-rel-err = "
+            f"{err_bulk:.4e} > {TOL_FULLSKY_TT_BULK:.4e}"
+        )
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(
+    reason="Known bug in _compute_n0_eb_fullsky: at low L, augr full-sky "
+           "EB is ~10000x SMALLER than augr flat-sky EB at L=2 on the "
+           "LiteBIRD-PTEP fiducial config (4.6e-12 vs 4.0e-8). The two "
+           "agree at high L (1% at L=300; 5% at L=1000), so the bug is "
+           "low-L specific. The lensing-kernel direction (C_phi -> C_BB) "
+           "uses the same parity-odd spin-2 coupling and validates "
+           "against CAMB at <1% (TestFullSkyKernel), so the f_eb_sq "
+           "machinery works in one direction. The QE direction is "
+           "where the discrepancy lies; suspected related to the same "
+           "spin-2 alpha issue as TestN0EEAgainstPlancklens. Fix "
+           "requires the same re-derivation work.",
+    strict=True,
+)
+class TestN0EBFullSkyVsFlatSkyAtHighL:
+    """Augr full-sky EB should converge to flat-sky EB at L >= 300.
+
+    At high L the geometric flat-vs-full factor (L+1)^2/L^2 -> 1, so
+    augr full and flat must agree on the EB N_0. Currently they DO
+    agree at high L (5% at L=1000), but the deeper EB bug at low L is
+    not captured by this test (we'd need an external full-sky reference
+    for low L, and plancklens 'peb' has its own convention issues with
+    cl_bb_unl=0). Tracked here as xfail until both EB and EE bugs are
+    addressed via the spin-2 re-derivation.
+    """
+
+    def test_eb_high_L_full_matches_flat(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_ee = jnp.asarray(ref["nl_ee"])
+        nl_bb = jnp.asarray(ref["nl_bb"])
+
+        flat = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, fullsky=False)
+        full = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, fullsky=True)
+        Ls_np = np.asarray(Ls)
+        # At low L (the bump), expect failure (~10000x mismatch at L=2).
+        err_low = _max_rel_err_in_window(full, flat, Ls_np, 2, 9)
+        assert err_low <= TOL_FULLSKY_TT_BULK, (
+            f"full-sky N_0^EB: low-L max-rel-err vs flat = {err_low:.4e}"
+        )

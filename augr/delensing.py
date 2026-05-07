@@ -511,14 +511,7 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
     Ls_np = np.asarray(Ls)
     l_E_arr = np.arange(l_min, l_max + 1, dtype=float)
 
-    # Sample L values (logarithmic + linear blend, ~100 points) and interpolate
-    L_min_int = max(2, int(Ls_np.min()))
-    L_max_int = int(Ls_np.max())
-    n_L_sample = min(len(Ls_np), max(50, L_max_int // 20))
-    L_samples = np.unique(np.concatenate([
-        np.arange(L_min_int, min(20, L_max_int + 1)),
-        np.geomspace(max(20, L_min_int), L_max_int, n_L_sample).astype(int),
-    ]).clip(L_min_int, L_max_int).astype(int))
+    L_samples = _fullsky_L_samples(Ls_np)
     n0_inv_samples = np.zeros(len(L_samples))
 
     for i_L, L in enumerate(L_samples):

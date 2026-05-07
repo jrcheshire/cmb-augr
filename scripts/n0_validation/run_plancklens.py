@@ -196,16 +196,23 @@ def plancklens_n0(inputs: dict, Ls: np.ndarray, lmax_ivf: int,
     lmax_qlm = int(Ls.max())
     Ls_idx = Ls.astype(int)
 
-    # plancklens supports these three QE keys for the lensing potential phi
-    # (see plancklens/n0s.py:380-440). 'pee'/'peb'/'pte'/'ptb' are NOT valid;
-    # they silently return zero. The validation maps:
-    #   'ptt' <-> augr.compute_n0_tt
-    #   'p_p' <-> MV(augr.compute_n0_ee, augr.compute_n0_eb)
-    #   'p'   <-> augr.compute_n0_mv (full 5-estimator MV)
+    # plancklens supports the following QE keys for the lensing potential phi:
+    #   'ptt' <-> augr.compute_n0_tt        (apples-to-apples)
+    #   'pee' <-> augr.compute_n0_ee        (apples-to-apples)
+    #   'p_p' <-> MV(augr.compute_n0_ee, augr.compute_n0_eb) (joint vs diagonal)
+    #   'p'   <-> augr.compute_n0_mv        (joint vs diagonal)
+    #
+    # Notes: 'peb' is invalid with cls_w['bb']=cl_unl (because cl_bb_unl=0
+    # in scalar-only models, the (e,b) projection of the joint p QE
+    # vanishes). 'peb' with cls_w['bb']=cl_lensed gives a non-zero but
+    # different result; the convention mismatch with augr's
+    # 'response uses C_EE only' makes that comparison ambiguous and we
+    # skip it here. 'pte' / 'ptb' similarly have convention complications.
     keys = {
         "tt": "ptt",   # temperature-only
-        "pp": "p_p",   # polarization-only (EE+EB-like)
-        "mv": "p",     # full MV (all 5)
+        "ee": "pee",   # E-mode-only (apples-to-apples)
+        "pp": "p_p",   # polarization-only joint (EE+EB-like)
+        "mv": "p",     # full MV (all 5, joint)
     }
 
     def _safe_div_squared(num: np.ndarray, denom: np.ndarray) -> np.ndarray:

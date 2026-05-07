@@ -221,31 +221,21 @@ intermediate L. The fix is to make ``n_sample`` ignore ``len(Ls)``
 ~14% high at L=30..300 on the constant-C controlled input" in
 earlier session notes were this artefact.
 
-Closed out (2026-05-06)
------------------------
+Status (2026-05-06, after expanding to EE/EB)
+---------------------------------------------
 
-All four action items from the previous session were knocked out:
+The TT validation is locked in to machine precision; the EE / EB
+validation revealed real bugs in augr's full-sky polarization paths.
+The test suite now tracks all three estimators with honest expected
+status:
 
-  1. ``run_plancklens.py`` now applies the standard plancklens
-     convention ``fal[s][:l_min] = 0`` and ``cls_w[s][:l_min] = 0``
-     (cf. ``plancklens/n0s.py:137``). New CLI flag ``--l-min``
-     defaulting to 2.
-  2. ``run_plancklens.py`` now passes ``cls_w = unlensed C_l`` to
-     ``qresp.get_response``, matching augr's HO02 response convention
-     exactly. Removes the ~5-10% "lensed-vs-unlensed in response"
-     systematic that the previous comment had accepted.
-  3. ``augr/delensing.py:_fullsky_L_samples`` drops the
-     ``len(Ls)`` cap on the internal sample grid and now always
-     includes the input ``Ls`` directly, eliminating the
-     sparse-input log-interp error.
-  4. NPZ regenerated with the fixes above and copied to
-     ``data/n0_reference_litebird.npz``.
-     ``tests/test_delensing.py::TestN0AgainstPlancklens`` is now an
-     active slow test gated on TT (the only apples-to-apples
-     comparison; PP and MV differ by the diagonal-vs-joint MV
-     formulation, which is real physics, not a tolerance bug).
+| component        | status                                  |
+|------------------|-----------------------------------------|
+| TT full-sky      | PASS at <1e-3 vs plancklens 'ptt'       |
+| EE full-sky      | XFAIL: 5-20x larger than plancklens 'pee' |
+| EB full-sky vs flat at low L | XFAIL: 10000x smaller at L=2 |
 
-Final agreement on TT, L in [2, 3000]:
+Final agreement on **TT**, L in [2, 3000]:
 
 | L band         | max ``\|ratio - 1\|`` |
 |----------------|-----------------------|
@@ -254,13 +244,87 @@ Final agreement on TT, L in [2, 3000]:
 | 200 - 2000     | 2.52e-10              |
 | 2000 - 3000    | 9.42e-5               |
 
-Bulk and high-L test tolerances locked at 1e-3 (~4 orders of
-magnitude headroom on the actual numbers, just to catch regressions
-without being noisy).
+Pipeline fixes from the previous session, all closed:
 
-The investigation did NOT find a bug in either augr or plancklens'
-QE math. All discrepancies traced back to mismatched conventions
-between the wrapper and plancklens's official recipe.
+  1. ``run_plancklens.py`` now applies the standard plancklens
+     ``fal[s][:l_min] = 0`` and ``cls_w[s][:l_min] = 0`` convention
+     (cf. ``plancklens/n0s.py:137``). New ``--l-min`` flag (default 2).
+  2. ``run_plancklens.py`` now passes ``cls_w = unlensed C_l`` to
+     match augr's HO02 response convention exactly.
+  3. ``augr/delensing.py:_fullsky_L_samples`` drops the ``len(Ls)``
+     cap and includes input Ls directly. ``_compute_n0_eb_fullsky``
+     also now uses this helper (was inline before).
+  4. NPZ regenerated with ``n0_pee`` added; copied to
+     ``data/n0_reference_litebird.npz``.
+
+EE / EB full-sky bugs (the new open thread)
+-------------------------------------------
+
+**Diagnostic, augr full-sky vs plancklens at LiteBIRD-PTEP, L=2..1000:**
+
+| L    | augr_ee_full | plancklens_pee | ratio | augr_eb_full | augr_eb_flat | full/flat |
+|------|--------------|----------------|-------|--------------|--------------|-----------|
+| 2    | 2.34e-06     | 1.14e-07       | 20.5  | 4.62e-12     | 4.04e-08     | 0.0001    |
+| 10   | 2.24e-09     | 3.06e-10       | 7.3   | 8.71e-14     | 6.49e-11     | 0.0013    |
+| 100  | 3.47e-13     | 5.07e-14       | 6.8   | 8.95e-16     | 6.25e-15     | 0.143     |
+| 300  | 3.88e-14     | 1.16e-14       | 3.3   | 8.02e-17     | 7.83e-17     | 1.025     |
+| 1000 | 1.40e-15     | 2.92e-16       | 4.8   | 1.08e-17     | 1.02e-17     | 1.054     |
+
+EE full-sky is **5-20x too large** at all L; EB full-sky is **0.0001x
+flat-sky at L=2** but converges to flat-sky at L >= 300.
+
+**Why we missed this earlier.** The constant-C controlled-input test
+(``controlled_input_test.py``) only validated the SUM
+``alpha_1 + alpha_2 = L(L+1)``, not the individual alpha factors.
+With constant C, ``(alpha_1 C + alpha_2 C) = (alpha_1 + alpha_2) C =
+L(L+1) C`` regardless of which form of alpha is used. The bug is
+invisible in that test by construction; it shows up only when C is
+non-constant.
+
+**Hypothesis on the bug.** augr's full-sky uses the substitution
+``L.l_i -> alpha_i = [L(L+1) + l_i(l_i+1) - l_j(l_j+1)] / 2`` for ALL
+spins. This is correct for spin-0 (TT) where the gradient eigenvalue
+is sqrt(l(l+1)). For spin-2 (EE, EB), the gradient on the polarization
+tensor uses spin-raising / spin-lowering eigenvalues
+``sqrt((l-2)(l+3))`` (raise) and ``sqrt((l+2)(l-1))`` (lower), which
+differ from spin-0's sqrt(l(l+1)) by terms of order ``2/l``. The
+correct full-sky alpha for spin-2 likely uses ``(l+2)(l-1)`` and/or
+``(l-2)(l+3)`` factors instead of ``l(l+1)``. Reference: plancklens
+``utils_spin.get_spin_raise/lower``.
+
+**Why the lensing kernel still works.** The forward direction
+(C_phi -> C_BB via parity-odd spin-2 coupling) is validated against
+CAMB at <1% (``TestFullSkyKernel::test_matches_camb_low_ell``). The
+kernel is dominated by the geometric ``geom = -l_B(l_B+1) +
+l_E(l_E+1) + L(L+1)`` factor and survives even with the wrong-spin
+alpha because the SUM of the alphas is right (L(L+1) terms cancel
+correctly in the net). Only the QE inverse, weighted by per-cell
+``C_EE_l_E^2``, sensitive to the individual alpha factors, exposes
+the bug.
+
+Action items (next session)
+---------------------------
+
+  1. Re-derive the full-sky polarization QE response from first
+     principles or from a clean reference. Best candidates:
+     Smith-Hanson-Lewis 2012 (arXiv:1205.0474) for the EB pathway,
+     Hu & Okamoto 2002 (astro-ph/0111606) Appendix A, Lewis-Pratten
+     2020 / carronj papers. Goal: an explicit closed-form expression
+     for the spin-2 alpha analog that augr can drop in.
+  2. Implement and test against ``plancklens 'pee'`` (already
+     wired up via the regenerated NPZ). The xfail tests in
+     ``TestN0EEAgainstPlancklens`` should start passing once the fix
+     lands.
+  3. The EB bug at low L may have the same root cause; once the
+     spin-2 alpha is correct, retest EB full-sky vs flat-sky at low L.
+     If still off, investigate further.
+  4. After both fixes, re-evaluate whether to remove "EXPERIMENTAL"
+     from full-sky delensing in the main ``README.md``.
+
+The investigation did NOT find a bug in either augr's flat-sky path
+or in plancklens. The EE/EB full-sky bugs are localized to augr's
+spin-2 substitution in ``_compute_n0_ee_fullsky`` and
+``_compute_n0_eb_fullsky``.
 
 How to reproduce
 ----------------
