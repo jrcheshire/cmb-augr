@@ -124,15 +124,21 @@ Knowing how the modules chain together matters more than any one file:
      test calls with `te_filter='strict_diagonal'` to align with
      plancklens's `fal['te']=0` apples-to-apples. Per
      `compute_n0_te`'s docstring TE contributes ~1-2% to N_0^MV at
-     space-experiment noise levels, so the 5% residual on TE is
-     sub-1-permille on N_0^MV — production sigma(r) forecasts are
-     unaffected (and `iterate_delensing` defaults to `fullsky=False`
-     anyway). Path to closure: port `plancklens.nhl._get_nhl`'s
-     leg-pair Wick logic to harmonic space; the leg-construction
-     half is already in `augr/_qe.py` (43 tests bit-exact vs
-     plancklens). Deferred — natural pair with future GMV /
-     iterative-N_0 work. Full diagnosis in `scripts/n0_validation/derivation.md`
-     "TE structural residual" section.
+     space-experiment noise levels, so the 5% TE residual propagates
+     as <0.1% on N_0^MV and <1% on A_L for realistic delensing
+     efficiencies — below the level where it would shift any sigma(r)
+     decision, so **the full-sky path is production-grade for space-
+     mission applications** (where the reionization bump dominates
+     the sigma(r) constraint and the `(L+1)^2/L^2` flat-vs-full
+     geometric correction matters at low L). Flat-sky remains the
+     `iterate_delensing` default for runtime (~5x faster) but is no
+     longer the math/physics preference. Path to closure (recovering
+     <1e-3 like the other estimators): port `plancklens.nhl._get_nhl`'s
+     leg-pair Wick logic to harmonic space; the leg-construction half
+     is already in `augr/_qe.py` (43 tests bit-exact vs plancklens).
+     Deferred — pairs naturally with future GMV / iterative-N_0 work.
+     Full diagnosis in `scripts/n0_validation/derivation.md` "TE
+     structural residual" section.
 
      The earlier "5-20x off in bulk-L" residual was a sign error in
      `augr.wigner._sg_b` (Schulten-Gordon recursion coefficient): the

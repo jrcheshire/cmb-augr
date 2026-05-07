@@ -267,10 +267,20 @@ defaults are unchanged.
 ### Why this matters (or doesn't)
 
 Per `compute_n0_te`'s own docstring, TE contributes ~1-2% to
-`N_0^MV` at space-experiment noise levels. A 5% residual on TE is
-therefore sub-1-permille on `N_0^MV`. `iterate_delensing` uses
-`fullsky=False` by default; production sigma(r) forecasts are
-unaffected by either the 5% residual or its fix.
+`N_0^MV` at space-experiment noise levels. A 5% TE residual
+therefore propagates as <0.1% on `N_0^MV`. With `A_L = N_0^MV /
+(C_phi + N_0^MV)`, `dA_L / A_L = (1 - A_L) * dN_0^MV / N_0^MV`,
+so a 0.1% shift on `N_0^MV` is at most a 1% relative shift on
+`A_L` even for aggressively-delensed cases (`A_L ~ 0.1`); for
+typical `A_L ~ 0.5` it's 0.05% relative. **Below the level where
+it would shift any sigma(r) decision, so the full-sky path is
+production-grade for space-mission applications.** The reionization
+bump (`l <~ 10`) is where space-mission sigma(r) gets its
+constraint, and full-sky is the right tool there because the
+`(L+1)^2 / L^2` flat-sky-vs-full-sky geometric correction
+matters most at low L. Flat-sky remains the `iterate_delensing`
+default for runtime (~5x faster) -- a runtime-convenience choice,
+not a math/physics preference.
 
 ### Path to closure (deferred)
 

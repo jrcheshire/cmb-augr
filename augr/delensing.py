@@ -855,15 +855,18 @@ def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
     (matching plancklens's ``fal['te']=0``) the structural residual is
     ~5% across mid-L; it goes to 10-20% at the C_TE zero-crossings
     near l~1850 where the response amplitude vanishes and the relative
-    error explodes. Per this function's caller's docstring, TE
-    contributes ~1-2% to N_0^MV at space-experiment noise levels, so a
-    5% TE residual is sub-1-permille on N_0^MV. Capturing the cross
-    term cleanly requires porting ``plancklens.nhl._get_nhl``'s leg-
-    pair Wick logic to harmonic space (``augr/_qe.py`` is the bit-
-    exact-validated leg-construction reference); deferred. The
-    ``TestN0TEAgainstPlancklens`` slow test in ``tests/test_delensing.py``
-    locks the 5% structural floor in at ``TOL_FULLSKY_TE_BULK = 6e-2``
-    in bulk-L = (10, 1800).
+    error explodes. TE contributes ~1-2% to N_0^MV at space-experiment
+    noise levels, so a 5% TE residual propagates as <0.1% on N_0^MV
+    and <1% on A_L for realistic delensing efficiencies -- below the
+    level where it would shift any sigma(r) decision, so the full-sky
+    path is production-grade for space-mission applications. Capturing
+    the cross term cleanly (to recover <1e-3 like the other estimators)
+    requires porting ``plancklens.nhl._get_nhl``'s leg-pair Wick logic
+    to harmonic space (``augr/_qe.py`` is the bit-exact-validated leg-
+    construction reference); deferred -- pairs naturally with future
+    GMV / iterative-N_0 work. The ``TestN0TEAgainstPlancklens`` slow
+    test in ``tests/test_delensing.py`` locks the 5% structural floor
+    in at ``TOL_FULLSKY_TE_BULK = 6e-2`` in bulk-L = (10, 1800).
 
     Parameters
     ----------

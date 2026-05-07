@@ -707,10 +707,14 @@ class TestN0TEAgainstPlancklens:
       rather than dominated by these localized blow-ups.
 
     Per ``compute_n0_te``'s own docstring, TE contributes ~1-2% to
-    ``N_0^MV`` at space-experiment noise levels, so the 5% residual
-    on TE is sub-1-permille on N_0^MV -- well below any forecast's
-    sensitivity. Production ``iterate_delensing`` uses ``fullsky=False``
-    by default; this test does NOT gate any production sigma(r) result.
+    ``N_0^MV`` at space-experiment noise levels, so the 5% TE residual
+    propagates as <0.1% on N_0^MV and <1% on A_L for realistic delensing
+    efficiencies -- well below decision-relevance for sigma(r) forecasts.
+    Full-sky is production-grade for space-mission applications (where
+    the reionization bump dominates the sigma(r) constraint and the
+    (L+1)^2 / L^2 flat-vs-full geometric correction matters at low L);
+    flat-sky remains the ``iterate_delensing`` default for runtime
+    (~5x faster) but is no longer the math/physics preference.
     """
 
     def test_te_max_rel_err_in_bulk(self):
