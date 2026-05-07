@@ -125,13 +125,28 @@ def _sg_a(j, j1, j2, m3):
 
 
 def _sg_b(j, j1, j2, m1, m2, m3):
-    """Scalar b(j) coefficient for the three-term recursion."""
+    """Scalar b(j) coefficient for the three-term recursion.
+
+    Per Schulten & Gordon 1975 Eq. 5, the diagonal coefficient on
+    the recursion (after the j(j+1) normalization that takes
+    `(j+1) E(j) f(j-1) + B_SG(j) f(j) + j E(j+1) f(j+1) = 0` into
+    `a_j f(j-1) + b_j f(j) + a_jp1 f(j+1) = 0`) is
+
+        b_j = (2j+1) [(m_2 - m_1) - m_3 X / (j(j+1))]
+
+    with X = j_1(j_1+1) - j_2(j_2+1). The sign on the m_3 term
+    matters: a previous version of this function had it flipped,
+    which silently gave wrong 3j values for any (m_1, m_2) with
+    m_3 = -(m_1+m_2) != 0. The bug was exposed by the n0_validation
+    work; m_3 = 0 cases (handled by wigner3j_000_vectorized via the
+    closed-form Racah path, not this recursion) were unaffected.
+    """
     j_f = float(j)
     denom = j_f * (j_f + 1.0)
     if abs(denom) < 1e-30:
         return 0.0
     return ((2.0 * j_f + 1.0)
-            * (m3 * (j1 * (j1 + 1) - j2 * (j2 + 1))
+            * (-m3 * (j1 * (j1 + 1) - j2 * (j2 + 1))
                - (m1 - m2) * j_f * (j_f + 1.0))
             / denom)
 
@@ -149,14 +164,18 @@ def _sg_a_vec(j, j1_arr, j2, m3):
 
 
 def _sg_b_vec(j, j1_arr, j2, m1, m2, m3):
-    """Vectorized b(j) over j1 array. j and j2 are scalars."""
+    """Vectorized b(j) over j1 array. j and j2 are scalars.
+
+    Sign convention: see ``_sg_b`` -- the m_3 term carries a leading
+    minus per Schulten-Gordon 1975 Eq. 5.
+    """
     j_f = float(j)
     j2_f = float(j2)
     denom = j_f * (j_f + 1.0)
     if abs(denom) < 1e-30:
         return np.zeros_like(j1_arr)
     return ((2.0 * j_f + 1.0)
-            * (m3 * (j1_arr * (j1_arr + 1) - j2_f * (j2_f + 1))
+            * (-m3 * (j1_arr * (j1_arr + 1) - j2_f * (j2_f + 1))
                - (m1 - m2) * j_f * (j_f + 1.0))
             / denom)
 
@@ -179,6 +198,12 @@ def wigner3j_recurse(j1: int, j2: int, m1: int, m2: int) -> tuple[np.ndarray, np
         (j_array, w3j_array): j values and corresponding 3j symbols.
     """
     m3 = -(m1 + m2)
+    # Magnetic-quantum-number constraints: |m_i| <= j_i. Violations
+    # make the 3j identically zero; previous code skipped this check
+    # so e.g. wigner3j_recurse(j1=0, j2=50, m1=-2, m2=0) returned a
+    # spurious 1/sqrt(2*50+1) instead of 0 (n=1 closed-form path).
+    if abs(m1) > j1 or abs(m2) > j2:
+        return np.array([], dtype=int), np.array([], dtype=float)
     j_min = max(abs(j1 - j2), abs(m3))
     j_max = j1 + j2
     n = j_max - j_min + 1
@@ -311,21 +336,31 @@ def wigner3j_vectorized(L: int, l1_array: np.ndarray,
     n_l1 = len(l1)
     L_f = float(L)
 
+    # Magnetic-quantum-number constraint on j2=L: if |m2| > L the entire
+    # 3j vanishes for any (j1, j3). Short-circuit so callers like
+    # _wignerc.wignerc_3j (which sweeps L from 0 upward and routinely
+    # invokes this with L < |m2|) get an honest zero matrix.
     l2_min = max(l2_min_global, abs(m3))
     l2_max = int(np.max(l1)) + L if l2_max_global is None else l2_max_global
     n_l2 = l2_max - l2_min + 1
 
-    if n_l2 <= 0:
-        return np.arange(l2_min, l2_max + 1, dtype=int), np.zeros((n_l1, 0))
+    if n_l2 <= 0 or abs(m2) > L:
+        return (np.arange(l2_min, l2_max + 1, dtype=int),
+                np.zeros((n_l1, max(n_l2, 0))))
 
     l2_grid = np.arange(l2_min, l2_max + 1, dtype=float)
 
-    # Per-l1 triangle: l2 in [|l1-L|, l1+L] and l2 >= |m3|
+    # Per-l1 triangle: l2 in [|l1-L|, l1+L] and l2 >= |m3|. Also
+    # require |m1| <= l1 (the 3j vanishes when this is violated; the
+    # recursion would otherwise produce spurious values via its
+    # n=1-element closed form for j_min == j_max cases).
     l2_lo = np.maximum(np.abs(l1 - L_f), abs(m3))
     l2_hi = l1 + L_f
+    m1_ok = (np.abs(m1) <= l1)
 
     mask = ((l2_grid[None, :] >= l2_lo[:, None])
-            & (l2_grid[None, :] <= l2_hi[:, None]))
+            & (l2_grid[None, :] <= l2_hi[:, None])
+            & m1_ok[:, None])
 
     # --- Backward recursion ---
     # Recursion: a(j)*w(j-1) + b(j)*w(j) + a(j+1)*w(j+1) = 0
@@ -335,12 +370,18 @@ def wigner3j_vectorized(L: int, l1_array: np.ndarray,
     w = np.zeros((n_l1, n_l2))
     jmax_idx = np.clip((l2_hi - l2_min).astype(int), 0, n_l2 - 1)
 
-    # Seed at each l1's j_max
-    w[np.arange(n_l1), jmax_idx] = 1.0
+    # Seed at each l1's j_max -- but only for rows that pass the
+    # |m1| <= l1 magnetic-quantum constraint. Rows that fail must
+    # stay at zero (the 3j is identically zero there).
+    seed_rows = np.where(m1_ok)[0]
+    w[seed_rows, jmax_idx[seed_rows]] = 1.0
 
-    # First backward step: w(j_max-1) = -b(j_max)/a(j_max)
+    # First backward step: w(j_max-1) = -b(j_max)/a(j_max).
+    # Skip rows that fail the |m1| <= l1 magnetic-quantum constraint.
     jmax_m1_idx = np.clip(jmax_idx - 1, 0, n_l2 - 1)
     for i in range(n_l1):
+        if not m1_ok[i]:
+            continue
         jm = int(l2_hi[i])
         # (j1=l1[i], j2=L, j=jm; m1, m2, m3)
         a_val = _sg_a(jm, l1[i], L_f, m3)

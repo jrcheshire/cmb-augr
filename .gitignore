@@ -13,3 +13,9 @@ data/hit_maps/
 data/falcons_validation/*.fits
 data/falcons_validation/*.html
 scripts/falcons_validation/*.html
+# n0_validation: keep the regen pipeline (run_plancklens.py, compare.py,
+# README.md) under git, but ignore the regen output NPZ (the accepted
+# version lives at data/n0_reference_litebird.npz) and the diagnostic
+# figures.
+scripts/n0_validation/*.npz
+scripts/n0_validation/figures/

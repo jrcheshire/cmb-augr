@@ -1,16 +1,22 @@
 """Tests for delensing.py — QE lensing reconstruction and residual BB."""
 
+from pathlib import Path
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from augr.config import simple_probe
 from augr.delensing import (
+    LensingSpectra,
     _gl_nodes,
     _interp_at,
     _triangle_geometry,
     compute_n0_eb,
+    compute_n0_ee,
     compute_n0_mv,
+    compute_n0_tb,
+    compute_n0_te,
     compute_n0_tt,
     iterate_delensing,
     lensing_kernel,
@@ -477,3 +483,278 @@ class TestSignalModelIntegration:
         assert J.shape == (signal.n_data, signal.n_params)
         # Jacobian should have no A_lens column
         assert J.shape[1] == signal.n_params
+
+
+# -----------------------------------------------------------------------
+# Cross-validation against plancklens (LiteBIRD-PTEP fiducial)
+#
+# Reference NPZ produced by scripts/n0_validation/run_plancklens.py;
+# regen recipe in scripts/n0_validation/README.md. The lightweight test
+# here just compares augr's compute_n0_* on the *same* nl_*/cl_* arrays
+# against the saved reference. Tolerances reflect the conventions both
+# codes use: response = unlensed C_l, filter = lensed + noise, MV =
+# diagonal 1/Sum 1/N_0_alpha.
+# -----------------------------------------------------------------------
+
+# Tolerances for the augr full-sky vs plancklens TT comparison.
+# Locked in 2026-05-06 after the controlled-input test + regen with
+# correct lmin filter (see scripts/n0_validation/README.md "RESOLVED"
+# section). On the LiteBIRD-PTEP fiducial config the agreement is
+# ~1e-6 in the bulk and ~1e-4 at L > 2000 (where both codes feel the
+# l1+l2 boundary truncation). 1e-3 is a safe headroom that catches
+# regressions while not being noisy.
+#
+# Only TT is tested here. plancklens 'p_p' / 'p' include inter-
+# estimator cross-correlations (joint GMV); augr's MV is diagonal
+# (HO02 Eq. 22). The diagonal-vs-joint difference is real physics, not
+# a bug, and varies with the relative weight of estimators -- not
+# something to lock into a tolerance test.
+N0_REF_PATH = Path(__file__).resolve().parents[1] / "data" / "n0_reference_litebird.npz"
+TOL_FULLSKY_TT_BULK = 1e-3   # bulk-L window
+TOL_FULLSKY_TT_TAIL = 1e-3   # high-L (l > 2000) where both feel boundary trunc
+
+# TE has a structural ~5% bulk-L residual not shared with the other 4
+# estimators; see TestN0TEAgainstPlancklens for diagnosis. Bulk-L band
+# stops at L=1800 to avoid the C_TE zero-crossings near l~1850 where
+# the response amplitude vanishes and any structural residual blows
+# up relative to plancklens.
+TOL_FULLSKY_TE_BULK = 6e-2
+L_BULK_TE = (10, 1800)
+
+L_BULK = (10, 2000)
+L_HIGH = (2001, 3000)
+
+
+def _load_reference():
+    """Load the in-tree plancklens reference NPZ, or skip if absent."""
+    if not N0_REF_PATH.exists():
+        pytest.skip(
+            f"plancklens reference not found at {N0_REF_PATH.relative_to(Path.cwd())}; "
+            "run scripts/n0_validation/run_plancklens.py and copy the output to "
+            "data/n0_reference_litebird.npz to enable this test."
+        )
+    npz = np.load(N0_REF_PATH, allow_pickle=True)
+    return {k: npz[k] for k in npz.files}
+
+
+def _make_spectra(ref):
+    return LensingSpectra(
+        ells=jnp.asarray(ref["ells"]),
+        cl_tt_unl=jnp.asarray(ref["cl_tt_unl"]),
+        cl_ee_unl=jnp.asarray(ref["cl_ee_unl"]),
+        cl_bb_unl=jnp.asarray(ref["cl_bb_unl"]),
+        cl_te_unl=jnp.asarray(ref["cl_te_unl"]),
+        cl_tt_len=jnp.asarray(ref["cl_tt_len"]),
+        cl_ee_len=jnp.asarray(ref["cl_ee_len"]),
+        cl_bb_len=jnp.asarray(ref["cl_bb_len"]),
+        cl_te_len=jnp.asarray(ref["cl_te_len"]),
+        cl_pp=jnp.asarray(ref["cl_pp"]),
+    )
+
+
+def _max_rel_err_in_window(augr_n0, ref_n0, Ls, lo, hi):
+    """|augr - ref| / |ref| max over Ls in [lo, hi]."""
+    augr_n0 = np.asarray(augr_n0)
+    ref_n0 = np.asarray(ref_n0)
+    mask = (Ls >= lo) & (Ls <= hi) & np.isfinite(augr_n0) & np.isfinite(ref_n0) & (ref_n0 != 0)
+    if not mask.any():
+        return 0.0
+    rel = np.abs(augr_n0[mask] - ref_n0[mask]) / np.abs(ref_n0[mask])
+    return float(rel.max())
+
+
+@pytest.mark.slow
+class TestN0AgainstPlancklens:
+    """Augr full-sky TT N_0 must match plancklens at LiteBIRD-PTEP.
+
+    Full-sky augr is the apples-to-apples comparison against plancklens
+    (which is full-sky natively). The flat-sky augr path is validated
+    separately by the closed-form ``controlled_input_test.py`` and
+    cannot match a full-sky reference at low L (geometric factor).
+
+    PP and MV combinations are NOT tested: augr uses the diagonal
+    HO02 Eq.22 ``1/Sum 1/N_alpha`` while plancklens 'p_p' / 'p' include
+    inter-estimator cross-correlations (joint GMV). The diagonal
+    answer is strictly larger than the joint GMV; the size of the gap
+    is real physics, not a bug to test against.
+
+    Slow because full-sky N_0 takes ~10 minutes for ~140 Ls.
+    """
+
+    def test_tt_max_rel_err_in_bulk(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_tt = jnp.asarray(ref["nl_tt"])
+
+        augr_n0 = compute_n0_tt(Ls, spectra, nl_tt, fullsky=True)
+        ref_n0 = ref["n0_tt"]
+        Ls_np = np.asarray(Ls)
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
+        assert err_bulk <= TOL_FULLSKY_TT_BULK, (
+            f"full-sky N_0^TT: bulk-L max-rel-err = "
+            f"{err_bulk:.4e} > {TOL_FULLSKY_TT_BULK:.4e}"
+        )
+
+    def test_tt_max_rel_err_at_high_L(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_tt = jnp.asarray(ref["nl_tt"])
+
+        augr_n0 = compute_n0_tt(Ls, spectra, nl_tt, fullsky=True)
+        ref_n0 = ref["n0_tt"]
+        Ls_np = np.asarray(Ls)
+
+        err_high = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_HIGH)
+        assert err_high <= TOL_FULLSKY_TT_TAIL, (
+            f"full-sky N_0^TT: high-L max-rel-err = "
+            f"{err_high:.4e} > {TOL_FULLSKY_TT_TAIL:.4e}"
+        )
+
+
+@pytest.mark.slow
+class TestN0EEAgainstPlancklens:
+    """Augr full-sky EE N_0 must match plancklens 'pee' to <1e-3 in bulk-L.
+
+    Locks in the resolution of the previously documented "5-20x"
+    EE / EB residual: it was a sign error in the m_3 term of
+    augr.wigner._sg_b (Schulten-Gordon recursion coefficient), not
+    a missing spin-lowering branch. The earlier `derivation.md`
+    diagnosis ("two-branch fix needed") is superseded; once
+    ``_sg_b`` honors SG 1975 Eq. 5 sign convention, the existing
+    Hu-Okamoto Eq. 14 single-bracket implementation matches
+    plancklens to <1e-7 in the realistic bulk.
+    """
+
+    def test_ee_max_rel_err_in_bulk(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_ee = jnp.asarray(ref["nl_ee"])
+
+        augr_n0 = compute_n0_ee(Ls, spectra, nl_ee, fullsky=True)
+        ref_n0 = ref["n0_ee"]
+        Ls_np = np.asarray(Ls)
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
+        assert err_bulk <= TOL_FULLSKY_TT_BULK, (
+            f"full-sky N_0^EE: bulk-L max-rel-err = "
+            f"{err_bulk:.4e} > {TOL_FULLSKY_TT_BULK:.4e}"
+        )
+
+
+@pytest.mark.slow
+class TestN0EBAgainstPlancklens:
+    """Augr full-sky EB N_0 must match plancklens 'p_eb' (symmetrized).
+
+    augr's ``compute_n0_eb`` weights both the EE and BB legs
+    symmetrically (Smith+ 2012 Eq. 6-7 with parity-odd coupling),
+    so the apples-to-apples plancklens reference is the symmetrized
+    'p_eb' = (peb + pbe)/2 variant exposed by ``run_plancklens.py``.
+    """
+
+    def test_eb_max_rel_err_in_bulk(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_ee = jnp.asarray(ref["nl_ee"])
+        nl_bb = jnp.asarray(ref["nl_bb"])
+
+        augr_n0 = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, fullsky=True)
+        ref_n0 = ref["n0_eb"]
+        Ls_np = np.asarray(Ls)
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
+        assert err_bulk <= TOL_FULLSKY_TT_BULK, (
+            f"full-sky N_0^EB: bulk-L max-rel-err = "
+            f"{err_bulk:.4e} > {TOL_FULLSKY_TT_BULK:.4e}"
+        )
+
+
+@pytest.mark.slow
+class TestN0TEAgainstPlancklens:
+    """Augr full-sky TE N_0 vs plancklens 'p_te' (symmetrized).
+
+    Locked at ``TOL_FULLSKY_TE_BULK`` (6e-2) in ``L_BULK_TE`` (10..1800),
+    a deliberately looser gate than the <1e-3 bulk-L lock-in for TT / EE
+    / EB / TB. The looseness is structural, not a tolerance kludge:
+
+    * **Production filter mismatch**: augr's ``compute_n0_te`` defaults
+      to HO02 Eq. 13's diagonal-approximation filter
+      ``1/(C_TT*C_EE + C_TE^2)``. Plancklens forces ``fal['te']=0``,
+      giving the strict-diagonal filter ``1/(C_TT*C_EE)``. This test
+      calls with ``te_filter='strict_diagonal'`` to align the filters
+      exactly; that part is apples-to-apples.
+    * **Symmetrization residual** (the structural ~5%): plancklens
+      ``p_te`` is the symmetric estimator ``g_pte + g_pet``, whose
+      variance is ``Var(pte) + Var(pet) + 2 Cov(pte, pet)``. Augr's
+      ``_compute_n0_te_fullsky`` implements OkaHu 2003 Table I's
+      single-projection response (E-leg spin-2, T-leg spin-0), which
+      reproduces ``Var(pte)`` only -- it does NOT capture the
+      ``Cov(pte, pet)`` cross-Wick contraction. With ``fal['te']=0``
+      the cross term is non-zero because ``cls_ivfs[te] = cl_te /
+      (C_TT_total * C_EE_total)`` is non-zero, and contributes a few
+      percent at all L. Closing it requires porting plancklens's
+      ``nhl._get_nhl`` cross-Wick logic to harmonic space (the
+      already-validated ``augr/_qe.py`` is the leg-construction
+      reference) -- deferred; out of scope for this test.
+    * **C_TE zero-crossings at L~1850**: the response amplitude
+      vanishes there, so any residual structural percent-level error
+      blows up to 10-20% in relative terms. The bulk-L band stops at
+      L=1800 to keep the test informative about the structural floor
+      rather than dominated by these localized blow-ups.
+
+    Per ``compute_n0_te``'s own docstring, TE contributes ~1-2% to
+    ``N_0^MV`` at space-experiment noise levels, so the 5% TE residual
+    propagates as <0.1% on N_0^MV and <1% on A_L for realistic delensing
+    efficiencies -- well below decision-relevance for sigma(r) forecasts.
+    Full-sky is production-grade for space-mission applications (where
+    the reionization bump dominates the sigma(r) constraint and the
+    (L+1)^2 / L^2 flat-vs-full geometric correction matters at low L);
+    flat-sky remains the ``iterate_delensing`` default for runtime
+    (~5x faster) but is no longer the math/physics preference.
+    """
+
+    def test_te_max_rel_err_in_bulk(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_tt = jnp.asarray(ref["nl_tt"])
+        nl_ee = jnp.asarray(ref["nl_ee"])
+
+        augr_n0 = compute_n0_te(
+            Ls, spectra, nl_tt, nl_ee,
+            fullsky=True, te_filter='strict_diagonal',
+        )
+        ref_n0 = ref["n0_te"]
+        Ls_np = np.asarray(Ls)
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK_TE)
+        assert err_bulk <= TOL_FULLSKY_TE_BULK, (
+            f"full-sky N_0^TE: bulk-L max-rel-err = "
+            f"{err_bulk:.4e} > {TOL_FULLSKY_TE_BULK:.4e}"
+        )
+
+
+@pytest.mark.slow
+class TestN0TBAgainstPlancklens:
+    """Augr full-sky TB N_0 must match plancklens 'p_tb' (symmetrized)."""
+
+    def test_tb_max_rel_err_in_bulk(self):
+        ref = _load_reference()
+        spectra = _make_spectra(ref)
+        Ls = jnp.asarray(ref["Ls"], dtype=float)
+        nl_tt = jnp.asarray(ref["nl_tt"])
+        nl_bb = jnp.asarray(ref["nl_bb"])
+
+        augr_n0 = compute_n0_tb(Ls, spectra, nl_tt, nl_bb, fullsky=True)
+        ref_n0 = ref["n0_tb"]
+        Ls_np = np.asarray(Ls)
+
+        err_bulk = _max_rel_err_in_window(augr_n0, ref_n0, Ls_np, *L_BULK)
+        assert err_bulk <= TOL_FULLSKY_TT_BULK, (
+            f"full-sky N_0^TB: bulk-L max-rel-err = "
+            f"{err_bulk:.4e} > {TOL_FULLSKY_TT_BULK:.4e}"
+        )

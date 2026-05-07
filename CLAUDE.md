@@ -86,7 +86,97 @@ Knowing how the modules chain together matters more than any one file:
    EB, TB), MV-combines, Wiener-filters to get C_L^{φ,res}, applies
    the lensing kernel for residual C_ℓ^{BB}, and iterates. Flat-sky
    uses Gauss-Legendre quadrature (~2 min / 5 iter); full-sky uses
-   `wigner.py` Schulten-Gordon recursion (experimental, ~10 min).
+   `wigner.py` Schulten-Gordon recursion (~10 min / 5 iter).
+
+   **N₀ validation status (2026-05-07).** Validated against `plancklens`
+   at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:
+   - **TT flat-sky**: machine-precision against the constant-Cℓ closed
+     form (`controlled_input_test.py`).
+   - **TT full-sky**: machine-precision against `plancklens 'ptt'`
+     (max |ratio−1| ≈ 5e-8 in bulk-L, 9e-5 at L > 2000). Locked in by
+     `tests/test_delensing.py::TestN0AgainstPlancklens`.
+   - **EE/EB flat-sky**: implicitly validated (EE matches plancklens at
+     high L to <1%; geometric flat-vs-full factor (L+1)²/L² explains
+     the low-L gap).
+   - **EE/EB/TB full-sky**: validated against `plancklens
+     'pee' / 'p_eb' / 'p_tb'` (symmetrized parity-odd variants for
+     EB / TB) to <1e-3 in bulk-L. Locked in by
+     `tests/test_delensing.py::TestN0{EE,EB,TB}AgainstPlancklens`.
+   - **TE full-sky**: validated against `plancklens 'p_te'`
+     (symmetrized) to **<6e-2** in bulk-L = (10, 1800). Deliberately
+     looser than the <1e-3 gate above for a documented structural
+     reason: `_compute_n0_te_fullsky` implements OkaHu 2003 Table I's
+     *single-projection* spin-mixed response (spin-2 on E leg via
+     `wigner3j_vectorized(m1=-2, m2=0)`, spin-0 on T leg via
+     `wigner3j_000_vectorized`, summed and squared together as
+     `(f_2 + f_0)^2`), with the spin-2 leg carrying the parity-even
+     mask. Plancklens `'p_te'` is the symmetric estimator `g_pte +
+     g_pet` whose variance carries an additional cross-Wick term
+     `2 Cov(pte, pet)` that the single-projection form does not
+     reproduce. With `fal['te']=0` the cross term is non-zero
+     (`cls_ivfs[te] = cl_te / (C_TT_tot * C_EE_tot)` is non-zero),
+     contributing the ~5% structural floor across mid-L. The C_TE
+     zero-crossings near l~1850 amplify this to 10-20% relative
+     residual where the response amplitude vanishes — the bulk-L
+     band stops at L=1800 to keep the test gate informative.
+     Production `compute_n0_te(fullsky=True)` keeps HO02 Eq. 13's
+     diagonal-approximation filter `1/(C_TT*C_EE + C_TE^2)`; the
+     test calls with `te_filter='strict_diagonal'` to align with
+     plancklens's `fal['te']=0` apples-to-apples. Per
+     `compute_n0_te`'s docstring TE contributes ~1-2% to N_0^MV at
+     space-experiment noise levels, so the 5% TE residual propagates
+     as <0.1% on N_0^MV and <1% on A_L for realistic delensing
+     efficiencies — below the level where it would shift any sigma(r)
+     decision, so **the full-sky path is production-grade for space-
+     mission applications** (where the reionization bump dominates
+     the sigma(r) constraint and the `(L+1)^2/L^2` flat-vs-full
+     geometric correction matters at low L). Flat-sky remains the
+     `iterate_delensing` default for runtime (~5x faster) but is no
+     longer the math/physics preference. Path to closure (recovering
+     <1e-3 like the other estimators): port `plancklens.nhl._get_nhl`'s
+     leg-pair Wick logic to harmonic space; the leg-construction half
+     is already in `augr/_qe.py` (43 tests bit-exact vs plancklens).
+     Deferred — pairs naturally with future GMV / iterative-N_0 work.
+     Full diagnosis in `scripts/n0_validation/derivation.md` "TE
+     structural residual" section.
+
+     The earlier "5-20x off in bulk-L" residual was a sign error in
+     `augr.wigner._sg_b` (Schulten-Gordon recursion coefficient): the
+     m_3 term had the wrong sign per SG 1975 Eq. 5, so the recursion
+     produced wrong values for any (m_1, m_2) with m_3 = -(m_1+m_2)
+     != 0. Affected every full-sky polarization path (EE, EB, TE,
+     TB N_0; the lensing kernel). TT was unaffected because it uses
+     `wigner3j_000_vectorized` (closed-form Racah path).
+     `tests/test_wigner.py` locks in the sympy-truth regression so
+     this can't reappear silently. The earlier "missing
+     spin-lowering branch" / "two-branch fix" diagnosis in
+     `scripts/n0_validation/derivation.md` was a misdiagnosis;
+     `derivation.md` rewritten with the actual fix and traceback.
+
+     **`iterate_delensing` defaults to `fullsky=False` (flat-sky
+     path is unaffected and used in production forecasts); the bug
+     only affected opt-in `fullsky=True` polarization N_0 and the
+     full-sky lensing kernel's per-cell values, neither of which any
+     production forecast consumed. The bug fix doesn't invalidate
+     any prior sigma(r) numbers.**
+
+     Foundation for any future plancklens-style GMV / iterative-N_0
+     work: numpy-only port of plancklens's QE-leg machinery
+     (`qeleg`, `qe`, `get_qes`, `qe_simplify`, `qe_proj`,
+     `get_resp_legs`, `get_covresp`, `spin_cls`, `get_spin_raise/lower`)
+     lives at `augr/_qe.py`, validated bit-for-bit by
+     `tests/test_qe.py` (43 tests, all passing under
+     PYTHONPATH=~/cmb/plancklens). Not consumed by any production
+     code today; dormant infrastructure for the GMV reach.
+
+   **plancklens-wrapper convention gotcha.** `run_plancklens.py` must
+   apply plancklens's standard `fal[s][:l_min] = 0` and
+   `cls_w[s][:l_min] = 0` (cf. `plancklens/n0s.py:137`); without it,
+   `nl_tt[0:2] = 1.5e-7` floor → `fal[0:2] = 6.5e6` pollutes
+   plancklens's QE response with monopole/dipole modes (inflates
+   `r_gg` by ~1000× at low L, gives spuriously small N_0). Apparent
+   "8000× discrepancy at L=2" earlier in the validation was this
+   wrapper bug, not augr.
 
 6. **`optimize.py`.** End-to-end differentiable σ(r).
    `make_optimization_context(...)` packs the static pieces;

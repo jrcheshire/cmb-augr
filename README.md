@@ -133,6 +133,11 @@ scripts/
                                component-separation forecast
   make_hit_maps.py             Per-channel L2 hit map FITS writer for BROOM
   generate_camb_templates.py   Regenerate the CAMB spectra under data/
+  n0_validation/               Full-sky N_0 lensing-noise validation against
+                               plancklens (LiteBIRD-PTEP); reference NPZ +
+                               compare/diagnose drivers + derivation.md
+  falcons_validation/          h_k crosslink validation against Falcons.jl;
+                               Julia + Python comparison drivers
   southpole_derivation/        Pedagogical walkthrough of the South Pole
                                h_k closed form
 
@@ -248,8 +253,8 @@ The `delensing.py` module computes self-consistent iterative QE delensing, repla
 
 Two modes are available:
 
-- **Flat-sky** (`fullsky=False`): Gauss-Legendre quadrature over the azimuthal angle. Fast (~2 min for 5 iterations at l_max=3000).
-- **Full-sky** (`fullsky=True`) [EXPERIMENTAL]: Wigner 3j coupling via Schulten-Gordon backward recursion, vectorized over l1 for fixed L with log-spaced L sampling.
+- **Flat-sky** (`fullsky=False`, current default): Gauss-Legendre quadrature over the azimuthal angle. Fast (~2 min for 5 iterations at l_max=3000). Default for runtime convenience.
+- **Full-sky** (`fullsky=True`): Wigner 3j coupling via Schulten-Gordon backward recursion, vectorized over l1 for fixed L with log-spaced L sampling. ~10 minutes for 5 iterations at `l_max = 3000`. TT, EE, EB, TB validated against `plancklens` to <1e-3 in bulk-L (10..2000) at the LiteBIRD-PTEP fiducial; TE validated to <6e-2 in (10, 1800) — see `scripts/n0_validation/derivation.md` for the structural-residual diagnosis (single-projection OkaHu Table I form vs plancklens's symmetric `pte+pet`; <0.1% effect on `N_0^MV` and <1% on `A_L`). **Production-grade for space-mission applications** (where the reionization bump `l ≲ 10` dominates the σ(r) constraint and the `(L+1)²/L²` flat-vs-full geometric correction matters at low L); flat-sky remains the default for runtime (~5× faster) but is no longer the math/physics preference for full-sky surveys.
 
 ```python
 from augr.delensing import load_lensing_spectra, iterate_delensing
