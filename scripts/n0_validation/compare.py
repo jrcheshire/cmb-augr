@@ -5,20 +5,34 @@ Loads the NPZ produced by ``run_plancklens.py``, runs
 LensingSpectra inputs in full-sky mode, plots the ratio, and prints
 max-relative-error per L band.
 
-The plancklens reference covers three QE keys:
+The plancklens reference covers seven QE keys:
 
-  - ``ptt``    -> ``n0_tt``      compared to ``augr.compute_n0_tt(fullsky=True)``
-  - ``p_p``    -> ``n0_pp``      compared to ``MV(augr.compute_n0_ee, augr.compute_n0_eb, fullsky=True)``
-  - ``p``      -> ``n0_mv``      compared to ``augr.compute_n0_mv(fullsky=True)``
+  - ``ptt``    -> ``n0_tt``  compared to ``augr.compute_n0_tt(fullsky=True)``           [<1e-3 in bulk-L]
+  - ``pee``    -> ``n0_ee``  compared to ``augr.compute_n0_ee(fullsky=True)``           [<1e-3 in bulk-L]
+  - ``p_eb``   -> ``n0_eb``  compared to ``augr.compute_n0_eb(fullsky=True)``           [<1e-3 in bulk-L]
+  - ``p_tb``   -> ``n0_tb``  compared to ``augr.compute_n0_tb(fullsky=True)``           [<1e-3 in bulk-L]
+  - ``p_te``   -> ``n0_te``  compared to ``augr.compute_n0_te(fullsky=True,             [<6e-2 in bulk-L]
+                                                                te_filter='strict_diagonal')``
+  - ``p_p``    -> ``n0_pp``  compared to ``MV(augr.compute_n0_ee, augr.compute_n0_eb, fullsky=True)``  [diagnostic]
+  - ``p``      -> ``n0_mv``  compared to ``augr.compute_n0_mv(fullsky=True)``                          [diagnostic]
 
-**Only TT is an apples-to-apples comparison.** plancklens's ``p_p``
-and ``p`` keys include the inter-estimator cross-correlations (joint
-GMV combination), while augr's ``compute_n0_mv`` and the manual MV
-of EE/EB use the diagonal HO02 Eq. 22
-``1 / Sum_alpha (1/N_alpha)``. The diagonal MV is *strictly* larger
-than the joint GMV at scales where multiple estimators contribute
-significantly (the cross-correlations help). PP and MV ratios are
-reported here for diagnostic eyes-on, NOT as a tolerance test.
+**Apples-to-apples comparisons:** TT, EE, EB, TB, TE. TE uses the
+``te_filter='strict_diagonal'`` arm to match plancklens's
+``fal['te']=0`` convention (production default is HO02 Eq. 13
+diagonal-approximation `1/(C_TT*C_EE + C_TE^2)`). TE has a 6e-2
+gate rather than 1e-3 because plancklens's symmetric ``'p_te'`` =
+pte+pet variance carries a cross-Wick contraction that the OkaHu
+single-projection form does not (~5% structural floor; 10-20%
+relative residual at C_TE zero-crossings near l~1850). See
+``derivation.md`` "TE structural residual" for the diagnosis.
+
+**Diagnostic only:** ``p_p`` and ``p`` keys include the inter-
+estimator cross-correlations (joint GMV combination), while augr's
+``compute_n0_mv`` and the manual MV of EE/EB use the diagonal HO02
+Eq. 22 ``1 / Sum_alpha (1/N_alpha)``. The diagonal MV is *strictly*
+larger than the joint GMV at scales where multiple estimators
+contribute significantly. PP/MV ratios are eyes-on, NOT a tolerance
+test.
 
 Flat-sky augr is NOT a meaningful comparison against plancklens
 (which is full-sky natively). The flat-sky-vs-full-sky geometric
@@ -44,8 +58,10 @@ import numpy as np
 
 
 # Estimators that the plancklens reference NPZ exposes (see
-# run_plancklens.py): n0_tt, n0_pp, n0_mv.
-REF_ESTIMATORS = ("tt", "pp", "mv")
+# run_plancklens.py).
+PERESTIMATOR_KEYS = ("tt", "ee", "eb", "tb", "te")  # apples-to-apples per-estimator
+DIAGNOSTIC_KEYS = ("pp", "mv")                       # joint-GMV vs diagonal-MV diagnostic
+REF_ESTIMATORS = PERESTIMATOR_KEYS + DIAGNOSTIC_KEYS
 
 L_BANDS = (
     ("low",  2,    9),
@@ -64,8 +80,11 @@ def load_reference(path: Path) -> dict:
 def compute_augr_n0(ref: dict) -> dict:
     """Run augr.delensing.compute_n0_* full-sky on the reference inputs.
 
-    Returns a dict with the same three keys as the reference NPZ:
-    ``tt``, ``pp`` (= diagonal MV of EE/EB), ``mv`` (= full diagonal MV).
+    Returns a dict with all 7 keys present in the reference NPZ:
+    ``tt``, ``ee``, ``eb``, ``tb``, ``te`` (per-estimator, apples-to-apples
+    against plancklens 'ptt' / 'pee' / 'p_eb' / 'p_tb' / 'p_te'), plus
+    ``pp`` (= diagonal MV of EE/EB) and ``mv`` (= full diagonal MV) as
+    joint-GMV-vs-diagonal-MV diagnostics.
     """
     import jax.numpy as jnp
 
@@ -74,6 +93,8 @@ def compute_augr_n0(ref: dict) -> dict:
         compute_n0_eb,
         compute_n0_ee,
         compute_n0_mv,
+        compute_n0_tb,
+        compute_n0_te,
         compute_n0_tt,
     )
 
@@ -97,12 +118,18 @@ def compute_augr_n0(ref: dict) -> dict:
     n0_tt = np.asarray(compute_n0_tt(Ls, spectra, nl_tt, fullsky=True))
     n0_ee = np.asarray(compute_n0_ee(Ls, spectra, nl_ee, fullsky=True))
     n0_eb = np.asarray(compute_n0_eb(Ls, spectra, nl_ee, nl_bb, fullsky=True))
+    n0_tb = np.asarray(compute_n0_tb(Ls, spectra, nl_tt, nl_bb, fullsky=True))
+    # TE: select strict-diagonal filter to match plancklens 'fal[te]=0'.
+    n0_te = np.asarray(compute_n0_te(Ls, spectra, nl_tt, nl_ee,
+                                     fullsky=True,
+                                     te_filter='strict_diagonal'))
     n0_mv = np.asarray(compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb,
                                      fullsky=True))
 
     n0_pp = 1.0 / (1.0 / n0_ee + 1.0 / n0_eb)  # diagonal MV(EE, EB)
 
-    return {"tt": n0_tt, "pp": n0_pp, "mv": n0_mv}
+    return {"tt": n0_tt, "ee": n0_ee, "eb": n0_eb, "tb": n0_tb, "te": n0_te,
+            "pp": n0_pp, "mv": n0_mv}
 
 
 def relative_error(augr: np.ndarray, ref: np.ndarray) -> np.ndarray:
@@ -136,7 +163,9 @@ def plot_ratios(ref: dict, augr_full: dict, out_dir: Path) -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     Ls = ref["Ls"]
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4), sharex=True)
+    n_keys = len(REF_ESTIMATORS)
+    fig, axes = plt.subplots(1, n_keys, figsize=(3.0 * n_keys + 1, 4),
+                             sharex=True)
     for ax, est in zip(axes, REF_ESTIMATORS, strict=True):
         ratio_full = augr_full[est] / ref[f"n0_{est}"]
         ax.semilogx(Ls, ratio_full, label="augr full-sky / plancklens",
@@ -145,7 +174,15 @@ def plot_ratios(ref: dict, augr_full: dict, out_dir: Path) -> None:
         ax.set_title(f"N_0^{est.upper()}")
         ax.set_xlabel("L")
         ax.set_ylabel("ratio")
-        ax.set_ylim(0.5, 1.5) if est == "tt" else ax.set_ylim(0.0, 5.0)
+        # Per-estimator ylims: tight on the per-estimator apples-to-apples
+        # axes (TT/EE/EB/TB <1e-3, TE <6e-2), wider on the diagnostic
+        # joint-vs-diagonal MV axes.
+        if est in ("tt", "ee", "eb", "tb"):
+            ax.set_ylim(0.99, 1.01)
+        elif est == "te":
+            ax.set_ylim(0.7, 1.3)
+        else:
+            ax.set_ylim(0.0, 5.0)
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
     fig.tight_layout()
@@ -187,7 +224,13 @@ def main() -> int:
 
     print()
     print("Notes:")
-    print("  - TT is the apples-to-apples comparison; expect <1% in bulk.")
+    print("  - TT/EE/EB/TB are apples-to-apples; expect <1e-3 in bulk-L.")
+    print("  - TE is apples-to-apples (with te_filter='strict_diagonal' to")
+    print("    match plancklens 'fal[te]=0'), but locked at the looser")
+    print("    6e-2 gate in (10, 1800) because the OkaHu single-projection")
+    print("    form does not capture the cross-Wick contraction in")
+    print("    plancklens's symmetric 'p_te' = pte+pet variance. See")
+    print("    derivation.md 'TE structural residual'.")
     print("  - PP/MV: augr uses the diagonal HO02 Eq.22 MV;")
     print("    plancklens 'p_p'/'p' include inter-estimator cross-corrs")
     print("    (joint GMV). Diagonal MV is strictly >= joint GMV; the")

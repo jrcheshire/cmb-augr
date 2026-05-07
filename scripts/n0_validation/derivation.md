@@ -1,8 +1,9 @@
 # Full-sky polarization N_0: derivation and bug localization
 
-Status: 2026-05-06 -- the bug is identified and fixed. EE / EB / TE /
-TB full-sky N_0 now match plancklens at the LiteBIRD-PTEP fiducial
-to <1e-3 in bulk-L (matching the existing TT tolerance).
+Status: 2026-05-07 -- TT / EE / EB / TB full-sky N_0 match plancklens
+at the LiteBIRD-PTEP fiducial to <1e-3 in bulk-L (matching the existing
+TT tolerance). TE is locked at a deliberately looser 6e-2 bulk-L
+gate in (10, 1800); see "TE structural residual" section at bottom.
 
 ## TL;DR
 
@@ -154,49 +155,134 @@ No production forecasts need to be re-run.
 Post-fix at the LiteBIRD-PTEP fiducial config, lmax_ivf=3000,
 augr full-sky N_0 vs plancklens (in `scripts/n0_validation/compare.py`):
 
-| Estimator       | bulk-L (10..2000) max rel-err |
-|-----------------|--------------------------------|
-| TT              | 5.0e-8                         |
-| EE              | <1e-3                          |
-| EB              | <1e-3                          |
-| TB              | <1e-3                          |
-| TE              | 51x (xfail: separate issues)   |
-| PP (= EE + EB)  | 5.6e-7                         |
+| Estimator       | bulk-L max rel-err            | bulk-L band      |
+|-----------------|-------------------------------|------------------|
+| TT              | 5.0e-8                        | (10, 2000)       |
+| EE              | <1e-3                         | (10, 2000)       |
+| EB              | <1e-3                         | (10, 2000)       |
+| TB              | <1e-3                         | (10, 2000)       |
+| TE              | <6e-2 (structural floor)      | (10, 1800)       |
+| PP (= EE + EB)  | 5.6e-7                        | (10, 2000)       |
 
 `tests/test_delensing.py` has `TestN0{TT,EE,EB,TB}AgainstPlancklens`
-locked in at <1e-3 bulk tolerance. The previous EE / EB xfail
-markers and the EB flat-vs-full proxy test are removed.
+locked at <1e-3 bulk tolerance and `TestN0TEAgainstPlancklens` at
+6e-2 in (10, 1800). The previous EE / EB xfail markers and the EB
+flat-vs-full proxy test are removed.
 
-`TestN0TEAgainstPlancklens` is xfail with two separate diagnoses
-(neither related to the `_sg_b` bug):
+## TE structural residual
 
-1. **STRUCTURAL.** Per OkaHu 2003 Table I, TE is spin-mixed:
+The TE single-projection structural fix (2026-05-07) takes the
+residual from 51x (the previous spin-0-on-both-legs form) down to
+~5% across mid-L. The remaining 5% is structural, not numerical:
+plancklens's `'p_te'` is the *symmetric* estimator and augr's
+`_compute_n0_te_fullsky` is OkaHu Table I's *single-projection* form.
 
-       f^TE(l1, l2, L) = C^TE(l1) * _2F_{l2 L l1}
-                       + C^TE(l2) * _0F_{l1 L l2}
+### The fix
 
-   (spin-2 on the E leg, spin-0 on the T leg). augr's
-   `_compute_n0_te_fullsky` uses the spin-0 (m=0,0,0) Wigner-3j on
-   both legs. A naive spin-2 swap on the E leg reduces the
-   residual from 130x to 51x but doesn't close it, indicating
-   that projection / sign subtleties in the symmetrized 'p_te' =
-   pte+pet aren't captured by OkaHu's single-projection Table I
-   form.
+Per OkaHu 2003 Table I, TE is spin-mixed:
 
-2. **FILTER MISMATCH.** augr uses HO02 Eq. 13's "diagonal
-   approximation" filter
-   `C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2)` (per augr's own
-   `compute_n0_te` docstring). `run_plancklens.py` forces
-   `fal['te']=0`, giving the strict diagonal `C_TT(l1)*C_EE(l2)`
-   filter -- different from augr's HO02 approximation.
-   Apples-to-apples would require either (a) moving augr to the
-   strict diagonal filter for the TT*EE leg or (b) configuring
-   `run_plancklens.py` for joint-TE inversion (`fal['te']` =
-   inverse of the (T,E) covariance).
+    f^TE(l1, l2, L) = C^TE(l1) * _2F_{l2 L l1} * eps_TE
+                    + C^TE(l2) * _0F_{l1 L l2}
 
-Per augr's own `compute_n0_te` docstring, TE contributes ~1-2% to
-N_0^MV at space-experiment noise levels; the approximation is
-adequate for production. Fixing TE end-to-end is deferred.
+(spin-2 on the E leg, spin-0 on the T leg). The previous
+`_compute_n0_te_fullsky` used the spin-0 (m=0,0,0) Wigner-3j on
+*both* legs and squared the entire response together as
+`(C(l1)*alpha1 + C(l2)*alpha2)^2 * w000^2`. The fix:
+
+* Compute both `w000` (spin-0) and `w2F` (spin-2, m=-2,0,2) on a
+  shared (l1, l2) grid. The two `wigner3j_*` functions agree on
+  l2-grid extent when called with matching `l_min/l_max` for `l_min
+  >= 2` (the spin-2 path internally clamps `l2_min = max(l_min,
+  |m_3|)` = `max(l_min, 2)`).
+* Build two response terms with the spin-2 leg carrying the
+  parity-even mask (since `w2F` does not vanish for L+l1+l2 odd
+  whereas `w000` does):
+
+      f_2 = C(l1) * alpha1 * pf * w2F * even_mask
+      f_0 = C(l2) * alpha2 * pf * w000
+
+* Form `(f_2 + f_0)**2` and integrate. The cross term `2*f_2*f_0`
+  is essential at low L; without it (variant `f_2**2 + f_0**2`)
+  the L=10 residual blows up by ~80x. With it, the bulk-L
+  agreement vs plancklens is at the few-percent structural floor.
+
+Bracket / prefactor convention: spin-0 form (`alpha = bracket/2`,
+`pf = sqrt(...(2L+1)/(4 pi))`) used uniformly on both terms.
+`pf * alpha` is numerically identical in the spin-0 and spin-2
+conventions of OkaHu Eq. 14 (cf. `_compute_n0_ee_fullsky` lines
+761-770).
+
+### What the 5% is
+
+Plancklens `p_te` is not a single-projection QE -- it is the
+symmetric estimator `g_p_te = g_pte + g_pet` (per
+`plancklens/qresp.py` and `augr/_qe.py:316-369` which is bit-for-bit
+validated against plancklens). Its variance is
+
+    Var(g_p_te) = Var(pte) + Var(pet) + 2 Cov(pte, pet)
+                = 2 Var(pte) + 2 Cov(pte, pet)        (by symmetry)
+
+`Cov(pte, pet)` is a Wick contraction between *different* QEs --
+the T leg of `pte` is paired with the T leg of `pet` (which sits
+at l2 not l1 in `pet`), and similarly for E legs. In plancklens
+`nhl._get_nhl`, the double loop `for qe1 in qes1: for qe2 in qes2`
+walks over all such cross-pairings, with the leg-pair contraction
+mediated by
+
+    cls_ivfs[te] = fal_tt . cl_te . fal_ee = cl_te / (C_TT_tot * C_EE_tot)
+
+In the strict-diagonal filter (`fal['te']=0`), this is the only
+non-zero off-diagonal element of `cls_ivfs`. It is non-zero, so
+`Cov(pte, pet)` does not vanish, and contributes a few-percent
+correction to `N_0^p_te` at all L.
+
+augr's `_compute_n0_te_fullsky` does the harmonic-space sum
+`sum_{l1, l2} (f_pte)^2 / denom` which captures `Var(pte)` only --
+it does NOT carry the cross-Wick contraction. This is the origin
+of the 5% bulk-L residual. EE / EB / TB do not have this issue
+because EE is single-projection (no symmetrization) and EB / TB
+are parity-odd whose Wick-pair structure is different.
+
+### The C_TE zero-crossing spikes
+
+At L ~ 1887 / 1969, the residual jumps to ~10-20% (as opposed to
+~5% in mid-L). These L's are near the C_TE zero-crossings around
+l ~ 1850. The response amplitude `f^TE(l1, l2, L)` vanishes when
+`C_TE(l1)*alpha1 + C_TE(l2)*alpha2 ~ 0`, and any structural
+percent-level difference between augr's form and plancklens's
+blows up to large *relative* error there. The bulk-L test band
+`L_BULK_TE = (10, 1800)` excludes this region so the test gate
+reports the structural floor cleanly.
+
+### Filter and apples-to-apples convention
+
+Plancklens forces `fal['te']=0` (strict-diagonal filter
+`1/(C_TT*C_EE)`); augr's production filter is HO02 Eq. 13's
+diagonal approximation `1/(C_TT*C_EE + C_TE^2)`. These differ by
+~few percent at acoustic peaks. To remove this from the validation
+arm, the test calls `compute_n0_te(..., te_filter='strict_diagonal')`
+which selects `1/(C_TT*C_EE)` in the full-sky path only. Production
+defaults are unchanged.
+
+### Why this matters (or doesn't)
+
+Per `compute_n0_te`'s own docstring, TE contributes ~1-2% to
+`N_0^MV` at space-experiment noise levels. A 5% residual on TE is
+therefore sub-1-permille on `N_0^MV`. `iterate_delensing` uses
+`fullsky=False` by default; production sigma(r) forecasts are
+unaffected by either the 5% residual or its fix.
+
+### Path to closure (deferred)
+
+Reaching <1e-3 like the other estimators requires porting
+`plancklens.nhl._get_nhl`'s cross-Wick contraction to harmonic
+space. The leg-construction is already ported in `augr/_qe.py`
+(43 tests bit-exact vs plancklens under `PYTHONPATH=~/cmb/plancklens`).
+The remaining work is the variance machinery itself: implement
+`get_qes('p_te', ...)` -> sum-over-(qe1, qe2)-pairs of
+`Wigner3j-spin-coupled (l1, l2) integrand`, mirroring `nhl.py:65-97`.
+This naturally also fixes any related residual on the multifrequency
+QE / iterative-N_0 path, so it pairs well with future GMV work.
 
 ## References
 

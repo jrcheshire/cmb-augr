@@ -391,7 +391,8 @@ def compute_n0_te(Ls: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
                   n_phi: int = 128,
-                  fullsky: bool = False) -> jnp.ndarray:
+                  fullsky: bool = False,
+                  te_filter: str = 'ho02_diag_approx') -> jnp.ndarray:
     """N_0^{TE}(L) — QE reconstruction noise for the TE estimator.
 
     Follows Hu & Okamoto 2002 (astro-ph/0111606) Table 1 with α = ΘE:
@@ -404,16 +405,30 @@ def compute_n0_te(Ls: jnp.ndarray,
     against the l₁ momentum.)
 
     The exact filter requires a 2×2 covariance inversion at each
-    (l₁, l₂) pair (HO02 Eq. 13). We use a diagonal approximation with
-    denominator C_TT(l₁)C_EE(l₂) + C_TE(l₁)C_TE(l₂). Unlike the full
-    HO02 denominator (always positive by Cauchy-Schwarz), this form
-    can flip sign at (l₁, l₂) where C_TE(l₁)C_TE(l₂) is negative and
+    (l₁, l₂) pair (HO02 Eq. 13). The default ``te_filter`` is augr's
+    diagonal approximation with denominator
+    ``C_TT(l₁) C_EE(l₂) + C_TE(l₁) C_TE(l₂)``. Unlike the full HO02
+    denominator (always positive by Cauchy-Schwarz), this form can
+    flip sign at (l₁, l₂) where C_TE(l₁)C_TE(l₂) is negative and
     large — hence the abs() guard in the full-sky variant. Since TE
     contributes ~1-2% to N_0^{MV} at space-experiment noise levels,
-    the approximation is adequate.
+    the approximation is adequate for production.
+
+    Parameters
+    ----------
+    te_filter : {'ho02_diag_approx', 'strict_diagonal'}
+        ONLY affects the full-sky path (``fullsky=True``); the flat-sky
+        path always uses HO02 Eq. 13's diagonal approximation, which is
+        validated against the closed-form constant-Cl test.
+        ``'ho02_diag_approx'`` (default) reproduces the production
+        filter described above. ``'strict_diagonal'`` drops the
+        ``C_TE * C_TE`` cross term, giving ``C_TT(l₁) C_EE(l₂)``; this
+        matches plancklens with ``fal['te']=0`` for the apples-to-apples
+        N_0 validation harness in ``scripts/n0_validation/``.
     """
     if fullsky:
-        return _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max)
+        return _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
+                                      te_filter=te_filter)
     phi, w_phi = _gl_nodes(n_phi)
     cl_tt_tot = spectra.cl_tt_len + nl_tt
     cl_ee_tot = spectra.cl_ee_len + nl_ee
@@ -802,13 +817,72 @@ def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
     return jnp.where(n0_inv_jax > 0, 1.0 / n0_inv_jax, jnp.inf)
 
 
-def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max):
-    """Full-sky N_0^{TE} using vectorized (l1 l2 L; 0 0 0).
+def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
+                           te_filter='ho02_diag_approx'):
+    """Full-sky N_0^{TE} using OkaHu Table I spin-mixed coupling.
 
-    Uses the scalar (0,0,0) coupling with the diagonal approximation
-    for the TE filter denominator (same as flat-sky).
+    Implements the spin-mixed response per Okamoto & Hu 2003 Table I:
+
+        f^TE(l1, l2, L) = C^TE(l1) * _2F_{l2 L l1} * eps_TE
+                        + C^TE(l2) * _0F_{l1 L l2}
+
+    where _2F uses the spin-2 Wigner-3j (l1, L, l2; -2, 0, 2) and _0F
+    uses the spin-0 Wigner-3j (l1, L, l2; 0, 0, 0). The spin-2 leg
+    carries the parity-even mask eps_TE (per OkaHu Eq. 22); the spin-0
+    (000) Wigner-3j vanishes for L+l1+l2 odd by symmetry, so no explicit
+    mask is needed on the C^TE(l2) leg. With mixed spins the squared
+    response carries an interference cross term
+
+        2 * (C^TE(l1) alpha1 pf w2F) * (C^TE(l2) alpha2 pf w000)
+
+    that pure-spin codes hide via flat-sky phi-integration. (f_2 + f_0)**2
+    captures it correctly.
+
+    Bracket / prefactor convention: we use the spin-0 form uniformly
+    (alpha = bracket/2, pf = sqrt(...(2L+1)/(4 pi))) on BOTH legs.
+    pf * alpha is numerically identical in the spin-0 and spin-2
+    conventions of OkaHu Eq. 14 (cf. _compute_n0_ee_fullsky lines
+    761-770), so the only spin dependence enters through the
+    Wigner-3j building block.
+
+    Residual vs plancklens 'p_te'
+    -----------------------------
+    The form above implements OkaHu Table I's *single-projection* TE
+    response (T-at-l1, E-at-l2). Plancklens's ``'p_te'`` is the
+    *symmetric* estimator ``g_pte + g_pet`` whose variance carries an
+    additional cross-Wick term ``2 * Cov(pte, pet)`` that the single-
+    projection form does not. With ``te_filter='strict_diagonal'``
+    (matching plancklens's ``fal['te']=0``) the structural residual is
+    ~5% across mid-L; it goes to 10-20% at the C_TE zero-crossings
+    near l~1850 where the response amplitude vanishes and the relative
+    error explodes. Per this function's caller's docstring, TE
+    contributes ~1-2% to N_0^MV at space-experiment noise levels, so a
+    5% TE residual is sub-1-permille on N_0^MV. Capturing the cross
+    term cleanly requires porting ``plancklens.nhl._get_nhl``'s leg-
+    pair Wick logic to harmonic space (``augr/_qe.py`` is the bit-
+    exact-validated leg-construction reference); deferred. The
+    ``TestN0TEAgainstPlancklens`` slow test in ``tests/test_delensing.py``
+    locks the 5% structural floor in at ``TOL_FULLSKY_TE_BULK = 6e-2``
+    in bulk-L = (10, 1800).
+
+    Parameters
+    ----------
+    te_filter : {'ho02_diag_approx', 'strict_diagonal'}
+        Filter denominator. Default 'ho02_diag_approx' matches the
+        production flat-sky path: HO02 Eq. 13 diagonal approximation
+        ``C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2)``. The combination can
+        flip sign at (l1, l2) where C_TE(l1)*C_TE(l2) is negative and
+        large, hence the abs() guard. 'strict_diagonal' uses
+        ``C_TT(l1)*C_EE(l2)`` only -- matches plancklens with
+        ``fal['te']=0`` for the apples-to-apples validation harness.
     """
-    from augr.wigner import wigner3j_000_vectorized
+    from augr.wigner import wigner3j_000_vectorized, wigner3j_vectorized
+
+    if te_filter not in ('ho02_diag_approx', 'strict_diagonal'):
+        raise ValueError(
+            f"te_filter must be 'ho02_diag_approx' or 'strict_diagonal', "
+            f"got {te_filter!r}"
+        )
 
     cl_tt_tot = np.asarray(spectra.cl_tt_len + nl_tt)
     cl_ee_tot = np.asarray(spectra.cl_ee_len + nl_ee)
@@ -825,8 +899,19 @@ def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max):
         L_LL = L * (L + 1)
         l1_ll1 = l1_arr * (l1_arr + 1)
 
-        l2_grid, w000 = wigner3j_000_vectorized(L, l1_arr, l2_min=l_min,
-                                                 l2_max=l_max)
+        # Both Wigner-3j building blocks on the same l2 grid.
+        # wigner3j_vectorized internally clamps l2_min to max(l2_min, |m3|);
+        # for m1=-2, m2=0 we have m3=2 so the clamp is a no-op when l_min>=2.
+        l2_grid, w000 = wigner3j_000_vectorized(
+            L, l1_arr, l2_min=l_min, l2_max=l_max,
+        )
+        l2_grid_2, w2F = wigner3j_vectorized(
+            L, l1_arr, m1=-2, m2=0,
+            l2_min_global=l_min, l2_max_global=l_max,
+        )
+        assert l2_grid.shape == l2_grid_2.shape and np.array_equal(
+            l2_grid, l2_grid_2
+        ), "w000 and w2F l2 grids disagree"
         l2_ll2 = l2_grid * (l2_grid + 1)
 
         alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
@@ -840,23 +925,38 @@ def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max):
         valid = (l2_grid >= 0) & (l2_grid < len(cl_te_unl))
         te_l2[valid] = cl_te_unl[l2_grid[valid]]
 
-        f_sq = (te_l1[:, None] * alpha1 + te_l2[None, :] * alpha2) ** 2 \
-               * pf**2 * w000**2
+        # Parity-even mask for the spin-2 leg (OkaHu Eq. 22 eps_TE).
+        # The spin-0 (000) Wigner-3j already vanishes for L+l1+l2 odd
+        # by column-permutation symmetry, so w000 carries the parity
+        # restriction implicitly on the spin-0 leg.
+        parity_sum = (l1_arr.astype(int)[:, None]
+                      + l2_grid.astype(int)[None, :] + L)
+        even_mask = (parity_sum % 2 == 0).astype(float)
 
-        # TE diagonal filter: 1 / (C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2))
+        # Two response terms; sum then square to capture the cross term.
+        f_2 = te_l1[:, None] * alpha1 * pf * w2F * even_mask
+        f_0 = te_l2[None, :] * alpha2 * pf * w000
+        f_total_sq = (f_2 + f_0) ** 2
+
+        # Filter denominator -- dispatched on te_filter.
         tt_l1 = cl_tt_tot[l1_arr]
         ee_l2 = np.zeros(len(l2_grid))
         ee_l2[valid] = cl_ee_tot[l2_grid[valid]]
-        te_tot_l1 = cl_te_tot[l1_arr]
-        te_tot_l2 = np.zeros(len(l2_grid))
-        te_tot_l2[valid] = cl_te_tot[l2_grid[valid]]
 
-        denom = (tt_l1[:, None] * ee_l2[None, :]
-                 + te_tot_l1[:, None] * te_tot_l2[None, :])
-        safe_denom = np.where(np.abs(denom) > 0, denom, 1.0)
-        inv_denom = np.where(np.abs(denom) > 0, 1.0 / safe_denom, 0.0)
+        if te_filter == 'ho02_diag_approx':
+            te_tot_l1 = cl_te_tot[l1_arr]
+            te_tot_l2 = np.zeros(len(l2_grid))
+            te_tot_l2[valid] = cl_te_tot[l2_grid[valid]]
+            denom = (tt_l1[:, None] * ee_l2[None, :]
+                     + te_tot_l1[:, None] * te_tot_l2[None, :])
+            safe_denom = np.where(np.abs(denom) > 0, denom, 1.0)
+            inv_denom = np.where(np.abs(denom) > 0, 1.0 / safe_denom, 0.0)
+        else:  # 'strict_diagonal' -- always positive (auto-spectra)
+            denom = tt_l1[:, None] * ee_l2[None, :]
+            safe_denom = np.where(denom > 0, denom, 1.0)
+            inv_denom = np.where(denom > 0, 1.0 / safe_denom, 0.0)
 
-        n0_inv_samples[i_L] = np.sum(f_sq * inv_denom) / (2 * L + 1)
+        n0_inv_samples[i_L] = np.sum(f_total_sq * inv_denom) / (2 * L + 1)
 
     log_n0_inv = np.log(np.maximum(np.abs(n0_inv_samples), 1e-300))
     n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float), log_n0_inv))

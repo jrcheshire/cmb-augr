@@ -86,9 +86,9 @@ Knowing how the modules chain together matters more than any one file:
    EB, TB), MV-combines, Wiener-filters to get C_L^{φ,res}, applies
    the lensing kernel for residual C_ℓ^{BB}, and iterates. Flat-sky
    uses Gauss-Legendre quadrature (~2 min / 5 iter); full-sky uses
-   `wigner.py` Schulten-Gordon recursion (experimental, ~10 min).
+   `wigner.py` Schulten-Gordon recursion (~10 min / 5 iter).
 
-   **N₀ validation status (2026-05-06).** Validated against `plancklens`
+   **N₀ validation status (2026-05-07).** Validated against `plancklens`
    at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:
    - **TT flat-sky**: machine-precision against the constant-Cℓ closed
      form (`controlled_input_test.py`).
@@ -102,18 +102,37 @@ Knowing how the modules chain together matters more than any one file:
      'pee' / 'p_eb' / 'p_tb'` (symmetrized parity-odd variants for
      EB / TB) to <1e-3 in bulk-L. Locked in by
      `tests/test_delensing.py::TestN0{EE,EB,TB}AgainstPlancklens`.
-   - **TE full-sky**: XFAIL. Two independent issues from the
-     `_sg_b` fix: (a) `_compute_n0_te_fullsky` uses spin-0 Wigner
-     on both legs but per OkaHu Table I should be spin-mixed
-     (spin-2 on E leg, spin-0 on T leg); (b) augr's TE filter
-     `C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2)` is HO02 Eq. 13's
-     diagonal approximation but `run_plancklens.py` forces
-     `fal['te']=0` giving the strict diagonal `C_TT*C_EE` instead.
-     A naive spin-2 swap on the E leg moves the residual from 130x
-     to 51x but doesn't close it (projection-sign subtleties in
-     the symmetrized 'p_te' = pte+pet). Per augr's own docstring
-     TE contributes ~1-2% to N_0^MV at space-experiment noise
-     levels; defer the full TE fix until/unless that gap matters.
+   - **TE full-sky**: validated against `plancklens 'p_te'`
+     (symmetrized) to **<6e-2** in bulk-L = (10, 1800). Deliberately
+     looser than the <1e-3 gate above for a documented structural
+     reason: `_compute_n0_te_fullsky` implements OkaHu 2003 Table I's
+     *single-projection* spin-mixed response (spin-2 on E leg via
+     `wigner3j_vectorized(m1=-2, m2=0)`, spin-0 on T leg via
+     `wigner3j_000_vectorized`, summed and squared together as
+     `(f_2 + f_0)^2`), with the spin-2 leg carrying the parity-even
+     mask. Plancklens `'p_te'` is the symmetric estimator `g_pte +
+     g_pet` whose variance carries an additional cross-Wick term
+     `2 Cov(pte, pet)` that the single-projection form does not
+     reproduce. With `fal['te']=0` the cross term is non-zero
+     (`cls_ivfs[te] = cl_te / (C_TT_tot * C_EE_tot)` is non-zero),
+     contributing the ~5% structural floor across mid-L. The C_TE
+     zero-crossings near l~1850 amplify this to 10-20% relative
+     residual where the response amplitude vanishes — the bulk-L
+     band stops at L=1800 to keep the test gate informative.
+     Production `compute_n0_te(fullsky=True)` keeps HO02 Eq. 13's
+     diagonal-approximation filter `1/(C_TT*C_EE + C_TE^2)`; the
+     test calls with `te_filter='strict_diagonal'` to align with
+     plancklens's `fal['te']=0` apples-to-apples. Per
+     `compute_n0_te`'s docstring TE contributes ~1-2% to N_0^MV at
+     space-experiment noise levels, so the 5% residual on TE is
+     sub-1-permille on N_0^MV — production sigma(r) forecasts are
+     unaffected (and `iterate_delensing` defaults to `fullsky=False`
+     anyway). Path to closure: port `plancklens.nhl._get_nhl`'s
+     leg-pair Wick logic to harmonic space; the leg-construction
+     half is already in `augr/_qe.py` (43 tests bit-exact vs
+     plancklens). Deferred — natural pair with future GMV /
+     iterative-N_0 work. Full diagnosis in `scripts/n0_validation/derivation.md`
+     "TE structural residual" section.
 
      The earlier "5-20x off in bulk-L" residual was a sign error in
      `augr.wigner._sg_b` (Schulten-Gordon recursion coefficient): the

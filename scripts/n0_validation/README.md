@@ -221,45 +221,69 @@ intermediate L. The fix is to make ``n_sample`` ignore ``len(Ls)``
 ~14% high at L=30..300 on the constant-C controlled input" in
 earlier session notes were this artefact.
 
-Status (2026-05-06, all 5 estimators validated)
+Status (2026-05-07, all 5 estimators validated)
 -----------------------------------------------
 
-Four out of five lensing-gradient estimators (TT, EE, EB, TB) now
-validate against plancklens to <1e-3 in bulk-L; TE is documented as
-a known-limit xfail (separate issues from the _sg_b sign bug):
+All five lensing-gradient estimators validate against plancklens.
+TT / EE / EB / TB are at <1e-3 in bulk-L; TE is at a deliberately
+looser 6e-2 bulk-L gate that locks in the structural floor below:
 
-| component   | status                                                   |
-|-------------|----------------------------------------------------------|
-| TT          | PASS at <5e-8 vs plancklens 'ptt'                       |
-| EE          | PASS at <1e-3 vs plancklens 'pee'                       |
-| EB          | PASS at <1e-3 vs plancklens 'p_eb' (symm.)              |
-| TB          | PASS at <1e-3 vs plancklens 'p_tb' (symm.)              |
-| TE          | XFAIL (strict): structural + filter-convention mismatch |
+| component   | status                                                       |
+|-------------|--------------------------------------------------------------|
+| TT          | PASS at <5e-8 vs plancklens 'ptt'                           |
+| EE          | PASS at <1e-3 vs plancklens 'pee'                           |
+| EB          | PASS at <1e-3 vs plancklens 'p_eb' (symm.)                  |
+| TB          | PASS at <1e-3 vs plancklens 'p_tb' (symm.)                  |
+| TE          | PASS at <6e-2 vs plancklens 'p_te' (symm.) -- see below     |
 
 The EE / EB / TB previously documented "5-20x off in bulk-L"
-residual was traced to a sign error in
-``augr.wigner._sg_b`` (Schulten-Gordon 1975 Eq. 5 recursion
-coefficient), not the "missing spin-lowering branch" that
-``derivation.md`` had earlier hypothesised. Once ``_sg_b`` honors
-the SG sign convention, the existing single-bracket Hu-Okamoto Eq.
-14 implementation matches plancklens directly. See
-``derivation.md`` for the full traceback.
+residual was traced to a sign error in ``augr.wigner._sg_b``
+(Schulten-Gordon 1975 Eq. 5 recursion coefficient), not the
+"missing spin-lowering branch" that ``derivation.md`` had earlier
+hypothesised. Once ``_sg_b`` honors the SG sign convention, the
+existing single-bracket Hu-Okamoto Eq. 14 implementation matches
+plancklens directly. See ``derivation.md`` for the full traceback.
 
-TE separately has (1) a structural issue in
-``_compute_n0_te_fullsky`` (uses spin-0 Wigner on both legs but per
-OkaHu Table I should be spin-mixed: spin-2 on the E leg, spin-0 on
-the T leg), and (2) a filter-convention mismatch (augr uses the
-HO02 Eq. 13 "diagonal approximation" filter
-``C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2)`` while ``run_plancklens.py``
-forces ``fal['te']=0`` for the strict diagonal-IVF
-``C_TT(l1)*C_EE(l2)``). A naive spin-2 swap on the E leg moves the
-residual from 130x → 51x but doesn't close it, indicating
-projection / sign subtleties in the symmetrized 'p_te' = pte+pet
-that OkaHu's single-projection form doesn't directly capture. Per
-augr's own docstring, "TE contributes ~1-2% to N_0^MV at
-space-experiment noise levels, the approximation is adequate" --
-fixing TE end-to-end is left as a follow-up. Full agreement on **TT**,
-L in [2, 3000]:
+TE was originally documented as XFAIL with two issues: (a) a
+structural use of spin-0 Wigner on both legs (should be spin-mixed
+per OkaHu 2003 Table I) and (b) a filter-convention mismatch
+between augr's HO02 Eq. 13 diagonal-approximation filter
+``C_TT*C_EE + C_TE^2`` and plancklens's ``fal['te']=0`` strict
+diagonal ``C_TT*C_EE``. The 2026-05-07 fix:
+
+* Resolves (a) by computing both ``w000`` and ``w_2F``
+  Wigner-3j building blocks on a shared (l1, l2) grid and forming
+  ``f^TE = f_2 + f_0`` with ``f_2 = C(l1)*alpha1*pf*w_2F*even_mask``
+  (spin-2 on the E leg) and ``f_0 = C(l2)*alpha2*pf*w_000`` (spin-0
+  on the T leg), squared as ``(f_2 + f_0)^2`` so the cross term is
+  retained.
+* Resolves (b) by adding a ``te_filter`` parameter to
+  ``compute_n0_te``: production default ``'ho02_diag_approx'``
+  preserves the existing filter; the validation harness selects
+  ``'strict_diagonal'`` to be apples-to-apples with plancklens.
+
+Residual after fix: ~5% structural across mid-L, ~10-20% at the
+C_TE zero-crossings around l~1850 where the response amplitude
+vanishes. The 5% is structural, not numerical: plancklens 'p_te' is
+the *symmetric* estimator ``g_pte + g_pet`` whose variance carries
+a cross-Wick term ``2 Cov(pte, pet)`` that augr's single-projection
+form doesn't capture. With ``fal['te']=0`` the cross term is
+non-zero because ``cls_ivfs[te] = cl_te / (C_TT_tot * C_EE_tot)``
+is non-zero; closing it cleanly requires porting
+``plancklens.nhl._get_nhl``'s leg-pair Wick logic to harmonic
+space. The leg-construction half is already ported in
+``augr/_qe.py`` (43 tests bit-exact vs plancklens under
+``PYTHONPATH=~/cmb/plancklens``); the variance machinery is the
+remaining piece. Deferred. See ``derivation.md`` "TE structural
+residual" for the full diagnosis.
+
+Per ``compute_n0_te``'s own docstring, TE contributes ~1-2% to
+``N_0^MV`` at space-experiment noise levels, so a 5% TE residual is
+sub-1-permille on ``N_0^MV``. ``iterate_delensing`` defaults to
+``fullsky=False`` so production sigma(r) forecasts are unaffected
+either way.
+
+Full agreement on **TT**, L in [2, 3000]:
 
 | L band         | max ``\|ratio - 1\|`` |
 |----------------|-----------------------|
