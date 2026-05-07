@@ -30,12 +30,10 @@ Default output: ``n0_reference_litebird.npz`` in this directory.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
 import numpy as np
-
 
 # ---------------------------------------------------------------------
 # 1. Build inputs from augr (the same nl_*, cl_* arrays augr.delensing
@@ -345,8 +343,9 @@ def main() -> None:
 
 def _plancklens_version() -> str:
     try:
-        import plancklens  # noqa: F401
         import importlib.metadata as md
+
+        import plancklens  # noqa: F401
 
         return md.version("plancklens")
     except Exception:  # pragma: no cover
