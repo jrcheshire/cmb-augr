@@ -42,6 +42,7 @@ import numpy as np
 #    sees when running compute_n0_*).
 # ---------------------------------------------------------------------
 
+
 def build_inputs(lmax_ivf: int):
     """Return a dict of inputs matching augr.delensing's compute_n0_*.
 
@@ -87,8 +88,8 @@ def build_inputs(lmax_ivf: int):
 # 2. plancklens N_0 wrapper.
 # ---------------------------------------------------------------------
 
-def plancklens_n0(inputs: dict, Ls: np.ndarray, lmax_ivf: int,
-                  l_min: int = 2) -> dict:
+
+def plancklens_n0(inputs: dict, Ls: np.ndarray, lmax_ivf: int, l_min: int = 2) -> dict:
     """Compute reference N_0 via the plancklens canonical recipe.
 
     Follows the construction at ``plancklens/n0s.py:380-440`` (the body
@@ -197,39 +198,66 @@ def plancklens_n0(inputs: dict, Ls: np.ndarray, lmax_ivf: int,
     Ls_idx = Ls.astype(int)
 
     # plancklens supports the following QE keys for the lensing potential phi:
-    #   'ptt' <-> augr.compute_n0_tt        (apples-to-apples)
-    #   'pee' <-> augr.compute_n0_ee        (apples-to-apples)
-    #   'p_p' <-> MV(augr.compute_n0_ee, augr.compute_n0_eb) (joint vs diagonal)
-    #   'p'   <-> augr.compute_n0_mv        (joint vs diagonal)
+    #   'ptt'  <-> augr.compute_n0_tt        (apples-to-apples)
+    #   'pee'  <-> augr.compute_n0_ee        (apples-to-apples)
+    #   'p_eb' <-> augr.compute_n0_eb        (symmetrized, apples-to-apples)
+    #   'p_te' <-> augr.compute_n0_te        (symmetrized, apples-to-apples)
+    #   'p_tb' <-> augr.compute_n0_tb        (symmetrized, apples-to-apples)
+    #   'p_p'  <-> MV(augr.compute_n0_ee, augr.compute_n0_eb) (joint vs diagonal)
+    #   'p'    <-> augr.compute_n0_mv        (joint vs diagonal)
     #
-    # Notes: 'peb' is invalid with cls_w['bb']=cl_unl (because cl_bb_unl=0
-    # in scalar-only models, the (e,b) projection of the joint p QE
-    # vanishes). 'peb' with cls_w['bb']=cl_lensed gives a non-zero but
-    # different result; the convention mismatch with augr's
-    # 'response uses C_EE only' makes that comparison ambiguous and we
-    # skip it here. 'pte' / 'ptb' similarly have convention complications.
+    # We use the symmetrized variants 'p_te' / 'p_eb' / 'p_tb'
+    # ((peb + pbe), (pte + pet), (ptb + pbt) per qresp.py:84-85) rather
+    # than the non-symmetrized 'pte' / 'peb' / 'ptb', for two reasons:
+    # (1) augr's compute_n0_te / _eb / _tb are themselves
+    # symmetrization-invariant -- compute_n0_te builds f =
+    # C^TE(l1)*alpha1 + C^TE(l2)*alpha2 which is l1 <-> l2 symmetric,
+    # and the EB / TB analogs are similarly built around the
+    # parity-odd coupling that survives the (E, B) leg swap. The
+    # symmetrized plancklens variants are the apples-to-apples
+    # reference. (2) Empirically, the non-symmetrized 'ptb' returns
+    # GG_N0 = 0 with our diagonal-IVF (no cls_ivfs['tb']) and
+    # cls_w['bb'] = cl_unl ~= 0 setup: at the qe-pair level
+    # (so=0, to=1) gives (-1)^(to+so) = -1 in nhl._get_nhl line 85,
+    # and with no imaginary-phase carriers in cls_ivfs we get
+    # R_sutv = R_msmtuv exactly so 0.5*R - 0.5*R = 0. The signal
+    # lives entirely in CC_N0 = R + R = 2R for the non-symmetrized
+    # parity-odd qe; the symmetrized variant restores it to GG_N0.
     keys = {
-        "tt": "ptt",   # temperature-only
-        "ee": "pee",   # E-mode-only (apples-to-apples)
-        "pp": "p_p",   # polarization-only joint (EE+EB-like)
-        "mv": "p",     # full MV (all 5, joint)
+        "tt": "ptt",  # temperature-only
+        "ee": "pee",  # E-mode-only
+        "eb": "p_eb",  # EB symmetrized
+        "te": "p_te",  # TE symmetrized
+        "tb": "p_tb",  # TB symmetrized
+        "pp": "p_p",  # polarization-only joint (EE+EB-like)
+        "mv": "p",  # full MV (all 5, joint)
     }
 
     def _safe_div_squared(num: np.ndarray, denom: np.ndarray) -> np.ndarray:
         """num / denom**2 with safe handling at denom==0."""
-        denom2 = denom ** 2
+        denom2 = denom**2
         return np.where(denom2 > 0, num / np.where(denom2 > 0, denom2, 1.0), 0.0)
 
     out: dict[str, np.ndarray] = {}
     for short, qe_key in keys.items():
         # 5a. Unnormalized QE variance (returns 4-tuple (GG, CC, GC, CG)).
         n_gg, _n_cc = nhl.get_nhl(
-            qe_key, qe_key, cls_w, cls_ivfs,
-            lmax_ivf, lmax_ivf, lmax_out=lmax_qlm,
+            qe_key,
+            qe_key,
+            cls_w,
+            cls_ivfs,
+            lmax_ivf,
+            lmax_ivf,
+            lmax_out=lmax_qlm,
         )[:2]
         # 5b. Response normalization (cls_f = cls_w for fiducial response).
         r_gg, _r_cc = qresp.get_response(
-            qe_key, lmax_ivf, "p", cls_w, cls_w, fal,
+            qe_key,
+            lmax_ivf,
+            "p",
+            cls_w,
+            cls_w,
+            fal,
             lmax_qlm=lmax_qlm,
         )[:2]
         # Actual N_0 in C_L^phi phi units.
@@ -245,53 +273,71 @@ def plancklens_n0(inputs: dict, Ls: np.ndarray, lmax_ivf: int,
 # 3. Driver.
 # ---------------------------------------------------------------------
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--out",
         default=str(Path(__file__).parent / "n0_reference_litebird.npz"),
         help="Output NPZ path (default: n0_reference_litebird.npz next to this script).",
     )
     parser.add_argument(
-        "--lmax-ivf", type=int, default=3000,
+        "--lmax-ivf",
+        type=int,
+        default=3000,
         help="Maximum ell in the QE filter sum; matches augr.delensing default (3000).",
     )
     parser.add_argument(
-        "--n-L", type=int, default=120,
+        "--n-L",
+        type=int,
+        default=120,
         help="Number of L sample points (log-uniform between 2 and lmax_ivf).",
     )
     parser.add_argument(
-        "--l-min", type=int, default=2,
+        "--l-min",
+        type=int,
+        default=2,
         help="Lower limit on the QE l1 sum. Below this, fal/cls are zeroed "
-             "(matches plancklens/n0s.py:137 and augr.compute_n0_*'s "
-             "l_min). Default 2.",
+        "(matches plancklens/n0s.py:137 and augr.compute_n0_*'s "
+        "l_min). Default 2.",
     )
     args = parser.parse_args()
 
     print("Building inputs from augr.config.litebird_like() ...", flush=True)
     inputs = build_inputs(args.lmax_ivf)
 
-    Ls = np.unique(np.concatenate([
-        np.arange(2, 21),  # dense at low L
-        np.geomspace(20, args.lmax_ivf, args.n_L).astype(int),
-    ]).clip(2, args.lmax_ivf)).astype(int)
+    Ls = np.unique(
+        np.concatenate(
+            [
+                np.arange(2, 21),  # dense at low L
+                np.geomspace(20, args.lmax_ivf, args.n_L).astype(int),
+            ]
+        ).clip(2, args.lmax_ivf)
+    ).astype(int)
 
-    print(f"Computing plancklens N_0 at {Ls.size} L values "
-          f"(lmax_ivf={args.lmax_ivf}, l_min={args.l_min}) ...", flush=True)
+    print(
+        f"Computing plancklens N_0 at {Ls.size} L values "
+        f"(lmax_ivf={args.lmax_ivf}, l_min={args.l_min}) ...",
+        flush=True,
+    )
     n0_dict = plancklens_n0(inputs, Ls, args.lmax_ivf, l_min=args.l_min)
 
     payload = {
         "Ls": Ls,
         **inputs,
         **n0_dict,
-        "_metadata": np.array([
-            f"plancklens version: {_plancklens_version()}",
-            "augr config: litebird_like() (LiteBIRD PTEP, 22 channels, 3 yr, f_sky=0.7)",
-            f"lmax_ivf: {args.lmax_ivf}",
-            f"l_min: {args.l_min}",
-            "convention: response uses UNLENSED C_l (cls_w, matches augr), filter uses lensed+noise; output in C_L^pp units; fal[:l_min]=0 applied (matches plancklens/n0s.py:137)",
-        ], dtype=object),
+        "_metadata": np.array(
+            [
+                f"plancklens version: {_plancklens_version()}",
+                "augr config: litebird_like() (LiteBIRD PTEP, 22 channels, 3 yr, f_sky=0.7)",
+                f"lmax_ivf: {args.lmax_ivf}",
+                f"l_min: {args.l_min}",
+                "convention: response uses UNLENSED C_l (cls_w, matches augr), filter uses lensed+noise; output in C_L^pp units; fal[:l_min]=0 applied (matches plancklens/n0s.py:137)",
+            ],
+            dtype=object,
+        ),
     }
     np.savez(args.out, **payload)
     print(f"Wrote {args.out}", flush=True)
@@ -301,6 +347,7 @@ def _plancklens_version() -> str:
     try:
         import plancklens  # noqa: F401
         import importlib.metadata as md
+
         return md.version("plancklens")
     except Exception:  # pragma: no cover
         return "unknown"
