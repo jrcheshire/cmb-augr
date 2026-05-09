@@ -35,7 +35,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 
 from augr.covariance import bandpower_covariance_blocks_from_noise
@@ -47,7 +46,6 @@ from augr.telescope import (
     count_pixels_continuous,
     horn_diameter,
 )
-
 
 # Backward-compat alias: the optimize and FisherForecast paths share the
 # same primitive (jnp.linalg.solve per bin). Kept as a name in case any

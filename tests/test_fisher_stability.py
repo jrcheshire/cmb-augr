@@ -46,9 +46,8 @@ from augr.fisher import FisherForecast
 from augr.foregrounds import MomentExpansionModel
 from augr.instrument import noise_nl_continuous
 from augr.optimize import make_optimization_context, sigma_r_from_channels
-from augr.signal import SignalModel, flatten_params
+from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
-
 
 # ---------------------------------------------------------------------------
 # Shared module-scope fixtures
@@ -286,9 +285,9 @@ class TestOptimizeMatchesFisherForecast:
         from dataclasses import replace
         new_channels = list(pico_instrument.channels)
         new_channels[20] = replace(new_channels[20],
-                                    n_detectors=int(round(n_det_new[20])))
+                                    n_detectors=round(n_det_new[20]))
         new_channels[9] = replace(new_channels[9],
-                                   n_detectors=int(round(n_det_new[9])))
+                                   n_detectors=round(n_det_new[9]))
         inst_new = replace(pico_instrument, channels=tuple(new_channels))
         sig_new = SignalModel(
             inst_new, signal_model.foreground_model, CMBSpectra(),
@@ -411,7 +410,7 @@ def test_lbfgs_finds_real_minimum_on_pico(opt_ctx, pico_instrument):
     from dataclasses import replace
     n_opt = np.asarray(tier_to_ndet(jnp.asarray(res.x)))
     new_channels = tuple(
-        replace(ch, n_detectors=int(round(n_opt[i])))
+        replace(ch, n_detectors=round(n_opt[i]))
         for i, ch in enumerate(pico_instrument.channels)
     )
     inst_opt = replace(pico_instrument, channels=new_channels)
