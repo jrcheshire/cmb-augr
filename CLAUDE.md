@@ -75,9 +75,11 @@ Knowing how the modules chain together matters more than any one file:
    the synthetic top-hat / Gaussian binning), and a full
    `(n_data, n_data)` solve dispatched automatically when
    `signal_model.has_measured_bpwf` is True (BPWFs typically overlap so
-   the per-bin block structure breaks). Both use eigendecomposition
-   with non-positive-eigenvalue clipping for robustness against
-   near-singular covariances.
+   the per-bin block structure breaks). Both use ``jnp.linalg.solve``
+   (LU with partial pivoting) and a closing ``0.5 * (F + F^T)``
+   symmetrization. ``optimize.sigma_r_from_channels`` and
+   ``FisherForecast.sigma`` route through the same primitive, so they
+   agree to fp64 precision at any allocation.
 
 5. **`delensing.py` + `wigner.py`.** Optional self-consistent
    iterative QE delensing replacing the `A_lens` parameter.
@@ -331,12 +333,35 @@ convention; naming is `omega_<species>_<quantity>` where species is
   This is the same family of footgun as `requires_external_noise=True`
   on `cleaned_map_instrument`, with the trigger sitting on the signal
   side rather than the instrument side.
-- **`optimize.sigma_r_from_*` vs `FisherForecast.sigma`.** `optimize`
-  uses a gradient-smooth `solve`-based inversion;
-  `FisherForecast.sigma` uses `eigh` with silent clipping of
-  non-positive eigenvalues. The two can disagree by a few percent in
-  degenerate-cov regimes. For reporting absolute numbers prefer
-  `FisherForecast.sigma`; for autodiff use `optimize.*`.
+- **`optimize.sigma_r_from_*` vs `FisherForecast.sigma` agree to fp64
+  precision.** Both route through ``fisher._fisher_from_blocks``
+  (``jnp.linalg.solve`` per bin, then a ``0.5 * (F + F^T)``
+  symmetrisation). The previous "few-percent disagreement" caveat was
+  inverted: at PICO-class conditioning (cov_b cond ~10^28 at ell=2),
+  the legacy ``eigh + (s>0)`` clip biased F upward by 5-44% per bin
+  -- it face-valued tiny positive eigenvalues that were fp64 rounding
+  artifacts, contributing fictitious Fisher info via ``s_inv = 1/s``
+  for ``s ~ 1e-14``. ``jnp.linalg.solve`` is essentially exact at fp64
+  (validated against mpmath @ 30 dps on bins 0/1/12/25/37 of the PICO
+  21-channel moment-FG fixture: rel error 1e-13 to 6e-3 across the ell
+  range, with bin 0 setting the ~0.6% floor). See
+  ``tests/test_fisher_stability.py`` for the locked-in regression.
+
+- **Open numerical follow-ups (PICO conditioning).** Two failure modes
+  remain after the unification, both tracked as xfail in the stability
+  test file:
+  - **JIT vs eager drift.** Wrapping ``sigma_r_from_channels`` in an
+    outer ``jax.jit`` reorders XLA fusion of the covariance build and
+    drifts σ(r) by ~10% from eager evaluation. The inner Fisher
+    primitive is unchanged; the drift is upstream in the cov_b
+    assembly under fusion.
+  - **Gradient stability for L-BFGS-B.** Forward solve is essentially
+    exact, but ``d/dθ A^{-1} J`` at cond~10^28 amplifies roundoff in
+    the backward pass through two ``solve`` calls per bin. L-BFGS-B
+    line search aborts with status=ABNORMAL even though the function
+    values do decrease through the trial steps. Likely fixable with a
+    prewhitening pass for the backward direction only; not addressed
+    in the unification PR.
 
 ## Measured bandpower window functions
 
