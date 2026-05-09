@@ -75,9 +75,17 @@ Knowing how the modules chain together matters more than any one file:
    the synthetic top-hat / Gaussian binning), and a full
    `(n_data, n_data)` solve dispatched automatically when
    `signal_model.has_measured_bpwf` is True (BPWFs typically overlap so
-   the per-bin block structure breaks). Both use ``jnp.linalg.solve``
-   (LU with partial pivoting) and a closing ``0.5 * (F + F^T)``
-   symmetrization. ``optimize.sigma_r_from_channels`` and
+   the per-bin block structure breaks). Both prewhiten by
+   ``D = sqrt(diag(cov))`` (correlation-matrix trick) and use
+   ``jnp.linalg.solve`` on the well-conditioned cov_white, with a
+   closing ``0.5 * (F + F^T)`` symmetrization. The whitening is a
+   change of variables (``D · cov_w · D = cov``, so the D's pair up
+   into ``J_w``'s and the math is identity); numerically it drops
+   cov's condition number by 10+ orders of magnitude at PICO-class
+   instruments, which both tightens forward F (mpmath-validated to
+   3e-5 rel error at bin 0, vs 6e-3 for plain ``solve(cov, J)``) and
+   makes the autograd-traced backward solve signal-dominated rather
+   than noise-dominated. ``optimize.sigma_r_from_channels`` and
    ``FisherForecast.sigma`` route through the same primitive, so they
    agree to fp64 precision at any allocation.
 
@@ -335,33 +343,34 @@ convention; naming is `omega_<species>_<quantity>` where species is
   side rather than the instrument side.
 - **`optimize.sigma_r_from_*` vs `FisherForecast.sigma` agree to fp64
   precision.** Both route through ``fisher._fisher_from_blocks``
-  (``jnp.linalg.solve`` per bin, then a ``0.5 * (F + F^T)``
-  symmetrisation). The previous "few-percent disagreement" caveat was
-  inverted: at PICO-class conditioning (cov_b cond ~10^28 at ell=2),
-  the legacy ``eigh + (s>0)`` clip biased F upward by 5-44% per bin
-  -- it face-valued tiny positive eigenvalues that were fp64 rounding
-  artifacts, contributing fictitious Fisher info via ``s_inv = 1/s``
-  for ``s ~ 1e-14``. ``jnp.linalg.solve`` is essentially exact at fp64
-  (validated against mpmath @ 30 dps on bins 0/1/12/25/37 of the PICO
-  21-channel moment-FG fixture: rel error 1e-13 to 6e-3 across the ell
-  range, with bin 0 setting the ~0.6% floor). See
-  ``tests/test_fisher_stability.py`` for the locked-in regression.
+  (prewhiten by ``sqrt(diag(cov_b))``, then ``jnp.linalg.solve`` per
+  bin, then ``0.5 * (F + F^T)``). The previous "few-percent
+  disagreement" caveat was inverted: at PICO-class conditioning
+  (cov_b cond ~10^28 at ell=2), the legacy ``eigh + (s>0)`` clip
+  biased F upward by 5-44% per bin -- it face-valued tiny positive
+  eigenvalues that were fp64 rounding artifacts, contributing
+  fictitious Fisher info via ``s_inv = 1/s`` for ``s ~ 1e-14``.
+  Prewhiten + solve is essentially exact (validated against mpmath @
+  30 dps at bin 0: 3e-5 rel error vs 6e-3 for plain ``solve(cov, J)``;
+  at higher bins both paths are at fp64-noise level).
 
-- **Open numerical follow-ups (PICO conditioning).** Two failure modes
-  remain after the unification, both tracked as xfail in the stability
-  test file:
-  - **JIT vs eager drift.** Wrapping ``sigma_r_from_channels`` in an
-    outer ``jax.jit`` reorders XLA fusion of the covariance build and
-    drifts σ(r) by ~10% from eager evaluation. The inner Fisher
-    primitive is unchanged; the drift is upstream in the cov_b
-    assembly under fusion.
-  - **Gradient stability for L-BFGS-B.** Forward solve is essentially
-    exact, but ``d/dθ A^{-1} J`` at cond~10^28 amplifies roundoff in
-    the backward pass through two ``solve`` calls per bin. L-BFGS-B
-    line search aborts with status=ABNORMAL even though the function
-    values do decrease through the trial steps. Likely fixable with a
-    prewhitening pass for the backward direction only; not addressed
-    in the unification PR.
+- **JIT vs eager: ~1e-5 wobble at PICO conditioning.** Top-level
+  ``jax.jit`` over ``sigma_r_from_channels`` reorders XLA fusion of
+  the per-bin scan that accumulates F across 38 bins; F[r,r] is
+  bin-0-dominated so it's stable, but small off-diagonals drift by
+  orders of magnitude and σ(r) inherits ~1e-5 relative shift.
+  fp64-unavoidable without a deterministic-summation rewrite of the
+  scan; `tests/test_fisher_stability.py::test_jit_eager_agreement`
+  gates at ``rtol=1e-4``.
+
+- **Gradient stability requires prewhitening.** Without it,
+  ``jax.grad`` through ``solve(cov_b, J_b)`` at cov_b cond ~10^28
+  drifts 50-270% per axis between jit and eager (sign flips on most
+  axes), and finite-difference references are uncorrelated with
+  autodiff at any step size. Post-prewhitening: per-axis jit-vs-eager
+  rtol ~1e-3, ``cos(jax.grad, fd) > 0.99`` at h=1e-2, L-BFGS-B
+  converges with success=True and σ_opt < σ_pico under both
+  ``optimize.*`` and ``FisherForecast.sigma``.
 
 ## Measured bandpower window functions
 

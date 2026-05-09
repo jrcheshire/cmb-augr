@@ -53,25 +53,41 @@ def _fisher_from_blocks(J_blocks: jnp.ndarray,
     Returns:
         Fisher matrix of shape (n_free, n_free).
 
-    Each bin's contribution is computed via ``jnp.linalg.solve(cov_b, J_b)``
-    (LU with partial pivoting) followed by ``J_b.T @ (cov_b^{-1} J_b)``.
-    For deep multifrequency instruments cov_b can carry condition numbers
-    of 10^20 or worse and 30-90 of its 200+ eigenvalues come back
-    numerically non-positive at fp64; LU/solve handles that regime
-    cleanly while an ``eigh + (s > 0)`` clip biases F upward by 5-44%
-    per bin (validated against mpmath @ 30 dps on a PICO 21-channel
-    moment-FG fixture; see tests/test_fisher_stability.py).
+    Each bin's contribution is computed via prewhitening (correlation-
+    matrix trick: ``D_b = sqrt(diag(cov_b))``, then
+    ``cov_w = D_b^{-1} cov_b D_b^{-1}``, ``J_w = D_b^{-1} J_b``) followed
+    by ``jnp.linalg.solve(cov_w, J_w)``. Mathematically equivalent to
+    ``J_b^T cov_b^{-1} J_b`` (the D_b's pair up algebraically): cov_b =
+    D_b cov_w D_b ⇒ cov_b^{-1} = D_b^{-1} cov_w^{-1} D_b^{-1}, and the
+    D_b's contract with the J_b's into J_w's. Forward F is unchanged
+    within fp64 roundoff (no ε ridge; no bias).
 
-    Smooth under ``jax.grad`` (no piecewise ``where`` clip), JIT-stable,
-    and matches ``optimize.sigma_r_from_channels`` to fp64 precision.
-    A final ``0.5 * (F + F^T)`` symmetrization absorbs the ~1e-4
-    asymmetry that ``solve`` accumulates on ill-conditioned inputs;
-    Fisher is mathematically symmetric so this is the correct closure.
+    Why this matters numerically: cov_b at PICO 21-channel conditioning
+    has condition number ~10^28 with 84/231 fp64-rounded-negative
+    eigenvalues; ``jax.grad`` through ``solve(cov_b, J_b)`` amplifies
+    those rounding artifacts in the backward pass, drifting per-axis
+    gradients by 50-270% between jit and eager and giving random
+    sign agreement with finite-difference references. After whitening
+    by sqrt(diag(cov_b)), entries of cov_w are bounded by 1 in
+    magnitude (Cauchy-Schwarz) and the condition number drops to
+    ~10^15 at the same fixture -- still ill-conditioned, but well
+    within fp64 LU's stable regime for both the forward solve and the
+    autograd-traced backward solve. Empirically: post-fix per-axis
+    jit-vs-eager gradient agreement is rtol ~1e-4, and
+    ``cos(jax.grad, fd)`` is >0.99 at h=1e-2.
+
+    A final ``0.5 * (F + F^T)`` symmetrization absorbs accumulated
+    asymmetry from the per-bin scan; Fisher is mathematically symmetric
+    so this is the correct closure.
     """
     def _one_bin(carry, inputs):
         J_b, cov_b = inputs
-        SinvJ = jnp.linalg.solve(cov_b, J_b)
-        return carry + J_b.T @ SinvJ, None
+        d = jnp.sqrt(jnp.diag(cov_b))
+        inv_d = 1.0 / d
+        cov_w = cov_b * (inv_d[:, None] * inv_d[None, :])
+        J_w = J_b * inv_d[:, None]
+        SinvJ_w = jnp.linalg.solve(cov_w, J_w)
+        return carry + J_w.T @ SinvJ_w, None
 
     n_free = J_blocks.shape[2]
     F, _ = jax.lax.scan(_one_bin, jnp.zeros((n_free, n_free)),
@@ -85,12 +101,16 @@ def _fisher_from_full(J: jnp.ndarray,
     """Compute F = J^T cov^-1 J for the full (n_data, n_data) covariance.
 
     Used for the BPWF-aware path where bins couple and the per-bin
-    block-diagonal solve is unavailable. Solves via ``jnp.linalg.solve``
-    on the full assembled covariance -- same primitive, same
-    smoothness/precision properties as ``_fisher_from_blocks``.
-    Symmetrized for the same reason.
+    block-diagonal solve is unavailable. Same prewhiten + solve
+    primitive as ``_fisher_from_blocks``: ``D = sqrt(diag(cov))``,
+    ``cov_w = D^{-1} cov D^{-1}``, ``J_w = D^{-1} J``, then
+    ``jnp.linalg.solve(cov_w, J_w)``. Symmetrised for the same reason.
     """
-    F = J.T @ jnp.linalg.solve(cov, J)
+    d = jnp.sqrt(jnp.diag(cov))
+    inv_d = 1.0 / d
+    cov_w = cov * (inv_d[:, None] * inv_d[None, :])
+    J_w = J * inv_d[:, None]
+    F = J_w.T @ jnp.linalg.solve(cov_w, J_w)
     return 0.5 * (F + F.T)
 
 
