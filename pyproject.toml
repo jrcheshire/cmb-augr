@@ -66,6 +66,7 @@ scipy = ">=1.10"
 matplotlib = ">=3.7"
 healpy = ">=1.16"
 pytest = ">=7.0"
+pytest-xdist = ">=3.0"
 camb = "*"
 jupyterlab = "*"
 ipykernel = "*"
@@ -81,9 +82,9 @@ pyyaml = "*"
 cmb-augr = { path = ".", editable = true }
 
 [tool.pixi.tasks]
-test = "pytest tests/ -v -m 'not slow'"
+test = { cmd = "pytest tests/ -m 'not slow' -n auto", env = { AUGR_DELENS_WORKERS = "1" } }
 test-slow = "pytest tests/ -v -m slow"
-test-all = "pytest tests/ -v"
+test-all = { depends-on = ["test", "test-slow"] }
 validate-pico = "python scripts/validate_pico.py"
 validate-bk = "python scripts/validate_bk.py"
 nb = "jupyter lab notebooks/"
