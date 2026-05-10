@@ -33,12 +33,86 @@ All spectra in C_ell convention [μK²] for CMB, dimensionless for φφ.
 
 from __future__ import annotations
 
+import atexit
+import multiprocessing as mp
 import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+
+# ---------------------------------------------------------------------------
+# Per-L parallelism inside the full-sky N_0 / lensing_kernel routines.
+#
+# Each ``_compute_n0_X_fullsky`` and ``_lensing_kernel_fullsky`` function
+# runs an outer ``for L in L_samples`` loop where the per-L work is
+# Wigner-3j-table generation + numpy matmul. We dispatch the loop to a
+# module-level lazy ``ProcessPoolExecutor`` so each L iteration runs in
+# a separate child process -- no GIL contention from the
+# Schulten-Gordon recursion's Python loop, no nested-thread
+# oversubscription against Apple Accelerate's intrinsic BLAS
+# parallelism. On a 16-core machine at PICO l_max_qe=1500 fullsky=True,
+# ProcessPool max_workers=cpu_count delivers ~10× speedup vs
+# sequential (1825s -> ~180s); ThreadPool was actively *slower* than
+# sequential due to GIL contention.
+#
+# AUGR_DELENS_WORKERS overrides the worker count; set to 1 to disable
+# the pool (useful for debugging, profiling, or when the caller is
+# running many delensing instances in parallel via outer
+# multiprocessing -- e.g. sweep_dmirror.py --workers -- and per-L
+# parallelism would oversubscribe).
+#
+# The pool is created lazily on first use and reused across calls
+# (`atexit` cleans it up). The per-L worker functions must be
+# *module-level* (not closures) so they're picklable for spawn. Each
+# `_compute_n0_X_fullsky` defines a `_per_L_X` module-level function
+# and passes ``functools.partial(_per_L_X, ...)`` to ``_per_L_map``.
+# ---------------------------------------------------------------------------
+_PER_L_WORKERS = int(os.environ.get("AUGR_DELENS_WORKERS",
+                                     str(os.cpu_count() or 1)))
+
+_PER_L_POOL: ProcessPoolExecutor | None = None
+_force_serial: bool = False  # opt-out per-call escape hatch
+
+
+def _get_per_L_pool() -> ProcessPoolExecutor | None:
+    """Return the module-level lazy ProcessPoolExecutor (None if disabled)."""
+    if _PER_L_WORKERS <= 1 or _force_serial:
+        return None
+    global _PER_L_POOL
+    if _PER_L_POOL is None:
+        _PER_L_POOL = ProcessPoolExecutor(
+            max_workers=_PER_L_WORKERS,
+            mp_context=mp.get_context("spawn"),
+        )
+    return _PER_L_POOL
+
+
+@atexit.register
+def _shutdown_per_L_pool() -> None:
+    if _PER_L_POOL is not None:
+        _PER_L_POOL.shutdown(wait=False, cancel_futures=True)
+
+
+def _per_L_map(per_L_fn, L_samples):
+    """Apply ``per_L_fn(L)`` for each L in ``L_samples``; return list of results.
+
+    Uses the module-level ProcessPool when ``_PER_L_WORKERS > 1`` and the
+    sample count justifies parallelism. Falls back to sequential list
+    comprehension otherwise.
+
+    ``per_L_fn`` MUST be picklable (use ``functools.partial`` of a
+    module-level function, not a closure). All extra args bound by
+    ``partial`` must be picklable too -- numpy arrays are fine; jnp
+    arrays cost extra serialisation, prefer to convert in advance.
+    """
+    pool = _get_per_L_pool()
+    if pool is None or len(L_samples) <= 1:
+        return [per_L_fn(L) for L in L_samples]
+    return list(pool.map(per_L_fn, L_samples))
 
 # Data file locations
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -466,7 +540,9 @@ def compute_n0_mv(Ls: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
                   n_phi: int = 128,
-                  fullsky: bool = False) -> jnp.ndarray:
+                  fullsky: bool = False,
+                  *,
+                  max_workers: int | None = None) -> jnp.ndarray:
     """Minimum-variance combination of all five QE estimators.
 
     1/N_0^{MV}(L) = Σ_α 1/N_0^α(L)    (HO02 Eq. 22)
@@ -476,7 +552,35 @@ def compute_n0_mv(Ls: jnp.ndarray,
     are exactly uncorrelated; within each sector, cross-correlations are
     a percent-level correction. For low-noise space experiments, EB
     dominates the MV and the approximation has negligible impact.
+
+    The five estimators run sequentially in the parent process; each
+    one's per-L sweep dispatches to the module-level ProcessPool that
+    saturates all cores via ``_per_L_map``. This single-level
+    parallelism strategy beats nested cross-estimator+per-L pools
+    (which oversubscribed cores against Apple Accelerate's intrinsic
+    BLAS multi-threading and ran *slower* than sequential in
+    benchmarks). The ``max_workers`` parameter is retained for
+    backward compatibility: ``max_workers=1`` disables the per-L pool
+    for this call (use ``AUGR_DELENS_WORKERS=1`` env var for the same
+    effect process-wide).
     """
+    global _force_serial
+    if max_workers == 1:
+        prev_force = _force_serial
+        _force_serial = True
+        try:
+            return _compute_n0_mv_body(
+                Ls, spectra, nl_tt, nl_ee, nl_bb,
+                l_min, l_max, n_phi, fullsky)
+        finally:
+            _force_serial = prev_force
+    return _compute_n0_mv_body(
+        Ls, spectra, nl_tt, nl_ee, nl_bb,
+        l_min, l_max, n_phi, fullsky)
+
+
+def _compute_n0_mv_body(Ls, spectra, nl_tt, nl_ee, nl_bb,
+                         l_min, l_max, n_phi, fullsky):
     n0_tt = compute_n0_tt(Ls, spectra, nl_tt, l_min, l_max, n_phi,
                           fullsky=fullsky)
     n0_ee = compute_n0_ee(Ls, spectra, nl_ee, l_min, l_max, n_phi,
@@ -495,7 +599,42 @@ def compute_n0_mv(Ls: jnp.ndarray,
 
 # -----------------------------------------------------------------------
 # Full-sky N_0 via Wigner 3j coupling
+#
+# The per-L helpers (``_per_L_X``, ``_per_L_lensing_kernel``) are
+# module-level so they're picklable for the spawn-mode ProcessPool used
+# by ``_per_L_map``. Each one is invoked via ``functools.partial``
+# binding the L-independent precomputed arrays. All array args must be
+# numpy (not jnp) for cheap pickle.
 # -----------------------------------------------------------------------
+
+
+def _per_L_eb(L_in, *, l_E_arr, l_E_weight, cl_bb_tot):
+    """N_0^{EB}(L) per-L worker. Returns scalar 1/N_0^{EB}(L)."""
+    from augr.wigner import wigner3j_vectorized
+    L = int(L_in)
+
+    # Cyclic: (l_B, l_E, L; 2,-2,0) = (l_E, L, l_B; -2, 0, 2)
+    l_B_grid, w3j = wigner3j_vectorized(L, l_E_arr, m1=-2, m2=0)
+
+    l_E_ll = l_E_arr * (l_E_arr + 1)
+    l_B_ll = l_B_grid * (l_B_grid + 1)
+    L_LL = L * (L + 1)
+    geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
+
+    prefactor = np.sqrt((2 * l_E_arr + 1)[:, None]
+                        * (2 * l_B_grid + 1)[None, :]
+                        * (2 * L + 1) / (16.0 * np.pi))
+
+    parity_sum = (l_E_arr.astype(int)[:, None]
+                  + l_B_grid.astype(int)[None, :] + L)
+    odd_mask = (parity_sum % 2 == 1).astype(float)
+
+    f_eb_sq = (prefactor * w3j * geom) ** 2 * odd_mask
+    inv_bb = _fullsky_inv_spectrum(cl_bb_tot, l_B_grid)
+
+    l_B_sum = f_eb_sq @ inv_bb
+    return np.sum(l_E_weight * l_B_sum) / (2 * L + 1)
+
 
 def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
                            spectra: LensingSpectra,
@@ -517,8 +656,6 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
     Computed via cyclic 3j identity:
         (l_B, l_E, L; 2, -2, 0) = (l_E, L, l_B; -2, 0, 2)
     """
-    from augr.wigner import wigner3j_vectorized
-
     cl_ee_tot = np.asarray(spectra.cl_ee_len + nl_ee)
     cl_bb_tot = np.asarray(spectra.cl_bb_len + nl_bb)
     cl_ee_unl = np.asarray(spectra.cl_ee_unl)
@@ -527,42 +664,17 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
     l_E_arr = np.arange(l_min, l_max + 1, dtype=float)
 
     L_samples = _fullsky_L_samples(Ls_np)
-    n0_inv_samples = np.zeros(len(L_samples))
 
-    for i_L, L in enumerate(L_samples):
-        L = int(L)
+    # Spectrum weights: C_EE^2 / C_EE_tot (indexed by l_E) -- L-independent.
+    ee_unl_sq = cl_ee_unl[l_min:l_max + 1] ** 2
+    ee_tot = cl_ee_tot[l_min:l_max + 1]
+    safe_ee_tot = np.where(ee_tot > 0, ee_tot, 1.0)
+    l_E_weight = np.where(ee_tot > 0, ee_unl_sq / safe_ee_tot, 0.0)
 
-        # Cyclic: (l_B, l_E, L; 2,-2,0) = (l_E, L, l_B; -2, 0, 2)
-        l_B_grid, w3j = wigner3j_vectorized(L, l_E_arr, m1=-2, m2=0)
-
-        # Smith's three-term geometric factor
-        l_E_ll = l_E_arr * (l_E_arr + 1)
-        l_B_ll = l_B_grid * (l_B_grid + 1)
-        L_LL = L * (L + 1)
-        geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
-
-        prefactor = np.sqrt((2 * l_E_arr + 1)[:, None]
-                            * (2 * l_B_grid + 1)[None, :]
-                            * (2 * L + 1) / (16.0 * np.pi))
-
-        # Parity-odd mask
-        parity_sum = (l_E_arr.astype(int)[:, None]
-                      + l_B_grid.astype(int)[None, :] + L)
-        odd_mask = (parity_sum % 2 == 1).astype(float)
-
-        f_eb_sq = (prefactor * w3j * geom) ** 2 * odd_mask
-
-        # Spectrum weights: C_EE^2 / C_EE_tot (indexed by l_E)
-        ee_unl_sq = cl_ee_unl[l_min:l_max + 1] ** 2
-        ee_tot = cl_ee_tot[l_min:l_max + 1]
-        safe_ee_tot = np.where(ee_tot > 0, ee_tot, 1.0)
-        l_E_weight = np.where(ee_tot > 0, ee_unl_sq / safe_ee_tot, 0.0)
-
-        # 1/C_BB (indexed by l_B)
-        inv_bb = _fullsky_inv_spectrum(cl_bb_tot, l_B_grid)
-
-        l_B_sum = f_eb_sq @ inv_bb  # (n_l_E,)
-        n0_inv_samples[i_L] = np.sum(l_E_weight * l_B_sum) / (2 * L + 1)
+    n0_inv_samples = np.array(_per_L_map(
+        partial(_per_L_eb, l_E_arr=l_E_arr, l_E_weight=l_E_weight,
+                cl_bb_tot=cl_bb_tot),
+        L_samples))
 
     # Interpolate N_0^{-1} to the requested L grid (log-space for smoothness)
     log_n0_inv = np.log(np.maximum(n0_inv_samples, 1e-300))
@@ -656,6 +768,15 @@ def _fullsky_inv_spectrum(cl_tot: np.ndarray, l2_grid: np.ndarray) -> np.ndarray
     return inv_cl
 
 
+def _per_L_tb(L_in, *, l_E_arr, l1_weight, cl_bb_tot):
+    """N_0^{TB}(L) per-L worker."""
+    L = int(L_in)
+    l_B_grid, f_odd_sq, _ = _fullsky_spin2_coupling(L, l_E_arr)
+    inv_bb = _fullsky_inv_spectrum(cl_bb_tot, l_B_grid)
+    l2_sum = f_odd_sq @ inv_bb
+    return np.sum(l1_weight * l2_sum) / (2 * L + 1)
+
+
 def _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max):
     """Full-sky N_0^{TB}: same parity-odd coupling as EB, but C^{TE}/C^{TT} weights."""
     cl_tt_tot = np.asarray(spectra.cl_tt_len + nl_tt)
@@ -665,19 +786,17 @@ def _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max):
     Ls_np = np.asarray(Ls)
     l_E_arr = np.arange(l_min, l_max + 1, dtype=float)
     L_samples = _fullsky_L_samples(Ls_np)
-    n0_inv_samples = np.zeros(len(L_samples))
 
-    for i_L, L in enumerate(L_samples):
-        l_B_grid, f_odd_sq, _ = _fullsky_spin2_coupling(int(L), l_E_arr)
-        inv_bb = _fullsky_inv_spectrum(cl_bb_tot, l_B_grid)
+    # L-independent weights
+    te_unl_sq = cl_te_unl[l_min:l_max + 1] ** 2
+    tt_tot = cl_tt_tot[l_min:l_max + 1]
+    safe_tt = np.where(tt_tot > 0, tt_tot, 1.0)
+    l1_weight = np.where(tt_tot > 0, te_unl_sq / safe_tt, 0.0)
 
-        te_unl_sq = cl_te_unl[l_min:l_max + 1] ** 2
-        tt_tot = cl_tt_tot[l_min:l_max + 1]
-        safe_tt = np.where(tt_tot > 0, tt_tot, 1.0)
-        l1_weight = np.where(tt_tot > 0, te_unl_sq / safe_tt, 0.0)
-
-        l2_sum = f_odd_sq @ inv_bb
-        n0_inv_samples[i_L] = np.sum(l1_weight * l2_sum) / (2 * L + 1)
+    n0_inv_samples = np.array(_per_L_map(
+        partial(_per_L_tb, l_E_arr=l_E_arr, l1_weight=l1_weight,
+                cl_bb_tot=cl_bb_tot),
+        L_samples))
 
     log_n0_inv = np.log(np.maximum(n0_inv_samples, 1e-300))
     n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float), log_n0_inv))
@@ -685,55 +804,93 @@ def _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max):
     return jnp.where(n0_inv_jax > 0, 1.0 / n0_inv_jax, jnp.inf)
 
 
+def _per_L_tt(L_in, *, l1_arr, l1_ll1, tt_l1, inv_tt_l1, cl_tt_unl,
+              cl_tt_tot, l_min, l_max):
+    """N_0^{TT}(L) per-L worker."""
+    from augr.wigner import wigner3j_000_vectorized
+    L = int(L_in)
+    L_LL = L * (L + 1)
+
+    l2_grid, w000 = wigner3j_000_vectorized(L, l1_arr, l2_min=l_min,
+                                             l2_max=l_max)
+    l2_ll2 = l2_grid * (l2_grid + 1)
+
+    alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
+    alpha2 = (L_LL + l2_ll2[None, :] - l1_ll1[:, None]) / 2.0
+
+    pf = np.sqrt((2*l1_arr+1)[:, None] * (2*l2_grid+1)[None, :] *
+                 (2*L+1) / (4.0 * np.pi))
+
+    tt_l2 = np.zeros(len(l2_grid))
+    valid = (l2_grid >= 0) & (l2_grid < len(cl_tt_unl))
+    tt_l2[valid] = cl_tt_unl[l2_grid[valid]]
+
+    f_sq = (tt_l1[:, None] * alpha1 + tt_l2[None, :] * alpha2) ** 2 \
+           * pf**2 * w000**2
+
+    inv_tt_l2 = _fullsky_inv_spectrum(cl_tt_tot, l2_grid.astype(float))
+    integrand = f_sq * inv_tt_l1[:, None] * inv_tt_l2[None, :] / 2.0
+    return np.sum(integrand) / (2 * L + 1)
+
+
 def _compute_n0_tt_fullsky(Ls, spectra, nl_tt, l_min, l_max):
     """Full-sky N_0^{TT} using vectorized (l1 l2 L; 0 0 0)."""
-    from augr.wigner import wigner3j_000_vectorized
-
     cl_tt_tot = np.asarray(spectra.cl_tt_len + nl_tt)
     cl_tt_unl = np.asarray(spectra.cl_tt_unl)
 
     Ls_np = np.asarray(Ls)
     l1_arr = np.arange(l_min, l_max + 1, dtype=int)
     L_samples = _fullsky_L_samples(Ls_np)
-    n0_inv_samples = np.zeros(len(L_samples))
 
-    for i_L, L in enumerate(L_samples):
-        L = int(L)
-        L_LL = L * (L + 1)
-        l1_ll1 = l1_arr * (l1_arr + 1)
+    l1_ll1 = l1_arr * (l1_arr + 1)
+    tt_l1 = cl_tt_unl[l1_arr]
+    inv_tt_l1 = np.where(cl_tt_tot[l1_arr] > 0,
+                         1.0 / cl_tt_tot[l1_arr], 0.0)
 
-        l2_grid, w000 = wigner3j_000_vectorized(L, l1_arr, l2_min=l_min,
-                                                 l2_max=l_max)
-        l2_ll2 = l2_grid * (l2_grid + 1)
-
-        # alpha(l1,l2,L) = [L(L+1)+l1(l1+1)-l2(l2+1)] / 2
-        alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
-        alpha2 = (L_LL + l2_ll2[None, :] - l1_ll1[:, None]) / 2.0
-
-        pf = np.sqrt((2*l1_arr+1)[:, None] * (2*l2_grid+1)[None, :] *
-                     (2*L+1) / (4.0 * np.pi))
-
-        # TT response: [C_TT(l1)*alpha1 + C_TT(l2)*alpha2] × pf × w000
-        tt_l1 = cl_tt_unl[l1_arr]
-        tt_l2 = np.zeros(len(l2_grid))
-        valid = (l2_grid >= 0) & (l2_grid < len(cl_tt_unl))
-        tt_l2[valid] = cl_tt_unl[l2_grid[valid]]
-
-        f_sq = (tt_l1[:, None] * alpha1 + tt_l2[None, :] * alpha2) ** 2 \
-               * pf**2 * w000**2
-
-        # Filter: 1 / (2 × C_TT_tot(l1) × C_TT_tot(l2))
-        inv_tt_l1 = np.where(cl_tt_tot[l1_arr] > 0,
-                             1.0 / cl_tt_tot[l1_arr], 0.0)
-        inv_tt_l2 = _fullsky_inv_spectrum(cl_tt_tot, l2_grid.astype(float))
-
-        integrand = f_sq * inv_tt_l1[:, None] * inv_tt_l2[None, :] / 2.0
-        n0_inv_samples[i_L] = np.sum(integrand) / (2 * L + 1)
+    n0_inv_samples = np.array(_per_L_map(
+        partial(_per_L_tt, l1_arr=l1_arr, l1_ll1=l1_ll1, tt_l1=tt_l1,
+                inv_tt_l1=inv_tt_l1, cl_tt_unl=cl_tt_unl,
+                cl_tt_tot=cl_tt_tot, l_min=l_min, l_max=l_max),
+        L_samples))
 
     log_n0_inv = np.log(np.maximum(n0_inv_samples, 1e-300))
     n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float), log_n0_inv))
     n0_inv_jax = jnp.array(n0_inv_interp)
     return jnp.where(n0_inv_jax > 0, 1.0 / n0_inv_jax, jnp.inf)
+
+
+def _per_L_ee(L_in, *, l1_arr, l1_ll1, ee_l1, inv_ee_l1, cl_ee_unl,
+              cl_ee_tot, l_min):
+    """N_0^{EE}(L) per-L worker."""
+    from augr.wigner import wigner3j_vectorized
+    L = int(L_in)
+    L_LL = L * (L + 1)
+
+    l2_grid, w3j = wigner3j_vectorized(L, l1_arr, m1=-2, m2=0)
+    l2_ll2 = l2_grid * (l2_grid + 1)
+
+    alpha1 = L_LL + l1_ll1[:, None] - l2_ll2[None, :]
+    alpha2 = L_LL + l2_ll2[None, :] - l1_ll1[:, None]
+
+    pf = np.sqrt((2 * l1_arr + 1)[:, None]
+                 * (2 * l2_grid + 1)[None, :]
+                 * (2 * L + 1) / (16.0 * np.pi))
+
+    parity_sum = (l1_arr.astype(int)[:, None]
+                  + l2_grid.astype(int)[None, :] + L)
+    even_mask = (parity_sum % 2 == 0).astype(float)
+
+    l2_int = l2_grid.astype(int)
+    valid = (l2_int >= l_min) & (l2_int < len(cl_ee_unl))
+    ee_at_l2 = np.zeros(len(l2_grid))
+    ee_at_l2[valid] = cl_ee_unl[l2_int[valid]]
+
+    f_sq = (ee_l1[:, None] * alpha1 + ee_at_l2[None, :] * alpha2) ** 2 \
+           * pf**2 * w3j**2 * even_mask
+
+    inv_ee_l2 = _fullsky_inv_spectrum(cl_ee_tot, l2_grid)
+    integrand = f_sq * inv_ee_l1[:, None] * inv_ee_l2[None, :] / 2.0
+    return np.sum(integrand) / (2 * L + 1)
 
 
 def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
@@ -753,68 +910,84 @@ def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
     m-values change between spin-0 and spin-2 (see OkaHu 2003 Eq. 14
     and `scripts/n0_validation/derivation.md`).
     """
-    from augr.wigner import wigner3j_vectorized
-
     cl_ee_tot = np.asarray(spectra.cl_ee_len + nl_ee)
     cl_ee_unl = np.asarray(spectra.cl_ee_unl)
 
     Ls_np = np.asarray(Ls)
     l1_arr = np.arange(l_min, l_max + 1, dtype=float)
     L_samples = _fullsky_L_samples(Ls_np)
-    n0_inv_samples = np.zeros(len(L_samples))
 
-    for i_L, L in enumerate(L_samples):
-        L = int(L)
-        L_LL = L * (L + 1)
+    l1_ll1 = l1_arr * (l1_arr + 1)
+    ee_l1 = cl_ee_unl[l_min:l_max + 1]
+    ee_tot_l1 = cl_ee_tot[l_min:l_max + 1]
+    safe_ee = np.where(ee_tot_l1 > 0, ee_tot_l1, 1.0)
+    inv_ee_l1 = np.where(ee_tot_l1 > 0, 1.0 / safe_ee, 0.0)
 
-        # Cyclic: (l1, l2, L; 2,-2,0) = (l2, L, l1; -2, 0, 2)
-        l2_grid, w3j = wigner3j_vectorized(L, l1_arr, m1=-2, m2=0)
-
-        l1_ll1 = l1_arr * (l1_arr + 1)
-        l2_ll2 = l2_grid * (l2_grid + 1)
-
-        # OkaHu 2003 Eq. 14 spin-2 bracket. NOT divided by 2 -- the /2
-        # that appears in the spin-0 (TT, TE) paths is an artefact of
-        # combining bracket/2 with the 4π prefactor; with the 16π
-        # prefactor here the bracket itself is the right factor.
-        alpha1 = L_LL + l1_ll1[:, None] - l2_ll2[None, :]
-        alpha2 = L_LL + l2_ll2[None, :] - l1_ll1[:, None]
-
-        pf = np.sqrt((2 * l1_arr + 1)[:, None]
-                     * (2 * l2_grid + 1)[None, :]
-                     * (2 * L + 1) / (16.0 * np.pi))
-
-        # Parity-even mask: per OkaHu 2003 Eq. 22 + Table I (EE row), the
-        # ε factor restricts the EE estimator to L+l1+l2 even.
-        parity_sum = (l1_arr.astype(int)[:, None]
-                      + l2_grid.astype(int)[None, :] + L)
-        even_mask = (parity_sum % 2 == 0).astype(float)
-
-        # EE spectra at l2 positions
-        l2_int = l2_grid.astype(int)
-        valid = (l2_int >= l_min) & (l2_int < len(cl_ee_unl))
-        ee_at_l2 = np.zeros(len(l2_grid))
-        ee_at_l2[valid] = cl_ee_unl[l2_int[valid]]
-
-        ee_l1 = cl_ee_unl[l_min:l_max + 1]
-
-        # Response: [C_EE(l1)·α1 + C_EE(l2)·α2] · pf · w_2 · ε
-        f_sq = (ee_l1[:, None] * alpha1 + ee_at_l2[None, :] * alpha2) ** 2 \
-               * pf**2 * w3j**2 * even_mask
-
-        # Filter: 1 / (2 × C_EE_tot(l1) × C_EE_tot(l2))
-        ee_tot = cl_ee_tot[l_min:l_max + 1]
-        safe_ee = np.where(ee_tot > 0, ee_tot, 1.0)
-        inv_ee_l1 = np.where(ee_tot > 0, 1.0 / safe_ee, 0.0)
-        inv_ee_l2 = _fullsky_inv_spectrum(cl_ee_tot, l2_grid)
-
-        integrand = f_sq * inv_ee_l1[:, None] * inv_ee_l2[None, :] / 2.0
-        n0_inv_samples[i_L] = np.sum(integrand) / (2 * L + 1)
+    n0_inv_samples = np.array(_per_L_map(
+        partial(_per_L_ee, l1_arr=l1_arr, l1_ll1=l1_ll1, ee_l1=ee_l1,
+                inv_ee_l1=inv_ee_l1, cl_ee_unl=cl_ee_unl,
+                cl_ee_tot=cl_ee_tot, l_min=l_min),
+        L_samples))
 
     log_n0_inv = np.log(np.maximum(n0_inv_samples, 1e-300))
     n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float), log_n0_inv))
     n0_inv_jax = jnp.array(n0_inv_interp)
     return jnp.where(n0_inv_jax > 0, 1.0 / n0_inv_jax, jnp.inf)
+
+
+def _per_L_te(L_in, *, l1_arr, l1_ll1, te_l1, tt_l1, te_tot_l1,
+              cl_te_unl, cl_te_tot, cl_ee_tot, l_min, l_max, te_filter):
+    """N_0^{TE}(L) per-L worker (spin-mixed coupling)."""
+    from augr.wigner import wigner3j_000_vectorized, wigner3j_vectorized
+    L = int(L_in)
+    L_LL = L * (L + 1)
+
+    l2_grid, w000 = wigner3j_000_vectorized(
+        L, l1_arr, l2_min=l_min, l2_max=l_max,
+    )
+    l2_grid_2, w2F = wigner3j_vectorized(
+        L, l1_arr, m1=-2, m2=0,
+        l2_min_global=l_min, l2_max_global=l_max,
+    )
+    assert l2_grid.shape == l2_grid_2.shape and np.array_equal(
+        l2_grid, l2_grid_2
+    ), "w000 and w2F l2 grids disagree"
+    l2_ll2 = l2_grid * (l2_grid + 1)
+
+    alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
+    alpha2 = (L_LL + l2_ll2[None, :] - l1_ll1[:, None]) / 2.0
+
+    pf = np.sqrt((2*l1_arr+1)[:, None] * (2*l2_grid+1)[None, :] *
+                 (2*L+1) / (4.0 * np.pi))
+
+    te_l2 = np.zeros(len(l2_grid))
+    valid = (l2_grid >= 0) & (l2_grid < len(cl_te_unl))
+    te_l2[valid] = cl_te_unl[l2_grid[valid]]
+
+    parity_sum = (l1_arr.astype(int)[:, None]
+                  + l2_grid.astype(int)[None, :] + L)
+    even_mask = (parity_sum % 2 == 0).astype(float)
+
+    f_2 = te_l1[:, None] * alpha1 * pf * w2F * even_mask
+    f_0 = te_l2[None, :] * alpha2 * pf * w000
+    f_total_sq = (f_2 + f_0) ** 2
+
+    ee_l2 = np.zeros(len(l2_grid))
+    ee_l2[valid] = cl_ee_tot[l2_grid[valid]]
+
+    if te_filter == 'ho02_diag_approx':
+        te_tot_l2 = np.zeros(len(l2_grid))
+        te_tot_l2[valid] = cl_te_tot[l2_grid[valid]]
+        denom = (tt_l1[:, None] * ee_l2[None, :]
+                 + te_tot_l1[:, None] * te_tot_l2[None, :])
+        safe_denom = np.where(np.abs(denom) > 0, denom, 1.0)
+        inv_denom = np.where(np.abs(denom) > 0, 1.0 / safe_denom, 0.0)
+    else:  # 'strict_diagonal'
+        denom = tt_l1[:, None] * ee_l2[None, :]
+        safe_denom = np.where(denom > 0, denom, 1.0)
+        inv_denom = np.where(denom > 0, 1.0 / safe_denom, 0.0)
+
+    return np.sum(f_total_sq * inv_denom) / (2 * L + 1)
 
 
 def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
@@ -879,8 +1052,6 @@ def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
         ``C_TT(l1)*C_EE(l2)`` only -- matches plancklens with
         ``fal['te']=0`` for the apples-to-apples validation harness.
     """
-    from augr.wigner import wigner3j_000_vectorized, wigner3j_vectorized
-
     if te_filter not in ('ho02_diag_approx', 'strict_diagonal'):
         raise ValueError(
             f"te_filter must be 'ho02_diag_approx' or 'strict_diagonal', "
@@ -895,76 +1066,55 @@ def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
     Ls_np = np.asarray(Ls)
     l1_arr = np.arange(l_min, l_max + 1, dtype=int)
     L_samples = _fullsky_L_samples(Ls_np)
-    n0_inv_samples = np.zeros(len(L_samples))
 
-    for i_L, L in enumerate(L_samples):
-        L = int(L)
-        L_LL = L * (L + 1)
-        l1_ll1 = l1_arr * (l1_arr + 1)
+    l1_ll1 = l1_arr * (l1_arr + 1)
+    te_l1 = cl_te_unl[l1_arr]
+    tt_l1 = cl_tt_tot[l1_arr]
+    te_tot_l1 = cl_te_tot[l1_arr]
 
-        # Both Wigner-3j building blocks on the same l2 grid.
-        # wigner3j_vectorized internally clamps l2_min to max(l2_min, |m3|);
-        # for m1=-2, m2=0 we have m3=2 so the clamp is a no-op when l_min>=2.
-        l2_grid, w000 = wigner3j_000_vectorized(
-            L, l1_arr, l2_min=l_min, l2_max=l_max,
-        )
-        l2_grid_2, w2F = wigner3j_vectorized(
-            L, l1_arr, m1=-2, m2=0,
-            l2_min_global=l_min, l2_max_global=l_max,
-        )
-        assert l2_grid.shape == l2_grid_2.shape and np.array_equal(
-            l2_grid, l2_grid_2
-        ), "w000 and w2F l2 grids disagree"
-        l2_ll2 = l2_grid * (l2_grid + 1)
-
-        alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
-        alpha2 = (L_LL + l2_ll2[None, :] - l1_ll1[:, None]) / 2.0
-
-        pf = np.sqrt((2*l1_arr+1)[:, None] * (2*l2_grid+1)[None, :] *
-                     (2*L+1) / (4.0 * np.pi))
-
-        te_l1 = cl_te_unl[l1_arr]
-        te_l2 = np.zeros(len(l2_grid))
-        valid = (l2_grid >= 0) & (l2_grid < len(cl_te_unl))
-        te_l2[valid] = cl_te_unl[l2_grid[valid]]
-
-        # Parity-even mask for the spin-2 leg (OkaHu Eq. 22 eps_TE).
-        # The spin-0 (000) Wigner-3j already vanishes for L+l1+l2 odd
-        # by column-permutation symmetry, so w000 carries the parity
-        # restriction implicitly on the spin-0 leg.
-        parity_sum = (l1_arr.astype(int)[:, None]
-                      + l2_grid.astype(int)[None, :] + L)
-        even_mask = (parity_sum % 2 == 0).astype(float)
-
-        # Two response terms; sum then square to capture the cross term.
-        f_2 = te_l1[:, None] * alpha1 * pf * w2F * even_mask
-        f_0 = te_l2[None, :] * alpha2 * pf * w000
-        f_total_sq = (f_2 + f_0) ** 2
-
-        # Filter denominator -- dispatched on te_filter.
-        tt_l1 = cl_tt_tot[l1_arr]
-        ee_l2 = np.zeros(len(l2_grid))
-        ee_l2[valid] = cl_ee_tot[l2_grid[valid]]
-
-        if te_filter == 'ho02_diag_approx':
-            te_tot_l1 = cl_te_tot[l1_arr]
-            te_tot_l2 = np.zeros(len(l2_grid))
-            te_tot_l2[valid] = cl_te_tot[l2_grid[valid]]
-            denom = (tt_l1[:, None] * ee_l2[None, :]
-                     + te_tot_l1[:, None] * te_tot_l2[None, :])
-            safe_denom = np.where(np.abs(denom) > 0, denom, 1.0)
-            inv_denom = np.where(np.abs(denom) > 0, 1.0 / safe_denom, 0.0)
-        else:  # 'strict_diagonal' -- always positive (auto-spectra)
-            denom = tt_l1[:, None] * ee_l2[None, :]
-            safe_denom = np.where(denom > 0, denom, 1.0)
-            inv_denom = np.where(denom > 0, 1.0 / safe_denom, 0.0)
-
-        n0_inv_samples[i_L] = np.sum(f_total_sq * inv_denom) / (2 * L + 1)
+    n0_inv_samples = np.array(_per_L_map(
+        partial(_per_L_te, l1_arr=l1_arr, l1_ll1=l1_ll1, te_l1=te_l1,
+                tt_l1=tt_l1, te_tot_l1=te_tot_l1, cl_te_unl=cl_te_unl,
+                cl_te_tot=cl_te_tot, cl_ee_tot=cl_ee_tot,
+                l_min=l_min, l_max=l_max, te_filter=te_filter),
+        L_samples))
 
     log_n0_inv = np.log(np.maximum(np.abs(n0_inv_samples), 1e-300))
     n0_inv_interp = np.exp(np.interp(Ls_np, L_samples.astype(float), log_n0_inv))
     n0_inv_jax = jnp.array(n0_inv_interp)
     return jnp.where(n0_inv_jax > 0, 1.0 / n0_inv_jax, jnp.inf)
+
+
+def _per_L_lensing_kernel(L_in, *, l_E_arr, l_E_ll, ee, ls_np, n_l):
+    """Lensing kernel K(:, L) per-L worker. Returns column of length n_l."""
+    from augr.wigner import wigner3j_vectorized
+    L = int(L_in)
+    K_col = np.zeros(n_l)
+    if L < 2:
+        return K_col
+
+    l_B_grid, w3j = wigner3j_vectorized(L, l_E_arr, m1=-2, m2=0)
+
+    l_B_ll = l_B_grid * (l_B_grid + 1)
+    L_LL = L * (L + 1)
+    geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
+
+    pf = np.sqrt((2 * l_E_arr + 1)[:, None]
+                 * (2 * l_B_grid + 1)[None, :]
+                 * (2 * L + 1) / (16.0 * np.pi))
+
+    parity_sum = (l_E_arr.astype(int)[:, None]
+                  + l_B_grid.astype(int)[None, :] + L)
+    odd_mask = (parity_sum % 2 == 1).astype(float)
+
+    f_eb_sq = (pf * w3j * geom) ** 2 * odd_mask
+
+    l_B_map = {int(v): j for j, v in enumerate(l_B_grid)}
+    for i_l in range(n_l):
+        j = l_B_map.get(int(ls_np[i_l]))
+        if j is not None:
+            K_col[i_l] = np.sum(ee * f_eb_sq[:, j]) / (2 * ls_np[i_l] + 1)
+    return K_col
 
 
 def _lensing_kernel_fullsky(ls: jnp.ndarray, Ls: jnp.ndarray,
@@ -986,8 +1136,6 @@ def _lensing_kernel_fullsky(ls: jnp.ndarray, Ls: jnp.ndarray,
     If w_ee is provided, C_EE is multiplied by W_EE(ℓ_E) inside the sum --
     needed for the exact Smith+ Eq. 12 residual BB (see residual_cl_bb).
     """
-    from augr.wigner import wigner3j_vectorized
-
     cl_ee_unl = np.asarray(spectra.cl_ee_unl)
     if w_ee is not None:
         cl_ee_unl = cl_ee_unl * np.asarray(w_ee)
@@ -996,10 +1144,8 @@ def _lensing_kernel_fullsky(ls: jnp.ndarray, Ls: jnp.ndarray,
     n_l = len(ls_np)
     n_L = len(Ls_np)
 
-    # l_E range for the sum
     l_E_arr = np.arange(l_min, l_max + 1, dtype=float)
 
-    # Sample L values and interpolate (kernel is smooth in L)
     L_min_int = max(2, int(Ls_np.min()))
     L_max_int = int(Ls_np.max())
     n_L_sample = min(n_L, max(50, L_max_int // 20))
@@ -1008,46 +1154,17 @@ def _lensing_kernel_fullsky(ls: jnp.ndarray, Ls: jnp.ndarray,
         np.geomspace(max(20, L_min_int), L_max_int, n_L_sample).astype(int),
     ]).clip(L_min_int, L_max_int).astype(int))
 
-    K_samples = np.zeros((n_l, len(L_samples)))
+    l_E_int = l_E_arr.astype(int)
+    valid_E = (l_E_int >= l_min) & (l_E_int < len(cl_ee_unl))
+    ee = np.zeros(len(l_E_arr))
+    ee[valid_E] = cl_ee_unl[l_E_int[valid_E]]
+    l_E_ll = l_E_arr * (l_E_arr + 1)
 
-    for i_L, L in enumerate(L_samples):
-        L = int(L)
-        if L < 2:
-            continue
-
-        # Cyclic: (l_B, l_E, L; 2,-2,0) = (l_E, L, l_B; -2, 0, 2)
-        # Recurse on l_B with l_E as input array
-        l_B_grid, w3j = wigner3j_vectorized(L, l_E_arr, m1=-2, m2=0)
-
-        # Smith's geometric factor and prefactor
-        l_E_ll = l_E_arr * (l_E_arr + 1)
-        l_B_ll = l_B_grid * (l_B_grid + 1)
-        L_LL = L * (L + 1)
-        geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
-
-        pf = np.sqrt((2 * l_E_arr + 1)[:, None]
-                     * (2 * l_B_grid + 1)[None, :]
-                     * (2 * L + 1) / (16.0 * np.pi))
-
-        # Parity-odd mask
-        parity_sum = (l_E_arr.astype(int)[:, None]
-                      + l_B_grid.astype(int)[None, :] + L)
-        odd_mask = (parity_sum % 2 == 1).astype(float)
-
-        f_eb_sq = (pf * w3j * geom) ** 2 * odd_mask  # (n_l_E, n_l_B)
-
-        # C_EE weights (indexed by l_E)
-        l_E_int = l_E_arr.astype(int)
-        valid_E = (l_E_int >= l_min) & (l_E_int < len(cl_ee_unl))
-        ee = np.zeros(len(l_E_arr))
-        ee[valid_E] = cl_ee_unl[l_E_int[valid_E]]
-
-        # For each target l_B, extract its column and sum over l_E
-        l_B_map = {int(v): j for j, v in enumerate(l_B_grid)}
-        for i_l in range(n_l):
-            j = l_B_map.get(int(ls_np[i_l]))
-            if j is not None:
-                K_samples[i_l, i_L] = np.sum(ee * f_eb_sq[:, j]) / (2 * ls_np[i_l] + 1)
+    K_columns = _per_L_map(
+        partial(_per_L_lensing_kernel, l_E_arr=l_E_arr, l_E_ll=l_E_ll,
+                ee=ee, ls_np=ls_np, n_l=n_l),
+        L_samples)
+    K_samples = np.stack(K_columns, axis=1)  # (n_l, n_L_sample)
 
     # Interpolate K to the requested L grid (per-l, log-space)
     K = np.zeros((n_l, n_L))
@@ -1204,16 +1321,22 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
     w_pp = cl_pp_at_L / (cl_pp_at_L + n0_mv)
     cl_pp_res = cl_pp_at_L * (1.0 - w_pp)           # = C_φφ N_0 / (C_φφ + N_0)
 
-    K = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi, fullsky=fullsky)
-
     if nl_ee is None:
+        K = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
+                           fullsky=fullsky)
         return K @ cl_pp_res
 
-    # Exact Smith+ 2012 Eq. 12: build K_WEE with the extra W_EE(ℓ_E) factor
-    # and add the W_EE-correction term.
+    # Exact Smith+ 2012 Eq. 12: build K_WEE with the extra W_EE(ℓ_E)
+    # factor and add the W_EE-correction term. K and K_WEE are
+    # computed sequentially in the parent process; each one's per-L
+    # sweep dispatches to the module-level ProcessPool that saturates
+    # all cores via ``_per_L_map``. Outer cross-call threading was
+    # tried and abandoned -- it oversubscribes against the per-L pool.
     cl_ee = spectra.cl_ee_unl
     nl_ee_arr = jnp.asarray(nl_ee)
     w_ee = cl_ee / (cl_ee + nl_ee_arr)
+    K = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
+                       fullsky=fullsky)
     K_wee = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
                            fullsky=fullsky, w_ee=w_ee)
     return K @ cl_pp_res + (K - K_wee) @ (cl_pp_at_L * w_pp)
