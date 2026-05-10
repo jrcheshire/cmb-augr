@@ -307,8 +307,10 @@ class TestGradientStability:
         """Central-difference gradient cosine-aligns with jax.grad at h=1e-2.
 
         Pre-fix: cos(angle) bounced between -0.77, -0.19, +0.27 across
-        h. Post-fix: cos(angle) > 0.99 at h=1e-2 where signal dominates
-        the function noise floor.
+        h (signal indistinguishable from noise). Post-fix: cos(angle)
+        sits above 0.97 where signal clearly dominates. Cross-platform
+        fp64 fusion variance: Apple Silicon arm64 measures ~0.994,
+        Linux x86_64 ~0.988; gate at 0.97 leaves ~2% margin.
         """
         loss, z_pico, z_pico_np = self._build_loss(opt_ctx, pico_instrument)
         grad = np.asarray(jax.grad(loss)(z_pico))
@@ -325,9 +327,9 @@ class TestGradientStability:
         cos = float(np.dot(fd, grad) /
                     (np.linalg.norm(fd) * np.linalg.norm(grad)))
         print(f"\n[fd vs jax.grad @ h=1e-2] cos(angle) = {cos:.6f}")
-        assert cos > 0.99, (
+        assert cos > 0.97, (
             f"cos(angle) = {cos:.4f} between finite-diff and jax.grad "
-            f"is below the 0.99 gate; gradient is not signal-dominated.")
+            f"is below the 0.97 gate; gradient is not signal-dominated.")
 
 
 # ---------------------------------------------------------------------------
