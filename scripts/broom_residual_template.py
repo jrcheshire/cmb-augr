@@ -300,7 +300,10 @@ def _experiment_name_for_aperture(aperture_m: float) -> str:
     return f"pico_ap{round(aperture_m * 100):04d}"
 
 
-def _build_pico_like_instrument(aperture_m: float) -> tuple[dict, list[str]]:
+def _build_pico_like_instrument(
+    aperture_m: float,
+    hits_prefix: str | None = None,
+) -> tuple[dict, list[str]]:
     """Build BROOM instrument-dict + channel tags from `pico_like`.
 
     Translates the augr ``Instrument`` (from ``pico_like(aperture_m=
@@ -313,6 +316,13 @@ def _build_pico_like_instrument(aperture_m: float) -> tuple[dict, list[str]]:
     depth_P [μK·arcmin] = √(w_inv [μK²·sr]) × (10800/π),
     depth_I = depth_P / √2.  ``white_noise_power`` already includes
     the polarization √2, so ``√w_inv`` is the polarization noise.
+
+    With ``hits_prefix`` set, additionally reads the first channel's
+    hit-map FITS, divides depth_I/P by ``mean_pixel_rescale_factor``
+    so the sky-averaged pixel noise variance matches spec (BROOM's
+    internal max-1 normalization would otherwise push the spec to
+    the deepest pixel), and injects ``path_hits_maps``. Generate the
+    FITS first via ``scripts/make_hit_maps.py --pico-like``.
     """
     inst = pico_like(aperture_m=aperture_m)
     n_chan = len(inst.channels)
@@ -336,6 +346,28 @@ def _build_pico_like_instrument(aperture_m: float) -> tuple[dict, list[str]]:
     # Match BROOM's own auto-generated tag convention for unique
     # frequencies (`f"{nu}GHz"`); pico_like's 21 bands are unique.
     tags = [f"{nu}GHz" for nu in instrument_dict["frequency"]]
+
+    if hits_prefix is not None:
+        # All channels share the v1 envelope hit map (same FITS, just
+        # per-channel filenames for BROOM's API). Read tag[0] only;
+        # the uniform rescale applied to every channel's depth is only
+        # correct under that shared-map assumption. Future per-feedhorn
+        # offsets would need per-channel reads.
+        first_fits = Path(f"{hits_prefix}_{tags[0]}.fits")
+        if not first_fits.exists():
+            raise FileNotFoundError(
+                f"hit map not found: {first_fits}. Generate first via "
+                "`python scripts/make_hit_maps.py --pico-like "
+                f"--prefix {hits_prefix}`."
+            )
+        hits = hp.read_map(str(first_fits))
+        k = mean_pixel_rescale_factor(hits)
+        print(f"  hit-map rescale factor k = {k:.4f} "
+              "(depth_I/P divided by k for sky-average normalization)")
+        instrument_dict["depth_I"] = [d / k for d in depth_I]
+        instrument_dict["depth_P"] = [d / k for d in depth_P]
+        instrument_dict["path_hits_maps"] = hits_prefix
+
     return instrument_dict, tags
 
 
@@ -728,8 +760,8 @@ def _parse_args() -> argparse.Namespace:
                         "instrument via the config['instrument'] dict-override "
                         "path. Output / sim-cache paths and the output "
                         "filename tag use 'pico_apXXXX' (cm-precision) for "
-                        "path discrimination. Incompatible with --hits-prefix "
-                        "/ --knee-config for now.")
+                        "path discrimination. Compatible with --hits-prefix; "
+                        "incompatible with --knee-config for now.")
     p.add_argument("--workers", type=int, default=1,
                    help="Number of parallel workers for the per-sim Phase 1 "
                         "loop (get_input_data + compsep + estimate_residuals). "
@@ -756,15 +788,16 @@ def main() -> None:
     print(f"Foreground model: {args.fg_model} -> {FOREGROUND_MODELS}")
 
     if args.aperture_m is not None:
-        if args.hits_prefix is not None or args.knee_config is not None:
+        if args.knee_config is not None:
             raise SystemExit(
-                "--aperture-m is incompatible with --hits-prefix / "
-                "--knee-config (the hits/knee paths consult BROOM's "
-                "experiment YAML, which is bypassed in aperture mode). "
-                "Drop the hits/knee flags or use the LiteBIRD_PTEP path."
+                "--aperture-m is incompatible with --knee-config (the "
+                "knee path consults BROOM's experiment YAML for tags, "
+                "which is bypassed in aperture mode). Drop --knee-config "
+                "or use the LiteBIRD_PTEP path."
             )
         EXPERIMENT = _experiment_name_for_aperture(args.aperture_m)
-        instrument_override, _ = _build_pico_like_instrument(args.aperture_m)
+        instrument_override, _ = _build_pico_like_instrument(
+            args.aperture_m, hits_prefix=args.hits_prefix)
         print(f"Aperture: {args.aperture_m:.2f} m -> experiment "
               f"{EXPERIMENT!r}, {len(instrument_override['frequency'])} "
               f"channels (pico_like, beams scaled by 1.4/D)")

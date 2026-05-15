@@ -31,6 +31,7 @@ import healpy as hp
 import numpy as np
 from broom import Configs
 
+from augr.config import pico_like
 from augr.hit_maps import l2_hit_map
 
 BROOM_EXPERIMENTS_YAML = (
@@ -59,6 +60,22 @@ def _channel_tags(experiment: str, nside: int) -> list[str]:
     return list(cfg.instrument.channels_tags)
 
 
+def _channel_tags_pico_like() -> list[str]:
+    """Channel tags for the `pico_like` 21-band channel set.
+
+    Mirrors the convention applied in
+    `broom_residual_template.py:_build_pico_like_instrument`
+    (`f"{nu}GHz"`, matching BROOM's auto-generation for unique
+    frequencies). Independent of aperture: pico_like's frequencies
+    are aperture-invariant; only beams scale with aperture, and the
+    hit-map content itself is aperture-independent (it's a pure
+    scan-strategy envelope), so a single file set written here
+    serves any --aperture-m sweep value downstream.
+    """
+    inst = pico_like()
+    return [f"{ch.nu_ghz}GHz" for ch in inst.channels]
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--prefix", type=str, required=True,
@@ -67,7 +84,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--experiment", type=str, default="LiteBIRD_PTEP",
                    help="Name of the BROOM experiment (key in "
                         "broom/utils/experiments.yaml). Default: "
-                        "LiteBIRD_PTEP")
+                        "LiteBIRD_PTEP. Ignored when --pico-like is set.")
+    p.add_argument("--pico-like", action="store_true",
+                   help="Use the augr pico_like 21-band channel set "
+                        "instead of --experiment YAML lookup. Pairs with "
+                        "broom_residual_template.py --aperture-m, which "
+                        "uses the same tag convention. The hit-map content "
+                        "itself is aperture-independent (scan envelope), "
+                        "so one --pico-like file set serves any aperture "
+                        "in the sweep.")
     p.add_argument("--nside", type=int, default=64,
                    help="HEALPix nside. Default: 64")
     p.add_argument("--spin-angle-deg", type=float, default=50.0,
@@ -87,8 +112,12 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
-    tags = _channel_tags(args.experiment, args.nside)
-    print(f"experiment={args.experiment}: {len(tags)} channels")
+    if args.pico_like:
+        tags = _channel_tags_pico_like()
+        print(f"pico_like (21 PICO bands): {len(tags)} channels")
+    else:
+        tags = _channel_tags(args.experiment, args.nside)
+        print(f"experiment={args.experiment}: {len(tags)} channels")
 
     hits = l2_hit_map(
         nside=args.nside,
