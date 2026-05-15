@@ -78,7 +78,16 @@ Knowing how the modules chain together matters more than any one file:
    unmodelled foreground complexity or any other un-fit ΔC_ℓ. Linear
    approximation; valid for |Δθ| ≲ few σ_θ. Standard derivation in
    Stompor+ 2016 (arXiv:1609.03807) and Amara & Refregier 2008
-   (arXiv:0710.5171).
+   (arXiv:0710.5171). `parameter_bias_iterative(ΔD, *, max_iter,
+   tol, return_diagnostics)` / `bias_from_truth_model_iterative(...)`
+   are Gauss-Newton refinements -- re-eval `J` and `F` at θ_k each
+   iteration, covariance held at θ_fid (matches `sigma`'s convention).
+   First step coincides with the linear formula; later steps clean up
+   the O(δθ²) error when |Δθ| / σ is large. Convergence on
+   `max_i |δθ_i / σ_i| < tol`; emits a `UserWarning` on max-iter
+   exhaustion or non-finite step (no damping yet; if the truth sits
+   outside the convergence basin of undamped Gauss-Newton, shrink ΔD
+   or richen the fit model).
    Two solver paths: a per-bin block-diagonal solve (default; valid for
    the synthetic top-hat / Gaussian binning), and a full
    `(n_data, n_data)` solve dispatched automatically when
