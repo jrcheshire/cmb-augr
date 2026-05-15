@@ -38,6 +38,8 @@ import argparse
 import itertools
 import json
 import math
+import multiprocessing
+import os
 from pathlib import Path
 
 import broom
@@ -542,41 +544,88 @@ def _spectra_block(mask_type: str) -> list[dict]:
 # Pipeline helpers
 # ---------------------------------------------------------------------------
 
-def run_all_sims(config: Configs) -> None:
-    # TODO(multiprocess): this loop is embarrassingly parallel -- each
-    # iteration is a self-contained (get_input_data -> component_separation
-    # -> estimate_residuals) chain with per-sim filenames so there is no
-    # write contention. BROOM's own `parallelize` config flag is read in
-    # broom.configurations but otherwise unreferenced ("Not implemented yet"
-    # per the demo config), so we would need to wrap it ourselves with
-    # multiprocessing.Pool.
-    # Gotchas for a future implementation:
-    #   - Pin BLAS to one thread per worker (OMP_NUM_THREADS=1 /
-    #     MKL_NUM_THREADS=1 / OPENBLAS_NUM_THREADS=1 set before Pool
-    #     spawns) -- otherwise BLAS threads fight each other. Currently
-    #     nsims=20 saturates ~3 cores; pinning + Pool(n=8..12) should
-    #     give near-linear speedup.
-    #   - The `config.compsep_residuals = _compsep_residuals_block()`
-    #     line below mutates shared state as a BROOM workaround, so
-    #     each worker needs its own Configs instance (fork-safe copy
-    #     or per-worker construction).
-    #   - compute_all_spectra / _compute_spectra below also loop over
-    #     sims internally; parallelize there too for consistency.
-    # Deferred until we move beyond ~20-sim exploratory runs; at nsims=100
-    # (Carones baseline) this is the difference between ~25 min serial
-    # and ~3 min parallel.
-    for nsim in range(config.nsim_start, config.nsim_start + config.nsims):
-        tag = _format_nsim(nsim)
-        print(f"\n=== sim {tag} ===")
-        print(f"[{tag}] get_input_data")
-        data = get_input_data(config, nsim=tag)
-        print(f"[{tag}] component_separation (NILC + GNILC)")
-        component_separation(config, data, nsim=tag)
-        # estimate_residuals mutates compsep_residuals in-place; rebuild
-        # fresh each iteration so nsim_weights does not leak across sims.
-        config.compsep_residuals = _compsep_residuals_block()
-        print(f"[{tag}] estimate_residuals")
-        estimate_residuals(config, nsim=tag)
+def _run_one_sim(args: tuple) -> None:
+    """Worker entrypoint: builds a fresh BROOM ``Configs`` from the parent's
+    config dict and runs one sim's get_input_data → component_separation →
+    estimate_residuals chain.
+
+    Each worker has its own Configs to avoid the in-place
+    `compsep_residuals` mutation footgun (BROOM's
+    `estimate_residuals` stamps `nsim_weights` on
+    `config.compsep_residuals[0]`, so sharing a single Configs across
+    sims leaks weights across sims).
+
+    Module globals EXPERIMENT / FG_TAG / FOREGROUND_MODELS govern
+    path resolution in helper functions; spawn-mode workers re-import
+    the module fresh and don't see main()'s mutations of these, so
+    the parent threads them in via args.
+    """
+    nsim_idx, config_dict, experiment, fg_tag, fg_models = args
+    global EXPERIMENT, FG_TAG, FOREGROUND_MODELS
+    EXPERIMENT = experiment
+    FG_TAG = fg_tag
+    FOREGROUND_MODELS = fg_models
+
+    cfg = Configs(config=config_dict)
+    tag = _format_nsim(nsim_idx)
+    print(f"\n=== sim {tag} ===")
+    print(f"[{tag}] get_input_data")
+    data = get_input_data(cfg, nsim=tag)
+    print(f"[{tag}] component_separation (NILC + GNILC)")
+    component_separation(cfg, data, nsim=tag)
+    cfg.compsep_residuals = _compsep_residuals_block()
+    print(f"[{tag}] estimate_residuals")
+    estimate_residuals(cfg, nsim=tag)
+
+
+def run_all_sims(config_dict: dict, n_workers: int = 1) -> Configs:
+    """Phase 1: per-sim get_input_data + compsep + estimate_residuals.
+
+    With ``n_workers > 1``, parallelizes the embarrassingly-parallel MC
+    loop via ``multiprocessing.Pool`` (spawn context for macOS-fork
+    safety). BLAS threads are pinned to 1 per worker (env vars set in
+    parent before pool creation; spawned workers inherit env) so the
+    per-needlet matrix ops in NILC/GNILC don't fight each other across
+    n_workers × n_BLAS_threads oversubscription.
+
+    Returns a fresh ``Configs`` built from the same dict for the
+    caller's Phase 2 (spectra) work.
+    """
+    nsims = config_dict["nsims"]
+    nsim_start = config_dict.get("nsim_start", 0)
+
+    if n_workers <= 1 or nsims <= 1:
+        cfg = Configs(config=config_dict)
+        for nsim in range(nsim_start, nsim_start + nsims):
+            tag = _format_nsim(nsim)
+            print(f"\n=== sim {tag} ===")
+            print(f"[{tag}] get_input_data")
+            data = get_input_data(cfg, nsim=tag)
+            print(f"[{tag}] component_separation (NILC + GNILC)")
+            component_separation(cfg, data, nsim=tag)
+            # estimate_residuals mutates compsep_residuals in-place; rebuild
+            # fresh each iteration so nsim_weights does not leak across sims.
+            cfg.compsep_residuals = _compsep_residuals_block()
+            print(f"[{tag}] estimate_residuals")
+            estimate_residuals(cfg, nsim=tag)
+        return cfg
+
+    n_workers = min(n_workers, nsims)
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
+
+    print(f"Parallelizing {nsims} sims across {n_workers} workers "
+          "(BLAS pinned to 1 thread/worker)")
+    args_list = [
+        (i, config_dict, EXPERIMENT, FG_TAG, FOREGROUND_MODELS)
+        for i in range(nsim_start, nsim_start + nsims)
+    ]
+
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(n_workers) as pool:
+        pool.map(_run_one_sim, args_list)
+
+    return Configs(config=config_dict)
 
 
 def compute_all_spectra(config: Configs) -> None:
@@ -681,6 +730,14 @@ def _parse_args() -> argparse.Namespace:
                         "filename tag use 'pico_apXXXX' (cm-precision) for "
                         "path discrimination. Incompatible with --hits-prefix "
                         "/ --knee-config for now.")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Number of parallel workers for the per-sim Phase 1 "
+                        "loop (get_input_data + compsep + estimate_residuals). "
+                        "Each worker has its own BROOM Configs (no shared "
+                        "compsep_residuals state) and BLAS threads are "
+                        "pinned to 1 per worker to avoid oversubscribing the "
+                        "host CPU. Default: 1 (serial). Use 4-8 for nsims "
+                        ">= 10 on a 16-core host.")
     return p.parse_args()
 
 
@@ -726,16 +783,18 @@ def main() -> None:
         has_hits=args.hits_prefix is not None,
         has_knee=args.knee_config is not None,
     )
-    config = Configs(config=_base_config(
+    config_dict = _base_config(
         nsims=args.nsims, mask_type=args.mask,
         instrument_override=instrument_override,
         input_cache_tag=cache_tag,
         cov_noise_debias_factor=args.cov_noise_debias,
-    ))
+    )
 
     if not args.skip_compsep:
         print(f"Phase 1: NILC + GNILC + estimate_residuals, nsims={args.nsims}")
-        run_all_sims(config)
+        config = run_all_sims(config_dict, n_workers=args.workers)
+    else:
+        config = Configs(config=config_dict)
 
     print("\nResolving GNILC path and attaching spectra block ...")
     config.compute_spectra = _spectra_block(args.mask)
