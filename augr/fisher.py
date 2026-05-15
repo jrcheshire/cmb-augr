@@ -27,6 +27,7 @@ Conditional constraint:   σ_α^{cond} = 1/√(F_{αα})
 from __future__ import annotations
 
 import math
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -485,31 +486,15 @@ class FisherForecast:
         return {name: float(delta_theta[i])
                 for i, name in enumerate(self._free_names)}
 
-    def bias_from_truth_model(self,
-                              signal_truth: SignalModel,
-                              fiducial_truth: dict[str, float]
-                              ) -> dict[str, float]:
-        """Linear bias from a parametric truth ``SignalModel``.
+    def _truth_delta_d(self,
+                        signal_truth: SignalModel,
+                        fiducial_truth: dict[str, float]
+                        ) -> jnp.ndarray:
+        """Validate compatibility and return ΔD = D_truth − D_fit(θ_fid).
 
-        Builds ΔD = D_truth − D_fit(θ_fid) from a second SignalModel
-        evaluated at its own fiducial, then delegates to
-        :meth:`parameter_bias`. The two models must produce
-        data vectors with matching layout (same Instrument frequencies,
-        same ℓ grid, same binning); they may have completely different
-        parameter lists (e.g. moment-truth vs Gaussian-fit).
-
-        Args:
-            signal_truth: Truth ``SignalModel``. Typically built on the
-                same Instrument + ℓ binning as ``self._signal`` but with
-                a richer foreground model (e.g.
-                ``MomentExpansionModel``).
-            fiducial_truth: Dict of fiducial parameter values for the
-                truth model. Keys must cover
-                ``signal_truth.parameter_names``.
-
-        Returns:
-            Same shape as :meth:`parameter_bias` -- one entry per
-            free parameter of the *fit* model.
+        Shared by :meth:`bias_from_truth_model` and
+        :meth:`bias_from_truth_model_iterative` so the validation
+        contract is identical between the two entry points.
         """
         fit_sig = self._signal
 
@@ -539,7 +524,238 @@ class FisherForecast:
         fit_params = flatten_params(self._fiducial, self._all_names)
         d_fit = fit_sig.data_vector(fit_params)
 
-        return self.parameter_bias(d_truth - d_fit)
+        return d_truth - d_fit
+
+    def bias_from_truth_model(self,
+                              signal_truth: SignalModel,
+                              fiducial_truth: dict[str, float]
+                              ) -> dict[str, float]:
+        """Linear bias from a parametric truth ``SignalModel``.
+
+        Builds ΔD = D_truth − D_fit(θ_fid) from a second SignalModel
+        evaluated at its own fiducial, then delegates to
+        :meth:`parameter_bias`. The two models must produce
+        data vectors with matching layout (same Instrument frequencies,
+        same ℓ grid, same binning); they may have completely different
+        parameter lists (e.g. moment-truth vs Gaussian-fit).
+
+        Args:
+            signal_truth: Truth ``SignalModel``. Typically built on the
+                same Instrument + ℓ binning as ``self._signal`` but with
+                a richer foreground model (e.g.
+                ``MomentExpansionModel``).
+            fiducial_truth: Dict of fiducial parameter values for the
+                truth model. Keys must cover
+                ``signal_truth.parameter_names``.
+
+        Returns:
+            Same shape as :meth:`parameter_bias` -- one entry per
+            free parameter of the *fit* model.
+        """
+        return self.parameter_bias(
+            self._truth_delta_d(signal_truth, fiducial_truth))
+
+    def parameter_bias_iterative(
+        self,
+        delta_data_vector: jnp.ndarray,
+        *,
+        max_iter: int = 20,
+        tol: float = 1e-4,
+        return_diagnostics: bool = False,
+    ) -> dict[str, float] | tuple[dict[str, float], dict]:
+        """Iterative (Gauss-Newton) version of :meth:`parameter_bias`.
+
+        Useful when the linear approximation breaks (|Δθ| ≳ few σ_θ).
+        At iteration k starting from θ₀ = θ_fid:
+
+            r_k     = D_truth − D_fit(θ_k)
+                      (D_truth ≡ D_fit(θ_fid) + ΔD, reconstructed
+                      internally)
+            F_k     = J(θ_k)ᵀ C⁻¹ J(θ_k)
+            δθ_k    = (F_k + Λ)⁻¹ · [J(θ_k)ᵀ C⁻¹ r_k − Λ·(θ_k − θ_fid)]
+            θ_{k+1} = θ_k + δθ_k
+
+        The covariance ``C`` is held at θ_fid throughout, matching the
+        :meth:`sigma` convention; the iterate is then the MAP under a
+        fixed-cov Gaussian likelihood plus Gaussian priors centered at
+        θ_fid. The first iteration's step equals the linear
+        :meth:`parameter_bias` result by construction, so this method
+        reduces to the linear formula in the linear regime (1-2
+        iterations) and continues to refine where the linear
+        approximation breaks.
+
+        Args:
+            delta_data_vector: ΔD on the same layout as
+                ``self._signal.data_vector(...)``; shape
+                ``(n_spectra * n_bins,)``.
+            max_iter: Hard cap on iteration count. Default 20.
+            tol: Convergence on ``max_i |δθ_i / σ_i| < tol`` where σ_i
+                is the fiducial marginalized 1-σ from :meth:`sigma`.
+                Default 1e-4 (step shrinks below 0.01% of σ).
+            return_diagnostics: If True, return a
+                ``(biases, diagnostics)`` tuple. ``diagnostics`` has
+                keys ``converged`` (bool), ``n_iter`` (int), and
+                ``step_history`` (list of float; per-iteration
+                ``max |δθ_i / σ_i|``).
+
+        Returns:
+            Dict of bias per *free* parameter; or
+            ``(biases, diagnostics)`` if ``return_diagnostics``.
+
+        Notes:
+            Emits a ``UserWarning`` (rather than raising) when
+            ``max_iter`` is exhausted without convergence: divergence
+            is itself a forecasting signal -- it usually means the
+            truth data vector is not fittable by this fit model at
+            this fiducial -- and inspecting the partial result is
+            often useful.
+        """
+        dd = jnp.asarray(delta_data_vector)
+        n_data = self._signal.n_data
+        if dd.shape != (n_data,):
+            raise ValueError(
+                f"delta_data_vector has shape {dd.shape}; expected "
+                f"({n_data},) matching SignalModel.data_vector output "
+                f"(n_spectra={self._signal.n_spectra}, "
+                f"n_bins={self._signal.n_bins}).")
+
+        if self._fisher_matrix is None:
+            self.compute()
+
+        n_free = self.n_free
+        if n_free == 0:
+            biases: dict[str, float] = {}
+            if return_diagnostics:
+                return biases, {"converged": True, "n_iter": 0,
+                                 "step_history": []}
+            return biases
+
+        # Implied D_truth = D_fit(θ_fid) + ΔD, held fixed across the loop.
+        params_fid_full = flatten_params(self._fiducial, self._all_names)
+        d_fid = self._signal.data_vector(params_fid_full)
+        d_obs = d_fid + dd
+
+        # Diagonal prior matrix on free params (Λ_{ii} = 1/σ_prior_i²).
+        lam = jnp.zeros(n_free)
+        for name, sigma_p in self._priors.items():
+            if name in self._fixed or name not in self._free_names:
+                continue
+            idx = self._free_names.index(name)
+            lam = lam.at[idx].set(1.0 / sigma_p ** 2)
+        Lam_diag = jnp.diag(lam)
+
+        # Fiducial σ for the convergence test.
+        sigma_fid = jnp.sqrt(jnp.diag(self.inverse))   # (n_free,)
+
+        # Covariance held at fiducial; build once.
+        use_full = self._signal.has_measured_bpwf
+        if use_full:
+            cov_full = bandpower_covariance_full_from_noise(
+                self._signal, self._external_noise_bb,
+                self._instrument.f_sky, params_fid_full)
+            cov_blocks = None
+        else:
+            if self._external_noise_bb is not None:
+                cov_blocks = bandpower_covariance_blocks_from_noise(
+                    self._signal, self._external_noise_bb,
+                    self._instrument.f_sky, params_fid_full)
+            else:
+                cov_blocks = bandpower_covariance_blocks(
+                    self._signal, self._instrument, params_fid_full)
+            cov_full = None
+
+        n_spec = self._signal.n_spectra
+        n_bins = self._signal.n_bins
+
+        # Gauss-Newton loop. delta_free is the cumulative Δθ on free params.
+        delta_free = jnp.zeros(n_free)
+        converged = False
+        step_history: list[float] = []
+
+        for _ in range(max_iter):
+            # θ_k: fixed params stay at fiducial; free params get δ.
+            delta_full = jnp.zeros_like(params_fid_full).at[
+                self._free_idx].set(delta_free)
+            theta_k = params_fid_full + delta_full
+
+            d_fit_k = self._signal.data_vector(theta_k)
+            r_k = d_obs - d_fit_k
+
+            J_full_k = self._signal.jacobian(theta_k)
+            J_free_k = J_full_k[:, self._free_idx]
+
+            if use_full:
+                cinv_r = _cinv_d_full(cov_full, r_k)
+                u = J_free_k.T @ cinv_r
+                F_k = _fisher_from_full(J_free_k, cov_full)
+            else:
+                J_blocks_k = J_free_k.reshape(n_spec, n_bins,
+                                                -1).transpose(1, 0, 2)
+                r_blocks = r_k.reshape(n_spec, n_bins).T
+                cinv_r_blocks = _cinv_d_blocks(cov_blocks, r_blocks)
+                u = jnp.einsum('bsf,bs->f', J_blocks_k, cinv_r_blocks)
+                F_k = _fisher_from_blocks(J_blocks_k, cov_blocks)
+
+            # (F_k + Λ) δθ = Jᵀ C⁻¹ r_k − Λ·(θ_k − θ_fid)
+            step = jnp.linalg.solve(F_k + Lam_diag, u - lam * delta_free)
+
+            # Bail out cleanly if the step has gone non-finite: Gauss-
+            # Newton without damping can overshoot into a region where
+            # the FG SED (or other nonlinear pieces) produces inf/NaN.
+            # Return the last finite iterate rather than silently
+            # propagating NaNs through the caller's analysis.
+            if not bool(jnp.all(jnp.isfinite(step))):
+                warnings.warn(
+                    "parameter_bias_iterative produced a non-finite "
+                    f"step at iteration {len(step_history) + 1}; "
+                    "aborting. The truth data vector is likely outside "
+                    "the convergence basin of undamped Gauss-Newton at "
+                    "this fiducial -- try a smaller ΔD, a richer fit "
+                    "model, or implement step damping.",
+                    stacklevel=2,
+                )
+                break
+
+            delta_free = delta_free + step
+            rel_step = float(jnp.max(jnp.abs(step) / sigma_fid))
+            step_history.append(rel_step)
+            if rel_step < tol:
+                converged = True
+                break
+
+        if not converged and step_history:
+            warnings.warn(
+                f"parameter_bias_iterative did not converge in "
+                f"{max_iter} iterations (last max |δθ/σ| = "
+                f"{step_history[-1]:.3e}, tol = {tol}). The returned "
+                "biases are the latest iterate; inspect step_history "
+                "for divergence diagnostics.",
+                stacklevel=2,
+            )
+
+        biases = {name: float(delta_free[i])
+                  for i, name in enumerate(self._free_names)}
+        if return_diagnostics:
+            return biases, {"converged": converged,
+                             "n_iter": len(step_history),
+                             "step_history": step_history}
+        return biases
+
+    def bias_from_truth_model_iterative(
+        self,
+        signal_truth: SignalModel,
+        fiducial_truth: dict[str, float],
+        **kwargs,
+    ) -> dict[str, float] | tuple[dict[str, float], dict]:
+        """Iterative analogue of :meth:`bias_from_truth_model`.
+
+        Builds ΔD = D_truth − D_fit(θ_fid) via :meth:`_truth_delta_d`,
+        then delegates to :meth:`parameter_bias_iterative` with any
+        forwarded keyword arguments (``max_iter``, ``tol``,
+        ``return_diagnostics``).
+        """
+        return self.parameter_bias_iterative(
+            self._truth_delta_d(signal_truth, fiducial_truth), **kwargs)
 
     # ------------------------------------------------------------------
     # Summary

@@ -852,3 +852,263 @@ class TestParameterBias:
         )
         with pytest.raises(ValueError, match="ells"):
             fisher_priors.bias_from_truth_model(sm_other, FIDUCIAL)
+
+
+class TestParameterBiasIterative:
+    """Gauss-Newton iteration of the linear bias formula."""
+
+    @pytest.fixture(scope="class")
+    def fisher_no_prior(self, signal_model, instrument):
+        return FisherForecast(
+            signal_model, instrument, FIDUCIAL,
+            fixed_params=["T_dust"],
+        )
+
+    @pytest.fixture(scope="class")
+    def fisher_priors(self, signal_model, instrument):
+        return FisherForecast(
+            signal_model, instrument, FIDUCIAL,
+            priors={"beta_dust": 0.11, "beta_sync": 0.3},
+            fixed_params=["T_dust"],
+        )
+
+    def test_first_step_matches_linear_formula(self, fisher_priors,
+                                                 signal_model):
+        """With max_iter=1, the iterative step equals the linear bias
+        by construction (modulo a single non-convergence warning).
+        """
+        rng = np.random.default_rng(42)
+        dd = jnp.asarray(rng.standard_normal(signal_model.n_data) * 1e-4)
+        linear = fisher_priors.parameter_bias(dd)
+        with pytest.warns(UserWarning,
+                          match="did not converge in 1 iterations"):
+            iterative = fisher_priors.parameter_bias_iterative(
+                dd, max_iter=1, tol=0.0)
+        for name in linear:
+            assert abs(iterative[name] - linear[name]) < \
+                max(1e-14, 1e-10 * abs(linear[name])), \
+                f"first-step mismatch on {name}"
+
+    def test_zero_delta_d_converges_in_one_iter(self, fisher_priors,
+                                                  signal_model):
+        biases, diag = fisher_priors.parameter_bias_iterative(
+            jnp.zeros(signal_model.n_data), return_diagnostics=True)
+        assert diag["converged"]
+        assert diag["n_iter"] == 1
+        assert diag["step_history"] == [0.0]
+        for val in biases.values():
+            assert val == 0.0
+
+    def test_linear_regime_matches_linear_after_few_iters(self,
+                                                            fisher_priors,
+                                                            signal_model):
+        """For ΔD built from a small in-manifold parameter shift, the
+        iterative MAP converges to the linear formula within fp64.
+
+        Use a tiny r-shift: r enters the BB model linearly so D(θ) is
+        exactly affine in r, the Gauss-Newton fixed point coincides
+        with the linear formula, and convergence is instant.
+        """
+        from augr.signal import flatten_params
+        fid_shifted = {**FIDUCIAL, "r": 1e-6}
+        p_fid = flatten_params(FIDUCIAL, signal_model.parameter_names)
+        p_shifted = flatten_params(fid_shifted,
+                                     signal_model.parameter_names)
+        dd = signal_model.data_vector(p_shifted) - \
+            signal_model.data_vector(p_fid)
+        linear = fisher_priors.parameter_bias(dd)
+        biases, diag = fisher_priors.parameter_bias_iterative(
+            dd, tol=1e-8, return_diagnostics=True)
+        assert diag["converged"]
+        assert diag["n_iter"] <= 3, \
+            f"unexpected slow convergence: {diag}"
+        for name in linear:
+            sigma_n = fisher_priors.sigma(name)
+            assert abs(biases[name] - linear[name]) < 1e-6 * sigma_n, \
+                f"linear-regime drift on {name}: " \
+                f"iter={biases[name]:.4e}, linear={linear[name]:.4e}"
+
+    def test_recovers_in_manifold_shift_no_prior(self, fisher_no_prior,
+                                                   signal_model):
+        """A substantial in-manifold shift of a nonlinear FG parameter
+        (beta_dust ↦ beta_dust + 0.1) is recovered to high precision by
+        Gauss-Newton iteration; the linear formula alone misses by
+        O(δθ²) because beta_dust enters the FG model nonlinearly.
+        """
+        from augr.signal import flatten_params
+        shift = 0.1
+        fid_shifted = {**FIDUCIAL,
+                        "beta_dust": FIDUCIAL["beta_dust"] + shift}
+        p_fid = flatten_params(FIDUCIAL, signal_model.parameter_names)
+        p_shifted = flatten_params(fid_shifted,
+                                     signal_model.parameter_names)
+        dd = signal_model.data_vector(p_shifted) - \
+            signal_model.data_vector(p_fid)
+        biases, diag = fisher_no_prior.parameter_bias_iterative(
+            dd, max_iter=30, tol=1e-8, return_diagnostics=True)
+        assert diag["converged"], \
+            f"failed to converge on in-manifold shift: {diag}"
+        # Recovered shift on the perturbed parameter.
+        assert abs(biases["beta_dust"] - shift) < 1e-6 * abs(shift), \
+            f"failed to recover beta_dust shift: " \
+            f"got {biases['beta_dust']:.6e}, expected {shift:.6e}"
+        # Other free params: near-zero (no degeneracy mixing at MAP
+        # since the truth is exactly representable).
+        for name in fisher_no_prior.free_parameter_names:
+            if name == "beta_dust":
+                continue
+            sigma_n = fisher_no_prior.sigma(name)
+            assert abs(biases[name]) < 1e-4 * sigma_n, \
+                f"unexpected leakage into {name}: {biases[name]:.4e} " \
+                f"(σ={sigma_n:.4e})"
+
+    def test_linear_overshoots_in_nonlinear_regime(self, fisher_no_prior,
+                                                     signal_model):
+        """Linear bias of an in-manifold β_dust shift is off by O(δθ²);
+        iterative cleans that up. Confirms the iterative refinement is
+        actually doing work and not just returning the linear formula.
+        """
+        from augr.signal import flatten_params
+        shift = 0.1
+        fid_shifted = {**FIDUCIAL,
+                        "beta_dust": FIDUCIAL["beta_dust"] + shift}
+        p_fid = flatten_params(FIDUCIAL, signal_model.parameter_names)
+        p_shifted = flatten_params(fid_shifted,
+                                     signal_model.parameter_names)
+        dd = signal_model.data_vector(p_shifted) - \
+            signal_model.data_vector(p_fid)
+        linear = fisher_no_prior.parameter_bias(dd)
+        iterative = fisher_no_prior.parameter_bias_iterative(
+            dd, max_iter=30, tol=1e-8)
+        # Linear should miss the true shift by visibly more than fp64
+        # noise (β_dust is nonlinear in the FG SED, so O(δθ²) bites);
+        # iterative should land within ~1e-5 relative of it.
+        assert abs(linear["beta_dust"] - shift) > 1e-3 * abs(shift), \
+            "shift too small to exercise nonlinearity"
+        assert abs(iterative["beta_dust"] - shift) < 1e-5 * abs(shift)
+
+    @pytest.mark.slow
+    def test_matches_scipy_nonlinear_mle(self, fisher_no_prior,
+                                          signal_model, instrument):
+        """Iterative bias agrees with scipy.minimize MAP on a
+        nonlinearly-shifted in-manifold truth."""
+        from scipy.optimize import minimize
+
+        from augr.covariance import bandpower_covariance_blocks
+        from augr.signal import flatten_params
+
+        shift = 0.15
+        fid_shifted = {**FIDUCIAL,
+                        "beta_dust": FIDUCIAL["beta_dust"] + shift}
+        all_names = signal_model.parameter_names
+        p_fid = flatten_params(FIDUCIAL, all_names)
+        p_shifted = flatten_params(fid_shifted, all_names)
+        d_target = np.asarray(signal_model.data_vector(p_shifted))
+        dd = jnp.asarray(d_target -
+                          np.asarray(signal_model.data_vector(p_fid)))
+
+        biases_iter, diag = fisher_no_prior.parameter_bias_iterative(
+            dd, max_iter=50, tol=1e-8, return_diagnostics=True)
+        assert diag["converged"]
+
+        # Brute-force MAP via scipy.minimize.
+        cov_blocks = np.asarray(bandpower_covariance_blocks(
+            signal_model, instrument, p_fid))
+        cov_inv_blocks = np.linalg.inv(cov_blocks)
+        n_spec, n_bins = (signal_model.n_spectra,
+                           signal_model.n_bins)
+        free_names = fisher_no_prior.free_parameter_names
+        free_idx = [all_names.index(n) for n in free_names]
+        p_fid_np = np.asarray(p_fid)
+
+        def neg_log_lik(free_arr):
+            full = p_fid_np.copy()
+            full[free_idx] = free_arr
+            d_model = np.asarray(signal_model.data_vector(
+                jnp.asarray(full)))
+            r_b = (d_target - d_model).reshape(n_spec, n_bins).T
+            return 0.5 * float(np.einsum('bs,bst,bt->',
+                                          r_b, cov_inv_blocks, r_b))
+
+        free_fid_arr = np.array([FIDUCIAL[n] for n in free_names])
+        res = minimize(
+            neg_log_lik, free_fid_arr, method='Nelder-Mead',
+            options={'xatol': 1e-10, 'fatol': 1e-16,
+                     'maxiter': 50000, 'adaptive': True},
+        )
+        delta_scipy = {n: float(res.x[i] - FIDUCIAL[n])
+                       for i, n in enumerate(free_names)}
+
+        for name in free_names:
+            sigma_n = fisher_no_prior.sigma(name)
+            diff = abs(biases_iter[name] - delta_scipy[name])
+            # 1% of σ tolerates Nelder-Mead convergence noise.
+            assert diff < 0.01 * sigma_n, (
+                f"iterative vs scipy mismatch on {name}: "
+                f"iter={biases_iter[name]:.4e}, "
+                f"scipy={delta_scipy[name]:.4e}, "
+                f"σ={sigma_n:.4e}, diff={diff:.4e}"
+            )
+
+    def test_diagnostics_dict_shape(self, fisher_priors, signal_model):
+        from augr.signal import flatten_params
+        # Use a small in-manifold shift so the iteration is well-behaved
+        # and we exercise the success path of the diagnostics output.
+        fid_shifted = {**FIDUCIAL, "r": 1e-5}
+        p_fid = flatten_params(FIDUCIAL, signal_model.parameter_names)
+        p_shifted = flatten_params(fid_shifted,
+                                     signal_model.parameter_names)
+        dd = signal_model.data_vector(p_shifted) - \
+            signal_model.data_vector(p_fid)
+        result = fisher_priors.parameter_bias_iterative(
+            dd, return_diagnostics=True)
+        assert isinstance(result, tuple) and len(result) == 2
+        biases, diag = result
+        assert set(diag) == {"converged", "n_iter", "step_history"}
+        assert isinstance(diag["converged"], bool)
+        assert isinstance(diag["n_iter"], int)
+        assert isinstance(diag["step_history"], list)
+        assert len(diag["step_history"]) == diag["n_iter"]
+        assert set(biases) == set(fisher_priors.free_parameter_names)
+
+    def test_warns_when_not_converged(self, fisher_priors, signal_model):
+        rng = np.random.default_rng(3)
+        dd = jnp.asarray(rng.standard_normal(signal_model.n_data) * 1e-3)
+        with pytest.warns(UserWarning, match="did not converge"):
+            biases, diag = fisher_priors.parameter_bias_iterative(
+                dd, max_iter=1, tol=0.0, return_diagnostics=True)
+        assert diag["converged"] is False
+        assert diag["n_iter"] == 1
+        # Biases should still be the latest iterate (the linear step).
+        for name in biases:
+            assert np.isfinite(biases[name])
+
+    def test_bias_from_truth_iterative_matches_direct_dd(self,
+                                                          fisher_no_prior,
+                                                          instrument):
+        """The truth-model wrapper produces the same iterate as feeding
+        the manually-built ΔD to parameter_bias_iterative."""
+        from augr.foregrounds import MomentExpansionModel
+        from augr.signal import flatten_params
+        sm_truth = SignalModel(
+            instrument, MomentExpansionModel(), CMBSpectra(),
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+        )
+        fid_truth = {**FIDUCIAL_MOMENT_TEST, "omega_d_beta": 5e-3}
+        via_wrapper = fisher_no_prior.bias_from_truth_model_iterative(
+            sm_truth, fid_truth, max_iter=30, tol=1e-8)
+
+        # Build ΔD by hand and call the primitive directly.
+        truth_params = flatten_params(fid_truth,
+                                       sm_truth.parameter_names)
+        d_truth = sm_truth.data_vector(truth_params)
+        p_fid = flatten_params(FIDUCIAL,
+                                fisher_no_prior._signal.parameter_names)
+        dd = d_truth - fisher_no_prior._signal.data_vector(p_fid)
+        direct = fisher_no_prior.parameter_bias_iterative(
+            dd, max_iter=30, tol=1e-8)
+
+        for name in via_wrapper:
+            assert via_wrapper[name] == direct[name], \
+                f"mismatch on {name}: " \
+                f"wrapper={via_wrapper[name]}, direct={direct[name]}"
