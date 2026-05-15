@@ -71,6 +71,14 @@ Knowing how the modules chain together matters more than any one file:
    `FisherForecast(signal, inst, fiducial, priors=..., fixed_params=...)`
    builds F = Jᵀ C⁻¹ J per bin, adds priors on the diagonal, and
    exposes `sigma(param)` (marginalized) and conditional constraints.
+   `parameter_bias(ΔD)` and `bias_from_truth_model(signal_truth,
+   fiducial_truth)` return the linear parameter bias
+   `Δθ = (F + Λ)^{-1} · Jᵀ · C^{-1} · (D_truth - D_fit)` from a
+   truth-vs-fit data-vector mismatch — used for forecasting Δr from
+   unmodelled foreground complexity or any other un-fit ΔC_ℓ. Linear
+   approximation; valid for |Δθ| ≲ few σ_θ. Standard derivation in
+   Stompor+ 2016 (arXiv:1609.03807) and Amara & Refregier 2008
+   (arXiv:0710.5171).
    Two solver paths: a per-bin block-diagonal solve (default; valid for
    the synthetic top-hat / Gaussian binning), and a full
    `(n_data, n_data)` solve dispatched automatically when

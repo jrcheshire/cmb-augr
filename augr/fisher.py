@@ -114,6 +114,58 @@ def _fisher_from_full(J: jnp.ndarray,
     return 0.5 * (F + F.T)
 
 
+@jax.jit
+def _cinv_d_blocks(cov_blocks: jnp.ndarray,
+                   dd_blocks: jnp.ndarray) -> jnp.ndarray:
+    """Per-bin C^{-1} · ΔD via the same sqrt(diag) prewhitening as
+    ``_fisher_from_blocks``.
+
+    Args:
+        cov_blocks: (n_bins, n_spec, n_spec) -- per-bin Knox covariance.
+        dd_blocks:  (n_bins, n_spec)         -- per-bin ΔD residual.
+
+    Returns:
+        (n_bins, n_spec) -- per-bin C_b^{-1} · ΔD_b.
+
+    Math: cov_b = D_b · cov_w · D_b with D_b = diag(sqrt(diag(cov_b)))
+    ⇒ cov_b^{-1} · ΔD_b = D_b^{-1} · cov_w^{-1} · D_b^{-1} · ΔD_b
+                       = D_b^{-1} · solve(cov_w, ΔD_b / d_b).
+    Conditioning benefit matches ``_fisher_from_blocks`` (cov_b cond
+    10^28 → cov_w cond ~10^15 at PICO bin 0), so bias gradients are
+    JIT-stable in the same regime where Fisher gradients are.
+    """
+    def _one_bin(carry, inputs):
+        cov_b, dd_b = inputs
+        d = jnp.sqrt(jnp.diag(cov_b))
+        inv_d = 1.0 / d
+        cov_w = cov_b * (inv_d[:, None] * inv_d[None, :])
+        dd_w = dd_b * inv_d
+        v_w = jnp.linalg.solve(cov_w, dd_w)
+        v = v_w * inv_d
+        return carry, v
+
+    _, v_blocks = jax.lax.scan(_one_bin, None, (cov_blocks, dd_blocks))
+    return v_blocks
+
+
+@jax.jit
+def _cinv_d_full(cov: jnp.ndarray, dd: jnp.ndarray) -> jnp.ndarray:
+    """BPWF-mode counterpart of ``_cinv_d_blocks``.
+
+    Args:
+        cov: (n_data, n_data) -- full covariance.
+        dd:  (n_data,)        -- ΔD residual.
+
+    Returns:
+        (n_data,) -- cov^{-1} · ΔD via prewhitening.
+    """
+    d = jnp.sqrt(jnp.diag(cov))
+    inv_d = 1.0 / d
+    cov_w = cov * (inv_d[:, None] * inv_d[None, :])
+    dd_w = dd * inv_d
+    return jnp.linalg.solve(cov_w, dd_w) * inv_d
+
+
 class FisherForecast:
     """Fisher information matrix and parameter constraints.
 
@@ -339,6 +391,155 @@ class FisherForecast:
             "rho": rho,
             "angle_deg": float(jnp.degrees(angle)),
         }
+
+    # ------------------------------------------------------------------
+    # Parameter bias from truth-vs-fit data-vector mismatch
+    # ------------------------------------------------------------------
+
+    def parameter_bias(self,
+                       delta_data_vector: jnp.ndarray
+                       ) -> dict[str, float]:
+        """Linear parameter bias from a truth-vs-fit data-vector mismatch.
+
+        Given ΔD = D_truth − D_fit(θ_fid), the maximum-likelihood
+        estimate of the fit-model parameters shifts away from the fit
+        fiducial by
+
+            Δθ = (F + Λ)^{-1} · J^T · C^{-1} · ΔD
+
+        to linear order in ΔD, where F is the data Fisher matrix, Λ is
+        the diagonal prior matrix (1/σ²_prior), J is the Jacobian of
+        the fit data vector at the fit fiducial, and C is the
+        bandpower covariance. ``self.inverse`` already includes the
+        prior contribution because priors are added on the F diagonal
+        in :meth:`compute`, so the implementation just multiplies by
+        ``self.inverse``.
+
+        Sign convention: a positive ``Δr`` means the fit's MAP estimate
+        lies above the fit fiducial r; equivalently, the data wants
+        more tensor power than the fit-model fiducial provides.
+
+        Args:
+            delta_data_vector: ΔD on the same ordering as
+                ``self._signal.data_vector(...)``; shape
+                ``(n_spectra * n_bins,)``.
+
+        Returns:
+            Dict mapping free-parameter name to linear bias. Fixed
+            parameters are absent (they are held at their fiducial
+            values by construction).
+
+        Validity:
+            Linear approximation; valid when |Δθ| is at most a few
+            σ_θ. Outside that regime an iterative form (re-evaluate J
+            at θ_fid + Δθ_linear and re-solve) is needed. See
+            Stompor et al. 2016 (arXiv:1609.03807) and Amara & Refregier
+            2008 (arXiv:0710.5171) for the standard derivation.
+        """
+        dd = jnp.asarray(delta_data_vector)
+        n_data = self._signal.n_data
+        if dd.shape != (n_data,):
+            raise ValueError(
+                f"delta_data_vector has shape {dd.shape}; expected "
+                f"({n_data},) matching SignalModel.data_vector output "
+                f"(n_spectra={self._signal.n_spectra}, "
+                f"n_bins={self._signal.n_bins}).")
+
+        # Make sure F (and self.inverse) are up to date.
+        if self._fisher_matrix is None:
+            self.compute()
+
+        params = flatten_params(self._fiducial, self._all_names)
+        J_full = self._signal.jacobian(params)          # (n_data, n_all)
+        J_free = J_full[:, self._free_idx]              # (n_data, n_free)
+
+        if self._signal.has_measured_bpwf:
+            # BPWF mode: bins couple, full covariance solve.
+            cov_full = bandpower_covariance_full_from_noise(
+                self._signal, self._external_noise_bb,
+                self._instrument.f_sky, params)
+            cinv_dd = _cinv_d_full(cov_full, dd)         # (n_data,)
+            u = J_free.T @ cinv_dd                        # (n_free,)
+        else:
+            # Block-diagonal mode: same dispatch as compute().
+            if self._external_noise_bb is not None:
+                cov_blocks = bandpower_covariance_blocks_from_noise(
+                    self._signal, self._external_noise_bb,
+                    self._instrument.f_sky, params)
+            else:
+                cov_blocks = bandpower_covariance_blocks(
+                    self._signal, self._instrument, params)
+
+            n_spec = len(self._signal.freq_pairs)
+            n_bins = self._signal.n_bins
+            # Data ordering is (spec, bin): match the J reshape in compute().
+            J_blocks = J_free.reshape(n_spec, n_bins,
+                                       -1).transpose(1, 0, 2)
+            dd_blocks = dd.reshape(n_spec, n_bins).T     # (n_bins, n_spec)
+
+            cinv_dd_blocks = _cinv_d_blocks(cov_blocks, dd_blocks)
+            # u = Σ_b J_b^T · C_b^{-1} · ΔD_b.
+            u = jnp.einsum('bsf,bs->f', J_blocks, cinv_dd_blocks)
+
+        delta_theta = self.inverse @ u                   # (n_free,)
+        return {name: float(delta_theta[i])
+                for i, name in enumerate(self._free_names)}
+
+    def bias_from_truth_model(self,
+                              signal_truth: SignalModel,
+                              fiducial_truth: dict[str, float]
+                              ) -> dict[str, float]:
+        """Linear bias from a parametric truth ``SignalModel``.
+
+        Builds ΔD = D_truth − D_fit(θ_fid) from a second SignalModel
+        evaluated at its own fiducial, then delegates to
+        :meth:`parameter_bias`. The two models must produce
+        data vectors with matching layout (same Instrument frequencies,
+        same ℓ grid, same binning); they may have completely different
+        parameter lists (e.g. moment-truth vs Gaussian-fit).
+
+        Args:
+            signal_truth: Truth ``SignalModel``. Typically built on the
+                same Instrument + ℓ binning as ``self._signal`` but with
+                a richer foreground model (e.g.
+                ``MomentExpansionModel``).
+            fiducial_truth: Dict of fiducial parameter values for the
+                truth model. Keys must cover
+                ``signal_truth.parameter_names``.
+
+        Returns:
+            Same shape as :meth:`parameter_bias` -- one entry per
+            free parameter of the *fit* model.
+        """
+        fit_sig = self._signal
+
+        if signal_truth.frequencies != fit_sig.frequencies:
+            raise ValueError(
+                "bias_from_truth_model: signal_truth.frequencies "
+                f"{signal_truth.frequencies} do not match the fit "
+                f"signal_model.frequencies {fit_sig.frequencies}. Build "
+                "both SignalModels on the same Instrument.")
+        if signal_truth.ells.shape != fit_sig.ells.shape or not bool(
+                jnp.all(signal_truth.ells == fit_sig.ells)):
+            raise ValueError(
+                "bias_from_truth_model: signal_truth.ells does not "
+                "match the fit signal_model.ells. Use the same "
+                "ell_min / ell_max for both models.")
+        if signal_truth.n_bins != fit_sig.n_bins or not bool(jnp.all(
+                signal_truth.bin_centers == fit_sig.bin_centers)):
+            raise ValueError(
+                "bias_from_truth_model: signal_truth bin_centers do "
+                "not match the fit signal_model bin_centers. Use the "
+                "same delta_ell / bandpower window for both models.")
+
+        truth_params = flatten_params(fiducial_truth,
+                                       signal_truth.parameter_names)
+        d_truth = signal_truth.data_vector(truth_params)
+
+        fit_params = flatten_params(self._fiducial, self._all_names)
+        d_fit = fit_sig.data_vector(fit_params)
+
+        return self.parameter_bias(d_truth - d_fit)
 
     # ------------------------------------------------------------------
     # Summary

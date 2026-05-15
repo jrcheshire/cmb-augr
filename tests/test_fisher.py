@@ -606,3 +606,248 @@ def test_fisher_summary_per_spectrum_label(instrument):
     ff.compute()
     text = ff.summary()
     assert "per-spec, first-pair" in text
+
+
+# -----------------------------------------------------------------------
+# Parameter bias
+# -----------------------------------------------------------------------
+
+# Moment-expansion superset of the test FIDUCIAL. Eight extra entries
+# beyond the 11-key BK15-like dict at the top of this file; values set
+# to zero so the moment fiducial reduces to Gaussian at the same SED.
+FIDUCIAL_MOMENT_TEST = {
+    **FIDUCIAL,
+    "c_sync":        0.0,
+    "Delta_sync":    0.0,
+    "omega_d_beta":  0.0,
+    "omega_d_T":     0.0,
+    "omega_d_betaT": 0.0,
+    "omega_s_beta":  0.0,
+    "omega_s_c":     0.0,
+    "omega_s_betac": 0.0,
+}
+
+
+class TestParameterBias:
+    """parameter_bias / bias_from_truth_model linear bias formula."""
+
+    @pytest.fixture(scope="class")
+    def fisher_no_prior(self, signal_model, instrument):
+        return FisherForecast(
+            signal_model, instrument, FIDUCIAL,
+            fixed_params=["T_dust"],
+        )
+
+    @pytest.fixture(scope="class")
+    def fisher_priors(self, signal_model, instrument):
+        return FisherForecast(
+            signal_model, instrument, FIDUCIAL,
+            priors={"beta_dust": 0.11, "beta_sync": 0.3},
+            fixed_params=["T_dust"],
+        )
+
+    # ----- ΔD primitive ----------------------------------------------------
+
+    def test_zero_delta_d_gives_zero_bias(self, fisher_priors, signal_model):
+        bias = fisher_priors.parameter_bias(jnp.zeros(signal_model.n_data))
+        assert set(bias) == set(fisher_priors.free_parameter_names)
+        for name, val in bias.items():
+            assert val == 0.0, f"non-zero bias on {name}: {val!r}"
+
+    def test_returns_dict_keyed_by_free_names(self, fisher_priors, signal_model):
+        rng = np.random.default_rng(0)
+        dd = jnp.asarray(rng.standard_normal(signal_model.n_data) * 1e-4)
+        bias = fisher_priors.parameter_bias(dd)
+        assert set(bias) == set(fisher_priors.free_parameter_names)
+        # T_dust is fixed in the fixture → must not appear.
+        assert "T_dust" not in bias
+
+    def test_linearity_in_delta_d(self, fisher_priors, signal_model):
+        rng = np.random.default_rng(1)
+        dd = jnp.asarray(rng.standard_normal(signal_model.n_data) * 1e-4)
+        bias_1 = fisher_priors.parameter_bias(dd)
+        bias_2 = fisher_priors.parameter_bias(2.0 * dd)
+        for name in bias_1:
+            # Allow a tiny absolute slack for fp64 roundoff at small values.
+            assert abs(bias_2[name] - 2.0 * bias_1[name]) < \
+                max(1e-14, 1e-10 * abs(bias_1[name]))
+
+    def test_rejects_wrong_shape(self, fisher_priors, signal_model):
+        with pytest.raises(ValueError, match="delta_data_vector has shape"):
+            fisher_priors.parameter_bias(jnp.zeros(signal_model.n_data + 1))
+
+    def test_recovers_known_r_shift_no_prior(self,
+                                              fisher_no_prior,
+                                              signal_model):
+        """With no priors, parameter_bias must recover an input r shift
+        exactly: the BB model is linear in r, so the Jacobian
+        linearization has no quadratic remainder, and (F⁻¹·F)_{r,r} = 1
+        with zero leakage into other params.
+        """
+        from augr.signal import flatten_params
+        delta_r = 0.01
+        fid_shifted = {**FIDUCIAL, "r": delta_r}
+        p_fid = flatten_params(FIDUCIAL, signal_model.parameter_names)
+        p_shifted = flatten_params(fid_shifted, signal_model.parameter_names)
+        dd = signal_model.data_vector(p_shifted) - \
+            signal_model.data_vector(p_fid)
+        bias = fisher_no_prior.parameter_bias(dd)
+        assert abs(bias["r"] - delta_r) < 1e-9 * abs(delta_r)
+        for n in fisher_no_prior.free_parameter_names:
+            if n != "r":
+                assert abs(bias[n]) < 1e-8 * abs(delta_r), \
+                    f"leakage into {n}: {bias[n]:.4e}"
+
+    @pytest.mark.slow
+    def test_matches_scipy_nonlinear_mle(self,
+                                          fisher_no_prior,
+                                          signal_model,
+                                          instrument):
+        """Brute-force MAP via scipy.minimize agrees with the linear
+        bias formula at a small truth shift (in-manifold).
+        """
+        from scipy.optimize import minimize
+        from augr.covariance import bandpower_covariance_blocks
+        from augr.signal import flatten_params
+
+        sigma_r = fisher_no_prior.sigma("r")
+        # 5% of σ_r — well within the linear regime.
+        delta_r = 0.05 * sigma_r
+        fid_shifted = {**FIDUCIAL, "r": delta_r}
+        all_names = signal_model.parameter_names
+        p_fid = flatten_params(FIDUCIAL, all_names)
+        p_shifted = flatten_params(fid_shifted, all_names)
+        d_target = np.asarray(signal_model.data_vector(p_shifted))
+        dd = jnp.asarray(d_target - np.asarray(
+            signal_model.data_vector(p_fid)))
+
+        bias_linear = fisher_no_prior.parameter_bias(dd)
+
+        # Brute-force MAP. Pre-invert cov blocks once.
+        cov_blocks = np.asarray(bandpower_covariance_blocks(
+            signal_model, instrument, p_fid))
+        cov_inv_blocks = np.linalg.inv(cov_blocks)
+        n_spec = signal_model.n_spectra
+        n_bins = signal_model.n_bins
+        free_names = fisher_no_prior.free_parameter_names
+        free_idx = [all_names.index(n) for n in free_names]
+        p_fid_np = np.asarray(p_fid)
+
+        def neg_log_lik(free_arr):
+            full = p_fid_np.copy()
+            full[free_idx] = free_arr
+            d_model = np.asarray(signal_model.data_vector(jnp.asarray(full)))
+            resid = d_target - d_model
+            r_blocks = resid.reshape(n_spec, n_bins).T   # (n_bins, n_spec)
+            chi2 = float(np.einsum('bs,bst,bt->',
+                                    r_blocks, cov_inv_blocks, r_blocks))
+            return 0.5 * chi2
+
+        free_fid_arr = np.array([FIDUCIAL[n] for n in free_names])
+        res = minimize(
+            neg_log_lik, free_fid_arr, method='Nelder-Mead',
+            options={'xatol': 1e-9, 'fatol': 1e-16,
+                     'maxiter': 50000, 'adaptive': True},
+        )
+        delta_scipy = {n: float(res.x[i] - FIDUCIAL[n])
+                       for i, n in enumerate(free_names)}
+
+        for name in free_names:
+            sigma_n = fisher_no_prior.sigma(name)
+            diff = abs(bias_linear[name] - delta_scipy[name])
+            # 1% of σ allows for Nelder-Mead convergence noise; the
+            # underlying agreement is much tighter on r itself.
+            assert diff < 0.01 * sigma_n, (
+                f"bias mismatch on {name}: "
+                f"linear={bias_linear[name]:.4e}, "
+                f"scipy={delta_scipy[name]:.4e}, "
+                f"σ={sigma_n:.4e}, diff={diff:.4e}"
+            )
+
+    # ----- bias_from_truth_model -------------------------------------------
+
+    def test_zero_when_truth_equals_fit(self, fisher_priors, instrument):
+        """Same FG model + same fiducials ⇒ ΔD = 0 ⇒ zero bias."""
+        from augr.foregrounds import GaussianForegroundModel as G
+        sm_truth = SignalModel(
+            instrument, G(), CMBSpectra(),
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+        )
+        bias = fisher_priors.bias_from_truth_model(sm_truth, FIDUCIAL)
+        for name, val in bias.items():
+            assert abs(val) < 1e-12, \
+                f"non-zero bias on {name}: {val:.4e}"
+
+    def test_moment_truth_with_zero_omega_matches_gaussian(self,
+                                                            fisher_priors,
+                                                            instrument):
+        """MomentExpansion(ω=0) ≡ Gaussian, so the bias must be ~zero."""
+        from augr.foregrounds import MomentExpansionModel
+        sm_truth = SignalModel(
+            instrument, MomentExpansionModel(), CMBSpectra(),
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+        )
+        bias = fisher_priors.bias_from_truth_model(
+            sm_truth, FIDUCIAL_MOMENT_TEST)
+        sigma_r = fisher_priors.sigma("r")
+        # The two FG models give identical C_ell at ω = 0; residual is
+        # pure roundoff in the moment-expansion arithmetic.
+        assert abs(bias["r"]) < 1e-6 * sigma_r, \
+            f"ω=0 moment truth gave non-trivial bias['r']: {bias['r']:.4e}"
+
+    def test_moment_truth_with_nonzero_omega_biases_r(self,
+                                                       fisher_priors,
+                                                       instrument):
+        """A non-zero ω_d_beta produces a measurable Δr when the fit
+        uses a Gaussian (no-moment) FG model."""
+        from augr.foregrounds import MomentExpansionModel
+        sm_truth = SignalModel(
+            instrument, MomentExpansionModel(), CMBSpectra(),
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+        )
+        fid = {**FIDUCIAL_MOMENT_TEST, "omega_d_beta": 1e-3}
+        bias = fisher_priors.bias_from_truth_model(sm_truth, fid)
+        sigma_r = fisher_priors.sigma("r")
+        # Effect should be well above any roundoff floor.
+        assert abs(bias["r"]) > 1e-3 * sigma_r, \
+            f"ω-truth gave suspiciously small bias['r']: {bias['r']:.4e}"
+
+    def test_bias_linear_in_omega(self, fisher_priors, instrument):
+        """The moment correction to C_ell is linear in ω at leading
+        order, so doubling ω should double |Δr| to ~10% in the linear
+        regime.
+        """
+        from augr.foregrounds import MomentExpansionModel
+        sm_truth = SignalModel(
+            instrument, MomentExpansionModel(), CMBSpectra(),
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+        )
+        fid_1 = {**FIDUCIAL_MOMENT_TEST, "omega_d_beta": 1e-3}
+        fid_2 = {**FIDUCIAL_MOMENT_TEST, "omega_d_beta": 2e-3}
+        b_1 = fisher_priors.bias_from_truth_model(sm_truth, fid_1)["r"]
+        b_2 = fisher_priors.bias_from_truth_model(sm_truth, fid_2)["r"]
+        ratio = b_2 / b_1
+        assert abs(ratio - 2.0) < 0.1, \
+            f"non-linear scaling: b(2ω)/b(ω) = {ratio:.3f}, expected ~2.0"
+
+    def test_validates_frequency_mismatch(self, fisher_priors, instrument):
+        eff = ScalarEfficiency(1.0, 1.0, 1.0, 1.0, 1.0)
+        inst_other = Instrument(channels=(
+            Channel(95.0,  500, 400.0, 30.0, efficiency=eff),
+            Channel(155.0, 1000, 300.0, 20.0, efficiency=eff),
+            Channel(220.0, 500, 500.0, 15.0, efficiency=eff),
+        ), mission_duration_years=5.0, f_sky=0.7)
+        sm_other = SignalModel(
+            inst_other, GaussianForegroundModel(), CMBSpectra(),
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+        )
+        with pytest.raises(ValueError, match="frequencies"):
+            fisher_priors.bias_from_truth_model(sm_other, FIDUCIAL)
+
+    def test_validates_ell_grid_mismatch(self, fisher_priors, instrument):
+        sm_other = SignalModel(
+            instrument, GaussianForegroundModel(), CMBSpectra(),
+            ell_min=20, ell_max=300, delta_ell=35, ell_per_bin_below=30,
+        )
+        with pytest.raises(ValueError, match="ells"):
+            fisher_priors.bias_from_truth_model(sm_other, FIDUCIAL)
