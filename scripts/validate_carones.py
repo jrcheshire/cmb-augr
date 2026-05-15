@@ -76,9 +76,21 @@ def _load_npy_pair(path: Path) -> tuple[np.ndarray, np.ndarray]:
 def run_fisher_variants(tres_ells: np.ndarray, tres_bb: np.ndarray,
                         nl_ells: np.ndarray, nl_bb: np.ndarray,
                         f_sky: float,
-                        a_res_prior: float) -> dict:
+                        a_res_prior: float,
+                        delensed_bb: np.ndarray | None = None,
+                        delensed_bb_ells: np.ndarray | None = None) -> dict:
     """Three Fisher runs: baseline (no template) and with-template under
-    flat and Gaussian A_res priors. Returns a dict of printable scalars."""
+    flat and Gaussian A_res priors. Returns a dict of printable scalars.
+
+    With ``delensed_bb`` / ``delensed_bb_ells`` provided, both
+    SignalModel instances replace ``A_lens * cl_bb_lensed`` with the
+    supplied residual BB (typically the output of
+    ``iterate_delensing``); ``A_lens`` is then dropped from the
+    parameter vector and the lensing-B variance contribution to
+    ``sigma(r)`` shrinks accordingly. The supplied range must span
+    ``[ELL_MIN, ELL_MAX]``; ``iterate_delensing``'s default
+    ``ls=[2, 300]`` covers ELL_MAX = 180.
+    """
     inst = cleaned_map_instrument(f_sky=f_sky)
     cmb = CMBSpectra()
 
@@ -89,6 +101,8 @@ def run_fisher_variants(tres_ells: np.ndarray, tres_bb: np.ndarray,
         cmb_spectra=cmb,
         ell_min=ELL_MIN, ell_max=ELL_MAX,
         delta_ell=DELTA_ELL, ell_per_bin_below=ELL_PER_BIN_BELOW,
+        delensed_bb=delensed_bb,
+        delensed_bb_ells=delensed_bb_ells,
     )
 
     # Nearest-neighbour extrapolation (jnp.interp default) outside the
@@ -117,6 +131,8 @@ def run_fisher_variants(tres_ells: np.ndarray, tres_bb: np.ndarray,
         delta_ell=DELTA_ELL, ell_per_bin_below=ELL_PER_BIN_BELOW,
         residual_template_cl=tres_bb,
         residual_template_ells=tres_ells,
+        delensed_bb=delensed_bb,
+        delensed_bb_ells=delensed_bb_ells,
     )
     fiducial = {**fiducial_base, "A_res": 1.0}
 
