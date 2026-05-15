@@ -707,6 +707,7 @@ class TestParameterBias:
         bias formula at a small truth shift (in-manifold).
         """
         from scipy.optimize import minimize
+
         from augr.covariance import bandpower_covariance_blocks
         from augr.signal import flatten_params
 
