@@ -164,7 +164,10 @@ def simple_probe() -> Instrument:
     return Instrument(channels=channels, mission_duration_years=5.0, f_sky=0.7)
 
 
-def pico_like() -> Instrument:
+_PICO_REFERENCE_APERTURE_M = 1.4
+
+
+def pico_like(aperture_m: float = _PICO_REFERENCE_APERTURE_M) -> Instrument:
     """PICO-like probe-class instrument (arXiv:1902.10541).
 
     21 frequency bands from 21 to 799 GHz, 12,996 TES bolometers at 0.1 K,
@@ -175,8 +178,20 @@ def pico_like() -> Instrument:
     counts include both polarizations per pixel (factor of 2 already
     in N_bolo). Beam FWHM = 6.2' × (155 GHz / ν_c).
     PICO assumed ~95% survey efficiency and 90% detector yield from L2.
+
+    Args:
+        aperture_m: Primary mirror diameter [m]. Default 1.4 m
+            (PICO baseline; preserves published beams). For other
+            apertures, beams scale as 1.4/D (FWHM ∝ λ/D); NET and
+            n_det are held fixed -- defensible at PICO-style
+            T_tel = 4.5 K + η_opt = 0.5 where NET is CMB-photon-
+            noise-dominated and largely aperture-independent. Used
+            by the BROOM-driven aperture sweep to isolate the
+            "does aperture give the low-ν channels enough resolution
+            to clean at r-relevant scales" axis.
     """
     eff = L2_EFFICIENCY
+    beam_scale = _PICO_REFERENCE_APERTURE_M / aperture_m
     # (nu_ghz, n_bolo, CBE bolo NET [μK_CMB √s], FWHM [arcmin])
     # Source: PICO mission study report instrument-specs table
     # (arXiv:1902.10541; the same table appears in the 10-page
@@ -208,7 +223,7 @@ def pico_like() -> Instrument:
     ]
     channels = tuple(
         Channel(nu_ghz=nu, n_detectors=nd, net_per_detector=net,
-                beam_fwhm_arcmin=fwhm, efficiency=eff)
+                beam_fwhm_arcmin=fwhm * beam_scale, efficiency=eff)
         for nu, nd, net, fwhm in _bands
     )
     return Instrument(channels=channels, mission_duration_years=5.0, f_sky=0.7)
