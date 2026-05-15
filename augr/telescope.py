@@ -493,12 +493,19 @@ def to_instrument(design: TelescopeDesign) -> Instrument:
 # Convenience factories
 # ---------------------------------------------------------------------------
 
-def probe_design() -> TelescopeDesign:
+def probe_design(aperture_m: float = 1.5) -> TelescopeDesign:
     """Probe-class (~$1B) space mission design.
 
-    1.5 m aperture, f/2 optics, 0.4 m focal plane.
+    f/2 optics, 0.4 m focal plane.
     6 bands in 3 dichroic pairs: (30, 40), (85, 150), (220, 340) GHz.
     Equal area allocation, 5-year L2 mission, f_sky = 0.7.
+
+    Args:
+        aperture_m: Primary mirror diameter [m]. Default 1.5 m
+            (PICO-class). Varying aperture changes only the per-channel
+            beam FWHM (∝ λ/D); horn size, detector count and photon-
+            noise NET are independent of aperture under the rest of
+            the model.
     """
     pixel_groups = (
         PixelGroup(
@@ -516,7 +523,7 @@ def probe_design() -> TelescopeDesign:
     )
     return TelescopeDesign(
         focal_plane=FocalPlaneSpec(
-            aperture_m=1.5, f_number=2.0, fp_diameter_m=0.4,
+            aperture_m=aperture_m, f_number=2.0, fp_diameter_m=0.4,
         ),
         thermal=ThermalSpec(),
         pixel_groups=pixel_groups,

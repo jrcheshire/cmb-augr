@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 from pathlib import Path
 
 import broom
@@ -53,6 +54,10 @@ from broom import (
 from broom.routines import _format_nsim
 
 from augr.hit_maps import mean_pixel_rescale_factor
+from augr.instrument import white_noise_power
+from augr.telescope import probe_design, to_instrument
+
+_ARCMIN_PER_RAD = 10800.0 / math.pi
 
 # ---------------------------------------------------------------------------
 # Fixed configuration (constants; override via CLI where sensible)
@@ -278,6 +283,57 @@ def _build_instrument_override(
         inst["alpha_knee"] = alpha_knee
 
     return inst, tags
+
+
+def _experiment_name_for_aperture(aperture_m: float) -> str:
+    """Path-discriminator experiment name for a given aperture.
+
+    Used wherever the existing code reads `EXPERIMENT` for cache /
+    output directory naming.  cm-precision keeps the 1.0:0.5:5.0 grid
+    distinct and lexicographically sortable.
+    """
+    return f"probe_ap{round(aperture_m * 100):04d}"
+
+
+def _build_probe_design_instrument(aperture_m: float) -> tuple[dict, list[str]]:
+    """Build BROOM instrument-dict + channel tags from augr's probe_design.
+
+    Translates an augr ``Instrument`` (from ``probe_design(aperture_m)
+    → to_instrument()``) into the BROOM ``InstrumentConfig`` dict
+    schema (frequency / depth_I / depth_P / fwhm / bandwidth / beams),
+    so BROOM consumes a custom aperture-varying telescope via the
+    ``config["instrument"] = <dict>`` override path documented in the
+    BROOM-API gotchas memory.
+
+    depth_P [μK·arcmin] = √(w_inv [μK²·sr]) × (10800/π),
+    depth_I = depth_P / √2.  ``white_noise_power`` already includes
+    the polarization √2, so ``√w_inv`` is the polarization noise.
+    """
+    inst = to_instrument(probe_design(aperture_m=aperture_m))
+    n_chan = len(inst.channels)
+    depth_P = []
+    depth_I = []
+    for ch in inst.channels:
+        w_inv = float(white_noise_power(
+            ch, inst.mission_duration_years, inst.f_sky))
+        d_p = math.sqrt(w_inv) * _ARCMIN_PER_RAD
+        depth_P.append(d_p)
+        depth_I.append(d_p / math.sqrt(2.0))
+    instrument_dict = {
+        "frequency": [float(ch.nu_ghz) for ch in inst.channels],
+        "depth_I": depth_I,
+        "depth_P": depth_P,
+        "fwhm": [float(ch.beam_fwhm_arcmin) for ch in inst.channels],
+        "bandwidth": [0.25] * n_chan,
+        "beams": "gaussian",
+        "path_beams": "",
+    }
+    # Match BROOM's own auto-generated tag convention for unique
+    # frequencies (`f"{nu}GHz"`); duplicate-frequency disambiguation
+    # would need the `aGHz`/`bGHz` suffix logic, but probe_design has
+    # unique GHz centers.
+    tags = [f"{nu}GHz" for nu in instrument_dict["frequency"]]
+    return instrument_dict, tags
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +670,17 @@ def _parse_args() -> argparse.Namespace:
                         "complex case (3D MKD dust + S-PASS-rescaled sync) "
                         "for foreground-complexity sanity checks. Default: "
                         "d1s1 (matches existing tags).")
+    p.add_argument("--aperture-m", type=float, default=None,
+                   help="If set, swap the LiteBIRD_PTEP experiment for a "
+                        "probe_design()-derived instrument with this primary "
+                        "aperture [m]. BROOM consumes the instrument via the "
+                        "config['instrument'] dict-override path; only the "
+                        "per-channel beam FWHM varies with aperture (NET and "
+                        "n_det are aperture-independent under the rest of "
+                        "the augr model). Output / sim-cache paths and the "
+                        "output filename tag use 'probe_apXXXX' (cm-precision) "
+                        "for path discrimination. Incompatible with "
+                        "--hits-prefix / --knee-config for now.")
     return p.parse_args()
 
 
@@ -621,20 +688,35 @@ def main() -> None:
     args = _parse_args()
     SCRATCH.mkdir(parents=True, exist_ok=True)
 
-    # Reassign the FG-model module globals from the CLI choice. Done here
-    # (rather than threading a parameter through every helper) because the
-    # downstream path helpers (_gnilc_root_dir, _output_tag, _base_config,
-    # ...) all read FG_TAG / FOREGROUND_MODELS at module level.
-    global FOREGROUND_MODELS, FG_TAG
+    # Reassign the FG-model and (if --aperture-m) experiment module globals
+    # from the CLI choices. Done here (rather than threading a parameter
+    # through every helper) because the downstream path helpers
+    # (_gnilc_root_dir, _output_tag, _base_config, ...) all read
+    # FG_TAG / FOREGROUND_MODELS / EXPERIMENT at module level.
+    global FOREGROUND_MODELS, FG_TAG, EXPERIMENT
     FOREGROUND_MODELS = _FG_MODEL_MAP[args.fg_model]
     FG_TAG = args.fg_model
     print(f"Foreground model: {args.fg_model} -> {FOREGROUND_MODELS}")
 
-    instrument_override, _ = _build_instrument_override(
-        EXPERIMENT,
-        hits_prefix=args.hits_prefix,
-        knee_config_path=args.knee_config,
-    )
+    if args.aperture_m is not None:
+        if args.hits_prefix is not None or args.knee_config is not None:
+            raise SystemExit(
+                "--aperture-m is incompatible with --hits-prefix / "
+                "--knee-config (the hits/knee paths consult BROOM's "
+                "experiment YAML, which is bypassed in aperture mode). "
+                "Drop the hits/knee flags or use the LiteBIRD_PTEP path."
+            )
+        EXPERIMENT = _experiment_name_for_aperture(args.aperture_m)
+        instrument_override, _ = _build_probe_design_instrument(args.aperture_m)
+        print(f"Aperture: {args.aperture_m:.2f} m -> experiment "
+              f"{EXPERIMENT!r}, {len(instrument_override['frequency'])} "
+              f"channels (probe_design)")
+    else:
+        instrument_override, _ = _build_instrument_override(
+            EXPERIMENT,
+            hits_prefix=args.hits_prefix,
+            knee_config_path=args.knee_config,
+        )
     if args.hits_prefix:
         print(f"Anisotropic noise: hit maps at {args.hits_prefix}_<tag>.fits")
     if args.knee_config:
