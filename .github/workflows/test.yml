@@ -1,8 +1,10 @@
 name: tests
 
 on:
-  push:
-    branches: [main]
+  # No `push` trigger on main: PRs run the suite at merge time, so the
+  # post-merge push to main would just re-run an identical green job.
+  # Use the weekly schedule below (and workflow_dispatch) to catch any
+  # regressions that slip in through a direct push.
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -35,7 +37,7 @@ jobs:
         run: pixi run lint
 
       - name: Run pytest (fast subset)
-        if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.run_slow != 'true')
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.run_slow != 'true')
         run: pixi run test
 
       - name: Run pytest (full suite, includes slow)
