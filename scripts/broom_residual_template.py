@@ -709,6 +709,20 @@ def _save_product(out_path: Path, ell_centres: np.ndarray,
     print(f"  wrote {out_path}  shape={stacked.shape}")
 
 
+def _save_persim(out_path: Path, ell_centres: np.ndarray,
+                 cl_persim: np.ndarray) -> None:
+    """Write per-sim (nsims, n_bins) BB spectra as .npz with `ells`, `cl_persim`.
+
+    Used for downstream consumers that want the realization-level
+    scatter (e.g. plotting median + percentile bands of sigma(r) across
+    sims). Companion to `_save_product` which writes only the MC mean.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out_path, ells=ell_centres, cl_persim=cl_persim)
+    print(f"  wrote {out_path}  shape=ells{ell_centres.shape} "
+          f"cl_persim{cl_persim.shape}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -850,6 +864,14 @@ def main() -> None:
     nl_mean = nl_post.mean(0)
     fgds_mean = fgds_res.mean(0)
 
+    # Per-sim debiased template: subtract the *MC-mean* noise from each
+    # raw sim. Keeps each sim independent (per-sim FG variation), with
+    # the noise-debias correction applied uniformly across sims rather
+    # than as per-sim subtraction (which would mix sim-i noise into the
+    # sim-i template, changing the statistical interpretation).
+    tres_persim = tres_raw - tres_noise.mean(0)[None, :]
+    nl_persim = nl_post
+
     n_bins = tres_mean.shape[-1]
     ell_centres = _bandpower_ell_centres(n_bins)
 
@@ -861,6 +883,10 @@ def main() -> None:
     _save_product(OUTPUTS_DIR / f"{tag}_nl_bb.npy", ell_centres, nl_mean)
     _save_product(OUTPUTS_DIR / f"{tag}_tres_bb.npy", ell_centres, tres_mean)
     _save_product(OUTPUTS_DIR / f"{tag}_fgds_bb.npy", ell_centres, fgds_mean)
+    _save_persim(OUTPUTS_DIR / f"{tag}_nl_bb_persim.npz",
+                 ell_centres, nl_persim)
+    _save_persim(OUTPUTS_DIR / f"{tag}_tres_bb_persim.npz",
+                 ell_centres, tres_persim)
 
     print("\nDone.")
 
