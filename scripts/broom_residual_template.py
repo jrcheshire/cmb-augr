@@ -37,6 +37,9 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
+import multiprocessing
+import os
 from pathlib import Path
 
 import broom
@@ -52,7 +55,11 @@ from broom import (
 )
 from broom.routines import _format_nsim
 
+from augr.config import pico_like
 from augr.hit_maps import mean_pixel_rescale_factor
+from augr.instrument import white_noise_power
+
+_ARCMIN_PER_RAD = 10800.0 / math.pi
 
 # ---------------------------------------------------------------------------
 # Fixed configuration (constants; override via CLI where sensible)
@@ -280,6 +287,90 @@ def _build_instrument_override(
     return inst, tags
 
 
+def _experiment_name_for_aperture(aperture_m: float) -> str:
+    """Path-discriminator experiment name for a given aperture.
+
+    Used wherever the existing code reads `EXPERIMENT` for cache /
+    output directory naming.  cm-precision keeps a (1.0, 5.0)-m grid
+    distinct and lexicographically sortable.  Tagged `pico_apXXXX`
+    because the underlying channels come from `pico_like` (21 bands
+    of the published PICO mission-study table) with beams scaled to
+    the requested aperture.
+    """
+    return f"pico_ap{round(aperture_m * 100):04d}"
+
+
+def _build_pico_like_instrument(
+    aperture_m: float,
+    hits_prefix: str | None = None,
+) -> tuple[dict, list[str]]:
+    """Build BROOM instrument-dict + channel tags from `pico_like`.
+
+    Translates the augr ``Instrument`` (from ``pico_like(aperture_m=
+    ...)`` -- 21 PICO bands with FWHM scaled by 1.4/aperture_m) into
+    the BROOM ``InstrumentConfig`` dict schema (frequency / depth_I /
+    depth_P / fwhm / bandwidth / beams), so BROOM consumes the custom
+    aperture-varying telescope via the ``config["instrument"] = <dict>``
+    override path documented in the BROOM-API gotchas memory.
+
+    depth_P [μK·arcmin] = √(w_inv [μK²·sr]) × (10800/π),
+    depth_I = depth_P / √2.  ``white_noise_power`` already includes
+    the polarization √2, so ``√w_inv`` is the polarization noise.
+
+    With ``hits_prefix`` set, additionally reads the first channel's
+    hit-map FITS, divides depth_I/P by ``mean_pixel_rescale_factor``
+    so the sky-averaged pixel noise variance matches spec (BROOM's
+    internal max-1 normalization would otherwise push the spec to
+    the deepest pixel), and injects ``path_hits_maps``. Generate the
+    FITS first via ``scripts/make_hit_maps.py --pico-like``.
+    """
+    inst = pico_like(aperture_m=aperture_m)
+    n_chan = len(inst.channels)
+    depth_P = []
+    depth_I = []
+    for ch in inst.channels:
+        w_inv = float(white_noise_power(
+            ch, inst.mission_duration_years, inst.f_sky))
+        d_p = math.sqrt(w_inv) * _ARCMIN_PER_RAD
+        depth_P.append(d_p)
+        depth_I.append(d_p / math.sqrt(2.0))
+    instrument_dict = {
+        "frequency": [float(ch.nu_ghz) for ch in inst.channels],
+        "depth_I": depth_I,
+        "depth_P": depth_P,
+        "fwhm": [float(ch.beam_fwhm_arcmin) for ch in inst.channels],
+        "bandwidth": [0.25] * n_chan,
+        "beams": "gaussian",
+        "path_beams": "",
+    }
+    # Match BROOM's own auto-generated tag convention for unique
+    # frequencies (`f"{nu}GHz"`); pico_like's 21 bands are unique.
+    tags = [f"{nu}GHz" for nu in instrument_dict["frequency"]]
+
+    if hits_prefix is not None:
+        # All channels share the v1 envelope hit map (same FITS, just
+        # per-channel filenames for BROOM's API). Read tag[0] only;
+        # the uniform rescale applied to every channel's depth is only
+        # correct under that shared-map assumption. Future per-feedhorn
+        # offsets would need per-channel reads.
+        first_fits = Path(f"{hits_prefix}_{tags[0]}.fits")
+        if not first_fits.exists():
+            raise FileNotFoundError(
+                f"hit map not found: {first_fits}. Generate first via "
+                "`python scripts/make_hit_maps.py --pico-like "
+                f"--prefix {hits_prefix}`."
+            )
+        hits = hp.read_map(str(first_fits))
+        k = mean_pixel_rescale_factor(hits)
+        print(f"  hit-map rescale factor k = {k:.4f} "
+              "(depth_I/P divided by k for sky-average normalization)")
+        instrument_dict["depth_I"] = [d / k for d in depth_I]
+        instrument_dict["depth_P"] = [d / k for d in depth_P]
+        instrument_dict["path_hits_maps"] = hits_prefix
+
+    return instrument_dict, tags
+
+
 # ---------------------------------------------------------------------------
 # BROOM config assembly
 # ---------------------------------------------------------------------------
@@ -485,41 +576,88 @@ def _spectra_block(mask_type: str) -> list[dict]:
 # Pipeline helpers
 # ---------------------------------------------------------------------------
 
-def run_all_sims(config: Configs) -> None:
-    # TODO(multiprocess): this loop is embarrassingly parallel -- each
-    # iteration is a self-contained (get_input_data -> component_separation
-    # -> estimate_residuals) chain with per-sim filenames so there is no
-    # write contention. BROOM's own `parallelize` config flag is read in
-    # broom.configurations but otherwise unreferenced ("Not implemented yet"
-    # per the demo config), so we would need to wrap it ourselves with
-    # multiprocessing.Pool.
-    # Gotchas for a future implementation:
-    #   - Pin BLAS to one thread per worker (OMP_NUM_THREADS=1 /
-    #     MKL_NUM_THREADS=1 / OPENBLAS_NUM_THREADS=1 set before Pool
-    #     spawns) -- otherwise BLAS threads fight each other. Currently
-    #     nsims=20 saturates ~3 cores; pinning + Pool(n=8..12) should
-    #     give near-linear speedup.
-    #   - The `config.compsep_residuals = _compsep_residuals_block()`
-    #     line below mutates shared state as a BROOM workaround, so
-    #     each worker needs its own Configs instance (fork-safe copy
-    #     or per-worker construction).
-    #   - compute_all_spectra / _compute_spectra below also loop over
-    #     sims internally; parallelize there too for consistency.
-    # Deferred until we move beyond ~20-sim exploratory runs; at nsims=100
-    # (Carones baseline) this is the difference between ~25 min serial
-    # and ~3 min parallel.
-    for nsim in range(config.nsim_start, config.nsim_start + config.nsims):
-        tag = _format_nsim(nsim)
-        print(f"\n=== sim {tag} ===")
-        print(f"[{tag}] get_input_data")
-        data = get_input_data(config, nsim=tag)
-        print(f"[{tag}] component_separation (NILC + GNILC)")
-        component_separation(config, data, nsim=tag)
-        # estimate_residuals mutates compsep_residuals in-place; rebuild
-        # fresh each iteration so nsim_weights does not leak across sims.
-        config.compsep_residuals = _compsep_residuals_block()
-        print(f"[{tag}] estimate_residuals")
-        estimate_residuals(config, nsim=tag)
+def _run_one_sim(args: tuple) -> None:
+    """Worker entrypoint: builds a fresh BROOM ``Configs`` from the parent's
+    config dict and runs one sim's get_input_data → component_separation →
+    estimate_residuals chain.
+
+    Each worker has its own Configs to avoid the in-place
+    `compsep_residuals` mutation footgun (BROOM's
+    `estimate_residuals` stamps `nsim_weights` on
+    `config.compsep_residuals[0]`, so sharing a single Configs across
+    sims leaks weights across sims).
+
+    Module globals EXPERIMENT / FG_TAG / FOREGROUND_MODELS govern
+    path resolution in helper functions; spawn-mode workers re-import
+    the module fresh and don't see main()'s mutations of these, so
+    the parent threads them in via args.
+    """
+    nsim_idx, config_dict, experiment, fg_tag, fg_models = args
+    global EXPERIMENT, FG_TAG, FOREGROUND_MODELS
+    EXPERIMENT = experiment
+    FG_TAG = fg_tag
+    FOREGROUND_MODELS = fg_models
+
+    cfg = Configs(config=config_dict)
+    tag = _format_nsim(nsim_idx)
+    print(f"\n=== sim {tag} ===")
+    print(f"[{tag}] get_input_data")
+    data = get_input_data(cfg, nsim=tag)
+    print(f"[{tag}] component_separation (NILC + GNILC)")
+    component_separation(cfg, data, nsim=tag)
+    cfg.compsep_residuals = _compsep_residuals_block()
+    print(f"[{tag}] estimate_residuals")
+    estimate_residuals(cfg, nsim=tag)
+
+
+def run_all_sims(config_dict: dict, n_workers: int = 1) -> Configs:
+    """Phase 1: per-sim get_input_data + compsep + estimate_residuals.
+
+    With ``n_workers > 1``, parallelizes the embarrassingly-parallel MC
+    loop via ``multiprocessing.Pool`` (spawn context for macOS-fork
+    safety). BLAS threads are pinned to 1 per worker (env vars set in
+    parent before pool creation; spawned workers inherit env) so the
+    per-needlet matrix ops in NILC/GNILC don't fight each other across
+    n_workers × n_BLAS_threads oversubscription.
+
+    Returns a fresh ``Configs`` built from the same dict for the
+    caller's Phase 2 (spectra) work.
+    """
+    nsims = config_dict["nsims"]
+    nsim_start = config_dict.get("nsim_start", 0)
+
+    if n_workers <= 1 or nsims <= 1:
+        cfg = Configs(config=config_dict)
+        for nsim in range(nsim_start, nsim_start + nsims):
+            tag = _format_nsim(nsim)
+            print(f"\n=== sim {tag} ===")
+            print(f"[{tag}] get_input_data")
+            data = get_input_data(cfg, nsim=tag)
+            print(f"[{tag}] component_separation (NILC + GNILC)")
+            component_separation(cfg, data, nsim=tag)
+            # estimate_residuals mutates compsep_residuals in-place; rebuild
+            # fresh each iteration so nsim_weights does not leak across sims.
+            cfg.compsep_residuals = _compsep_residuals_block()
+            print(f"[{tag}] estimate_residuals")
+            estimate_residuals(cfg, nsim=tag)
+        return cfg
+
+    n_workers = min(n_workers, nsims)
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
+
+    print(f"Parallelizing {nsims} sims across {n_workers} workers "
+          "(BLAS pinned to 1 thread/worker)")
+    args_list = [
+        (i, config_dict, EXPERIMENT, FG_TAG, FOREGROUND_MODELS)
+        for i in range(nsim_start, nsim_start + nsims)
+    ]
+
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(n_workers) as pool:
+        pool.map(_run_one_sim, args_list)
+
+    return Configs(config=config_dict)
 
 
 def compute_all_spectra(config: Configs) -> None:
@@ -571,6 +709,20 @@ def _save_product(out_path: Path, ell_centres: np.ndarray,
     print(f"  wrote {out_path}  shape={stacked.shape}")
 
 
+def _save_persim(out_path: Path, ell_centres: np.ndarray,
+                 cl_persim: np.ndarray) -> None:
+    """Write per-sim (nsims, n_bins) BB spectra as .npz with `ells`, `cl_persim`.
+
+    Used for downstream consumers that want the realization-level
+    scatter (e.g. plotting median + percentile bands of sigma(r) across
+    sims). Companion to `_save_product` which writes only the MC mean.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out_path, ells=ell_centres, cl_persim=cl_persim)
+    print(f"  wrote {out_path}  shape=ells{ell_centres.shape} "
+          f"cl_persim{cl_persim.shape}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -614,6 +766,24 @@ def _parse_args() -> argparse.Namespace:
                         "complex case (3D MKD dust + S-PASS-rescaled sync) "
                         "for foreground-complexity sanity checks. Default: "
                         "d1s1 (matches existing tags).")
+    p.add_argument("--aperture-m", type=float, default=None,
+                   help="If set, swap the LiteBIRD_PTEP experiment for a "
+                        "pico_like()-derived instrument with this primary "
+                        "aperture [m] (21 PICO bands, FWHM scaled by 1.4/D, "
+                        "NET and n_det held fixed). BROOM consumes the "
+                        "instrument via the config['instrument'] dict-override "
+                        "path. Output / sim-cache paths and the output "
+                        "filename tag use 'pico_apXXXX' (cm-precision) for "
+                        "path discrimination. Compatible with --hits-prefix; "
+                        "incompatible with --knee-config for now.")
+    p.add_argument("--workers", type=int, default=1,
+                   help="Number of parallel workers for the per-sim Phase 1 "
+                        "loop (get_input_data + compsep + estimate_residuals). "
+                        "Each worker has its own BROOM Configs (no shared "
+                        "compsep_residuals state) and BLAS threads are "
+                        "pinned to 1 per worker to avoid oversubscribing the "
+                        "host CPU. Default: 1 (serial). Use 4-8 for nsims "
+                        ">= 10 on a 16-core host.")
     return p.parse_args()
 
 
@@ -621,20 +791,36 @@ def main() -> None:
     args = _parse_args()
     SCRATCH.mkdir(parents=True, exist_ok=True)
 
-    # Reassign the FG-model module globals from the CLI choice. Done here
-    # (rather than threading a parameter through every helper) because the
-    # downstream path helpers (_gnilc_root_dir, _output_tag, _base_config,
-    # ...) all read FG_TAG / FOREGROUND_MODELS at module level.
-    global FOREGROUND_MODELS, FG_TAG
+    # Reassign the FG-model and (if --aperture-m) experiment module globals
+    # from the CLI choices. Done here (rather than threading a parameter
+    # through every helper) because the downstream path helpers
+    # (_gnilc_root_dir, _output_tag, _base_config, ...) all read
+    # FG_TAG / FOREGROUND_MODELS / EXPERIMENT at module level.
+    global FOREGROUND_MODELS, FG_TAG, EXPERIMENT
     FOREGROUND_MODELS = _FG_MODEL_MAP[args.fg_model]
     FG_TAG = args.fg_model
     print(f"Foreground model: {args.fg_model} -> {FOREGROUND_MODELS}")
 
-    instrument_override, _ = _build_instrument_override(
-        EXPERIMENT,
-        hits_prefix=args.hits_prefix,
-        knee_config_path=args.knee_config,
-    )
+    if args.aperture_m is not None:
+        if args.knee_config is not None:
+            raise SystemExit(
+                "--aperture-m is incompatible with --knee-config (the "
+                "knee path consults BROOM's experiment YAML for tags, "
+                "which is bypassed in aperture mode). Drop --knee-config "
+                "or use the LiteBIRD_PTEP path."
+            )
+        EXPERIMENT = _experiment_name_for_aperture(args.aperture_m)
+        instrument_override, _ = _build_pico_like_instrument(
+            args.aperture_m, hits_prefix=args.hits_prefix)
+        print(f"Aperture: {args.aperture_m:.2f} m -> experiment "
+              f"{EXPERIMENT!r}, {len(instrument_override['frequency'])} "
+              f"channels (pico_like, beams scaled by 1.4/D)")
+    else:
+        instrument_override, _ = _build_instrument_override(
+            EXPERIMENT,
+            hits_prefix=args.hits_prefix,
+            knee_config_path=args.knee_config,
+        )
     if args.hits_prefix:
         print(f"Anisotropic noise: hit maps at {args.hits_prefix}_<tag>.fits")
     if args.knee_config:
@@ -644,16 +830,18 @@ def main() -> None:
         has_hits=args.hits_prefix is not None,
         has_knee=args.knee_config is not None,
     )
-    config = Configs(config=_base_config(
+    config_dict = _base_config(
         nsims=args.nsims, mask_type=args.mask,
         instrument_override=instrument_override,
         input_cache_tag=cache_tag,
         cov_noise_debias_factor=args.cov_noise_debias,
-    ))
+    )
 
     if not args.skip_compsep:
         print(f"Phase 1: NILC + GNILC + estimate_residuals, nsims={args.nsims}")
-        run_all_sims(config)
+        config = run_all_sims(config_dict, n_workers=args.workers)
+    else:
+        config = Configs(config=config_dict)
 
     print("\nResolving GNILC path and attaching spectra block ...")
     config.compute_spectra = _spectra_block(args.mask)
@@ -676,6 +864,14 @@ def main() -> None:
     nl_mean = nl_post.mean(0)
     fgds_mean = fgds_res.mean(0)
 
+    # Per-sim debiased template: subtract the *MC-mean* noise from each
+    # raw sim. Keeps each sim independent (per-sim FG variation), with
+    # the noise-debias correction applied uniformly across sims rather
+    # than as per-sim subtraction (which would mix sim-i noise into the
+    # sim-i template, changing the statistical interpretation).
+    tres_persim = tres_raw - tres_noise.mean(0)[None, :]
+    nl_persim = nl_post
+
     n_bins = tres_mean.shape[-1]
     ell_centres = _bandpower_ell_centres(n_bins)
 
@@ -687,6 +883,10 @@ def main() -> None:
     _save_product(OUTPUTS_DIR / f"{tag}_nl_bb.npy", ell_centres, nl_mean)
     _save_product(OUTPUTS_DIR / f"{tag}_tres_bb.npy", ell_centres, tres_mean)
     _save_product(OUTPUTS_DIR / f"{tag}_fgds_bb.npy", ell_centres, fgds_mean)
+    _save_persim(OUTPUTS_DIR / f"{tag}_nl_bb_persim.npz",
+                 ell_centres, nl_persim)
+    _save_persim(OUTPUTS_DIR / f"{tag}_tres_bb_persim.npz",
+                 ell_centres, tres_persim)
 
     print("\nDone.")
 
