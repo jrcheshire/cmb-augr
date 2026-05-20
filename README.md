@@ -308,6 +308,47 @@ Two tiers are available:
 - **Tier 1** (`sigma_r_from_channels`): optimize detector counts, NETs, and beam sizes directly as continuous floats.
 - **Tier 2** (`sigma_r_from_design`): optimize telescope geometry (aperture, f-number, focal plane diameter, area fractions) and derive channel parameters via the physics.
 
+For grid sweeps over either tier's knobs (aperture grids, NET grids, etc.), see the `augr.sweep` `jax.vmap` wrappers in the **Parallelism** section below — they replace the Python `for` loop pattern with a single vmapped call that composes with `jax.grad` and `jax.jit`.
+
+## Parallelism
+
+Two complementary entry points cover the parallelism cases that come up in practice:
+
+`augr.sweep` — ready-made `jax.vmap` wrappers over the differentiable forward path. Use these for embarrassingly-parallel sweeps over `sigma_r_from_channels` or `sigma_r_from_design` knobs (aperture, f-number, NET, detector count, etc.). No multiprocessing, no BLAS thread juggling — JAX handles the parallelism inside one process. Composes with `jax.grad` and `jax.jit`.
+
+```python
+import jax.numpy as jnp
+from augr.sweep import sigma_r_over_aperture
+# ctx, design_args built as in the optimize.py example above
+sigmas = sigma_r_over_aperture(
+    jnp.linspace(1.0, 5.0, 9),  # aperture grid
+    f_number, fp_diameter_m, area_fractions, ctx, freqs_per_group,
+)
+```
+
+`augr.parallel` — process-pool helpers for the cases JAX doesn't fit: BROOM/PySM-driven sims, external compsep, anything subprocess-bound or with Python side effects. One context manager covers spawn-context creation, BLAS-thread pinning, and the `AUGR_DELENS_WORKERS` accounting that nested-pool callers need to avoid oversubscribing.
+
+```python
+from augr.parallel import process_pool, parallel_map, kill_orphan_workers
+
+# Context-manager style: yield None when n_workers <= 1 so callers can
+# fall through to a serial loop without a duplicate code path.
+with process_pool(n_workers=8) as pool:
+    if pool is None:
+        results = [worker(a) for a in args]
+    else:
+        results = pool.map(worker, args)
+
+# Or: parallel_map shorthand for the "just map" case.
+results = parallel_map(worker, args, workers=8)
+
+# Cleanup after a Ctrl-C left spawn workers orphaned (~2 GB each for
+# JAX-using workers); POSIX-only.
+kill_orphan_workers()
+```
+
+For nested-pool callers (outer pool calling into `iterate_delensing` per worker), `process_pool` automatically sets `AUGR_DELENS_WORKERS = max(1, cpu_count // n_workers)` for the children so total CPU use ≈ `cpu_count`. Override with `process_pool(n, delens_workers=K)`.
+
 ## Post-component-separation forecasts
 
 When the foregrounds have been removed by an external component-separation pipeline (e.g. NILC + GNILC via [BROOM](https://github.com/alecarones/broom)), `augr` can consume the cleaned map and residual-template spectra directly, replacing the analytic multifrequency model with measured inputs:

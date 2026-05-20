@@ -318,6 +318,19 @@ convention; naming is `omega_<species>_<quantity>` where species is
   velocity. Do not relax test tolerances to make a test pass without
   explicit discussion; investigate the discrepancy.
   `scripts/validate_pico.py` is the canonical external check.
+- **Parallelism uses `augr.parallel` + `augr.sweep`.** Scripts that
+  need process-pool parallelism (BROOM MC, validate_pico case sweeps,
+  JPL-side design sweeps) import `process_pool` /
+  `parallel_map` / `pin_blas_env` from `augr.parallel` -- do not
+  reimplement the spawn-context / BLAS-pin / `AUGR_DELENS_WORKERS`
+  boilerplate per script. Embarrassingly-parallel sweeps over the
+  differentiable forward (aperture grids, NET grids, eta grids) go
+  through `augr.sweep` (`sigma_r_over_aperture` etc.) instead of a
+  Python `for` loop. `iterate_delensing` keeps its own module-level
+  lazy `ProcessPoolExecutor` for the per-L Wigner-3j parallelism
+  (`AUGR_DELENS_WORKERS` env var), but imports `cpu_count` from
+  `augr.parallel` so there is a single source of truth on the
+  worker-count default.
 
 ## Invariants worth preserving
 
