@@ -44,6 +44,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
+from augr.parallel import cpu_count as _cpu_count
+
 # ---------------------------------------------------------------------------
 # Per-L parallelism inside the full-sky N_0 / lensing_kernel routines.
 #
@@ -72,7 +74,7 @@ from jax import lax
 # and passes ``functools.partial(_per_L_X, ...)`` to ``_per_L_map``.
 # ---------------------------------------------------------------------------
 _PER_L_WORKERS = int(os.environ.get("AUGR_DELENS_WORKERS",
-                                     str(os.cpu_count() or 1)))
+                                     str(_cpu_count())))
 
 _PER_L_POOL: ProcessPoolExecutor | None = None
 _force_serial: bool = False  # opt-out per-call escape hatch

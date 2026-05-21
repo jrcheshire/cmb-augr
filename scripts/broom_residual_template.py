@@ -38,8 +38,6 @@ import argparse
 import itertools
 import json
 import math
-import multiprocessing
-import os
 from pathlib import Path
 
 import broom
@@ -58,6 +56,7 @@ from broom.routines import _format_nsim
 from augr.config import pico_like
 from augr.hit_maps import mean_pixel_rescale_factor
 from augr.instrument import white_noise_power
+from augr.parallel import process_pool
 
 _ARCMIN_PER_RAD = 10800.0 / math.pi
 
@@ -614,11 +613,11 @@ def run_all_sims(config_dict: dict, n_workers: int = 1) -> Configs:
     """Phase 1: per-sim get_input_data + compsep + estimate_residuals.
 
     With ``n_workers > 1``, parallelizes the embarrassingly-parallel MC
-    loop via ``multiprocessing.Pool`` (spawn context for macOS-fork
-    safety). BLAS threads are pinned to 1 per worker (env vars set in
-    parent before pool creation; spawned workers inherit env) so the
-    per-needlet matrix ops in NILC/GNILC don't fight each other across
-    n_workers × n_BLAS_threads oversubscription.
+    loop via :func:`augr.parallel.process_pool`, which uses a
+    spawn-context ``multiprocessing.Pool``, pins BLAS threads to 1 in
+    the parent env (children inherit), and sets ``AUGR_DELENS_WORKERS``
+    so any nested ``iterate_delensing`` call inside a worker doesn't
+    oversubscribe.
 
     Returns a fresh ``Configs`` built from the same dict for the
     caller's Phase 2 (spectra) work.
@@ -643,9 +642,6 @@ def run_all_sims(config_dict: dict, n_workers: int = 1) -> Configs:
         return cfg
 
     n_workers = min(n_workers, nsims)
-    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-        os.environ.setdefault(var, "1")
-
     print(f"Parallelizing {nsims} sims across {n_workers} workers "
           "(BLAS pinned to 1 thread/worker)")
     args_list = [
@@ -653,8 +649,7 @@ def run_all_sims(config_dict: dict, n_workers: int = 1) -> Configs:
         for i in range(nsim_start, nsim_start + nsims)
     ]
 
-    ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(n_workers) as pool:
+    with process_pool(n_workers) as pool:
         pool.map(_run_one_sim, args_list)
 
     return Configs(config=config_dict)

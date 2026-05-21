@@ -45,6 +45,7 @@ from augr.instrument import (
     white_noise_power,
 )
 from augr.multipatch import MultiPatchFisher
+from augr.parallel import process_pool
 from augr.signal import SignalModel
 from augr.sky_patches import SkyModel, SkyPatch
 from augr.spectra import CMBSpectra
@@ -680,8 +681,7 @@ def plot_delensing_sweep(savefig):
             all_jobs.append((float(A_l), marg_fg, fg_type))
 
     print(f"    delens sweep: {len(all_jobs)} jobs on 4 workers...")
-    ctx = __import__("multiprocessing").get_context("spawn")
-    with ctx.Pool(4) as pool:
+    with process_pool(4, pin_blas=False) as pool:
         all_sigmas = pool.map(_delens_worker, all_jobs)
 
     fig, ax = plt.subplots(figsize=(9, 6))
@@ -1008,13 +1008,11 @@ def main():
     print("-" * 72)
 
     # Run all cases (parallelized with spawn context for JAX compatibility)
-    import multiprocessing as mp
-    ctx = mp.get_context("spawn")
     N_WORKERS = min(4, len(CASES))
     print(f"\nRUNNING FORECASTS ({len(CASES)} cases on {N_WORKERS} workers)")
     print("-" * 72)
     t0 = time.time()
-    with ctx.Pool(N_WORKERS) as pool:
+    with process_pool(N_WORKERS, pin_blas=False) as pool:
         results = pool.map(run_single, CASES)
     dt = time.time() - t0
     for r in results:
@@ -1034,8 +1032,6 @@ def main():
     print("  PICO uses ~110 independent 15° patches with per-patch amplitudes.")
     print("  We approximate with 3 and 6 patches at f_sky=0.6.\n")
 
-    import multiprocessing as mp2
-    ctx2 = mp2.get_context("spawn")
     mp_jobs = [
         (3, 0.27, "gaussian"),
         (6, 0.27, "gaussian"),
@@ -1043,7 +1039,7 @@ def main():
         (6, 0.27, "moment"),
     ]
     t0 = time.time()
-    with ctx2.Pool(4) as pool:
+    with process_pool(4, pin_blas=False) as pool:
         mp_results = pool.map(_multipatch_worker, mp_jobs)
     dt = time.time() - t0
 
