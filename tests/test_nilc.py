@@ -93,7 +93,7 @@ def test_ilc_weights_sum_to_one(localization) -> None:
         needlet_peaks=[8, 24, lmax],
         localization_fwhm_arcmin=localization,
     )
-    wsum = np.asarray(jnp.sum(res.weights, axis=1))  # (J, npix)
+    wsum = np.asarray(jnp.sum(res.weights, axis=1))  # (J,) global / (J, npix) localized
     np.testing.assert_allclose(wsum, 1.0, atol=1e-8)
 
 
@@ -134,7 +134,7 @@ def test_coarse_band_downweighted_at_fine_scales() -> None:
         sky, jnp.array([1.0e-3, 1.0e-3]), jnp.ones(sky.npix), noise_key=jax.random.PRNGKey(0)
     )
     res = nilc_clean(maps, beams, lmax=lmax, nside=nside)
-    w_last = np.asarray(res.weights[-1, :, 0])  # finest needlet band, any pixel (global)
+    w_last = np.asarray(res.weights[-1])  # finest needlet band per-channel weights (global → (n_band,))
     assert w_last[0] < w_last[1]  # coarse band carries less weight than the fine band
     assert w_last[0] < 0.25
 

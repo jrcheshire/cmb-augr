@@ -157,9 +157,16 @@ def combine_needlets(
 ) -> jax.Array:
     """Weight + recompose needlet maps into a single cleaned B alm, shape ``(Nlm,)``.
 
-    ``s_j = Σ_b w_{j,b} β_{j,b}``; ``cleaned = Σ_j h_j · map2alm(s_j)``.
+    ``s_j = Σ_b w_{j,b} β_{j,b}``; ``cleaned = Σ_j h_j · map2alm(s_j)``. ``weights``
+    is ``(J, n_band)`` (global, pixel-constant) or ``(J, n_band, npix)``
+    (localized); the ``einsum`` fuses the multiply+reduce so the
+    ``(J, n_band, npix)`` product is never materialised — the memory saving for
+    the global default at high nside.
     """
-    s = jnp.sum(weights * beta, axis=1)  # (J, npix)
+    if weights.ndim == 2:
+        s = jnp.einsum("jb,jbp->jp", weights, beta)  # global: pixel-constant weights
+    else:
+        s = jnp.einsum("jbp,jbp->jp", weights, beta)  # localized: per-pixel weights
     acc = [
         almxfl(map2alm(s[j][None, :], 0, lmax, nside, n_iter)[0], hj, lmax)
         for j, hj in enumerate(needlet_bands)
@@ -233,11 +240,14 @@ def _needlet_channel_mask(
 
 
 def _global_weights(beta: jax.Array, ridge: float, active: np.ndarray) -> jax.Array:
-    """Spatially-constant weights per needlet band, shape ``(J, n_band, npix)``.
+    """Spatially-constant weights per needlet band, shape ``(J, n_band)``.
 
     The empirical covariance and ILC solve run over the *active* channels of each
     needlet band (``active[j]``); excluded channels get weight exactly 0, so their
-    (possibly deconvolution-inflated) maps never enter the cleaned product.
+    (possibly deconvolution-inflated) maps never enter the cleaned product. The
+    weights are pixel-independent, so they are returned as ``(J, n_band)`` and
+    broadcast at apply time (``combine_needlets``) — *not* materialised to
+    ``(J, n_band, npix)``, which would be a redundant ~13 GB at nside=1024.
     """
     n_j, n_band, npix = beta.shape
     ws = []
@@ -246,9 +256,8 @@ def _global_weights(beta: jax.Array, ridge: float, active: np.ndarray) -> jax.Ar
         bj = beta[j][idx]  # (n_active, npix)
         cov = (bj @ bj.T) / npix  # (n_active, n_active)
         w_active = _ilc_weights_from_cov(_ridge(cov, ridge))  # (n_active,)
-        w = jnp.zeros(n_band).at[jnp.asarray(idx)].set(w_active)
-        ws.append(jnp.broadcast_to(w[:, None], (n_band, npix)))
-    return jnp.stack(ws, axis=0)
+        ws.append(jnp.zeros(n_band).at[jnp.asarray(idx)].set(w_active))  # (n_band,)
+    return jnp.stack(ws, axis=0)  # (J, n_band)
 
 
 def _localized_weights(
@@ -307,8 +316,9 @@ class NILCResult:
     cleaned_b_alm
         Cleaned B-mode alm at the common resolution, shape ``(Nlm,)``.
     weights
-        ILC weights, shape ``(J, n_band, npix)`` (constant over pixels in the
-        global case).
+        ILC weights: ``(J, n_band)`` for the global (pixel-constant) case, or
+        ``(J, n_band, npix)`` for localized weights. ``combine_needlets`` /
+        :meth:`project` broadcast the global form at apply time.
     needlet_bands
         Cosine-needlet windows used, shape ``(J, lmax+1)``.
     beam_fwhm_arcmin, common_fwhm_arcmin
