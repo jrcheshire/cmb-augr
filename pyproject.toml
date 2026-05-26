@@ -41,6 +41,7 @@ Issues = "https://github.com/jrcheshire/cmb-augr/issues"
 dev = ["pytest>=7.0", "pywigxjpf"]
 camb = ["camb"]
 broom = ["cmbroom", "pyyaml"]
+compsep = ["ducc0", "pysm3"]
 notebooks = ["jupyterlab", "ipykernel", "matplotlib"]
 
 [tool.setuptools.packages.find]
@@ -68,6 +69,8 @@ healpy = ">=1.16"
 pytest = ">=7.0"
 pytest-xdist = ">=3.0"
 camb = "*"
+ducc0 = "*"
+pysm3 = "*"
 jupyterlab = "*"
 ipykernel = "*"
 ipython = "*"
