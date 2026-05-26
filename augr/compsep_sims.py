@@ -138,6 +138,46 @@ class BandSky:
         return 12 * self.nside**2
 
 
+@dataclass(frozen=True)
+class HarmonicSky:
+    """Aperture-independent harmonic-space sky: CMB B alm + per-band FG E/B alm.
+
+    The expensive, aperture-independent part of a sim -- the CMB realization and
+    the PySM foreground emission + analysis -- factored out of the per-band beaming
+    so it can be built **once** and beamed at many apertures. The per-band beam is
+    the only aperture-dependent step, so an aperture sweep at fixed sim builds one
+    ``HarmonicSky`` and calls :func:`beam_harmonic_sky` per aperture, rather than
+    regenerating the (multi-GB, multi-minute) PySM sky for every diameter. Holding
+    the E/B alm (``(n_band, 2, n_alm)``, ~1.4 GB at nside=1024 / 21 bands) across
+    the sweep is far cheaper than re-running PySM.
+
+    Attributes
+    ----------
+    freqs_ghz
+        Band center frequencies [GHz], length ``n_band``.
+    nside, lmax
+        HEALPix resolution and band limit.
+    r_in
+        Input tensor-to-scalar ratio of the CMB realization.
+    cmb_b_alm
+        CMB B-mode alm, shape ``(n_alm,)`` [healpy packing].
+    fg_eb_alm
+        Per-band foreground E/B alm, shape ``(n_band, 2, n_alm)``, or ``None`` for
+        a CMB-only sky.
+    """
+
+    freqs_ghz: tuple[float, ...]
+    nside: int
+    lmax: int
+    r_in: float
+    cmb_b_alm: jax.Array
+    fg_eb_alm: jax.Array | None
+
+    @property
+    def n_band(self) -> int:
+        return len(self.freqs_ghz)
+
+
 def cmb_b_alm(spectra: CMBSpectra, r_in: float, lmax: int, *, seed: int = 0) -> jax.Array:
     """Draw a Gaussian CMB B-mode alm from ``C_ℓ^{BB}(r_in)`` [healpy packing].
 
@@ -231,6 +271,39 @@ def pysm_fg_iqu(
     return out
 
 
+def _fg_eb_alm(
+    freqs_ghz: tuple[float, ...], fg_model: str, lmax: int, nside: int, *, fg_seed: int = 0
+) -> jax.Array:
+    """PySM foregrounds analyzed per band → E/B alm ``(n_band, 2, n_alm)``.
+
+    The aperture-independent half of the foreground path: PySM emission + healpy
+    quadrature analysis. The beam (aperture-dependent) is applied later by
+    :func:`_beam_fg_eb`.
+    """
+    import healpy as hp
+
+    iqu = pysm_fg_iqu(freqs_ghz, fg_model, nside, fg_seed=fg_seed)
+    eb = []
+    for i in range(len(freqs_ghz)):
+        # healpy quadrature analysis (allocation-independent → need not be diff'able)
+        _alm_t, alm_e, alm_b = hp.map2alm(iqu[i], lmax=lmax, pol=True)
+        eb.append(jnp.stack([jnp.asarray(alm_e), jnp.asarray(alm_b)], axis=0))
+    return jnp.stack(eb, axis=0)
+
+
+def _beam_fg_eb(
+    fg_eb_alm: jax.Array, beam_fwhm_arcmin: tuple[float, ...], lmax: int, nside: int
+) -> jax.Array:
+    """Beam precomputed per-band FG E/B alm → ``(n_band, 2, npix)`` Q/U."""
+    return jnp.stack(
+        [
+            _beam_qu_from_eb(fg_eb_alm[i, 0], fg_eb_alm[i, 1], fw, lmax, nside)
+            for i, fw in enumerate(beam_fwhm_arcmin)
+        ],
+        axis=0,
+    )
+
+
 def fg_band_qu(
     freqs_ghz: tuple[float, ...],
     beam_fwhm_arcmin: tuple[float, ...],
@@ -241,15 +314,75 @@ def fg_band_qu(
     fg_seed: int = 0,
 ) -> jax.Array:
     """PySM foregrounds, analyzed and beamed per band → ``(n_band, 2, npix)`` Q/U."""
-    import healpy as hp
+    fg_eb = _fg_eb_alm(freqs_ghz, fg_model, lmax, nside, fg_seed=fg_seed)
+    return _beam_fg_eb(fg_eb, beam_fwhm_arcmin, lmax, nside)
 
-    iqu = pysm_fg_iqu(freqs_ghz, fg_model, nside, fg_seed=fg_seed)
-    bands = []
-    for i, fw in enumerate(beam_fwhm_arcmin):
-        # healpy quadrature analysis (allocation-independent → need not be diff'able)
-        _alm_t, alm_e, alm_b = hp.map2alm(iqu[i], lmax=lmax, pol=True)
-        bands.append(_beam_qu_from_eb(alm_e, alm_b, fw, lmax, nside))
-    return jnp.stack(bands, axis=0)
+
+def harmonic_sky(
+    freqs_ghz: tuple[float, ...],
+    *,
+    spectra: CMBSpectra,
+    r_in: float,
+    nside: int,
+    lmax: int,
+    fg_model: str | None = "d1s1",
+    cmb_seed: int = 0,
+    fg_seed: int | None = None,
+) -> HarmonicSky:
+    """Build the aperture-independent harmonic sky (CMB B alm + per-band FG E/B alm).
+
+    This is the expensive, aperture-independent part of a sim: the CMB realization
+    and the PySM foreground emission + analysis. Beam it at one or more apertures
+    with :func:`beam_harmonic_sky`. See :class:`HarmonicSky` for why the split
+    matters for an aperture sweep.
+
+    Parameters mirror :func:`generate_band_sky` (minus ``beam_fwhm_arcmin``, which
+    is supplied per aperture at the beaming step).
+    """
+    check_band_limit(lmax, nside)
+    if fg_seed is None:
+        fg_seed = cmb_seed
+
+    b_alm = cmb_b_alm(spectra, r_in, lmax, seed=cmb_seed)
+    fg_eb = (
+        None if fg_model is None else _fg_eb_alm(freqs_ghz, fg_model, lmax, nside, fg_seed=fg_seed)
+    )
+
+    return HarmonicSky(
+        freqs_ghz=tuple(float(f) for f in freqs_ghz),
+        nside=int(nside),
+        lmax=int(lmax),
+        r_in=float(r_in),
+        cmb_b_alm=b_alm,
+        fg_eb_alm=fg_eb,
+    )
+
+
+def beam_harmonic_sky(hsky: HarmonicSky, beam_fwhm_arcmin: tuple[float, ...]) -> BandSky:
+    """Beam an aperture-independent :class:`HarmonicSky` at one aperture → :class:`BandSky`.
+
+    The only aperture-dependent step. Cheap relative to :func:`harmonic_sky`, so an
+    aperture sweep at fixed sim calls this once per diameter on a shared ``hsky``.
+    """
+    if len(beam_fwhm_arcmin) != hsky.n_band:
+        raise ValueError(
+            f"beam_fwhm_arcmin has {len(beam_fwhm_arcmin)} entries but the harmonic "
+            f"sky has {hsky.n_band} bands."
+        )
+    cmb_qu = cmb_band_qu(hsky.cmb_b_alm, beam_fwhm_arcmin, hsky.lmax, hsky.nside)
+    if hsky.fg_eb_alm is None:
+        fg_qu = jnp.zeros_like(cmb_qu)
+    else:
+        fg_qu = _beam_fg_eb(hsky.fg_eb_alm, beam_fwhm_arcmin, hsky.lmax, hsky.nside)
+    return BandSky(
+        freqs_ghz=hsky.freqs_ghz,
+        beam_fwhm_arcmin=tuple(float(f) for f in beam_fwhm_arcmin),
+        nside=hsky.nside,
+        lmax=hsky.lmax,
+        r_in=hsky.r_in,
+        cmb_qu=cmb_qu,
+        fg_qu=fg_qu,
+    )
 
 
 def generate_band_sky(
@@ -265,6 +398,10 @@ def generate_band_sky(
     fg_seed: int | None = None,
 ) -> BandSky:
     """Build the fixed beamed sky (CMB + optional PySM FG) for all bands.
+
+    Convenience wrapper = :func:`harmonic_sky` then :func:`beam_harmonic_sky` at a
+    single aperture. For an aperture sweep at fixed sim, call those two directly so
+    the (expensive) :func:`harmonic_sky` runs once and only the beaming repeats.
 
     Parameters
     ----------
@@ -290,27 +427,17 @@ def generate_band_sky(
     """
     if len(freqs_ghz) != len(beam_fwhm_arcmin):
         raise ValueError("freqs_ghz and beam_fwhm_arcmin must have the same length.")
-    check_band_limit(lmax, nside)
-    if fg_seed is None:
-        fg_seed = cmb_seed
-
-    b_alm = cmb_b_alm(spectra, r_in, lmax, seed=cmb_seed)
-    cmb_qu = cmb_band_qu(b_alm, beam_fwhm_arcmin, lmax, nside)
-
-    if fg_model is None:
-        fg_qu = jnp.zeros_like(cmb_qu)
-    else:
-        fg_qu = fg_band_qu(freqs_ghz, beam_fwhm_arcmin, fg_model, lmax, nside, fg_seed=fg_seed)
-
-    return BandSky(
-        freqs_ghz=tuple(float(f) for f in freqs_ghz),
-        beam_fwhm_arcmin=tuple(float(f) for f in beam_fwhm_arcmin),
-        nside=int(nside),
-        lmax=int(lmax),
-        r_in=float(r_in),
-        cmb_qu=cmb_qu,
-        fg_qu=fg_qu,
+    hsky = harmonic_sky(
+        freqs_ghz,
+        spectra=spectra,
+        r_in=r_in,
+        nside=nside,
+        lmax=lmax,
+        fg_model=fg_model,
+        cmb_seed=cmb_seed,
+        fg_seed=fg_seed,
     )
+    return beam_harmonic_sky(hsky, beam_fwhm_arcmin)
 
 
 # ---------------------------------------------------------------------------

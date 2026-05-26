@@ -19,7 +19,9 @@ import healpy as hp  # noqa: E402
 from augr.compsep_sims import (  # noqa: E402
     BandSky,
     assemble_band_maps,
+    beam_harmonic_sky,
     generate_band_sky,
+    harmonic_sky,
 )
 from augr.instrument import beam_bl  # noqa: E402
 from augr.spectra import CMBSpectra  # noqa: E402
@@ -250,3 +252,70 @@ def test_s6_realization_reproducible_and_seed_varying() -> None:
     assert np.all(np.isfinite(a0))
     np.testing.assert_array_equal(a0, a0_again)  # same seed -> bit-identical
     assert not np.allclose(a0, a1)  # different seed -> different realization
+
+
+# --- harmonic-sky reuse across apertures (the aperture-sweep cost fix) ------
+#
+# harmonic_sky() builds the aperture-independent CMB + FG harmonic sky once;
+# beam_harmonic_sky() applies the per-aperture beam. The aperture sweep relies on
+# beaming one shared harmonic sky giving bit-identical results to regenerating the
+# sky from scratch at each aperture.
+
+
+def test_beam_harmonic_sky_matches_generate_band_sky_cmb_only() -> None:
+    """Beaming a shared harmonic sky == fresh generate_band_sky, at two apertures."""
+    spectra = CMBSpectra()
+    freqs = (30.0, 100.0)
+    hsky = harmonic_sky(
+        freqs, spectra=spectra, r_in=0.01, nside=NSIDE, lmax=LMAX, fg_model=None, cmb_seed=7
+    )
+    for beams in [(40.0, 12.0), (20.0, 8.0)]:
+        reused = beam_harmonic_sky(hsky, beams)
+        fresh = generate_band_sky(
+            freqs,
+            beams,
+            spectra=spectra,
+            r_in=0.01,
+            nside=NSIDE,
+            lmax=LMAX,
+            fg_model=None,
+            cmb_seed=7,
+        )
+        np.testing.assert_array_equal(np.asarray(reused.cmb_qu), np.asarray(fresh.cmb_qu))
+        np.testing.assert_array_equal(np.asarray(reused.fg_qu), np.asarray(fresh.fg_qu))
+        assert np.allclose(np.asarray(reused.fg_qu), 0.0)  # CMB-only -> no foreground
+
+
+def test_beam_harmonic_sky_rejects_wrong_band_count() -> None:
+    spectra = CMBSpectra()
+    hsky = harmonic_sky(
+        (30.0, 100.0), spectra=spectra, r_in=0.0, nside=NSIDE, lmax=LMAX, fg_model=None
+    )
+    with pytest.raises(ValueError, match="bands"):
+        beam_harmonic_sky(hsky, (40.0, 12.0, 5.0))
+
+
+@pytest.mark.slow
+def test_beam_harmonic_sky_matches_generate_band_sky_with_fg() -> None:
+    """Foreground path too: shared harmonic sky beamed == fresh, at two apertures."""
+    pytest.importorskip("pysm3")
+    spectra = CMBSpectra()
+    nside, lmax = 32, 64
+    freqs = (30.0, 100.0)
+    hsky = harmonic_sky(
+        freqs, spectra=spectra, r_in=0.0, nside=nside, lmax=lmax, fg_model="d1s1", cmb_seed=3
+    )
+    for beams in [(40.0, 12.0), (25.0, 9.0)]:
+        reused = beam_harmonic_sky(hsky, beams)
+        fresh = generate_band_sky(
+            freqs,
+            beams,
+            spectra=spectra,
+            r_in=0.0,
+            nside=nside,
+            lmax=lmax,
+            fg_model="d1s1",
+            cmb_seed=3,
+        )
+        np.testing.assert_array_equal(np.asarray(reused.fg_qu), np.asarray(fresh.fg_qu))
+        np.testing.assert_array_equal(np.asarray(reused.cmb_qu), np.asarray(fresh.cmb_qu))
