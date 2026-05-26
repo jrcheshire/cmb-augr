@@ -175,3 +175,78 @@ def test_generate_band_sky_with_pysm_foregrounds() -> None:
     ells = np.arange(lmax + 1)
     band = (ells >= 10) & (ells <= 50)
     assert bb30[band].sum() > bb100[band].sum()
+
+
+# --- foreground seed reproducibility (CRN for the aperture sweep) -----------
+#
+# The load-bearing logic (which PySM component gets an explicit `seeds`, and that
+# the seed tracks `fg_seed`) is tested network-free against the preset dicts. The
+# actual map-level reproducibility is a slow test against an s6-only Sky -- only
+# the small synch alm/cl realization templates download, not the heavy GNILC dust
+# maps the full d10s6 path would pull.
+
+
+def test_seeded_component_config_seeds_only_realizations() -> None:
+    """Only stochastic *Realization components get a `seeds` field injected."""
+    pytest.importorskip("pysm3")
+    from augr.compsep_sims import _seeded_component_config
+
+    cfg = _seeded_component_config("d10s6", fg_seed=0)
+    assert "seeds" in cfg["s6"]  # PowerLawRealization -> seeded for reproducibility
+    assert "seeds" not in cfg["d10"]  # ModifiedBlackBody is a fixed template
+
+    # Fixed-template models have no stochastic component -> nothing is seeded.
+    for model in ("d1s1", "d10s5"):
+        cfg_fixed = _seeded_component_config(model, fg_seed=0)
+        assert all("seeds" not in c for c in cfg_fixed.values())
+
+
+def test_seeded_component_config_seed_varies_with_fg_seed() -> None:
+    pytest.importorskip("pysm3")
+    from augr.compsep_sims import _seeded_component_config
+
+    s0 = _seeded_component_config("d10s6", fg_seed=0)["s6"]["seeds"]
+    s1 = _seeded_component_config("d10s6", fg_seed=1)["s6"]["seeds"]
+    assert s0 != s1
+
+
+def test_seeded_component_config_does_not_mutate_presets() -> None:
+    """Deep-copy guard: the global PRESET_MODELS dict is never mutated."""
+    pytest.importorskip("pysm3")
+    from pysm3.sky import PRESET_MODELS
+
+    from augr.compsep_sims import _seeded_component_config
+
+    assert "seeds" not in PRESET_MODELS["s6"]
+    _seeded_component_config("d10s6", fg_seed=0)
+    assert "seeds" not in PRESET_MODELS["s6"]
+
+
+@pytest.mark.slow
+def test_s6_realization_reproducible_and_seed_varying() -> None:
+    """s6 small scales are bit-identical at a fixed fg_seed and differ across seeds.
+
+    This is the core of the CRN fix: with the preset default (seeds=None) s6
+    reseeds numpy from entropy at construction, so the realization is neither
+    reproducible nor held fixed across apertures. The injected seeds make it both.
+    """
+    pysm3 = pytest.importorskip("pysm3")
+    import pysm3.units as u
+
+    from augr.compsep_sims import _seeded_component_config
+
+    nside = 16
+
+    def synch_emission(seed: int) -> np.ndarray:
+        # s6-only Sky -> downloads just the synch realization templates, no dust.
+        cfg = {"s6": _seeded_component_config("d10s6", seed)["s6"]}
+        sky = pysm3.Sky(nside=nside, component_config=cfg)
+        return np.asarray(sky.get_emission(23.0 * u.GHz).value)
+
+    a0 = synch_emission(0)
+    a0_again = synch_emission(0)
+    a1 = synch_emission(1)
+
+    assert np.all(np.isfinite(a0))
+    np.testing.assert_array_equal(a0, a0_again)  # same seed -> bit-identical
+    assert not np.allclose(a0, a1)  # different seed -> different realization

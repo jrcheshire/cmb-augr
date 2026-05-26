@@ -44,6 +44,7 @@ path; the CMB-only and noise paths need just healpy + ducc0.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 
 import jax
@@ -174,16 +175,53 @@ def cmb_band_qu(
     )
 
 
-def pysm_fg_iqu(freqs_ghz: tuple[float, ...], fg_model: str, nside: int) -> np.ndarray:
+def _seeded_component_config(fg_model: str, fg_seed: int) -> dict:
+    """Build a PySM ``component_config`` for ``fg_model`` with seeded small scales.
+
+    Stochastic small-scale components (PySM ``*Realization`` classes, e.g. ``s6``
+    = ``PowerLawRealization``) reseed ``numpy``'s global RNG from entropy at
+    construction when their ``seeds`` field is left ``None`` (the preset default).
+    That makes the foreground realization both non-reproducible and not held fixed
+    across apertures, which breaks the common-random-number assumption the Δr(D)
+    sweep relies on (the CMB and noise are CRN'd by ``cmb_seed`` / the JAX key, so
+    the foreground must be too). We therefore deep-copy each preset dict and inject
+    an explicit ``seeds`` list for any ``*Realization`` component, keyed off
+    ``fg_seed``. Non-realization components (fixed-template ``PowerLaw`` /
+    ``ModifiedBlackBody`` such as ``d1``/``d10``/``s1``/``s5``) take no ``seeds``
+    kwarg, so they are passed through untouched and are deterministic regardless of
+    ``fg_seed``.
+    """
+    from pysm3.sky import PRESET_MODELS
+
+    seed0 = int(fg_seed) % (2**31)  # keep inside numpy's [0, 2**32) seed range
+    config: dict[str, dict] = {}
+    for k, preset in enumerate(_FG_PRESETS[fg_model]):
+        cfg = copy.deepcopy(PRESET_MODELS[preset])
+        if "Realization" in cfg.get("class", ""):
+            # Offset per component so two stochastic components never share a seed
+            # (none do in the current presets, but a future dust-realization preset
+            # would). PowerLawRealization reads seeds[0:2]; a 3rd is for a future
+            # ModifiedBlackBodyRealization and is harmlessly ignored otherwise.
+            base = (seed0 + 1000 * k) % (2**31)
+            cfg["seeds"] = [base, base + 1, base + 2]
+        config[preset] = cfg
+    return config
+
+
+def pysm_fg_iqu(
+    freqs_ghz: tuple[float, ...], fg_model: str, nside: int, *, fg_seed: int = 0
+) -> np.ndarray:
     """PySM Galactic foreground I/Q/U per band [μK_CMB], shape ``(n_band, 3, npix)``.
 
     Maps are at native HEALPix resolution (unbeamed); beaming happens in
-    :func:`fg_band_qu`. ``fg_model`` is a key of :data:`_FG_PRESETS`.
+    :func:`fg_band_qu`. ``fg_model`` is a key of :data:`_FG_PRESETS`. ``fg_seed``
+    fixes any stochastic small-scale realization (e.g. ``s6``) for reproducibility
+    and common random numbers; see :func:`_seeded_component_config`.
     """
     if fg_model not in _FG_PRESETS:
         raise ValueError(f"unknown fg_model {fg_model!r}; expected one of {sorted(_FG_PRESETS)}")
     pysm3, u = _require_pysm()
-    sky = pysm3.Sky(nside=int(nside), preset_strings=list(_FG_PRESETS[fg_model]))
+    sky = pysm3.Sky(nside=int(nside), component_config=_seeded_component_config(fg_model, fg_seed))
     npix = 12 * int(nside) ** 2
     out = np.empty((len(freqs_ghz), 3, npix), dtype=np.float64)
     for i, nu in enumerate(freqs_ghz):
@@ -199,11 +237,13 @@ def fg_band_qu(
     fg_model: str,
     lmax: int,
     nside: int,
+    *,
+    fg_seed: int = 0,
 ) -> jax.Array:
     """PySM foregrounds, analyzed and beamed per band → ``(n_band, 2, npix)`` Q/U."""
     import healpy as hp
 
-    iqu = pysm_fg_iqu(freqs_ghz, fg_model, nside)
+    iqu = pysm_fg_iqu(freqs_ghz, fg_model, nside, fg_seed=fg_seed)
     bands = []
     for i, fw in enumerate(beam_fwhm_arcmin):
         # healpy quadrature analysis (allocation-independent → need not be diff'able)
@@ -222,6 +262,7 @@ def generate_band_sky(
     lmax: int,
     fg_model: str | None = "d1s1",
     cmb_seed: int = 0,
+    fg_seed: int | None = None,
 ) -> BandSky:
     """Build the fixed beamed sky (CMB + optional PySM FG) for all bands.
 
@@ -236,14 +277,22 @@ def generate_band_sky(
     nside, lmax
         HEALPix resolution and band limit.
     fg_model
-        PySM preset key (``"d1s1"`` / ``"d10s5"``) or ``None`` for a CMB-only sky
-        (foreground maps all zero).
+        PySM preset key (``"d1s1"`` / ``"d10s5"`` / ``"d10s6"``) or ``None`` for a
+        CMB-only sky (foreground maps all zero).
     cmb_seed
         Seed for the CMB B-mode realization (CRN).
+    fg_seed
+        Seed for any stochastic small-scale foreground realization (e.g. ``s6``).
+        Defaults to ``cmb_seed`` so that a single per-sim index CRN's the CMB,
+        foreground, and (via the JAX key downstream) noise together — fixed across
+        apertures, varied across sims. Fixed-template foreground models are
+        deterministic and ignore this. See :func:`_seeded_component_config`.
     """
     if len(freqs_ghz) != len(beam_fwhm_arcmin):
         raise ValueError("freqs_ghz and beam_fwhm_arcmin must have the same length.")
     check_band_limit(lmax, nside)
+    if fg_seed is None:
+        fg_seed = cmb_seed
 
     b_alm = cmb_b_alm(spectra, r_in, lmax, seed=cmb_seed)
     cmb_qu = cmb_band_qu(b_alm, beam_fwhm_arcmin, lmax, nside)
@@ -251,7 +300,7 @@ def generate_band_sky(
     if fg_model is None:
         fg_qu = jnp.zeros_like(cmb_qu)
     else:
-        fg_qu = fg_band_qu(freqs_ghz, beam_fwhm_arcmin, fg_model, lmax, nside)
+        fg_qu = fg_band_qu(freqs_ghz, beam_fwhm_arcmin, fg_model, lmax, nside, fg_seed=fg_seed)
 
     return BandSky(
         freqs_ghz=tuple(float(f) for f in freqs_ghz),
