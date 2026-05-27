@@ -363,3 +363,51 @@ def bandpower_covariance_blocks_from_noise(
     for i in range(n_chan):
         M = M.at[i, i, :].add(W @ noise_nls[i])
     return _knox_blocks(M, signal_model, f_sky)
+
+
+def knox_sigma_from_measured_spectrum(
+    measured_cl: jnp.ndarray,
+    bin_edges: list[tuple[int, int]],
+    f_sky: float,
+    *,
+    partner_cl: jnp.ndarray | None = None,
+    cross_cl: jnp.ndarray | None = None,
+) -> jnp.ndarray:
+    """Per-bin Knox standard deviation of a single BB (cross-)spectrum from a
+    **measured** total power, bypassing the S+N model assembly.
+
+    For a (cross-)spectrum between maps ``k`` and ``p`` in bandpower bin ``b``
+    the Gaussian/Knox variance is
+
+        Var(Ĉ_b) = [M_kk(b) M_pp(b) + M_kp(b)²] / ν_b,
+        ν_b = f_sky × Σ_{ℓ in b} (2ℓ+1),
+
+    where ``M_xy`` is the **total** measured bandpower (signal + residual +
+    noise) of the relevant (cross-)spectrum -- no CMB / foreground / noise
+    decomposition is assumed. This is the model-free counterpart to
+    :func:`bandpower_covariance_blocks`, for post-component-separation
+    likelihoods that estimate the cleaned-map (cross-)power directly and want a
+    Gaussian bandpower error consistent with the same Knox forecasting formula.
+
+    Args:
+        measured_cl:  ``(n_bins,)`` measured auto-power ``M_kk`` of map ``k``.
+        bin_edges:    list of inclusive integer ``(lo, hi)`` ℓ-ranges, as
+                      consumed by :func:`_nu_b`.
+        f_sky:        effective sky fraction; the caller folds in any
+                      apodization mode-loss (e.g. ``w2²/w4``).
+        partner_cl:   ``(n_bins,)`` partner auto-power ``M_pp``. Defaults to
+                      ``measured_cl`` (auto-spectrum / statistically-equivalent
+                      partner).
+        cross_cl:     ``(n_bins,)`` measured cross-power ``M_kp``. Defaults to
+                      ``measured_cl`` (fully-correlated / auto limit).
+
+    Returns:
+        ``(n_bins,)`` per-bin standard deviation ``sqrt(Var)``. With the
+        defaults this reduces to the auto-spectrum form ``sqrt(2) M_b / sqrt(ν_b)``.
+    """
+    m_kk = jnp.asarray(measured_cl)
+    m_pp = m_kk if partner_cl is None else jnp.asarray(partner_cl)
+    m_kp = m_kk if cross_cl is None else jnp.asarray(cross_cl)
+    nu = _nu_b(bin_edges, f_sky)
+    var = (m_kk * m_pp + m_kp**2) / nu
+    return jnp.sqrt(var)
