@@ -30,6 +30,7 @@ dependencies = [
     "scipy>=1.10",
     "matplotlib>=3.7",
     "healpy>=1.16",
+    "equinox>=0.11",
 ]
 
 [project.urls]
@@ -76,6 +77,7 @@ ruff = "*"
 [tool.pixi.pypi-dependencies]
 jax = ">=0.4"
 jaxlib = ">=0.4"
+equinox = ">=0.11"
 pywigxjpf = "*"
 cmbroom = "*"
 pyyaml = "*"
