@@ -311,13 +311,16 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/websocket-client-1.9.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-3.23.1-pyhcf101f3_0.conda
       - pypi: .
+      - pypi: https://files.pythonhosted.org/packages/0e/a7/83b321492fe7e5d0af07f484ec0100bb6ca561aa64cad1d34fc58a015d0f/blackjax-1.5-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/15/88/3cdd54fa279341afa10acf8d2b503556b1375245dccc9315659f795dd2e9/pandas-3.0.2-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/18/a6/907a406bb7d359e6a63f99c313846d9eec4f7e6f7437809e03aa00fa3074/absl_py-2.4.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/23/cd/066e86230ae37ed0be70aae89aabf03ca8d9f39c8aea0dec8029455b5540/opt_einsum-3.4.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/32/d5/f9a850d79b0851d1d4ef6456097579a9005b31fea68726a4ae5f2d82ddd9/threadpoolctl-3.6.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/33/b9/817cb5c68f746b754e52f4e6263ebb4b7d8158c852831df24ac35ad52661/pywigxjpf-1.13.3.tar.gz
       - pypi: https://files.pythonhosted.org/packages/60/cc/6f159b25a171da769c4fce3adc42dad76e009599c2ed42050e6942b701b7/cmbroom-0.2.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/61/61/91ffc93953cb2d4ea18db4cf4f3654690a9482443ae3c4c49ca7dc3d2de2/jaxtyping-0.3.10-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/70/aa/dfac6d72cc35bc07e7587115b6946e333ef4ccb2e6cd26ecf639438c5d26/jax-0.10.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/8a/69/6a93d8600c339d7687a05857c7907bd4dd8cf88691a5ea106d7a50af90a1/optax-0.2.8-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/8d/96/04e7b441807b26b794da5b11e59ed7f83b2cf8af202bd7eba8ad2fa6046e/wadler_lindig-0.1.7-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/a1/8e/b2a08ffc51c93842de71f7f988865cebfa7f43d6721957812dc8cc8b9d40/jaxlib-0.10.0-cp314-cp314-manylinux_2_27_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/ae/d6/69a76c8ccdef14af687c497040292a46e59fc7a0ab24724b60e50ca61030/equinox-0.13.8-py3-none-any.whl
@@ -576,6 +579,8 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zlib-ng-2.3.3-hed4e4f5_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-hbf9d68e_6.conda
       - pypi: .
+      - pypi: https://files.pythonhosted.org/packages/0e/a7/83b321492fe7e5d0af07f484ec0100bb6ca561aa64cad1d34fc58a015d0f/blackjax-1.5-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/18/a6/907a406bb7d359e6a63f99c313846d9eec4f7e6f7437809e03aa00fa3074/absl_py-2.4.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/23/cd/066e86230ae37ed0be70aae89aabf03ca8d9f39c8aea0dec8029455b5540/opt_einsum-3.4.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/32/d5/f9a850d79b0851d1d4ef6456097579a9005b31fea68726a4ae5f2d82ddd9/threadpoolctl-3.6.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/33/b9/817cb5c68f746b754e52f4e6263ebb4b7d8158c852831df24ac35ad52661/pywigxjpf-1.13.3.tar.gz
@@ -583,6 +588,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/61/61/91ffc93953cb2d4ea18db4cf4f3654690a9482443ae3c4c49ca7dc3d2de2/jaxtyping-0.3.10-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/70/aa/dfac6d72cc35bc07e7587115b6946e333ef4ccb2e6cd26ecf639438c5d26/jax-0.10.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/72/4e/1339dc6e2557a344f5ba5590872e80346f76f6cb2ac3dd16e4666e88818c/ml_dtypes-0.5.4-cp314-cp314-macosx_10_13_universal2.whl
+      - pypi: https://files.pythonhosted.org/packages/8a/69/6a93d8600c339d7687a05857c7907bd4dd8cf88691a5ea106d7a50af90a1/optax-0.2.8-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/8d/96/04e7b441807b26b794da5b11e59ed7f83b2cf8af202bd7eba8ad2fa6046e/wadler_lindig-0.1.7-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/95/25/bdb9326c3b5455f8d4d3549fce7abcf967259de146fe2cf7a82368141948/pandas-3.0.2-cp314-cp314-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/a7/25/e1e52a21786b321fb6a2edf9ef9971aa70f06bb2738aef9afd6d8f46a441/jaxlib-0.10.0-cp314-cp314-macosx_11_0_arm64.whl
@@ -6535,10 +6541,24 @@ packages:
   - pyyaml ; extra == 'broom'
   - ducc0 ; extra == 'compsep'
   - pysm3 ; extra == 'compsep'
+  - blackjax ; extra == 'sampling'
   - jupyterlab ; extra == 'notebooks'
   - ipykernel ; extra == 'notebooks'
   - matplotlib ; extra == 'notebooks'
   requires_python: '>=3.12'
+- pypi: https://files.pythonhosted.org/packages/0e/a7/83b321492fe7e5d0af07f484ec0100bb6ca561aa64cad1d34fc58a015d0f/blackjax-1.5-py3-none-any.whl
+  name: blackjax
+  version: '1.5'
+  sha256: f3ba5cab7aeee79939326a49d71a08dd1ce35f647e96ff82d2e8556f19e4e487
+  requires_dist:
+  - jax>=0.9.0
+  - jaxlib>=0.9.0
+  - numpy>=1.25
+  - optax>=0.2.3
+  - scipy>=1.13
+  - typing-extensions>=4.4.0
+  - fastprogress>=1.0.0,<1.1 ; extra == 'progress'
+  requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/15/88/3cdd54fa279341afa10acf8d2b503556b1375245dccc9315659f795dd2e9/pandas-3.0.2-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
   name: pandas
   version: 3.0.2
@@ -6629,6 +6649,11 @@ packages:
   - xlsxwriter>=3.2.0 ; extra == 'all'
   - zstandard>=0.23.0 ; extra == 'all'
   requires_python: '>=3.11'
+- pypi: https://files.pythonhosted.org/packages/18/a6/907a406bb7d359e6a63f99c313846d9eec4f7e6f7437809e03aa00fa3074/absl_py-2.4.0-py3-none-any.whl
+  name: absl-py
+  version: 2.4.0
+  sha256: 88476fd881ca8aab94ffa78b7b6c632a782ab3ba1cd19c9bd423abc4fb4cd28d
+  requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/23/cd/066e86230ae37ed0be70aae89aabf03ca8d9f39c8aea0dec8029455b5540/opt_einsum-3.4.0-py3-none-any.whl
   name: opt-einsum
   version: 3.4.0
@@ -6714,6 +6739,31 @@ packages:
   - pylint>=2.6.0 ; extra == 'dev'
   - pyink ; extra == 'dev'
   requires_python: '>=3.9'
+- pypi: https://files.pythonhosted.org/packages/8a/69/6a93d8600c339d7687a05857c7907bd4dd8cf88691a5ea106d7a50af90a1/optax-0.2.8-py3-none-any.whl
+  name: optax
+  version: 0.2.8
+  sha256: e3ca2d36c99daab1800ae9dbc0545034382d6bc780b24d969e1b0df65fa31cb4
+  requires_dist:
+  - absl-py>=0.7.1
+  - jax>=0.5.3
+  - jaxlib>=0.5.3
+  - numpy>=1.18.0
+  - sphinx>=6.0.0 ; extra == 'docs'
+  - sphinx-book-theme>=1.0.1 ; extra == 'docs'
+  - sphinxcontrib-katex ; extra == 'docs'
+  - sphinx-autodoc-typehints ; extra == 'docs'
+  - ipython>=8.8.0 ; extra == 'docs'
+  - myst-nb>=1.0.0 ; extra == 'docs'
+  - matplotlib>=3.5.0 ; extra == 'docs'
+  - sphinx-gallery>=0.14.0 ; extra == 'docs'
+  - sphinx-collections>=0.0.1 ; extra == 'docs'
+  - flax ; extra == 'docs'
+  - sphinx-contributors ; extra == 'docs'
+  - setuptools ; extra == 'docs'
+  - flax>=0.5.3 ; extra == 'test'
+  - scipy>=1.7.1 ; extra == 'test'
+  - scikit-learn ; extra == 'test'
+  requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/8d/96/04e7b441807b26b794da5b11e59ed7f83b2cf8af202bd7eba8ad2fa6046e/wadler_lindig-0.1.7-py3-none-any.whl
   name: wadler-lindig
   version: 0.1.7

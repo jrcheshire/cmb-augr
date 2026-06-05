@@ -43,6 +43,7 @@ dev = ["pytest>=7.0", "pywigxjpf"]
 camb = ["camb"]
 broom = ["cmbroom", "pyyaml"]
 compsep = ["ducc0", "pysm3"]
+sampling = ["blackjax"]
 notebooks = ["jupyterlab", "ipykernel", "matplotlib"]
 
 [tool.setuptools.packages.find]
@@ -81,6 +82,7 @@ ruff = "*"
 jax = ">=0.4"
 jaxlib = ">=0.4"
 equinox = ">=0.11"
+blackjax = "*"
 pywigxjpf = "*"
 cmbroom = "*"
 pyyaml = "*"

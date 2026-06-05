@@ -68,6 +68,18 @@ class Likelihood(Protocol):
     def log_prob(self, prediction: BinnedSpectra) -> jax.Array: ...
 
 
+@runtime_checkable
+class Prior(Protocol):
+    """constrained free-parameter vector → scalar log-prior density.
+
+    Injected into :func:`augr.likelihood.posterior.make_log_posterior` so the
+    sampler is agnostic to where the prior comes from (augr's
+    :class:`~augr.likelihood.prior.GaussianPrior`, or a future bk-jax prior).
+    """
+
+    def log_prob(self, free_params: jax.Array) -> jax.Array: ...
+
+
 class SignalSpectrumModel:
     """Adapter wrapping an augr ``SignalModel`` as a :class:`SpectrumModel`.
 
