@@ -12,6 +12,7 @@ from augr.covariance import (
     bandpower_covariance_blocks_from_noise,
     bandpower_covariance_full,
     bandpower_covariance_full_from_noise,
+    knox_sigma_from_measured_spectrum,
 )
 from augr.foregrounds import GaussianForegroundModel
 from augr.instrument import Channel, Instrument, ScalarEfficiency
@@ -564,3 +565,61 @@ def test_per_spec_covariance_uses_per_pair_window(two_chan_instrument):
                                 4.0 * np.asarray(
                                     jnp.diag(target_block_a)),
                                 rtol=1e-10)
+
+
+# -----------------------------------------------------------------------
+# knox_sigma_from_measured_spectrum (model-free post-compsep path)
+# -----------------------------------------------------------------------
+
+def test_knox_sigma_auto_reduces_to_2M2_over_nu():
+    """Defaults (partner=cross=measured) give the auto-spectrum form
+    Var = 2 M^2 / nu_b, i.e. sigma = sqrt(2) M / sqrt(nu_b)."""
+    edges = [(30, 64), (65, 99)]
+    measured = jnp.array([1.2e-2, 3.4e-3])
+    f_sky = 0.02
+    sigma = knox_sigma_from_measured_spectrum(measured, edges, f_sky)
+    nu = _nu_b(edges, f_sky)
+    expected = jnp.sqrt(2.0 * measured**2 / nu)
+    np.testing.assert_allclose(np.asarray(sigma), np.asarray(expected), rtol=1e-12)
+
+
+def test_knox_sigma_cross_matches_four_point_formula():
+    """Cross-spectrum: Var = (M_kk M_pp + M_kp^2) / nu_b."""
+    edges = [(30, 64), (65, 99), (100, 134)]
+    m_kk = jnp.array([1.0e-2, 5.0e-3, 2.0e-3])
+    m_pp = jnp.array([1.1e-2, 4.0e-3, 2.5e-3])
+    m_kp = jnp.array([9.0e-3, 3.0e-3, 1.5e-3])
+    f_sky = 0.015
+    sigma = knox_sigma_from_measured_spectrum(
+        m_kk, edges, f_sky, partner_cl=m_pp, cross_cl=m_kp
+    )
+    nu = _nu_b(edges, f_sky)
+    expected = jnp.sqrt((m_kk * m_pp + m_kp**2) / nu)
+    np.testing.assert_allclose(np.asarray(sigma), np.asarray(expected), rtol=1e-12)
+
+
+def test_knox_sigma_fsky_scaling():
+    """sigma scales as 1/sqrt(f_sky) (nu_b is linear in f_sky)."""
+    edges = [(50, 99)]
+    measured = jnp.array([1.0e-2])
+    s_half = float(knox_sigma_from_measured_spectrum(measured, edges, 0.5)[0])
+    s_full = float(knox_sigma_from_measured_spectrum(measured, edges, 1.0)[0])
+    assert abs(s_half / s_full - np.sqrt(2.0)) < 1e-10
+
+
+def test_knox_sigma_matches_blocks_auto_variance(signal_model, two_chan_instrument):
+    """For a measured spectrum equal to an auto-block M_ii, the helper's
+    variance matches the (i,i) diagonal of bandpower_covariance_blocks — i.e.
+    the model-free path is the same Knox formula as the SignalModel path."""
+    params = flatten_params(FIDUCIAL, signal_model.parameter_names)
+    M = _build_M(signal_model, two_chan_instrument, params)
+    blocks = bandpower_covariance_blocks(signal_model, two_chan_instrument, params)
+    # Auto-spectrum (0,0) is spec index 0; its per-bin variance is blocks[b,0,0].
+    m_00 = M[0, 0, :]
+    sigma = knox_sigma_from_measured_spectrum(
+        m_00, signal_model._bin_edges, two_chan_instrument.f_sky
+    )
+    expected_var = jnp.array([blocks[b, 0, 0] for b in range(signal_model.n_bins)])
+    np.testing.assert_allclose(
+        np.asarray(sigma**2), np.asarray(expected_var), rtol=1e-10
+    )
