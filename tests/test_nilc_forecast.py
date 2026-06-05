@@ -14,16 +14,16 @@ import pytest
 
 pytest.importorskip("ducc0")
 
-from augr.compsep_sims import assemble_band_maps, generate_band_sky  # noqa: E402
-from augr.nilc import common_resolution_b_alm, nilc_clean  # noqa: E402
-from augr.nilc_forecast import (  # noqa: E402
+from augr.compsep_sims import assemble_band_maps, generate_band_sky
+from augr.nilc import common_resolution_b_alm, nilc_clean
+from augr.nilc_forecast import (
     cl_bb,
     nilc_forecast,
     nilc_leakage_correlation,
     nilc_spectra,
 )
-from augr.noise_sims import noise_maps  # noqa: E402
-from augr.spectra import CMBSpectra  # noqa: E402
+from augr.noise_sims import noise_maps
+from augr.spectra import CMBSpectra
 
 NSIDE, LMAX = 32, 48
 FREQS = (30.0, 90.0, 150.0)

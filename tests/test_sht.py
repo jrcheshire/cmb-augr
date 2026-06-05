@@ -15,16 +15,16 @@ import pytest
 
 pytest.importorskip("ducc0")
 
-import healpy as hp  # noqa: E402
+import healpy as hp
 
-from augr.sht import (  # noqa: E402
+from augr.sht import (
+    _ell_of_alm,
+    _m_of_alm,
+    _resolve_nthreads,
     adjoint_synthesis,
     alm_size,
     band_limit,
     check_band_limit,
-    _ell_of_alm,
-    _m_of_alm,
-    _resolve_nthreads,
     map2alm,
     synthesis,
     synthesis_pol,

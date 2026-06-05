@@ -14,17 +14,17 @@ import pytest
 
 pytest.importorskip("ducc0")
 
-import healpy as hp  # noqa: E402
+import healpy as hp
 
-from augr.compsep_sims import (  # noqa: E402
+from augr.compsep_sims import (
     BandSky,
     assemble_band_maps,
     beam_harmonic_sky,
     generate_band_sky,
     harmonic_sky,
 )
-from augr.instrument import beam_bl  # noqa: E402
-from augr.spectra import CMBSpectra  # noqa: E402
+from augr.instrument import beam_bl
+from augr.spectra import CMBSpectra
 
 NSIDE = 64
 LMAX = 128

@@ -14,8 +14,8 @@ import pytest
 
 pytest.importorskip("ducc0")
 
-from augr.compsep_sims import assemble_band_maps, generate_band_sky  # noqa: E402
-from augr.nilc import (  # noqa: E402
+from augr.compsep_sims import assemble_band_maps, generate_band_sky
+from augr.nilc import (
     _needlet_channel_mask,
     combine_needlets,
     common_resolution_b_alm,
@@ -24,8 +24,8 @@ from augr.nilc import (  # noqa: E402
     needlet_beta,
     nilc_clean,
 )
-from augr.sht import _m_of_alm, alm_size  # noqa: E402
-from augr.spectra import CMBSpectra  # noqa: E402
+from augr.sht import _m_of_alm, alm_size
+from augr.spectra import CMBSpectra
 
 
 def _rand_b_alm(seed: int, lmax: int) -> jax.Array:
