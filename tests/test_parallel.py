@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import os
+import time
 
 import pytest
 
 from augr.parallel import (
     cpu_count,
     kill_orphan_workers,
+    parallel_imap_unordered,
     parallel_map,
     pin_blas_env,
     process_pool,
@@ -21,6 +24,15 @@ from augr.parallel import (
 
 def _square(x: int) -> int:
     return x * x
+
+
+def _getpid(_x: int) -> int:
+    return os.getpid()
+
+
+def _sleep_then_echo(x: float) -> float:
+    time.sleep(x)
+    return x
 
 
 def _read_delens_workers(_x: int) -> str:
@@ -38,6 +50,7 @@ def _read_blas_env(_x: int) -> tuple[str | None, str | None, str | None]:
 # -----------------------------------------------------------------------
 # Worker-count arithmetic
 # -----------------------------------------------------------------------
+
 
 class TestWorkerArithmetic:
     def test_workers_for_outer_1_returns_cpu_count(self):
@@ -65,6 +78,7 @@ class TestWorkerArithmetic:
 # -----------------------------------------------------------------------
 # BLAS env pinning
 # -----------------------------------------------------------------------
+
 
 class TestPinBlasEnv:
     def test_sets_all_three(self, monkeypatch):
@@ -104,6 +118,7 @@ class TestPinBlasEnv:
 # -----------------------------------------------------------------------
 # process_pool context manager
 # -----------------------------------------------------------------------
+
 
 class TestProcessPool:
     def test_yields_none_for_n_workers_le_1(self):
@@ -172,6 +187,7 @@ class TestProcessPool:
     def test_terminate_on_exception(self):
         class BoomError(RuntimeError):
             pass
+
         with pytest.raises(BoomError), process_pool(2):
             raise BoomError("kaboom")
         # If terminate() didn't run, this test would hang or zombie -- pytest
@@ -181,6 +197,7 @@ class TestProcessPool:
 # -----------------------------------------------------------------------
 # parallel_map convenience
 # -----------------------------------------------------------------------
+
 
 class TestParallelMap:
     def test_serial_fallback(self):
@@ -198,8 +215,61 @@ class TestParallelMap:
 
 
 # -----------------------------------------------------------------------
+# maxtasksperchild worker recycling
+# -----------------------------------------------------------------------
+
+
+class TestMaxTasksPerChild:
+    @pytest.mark.slow
+    def test_recycles_workers_when_set(self):
+        # maxtasksperchild=1 => a fresh process per task, so 8 tasks across
+        # 2 workers visit > 2 distinct PIDs (each recycle is a new spawn).
+        pids = parallel_map(_getpid, list(range(8)), workers=2, maxtasksperchild=1)
+        assert len(set(pids)) > 2
+
+    @pytest.mark.slow
+    def test_no_recycle_by_default(self):
+        # Default (None) keeps long-lived workers: at most `workers` PIDs.
+        pids = parallel_map(_getpid, list(range(8)), workers=2)
+        assert len(set(pids)) <= 2
+
+
+# -----------------------------------------------------------------------
+# parallel_imap_unordered streaming
+# -----------------------------------------------------------------------
+
+
+class TestParallelImapUnordered:
+    def test_serial_fallback_in_order(self):
+        # workers <= 1: yields fn(a) in input order.
+        out = list(parallel_imap_unordered(_square, [1, 2, 3, 4, 5], workers=1))
+        assert out == [1, 4, 9, 16, 25]
+
+    def test_empty_input(self):
+        assert list(parallel_imap_unordered(_square, [], workers=1)) == []
+        assert list(parallel_imap_unordered(_square, [], workers=2)) == []
+
+    @pytest.mark.slow
+    def test_parallel_yields_all_results(self):
+        # Completion order is not input order, so compare as a set.
+        out = list(parallel_imap_unordered(_square, [1, 2, 3, 4, 5], workers=2))
+        assert set(out) == {1, 4, 9, 16, 25}
+
+    @pytest.mark.slow
+    def test_result_timeout_fires(self):
+        # Tasks sleep 3s; a 0.5s watchdog must trip before any completes,
+        # raising TimeoutError (and terminating the pool, so the test does
+        # not wait out the sleeps).
+        with pytest.raises(multiprocessing.TimeoutError):
+            list(
+                parallel_imap_unordered(_sleep_then_echo, [3.0, 3.0], workers=2, result_timeout=0.5)
+            )
+
+
+# -----------------------------------------------------------------------
 # kill_orphan_workers smoke
 # -----------------------------------------------------------------------
+
 
 class TestKillOrphanWorkers:
     def test_runs_without_raising(self):

@@ -41,6 +41,7 @@ Issues = "https://github.com/jrcheshire/cmb-augr/issues"
 dev = ["pytest>=7.0", "pywigxjpf"]
 camb = ["camb"]
 broom = ["cmbroom", "pyyaml"]
+compsep = ["ducc0", "pysm3"]
 notebooks = ["jupyterlab", "ipykernel", "matplotlib"]
 
 [tool.setuptools.packages.find]
@@ -68,6 +69,8 @@ healpy = ">=1.16"
 pytest = ">=7.0"
 pytest-xdist = ">=3.0"
 camb = "*"
+ducc0 = "*"
+pysm3 = "*"
 jupyterlab = "*"
 ipykernel = "*"
 ipython = "*"
@@ -82,7 +85,7 @@ pyyaml = "*"
 cmb-augr = { path = ".", editable = true }
 
 [tool.pixi.tasks]
-test = { cmd = "pytest tests/ -m 'not slow' -n auto", env = { AUGR_DELENS_WORKERS = "1" } }
+test = { cmd = "pytest tests/ -m 'not slow' -n auto --maxprocesses=8", env = { AUGR_DELENS_WORKERS = "1", AUGR_SHT_NTHREADS = "1" } }
 test-slow = "pytest tests/ -v -m slow"
 test-all = { depends-on = ["test", "test-slow"] }
 validate-pico = "python scripts/validate_pico.py"

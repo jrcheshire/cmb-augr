@@ -104,6 +104,7 @@ def process_pool(
     *,
     pin_blas: bool = True,
     delens_workers: int | None = None,
+    maxtasksperchild: int | None = None,
 ) -> Iterator[Pool | None]:
     """Spawn-context :class:`multiprocessing.pool.Pool` with BLAS + delens-workers policy.
 
@@ -127,6 +128,23 @@ def process_pool(
         else use ``resolve_delens_workers(n_workers)`` so
         outer × inner ≈ ``cpu_count()``. Explicit ``int`` always wins.
         Restored on exit to the prior state.
+    maxtasksperchild
+        Forwarded to :class:`multiprocessing.pool.Pool`. ``None``
+        (default) keeps the standard behaviour: each worker lives for
+        the whole pool and is reused for every task it pulls. A finite
+        value recycles a worker (clean ``exit`` + fresh ``spawn``)
+        after it has completed that many tasks, which **bounds RSS
+        growth across tasks** -- the failure mode that OOM-kills a
+        long-lived worker when per-task allocations (JAX/XLA
+        retention, ducc0 buffers, large transient arrays) accumulate
+        over hundreds of tasks. Set ``1`` for the tightest ceiling (a
+        fresh process per task) at the cost of re-paying per-process
+        import / warm-up; a small value (2-4) amortises that.
+        Recycling happens on *clean* task completion only -- a worker
+        SIGKILLed mid-task (e.g. by the OS OOM-killer) is not recycled
+        and will hang ``map`` / ``imap``; see
+        :func:`parallel_imap_unordered`'s ``result_timeout`` watchdog
+        for the fail-fast on that path.
 
     Yields
     ------
@@ -163,7 +181,7 @@ def process_pool(
         os.environ["AUGR_DELENS_WORKERS"] = str(int(delens_workers))
 
     ctx = multiprocessing.get_context("spawn")
-    pool = ctx.Pool(n_workers)
+    pool = ctx.Pool(n_workers, maxtasksperchild=maxtasksperchild)
     try:
         yield pool
     except BaseException:
@@ -188,21 +206,89 @@ def parallel_map(
     chunksize: int = 1,
     pin_blas: bool = True,
     delens_workers: int | None = None,
+    maxtasksperchild: int | None = None,
 ) -> list:
     """``pool.map`` convenience: serial when ``workers <= 1``, parallel otherwise.
 
     Always returns a list in input order. Wraps :func:`process_pool`
-    so the BLAS-pin / ``AUGR_DELENS_WORKERS`` policy is identical to
-    the context-manager path.
+    so the BLAS-pin / ``AUGR_DELENS_WORKERS`` / ``maxtasksperchild``
+    policy is identical to the context-manager path.
     """
     with process_pool(
         workers,
         pin_blas=pin_blas,
         delens_workers=delens_workers,
+        maxtasksperchild=maxtasksperchild,
     ) as pool:
         if pool is None:
             return [fn(a) for a in args]
         return list(pool.map(fn, args, chunksize=chunksize))
+
+
+def parallel_imap_unordered(
+    fn: Callable,
+    args: Sequence,
+    *,
+    workers: int = 1,
+    chunksize: int = 1,
+    pin_blas: bool = True,
+    delens_workers: int | None = None,
+    maxtasksperchild: int | None = None,
+    result_timeout: float | None = None,
+) -> Iterator:
+    """Streaming ``pool.imap_unordered``: yields results **as they complete**.
+
+    Unlike :func:`parallel_map` (which blocks until every task is done and
+    returns one list), this is a generator: each result is yielded the moment
+    a worker finishes it. That lets the caller act on partial progress --
+    checkpoint each completed task to disk, print a heartbeat, update an ETA --
+    so a crash or kill loses at most the in-flight tasks rather than the whole
+    run. Results arrive in **completion order, not input order**; the worker
+    must therefore return enough identity in its payload for the caller to
+    place it (e.g. return ``(key, value)``).
+
+    Serial fallback (``workers <= 1``) yields in input order, one ``fn(a)`` at
+    a time, so the streaming-consumer code path is identical with and without a
+    pool.
+
+    Parameters
+    ----------
+    fn, args, workers, chunksize, pin_blas, delens_workers, maxtasksperchild
+        As for :func:`parallel_map` / :func:`process_pool`.
+    result_timeout
+        Watchdog, in seconds. ``None`` (default) waits indefinitely for the
+        next result (standard ``imap_unordered`` behaviour). A finite value is
+        the maximum time to wait for *any* one task to complete; if no result
+        arrives within it, a :class:`multiprocessing.TimeoutError` is raised
+        and the pool is terminated. This is the fail-fast for a deadlocked
+        pool -- e.g. a worker SIGKILLed by the OS OOM-killer, which leaves
+        ``imap_unordered`` waiting forever on a result that will never arrive
+        while the surviving workers go idle. Size it well above a single
+        task's wall time (it also bounds the gap between the *last* few
+        results, when fewer tasks than workers remain) so a slow-but-live task
+        does not trip it. Pairs with caller-side checkpointing: a tripped
+        watchdog becomes a clean, resumable stop instead of a silent hang.
+    """
+    with process_pool(
+        workers,
+        pin_blas=pin_blas,
+        delens_workers=delens_workers,
+        maxtasksperchild=maxtasksperchild,
+    ) as pool:
+        if pool is None:
+            for a in args:
+                yield fn(a)
+            return
+        # IMapUnorderedIterator.next(timeout) raises multiprocessing.TimeoutError
+        # if no result lands within `timeout`, and StopIteration when drained.
+        # Letting the TimeoutError propagate out of this `with` triggers
+        # process_pool's `except BaseException: pool.terminate()` path.
+        it = pool.imap_unordered(fn, args, chunksize)
+        while True:
+            try:
+                yield it.next(result_timeout)
+            except StopIteration:
+                return
 
 
 def kill_orphan_workers(name_filter: str = "spawn_main") -> int:
@@ -246,7 +332,9 @@ def kill_orphan_workers(name_filter: str = "spawn_main") -> int:
     try:
         out = subprocess.run(
             ["pgrep", "-f", name_filter],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
     except FileNotFoundError:
         return 0
