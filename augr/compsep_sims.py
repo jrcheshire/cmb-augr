@@ -69,6 +69,12 @@ _FG_PRESETS: dict[str, tuple[str, ...]] = {
     "d1s1": ("d1", "s1"),
     "d10s5": ("d10", "s5"),
     "d10s6": ("d10", "s6"),
+    # Single-component skies, to attribute the aperture dependence to dust vs synch:
+    # "d10" (fixed GNILC dust) is traced by the fine high-nu beams (resolution-
+    # insensitive); "s6" (stochastic small-scale synch) by the coarse low-nu beams
+    # (the hypothesized D_min driver).
+    "d10": ("d10",),
+    "s6": ("s6",),
 }
 
 
