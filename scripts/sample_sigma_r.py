@@ -18,7 +18,8 @@ Example::
 
 Pass ``--init-from-mle`` to locate the mode by L-BFGS multistart and start the
 chains in a small dither cloud around it (a more robust init than the ~1σ Fisher
-draws), reporting the MLE point alongside the sampled σ(r).
+draws), reporting the MLE point alongside the sampled σ(r). Pass ``--profile`` to
+also report profile-likelihood σ(r) — the sampling-free non-Gaussian cross-check.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ from augr.likelihood import (
     HLLikelihood,
     PositivityTransform,
     SignalSpectrumModel,
+    compute_fisher_at_mle,
+    compute_profile_sigma,
     constrain,
     converged,
     diagnostics_summary,
@@ -151,6 +154,39 @@ def sigma_r_nuts(
     return sigma_r, diag, mle_info
 
 
+def profile_sigma_r(
+    likelihood, model, signal_model, instrument, fid, fixed, key, *, positive, n_search: int = 4
+):
+    """Profile-likelihood σ(r) + Hessian-at-MLE σ(r) — no sampling.
+
+    Locates the mode by L-BFGS multistart, then (a) scans r and profiles out the
+    nuisances for the non-Gaussian-robust profile σ(r), and (b) reads the curvature
+    σ(r) off the Hessian at the MLE. Returns ``(profile_sigma_r, hessian_sigma_r)``;
+    the Hessian σ reads NaN for the Hamimeche-Lewis likelihood at the Asimov optimum
+    (its gradient is undefined there — use Fisher/profile instead).
+    """
+    free_names = [n for n in signal_model.parameter_names if n not in fixed]
+    prior = GaussianPrior.from_priors(free_names, fid, DEFAULT_PRIORS)
+    transform = PositivityTransform.from_names(free_names, positive_params=positive)
+    post = make_log_posterior(model, likelihood, prior, transform, fiducial=fid, fixed=fixed)
+
+    ff = FisherForecast(signal_model, instrument, fid, priors=DEFAULT_PRIORS, fixed_params=fixed)
+    fisher_cov = jnp.asarray(np.linalg.inv(np.asarray(ff.compute())))
+    fisher_sigma = jnp.sqrt(jnp.diag(fisher_cov))
+    x_fid = post.fiducial_full[post.free_idx]
+
+    mle_key, prof_key = jax.random.split(key)
+    mle_inits = draw_fisher_inits(x_fid, fisher_cov, transform, mle_key, n_search, scale=0.3)
+    mle = run_mle_search(post.log_prob, mle_inits)
+
+    prof = compute_profile_sigma(
+        post.log_prob, post.free_names, "r", mle.best.x, fisher_sigma, transform, key=prof_key
+    )
+    fam = compute_fisher_at_mle(post.log_prob, mle.best.x, post.free_names)
+    r_idx = list(post.free_names).index("r")
+    return float(prof), float(fam.sigmas[r_idx])
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ell-min", type=int, default=2)
@@ -173,6 +209,12 @@ def main() -> None:
         action="store_true",
         help="locate the mode by L-BFGS multistart and start the NUTS chains in a "
         "small dither cloud around it, instead of ~1σ Fisher draws at the fiducial.",
+    )
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help="also report profile-likelihood σ(r) (no sampling): scan r, profile out "
+        "the nuisances, fit the Δχ² width. The cheap non-Gaussian cross-check on NUTS.",
     )
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -263,6 +305,26 @@ def main() -> None:
     print("-" * 64)
     print(f"  HL widening over Gaussian : {sigma_h / sigma_g - 1:+.1%}")
     print(f"  (Gaussian-NUTS parity     : {sigma_g / sigma_fisher - 1:+.1%})")
+    if args.profile:
+        key_pg, key_ph = jax.random.split(jax.random.fold_in(jax.random.PRNGKey(args.seed), 1))
+        prof_g, hess_g = profile_sigma_r(
+            gauss, model, sm, inst, fid, fixed, key_pg, positive=positive
+        )
+        prof_h, hess_h = profile_sigma_r(hl, model, sm, inst, fid, fixed, key_ph, positive=positive)
+        print("-" * 64)
+        print("  Profile-likelihood σ(r) (no sampling):")
+        print(
+            f"    Gaussian        : profile={prof_g:.4e} ({prof_g / sigma_fisher - 1:+.1%} vs Fisher)"
+            f"   Hessian@MLE={hess_g:.4e}"
+        )
+        print(
+            f"    Hamimeche-Lewis : profile={prof_h:.4e} ({prof_h / sigma_fisher - 1:+.1%} vs Fisher)"
+            f"   Hessian@MLE={hess_h:.4e}"
+        )
+        print(
+            "    (HL Hessian@MLE is unreliable near the Asimov optimum — its exact-"
+            "fiducial Hessian is NaN; profile σ is the non-Gaussian width to compare to HL-NUTS.)"
+        )
     print(
         "  Convergence gate: R̂(r) < 1.01, E-BFMI > 0.3, divergences ≪ 1% → σ(r) is trustworthy.\n"
     )
