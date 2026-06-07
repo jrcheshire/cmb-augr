@@ -52,7 +52,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .instrument import beam_bl
-from .noise_sims import noise_maps
+from .noise_sims import correlated_noise_maps, noise_maps
 from .sht import almxfl, check_band_limit, synthesis
 from .spectra import CMBSpectra
 
@@ -457,6 +457,8 @@ def assemble_band_maps(
     hit_map: jax.Array,
     *,
     noise_key: jax.Array,
+    knee_ell: jax.Array | None = None,
+    alpha_knee: jax.Array = 1.0,
 ) -> jax.Array:
     """Per-band total Q/U maps = beamed sky + anisotropic noise [μK_CMB].
 
@@ -466,6 +468,13 @@ def assemble_band_maps(
     noise realizations (split keys) at the same per-band ``w_inv`` — the
     polarization white-noise power, for which each of Q, U carries pixel variance
     ``w_inv / Ω_pix`` and the map gives ``N_ℓ^{BB} = w_inv``.
+
+    With ``knee_ell`` supplied, the noise picks up a 1/f tilt ``N_ℓ = w_inv · (1 +
+    (ℓ_knee/ℓ)^α)`` via :func:`augr.noise_sims.correlated_noise_maps` (drawn in
+    harmonic space at ``band_sky.lmax`` / ``band_sky.nside``), differentiable
+    additionally in ``knee_ell`` / ``alpha_knee``. Q and U get independent 1/f draws
+    (isotropic; no scan-direction structure — see the ``noise_sims`` docstring). Left
+    as ``None`` (default) the fast white pixel-domain path is used.
 
     Parameters
     ----------
@@ -478,13 +487,27 @@ def assemble_band_maps(
         Shared relative exposure per pixel, shape ``(npix,)``.
     noise_key
         JAX PRNG key; fixed across allocations for CRN gradients.
+    knee_ell, alpha_knee
+        Per-band 1/f knee multipole and slope (scalars broadcast to all bands). When
+        ``knee_ell`` is ``None`` the noise is pure white; otherwise the correlated
+        1/f draw is used. ``knee_ell = 0`` per band reduces to white for that band.
 
     Returns
     -------
     Total maps, shape ``(n_band, 2, npix)`` (axis 1 = Q, U).
     """
     key_q, key_u = jax.random.split(noise_key)
-    noise_q = noise_maps(hit_map, w_inv, key_q)  # (n_band, npix)
-    noise_u = noise_maps(hit_map, w_inv, key_u)
+    if knee_ell is None:
+        noise_q = noise_maps(hit_map, w_inv, key_q)  # (n_band, npix)
+        noise_u = noise_maps(hit_map, w_inv, key_u)
+    else:
+        noise_q = correlated_noise_maps(
+            hit_map, w_inv, knee_ell, alpha_knee, key_q,
+            lmax=band_sky.lmax, nside=band_sky.nside,
+        )
+        noise_u = correlated_noise_maps(
+            hit_map, w_inv, knee_ell, alpha_knee, key_u,
+            lmax=band_sky.lmax, nside=band_sky.nside,
+        )
     noise_qu = jnp.stack([noise_q, noise_u], axis=1)  # (n_band, 2, npix)
     return band_sky.cmb_qu + band_sky.fg_qu + noise_qu

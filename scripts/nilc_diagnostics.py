@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from augr.compsep_sims import assemble_band_maps, generate_band_sky
+from augr.hit_maps import l2_hit_map
 from augr.nilc import common_resolution_b_alm, nilc_clean
 from augr.nilc_forecast import (
     analytic_mv_noise_floor,
@@ -42,7 +43,7 @@ BEAMS = (72.0, 52.0, 28.0, 20.0, 12.0)  # arcmin
 W_INV = (2.0e-4, 1.2e-4, 5.0e-5, 5.0e-5, 1.5e-4)  # uK^2 sr per band
 
 
-def _build(fg_model: str, r_in: float, nside: int, lmax: int, seed: int):
+def _build(fg_model: str, r_in: float, nside: int, lmax: int, seed: int, hit: jnp.ndarray):
     sky = generate_band_sky(
         FREQS,
         BEAMS,
@@ -53,9 +54,7 @@ def _build(fg_model: str, r_in: float, nside: int, lmax: int, seed: int):
         fg_model=fg_model,
         cmb_seed=seed,
     )
-    total = assemble_band_maps(
-        sky, jnp.asarray(W_INV), jnp.ones(sky.npix), noise_key=jax.random.PRNGKey(seed)
-    )
+    total = assemble_band_maps(sky, jnp.asarray(W_INV), hit, noise_key=jax.random.PRNGKey(seed))
     noise = total - sky.cmb_qu - sky.fg_qu
     return total, noise, sky.fg_qu, sky.cmb_qu
 
@@ -68,12 +67,19 @@ def main() -> None:
     p.add_argument("--r-in", type=float, default=0.0)
     p.add_argument("--ell-max", type=int, default=100)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--uniform-hits",
+        action="store_true",
+        help="use a uniform hit map instead of the default L2 anisotropic scan depth",
+    )
     p.add_argument("--out", default="nilc_diagnostics.png")
     args = p.parse_args()
 
     plt.switch_backend("Agg")  # headless render
 
-    total, noise, fg, cmb = _build(args.fg_model, args.r_in, args.nside, args.lmax, args.seed)
+    npix = 12 * args.nside**2
+    hit = jnp.ones(npix) if args.uniform_hits else jnp.asarray(l2_hit_map(args.nside, coord="G"))
+    total, noise, fg, cmb = _build(args.fg_model, args.r_in, args.nside, args.lmax, args.seed, hit)
     res = nilc_clean(total, BEAMS, lmax=args.lmax, nside=args.nside)
     spec = nilc_spectra(res, total_qu=total, noise_qu=noise, fg_qu=fg, cmb_qu=cmb, f_sky=1.0)
 
