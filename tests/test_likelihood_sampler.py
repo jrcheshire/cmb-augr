@@ -34,11 +34,18 @@ from augr.likelihood import (
     HLLikelihood,
     PositivityTransform,
     SignalSpectrumModel,
+    chain_e_bfmi,
+    chain_ess,
+    chain_rhat,
     constrain,
+    converged,
+    diagnostics_summary,
     draw_fisher_init,
+    draw_fisher_inits,
     make_log_posterior,
     marginal_sigma,
     run_nuts,
+    run_nuts_chains,
 )
 from augr.signal import SignalModel, flatten_params
 from augr.spectra import CMBSpectra
@@ -145,3 +152,110 @@ def test_sampler_divergences_low(sampled):
     # the likelihood). A regression that breaks the geometry would blow this up.
     assert sampled["div_g"] < 0.05 * sampled["n"]
     assert sampled["div_h"] < 0.05 * sampled["n"]
+
+
+# --- Multi-chain + convergence diagnostics ---------------------------------
+
+NUM_CHAINS = 4
+MC_WARMUP = 400
+MC_SAMPLES = 600
+
+
+@pytest.fixture(scope="module")
+def multichain(forecast):
+    """A 4-chain Gaussian-likelihood run, for the diagnostics gates.
+
+    Uses the Gaussian (not HL) likelihood to stay fast and well-behaved — the
+    diagnostics machinery is likelihood-agnostic, so the convergence gates it
+    validates (R-hat, ESS, E-BFMI) carry over to the HL run. Chains start from
+    independent Fisher-covariance draws (``draw_fisher_inits`` default scale=1) —
+    dispersed across the posterior bulk enough for R-hat to be a genuine
+    between-chain test, without over-dispersing into the FG-index banana tails
+    where NUTS freezes.
+    """
+    inst, sm, fid = forecast
+    model = SignalSpectrumModel(sm)
+    fid_vec = flatten_params(fid, sm.parameter_names)
+    free_names = [n for n in sm.parameter_names if n not in FIXED]
+
+    gauss = GaussianLikelihood.from_forecast(sm, inst, fid_vec)
+    prior = GaussianPrior.from_priors(free_names, fid, DEFAULT_PRIORS)
+    transform = PositivityTransform.from_names(free_names, positive_params=frozenset())
+    post = make_log_posterior(model, gauss, prior, transform, fiducial=fid, fixed=FIXED)
+
+    ff = FisherForecast(sm, inst, fid, priors=DEFAULT_PRIORS, fixed_params=FIXED)
+    fisher_cov = jnp.asarray(np.linalg.inv(np.asarray(ff.compute())))
+    x_fid = post.fiducial_full[post.free_idx]
+
+    k_init, k_run = jax.random.split(jax.random.PRNGKey(1))
+    u0 = draw_fisher_inits(x_fid, fisher_cov, transform, k_init, NUM_CHAINS)
+    positions, info = run_nuts_chains(
+        post.log_prob,
+        u0,
+        k_run,
+        num_warmup=MC_WARMUP,
+        num_samples=MC_SAMPLES,
+        target_acceptance_rate=TARGET_ACCEPT,
+    )
+    diag = diagnostics_summary(positions, info, post.free_names)
+    return positions, info, post.free_names, diag
+
+
+@pytest.mark.slow
+def test_multichain_shapes(multichain):
+    positions, info, free_names, diag = multichain
+    assert positions.shape == (NUM_CHAINS, MC_SAMPLES, len(free_names))
+    assert info.energy.shape == (NUM_CHAINS, MC_SAMPLES)
+    assert diag["n_chains"] == NUM_CHAINS
+    assert diag["n_total"] == NUM_CHAINS * MC_SAMPLES
+
+
+@pytest.mark.slow
+def test_multichain_rhat_converged(multichain):
+    # The science parameter must converge tightly; the weakly-constrained FG
+    # nuisance directions get a looser gate (they mix more slowly).
+    _, _, _, diag = multichain
+    assert diag["r_hat"]["r"] < 1.05
+    assert diag["r_hat_max"] < 1.1
+
+
+@pytest.mark.slow
+def test_multichain_ess_healthy(multichain):
+    # r retains a decent fraction of independent draws (no pathological autocorr).
+    _, _, _, diag = multichain
+    assert diag["ess"]["r"] > 0.05 * diag["n_total"]
+
+
+@pytest.mark.slow
+def test_multichain_e_bfmi_healthy(multichain):
+    # Per-chain E-BFMI above the ~0.3 Betancourt threshold (0.2 margin for noise).
+    _, _, _, diag = multichain
+    assert len(diag["e_bfmi"]) == NUM_CHAINS
+    assert diag["e_bfmi_min"] > 0.2
+
+
+@pytest.mark.slow
+def test_diagnostics_match_summary(multichain):
+    # The standalone diagnostic fns agree with what diagnostics_summary aggregated.
+    positions, info, free_names, diag = multichain
+    rhat = chain_rhat(positions)
+    ess = chain_ess(positions)
+    ebfmi = chain_e_bfmi(info.energy)
+    assert rhat.shape == (len(free_names),)
+    assert ess.shape == (len(free_names),)
+    assert ebfmi.shape == (NUM_CHAINS,)
+    np.testing.assert_allclose(float(jnp.max(rhat)), diag["r_hat_max"], rtol=1e-6)
+    np.testing.assert_allclose(float(jnp.min(ebfmi)), diag["e_bfmi_min"], rtol=1e-6)
+
+
+@pytest.mark.slow
+def test_converged_gate(multichain):
+    # The clean Gaussian fixture run passes the gate on r; injected pathologies fail.
+    _, _, _, diag = multichain
+    assert converged(diag) is True
+    frozen = {**diag, "e_bfmi_min": float("nan")}  # a frozen chain → NaN E-BFMI
+    assert converged(frozen) is False
+    diverging = {**diag, "n_divergent": diag["n_total"]}  # 100% divergent
+    assert converged(diverging) is False
+    stuck_r = {**diag, "r_hat": {**diag["r_hat"], "r": 1.5}}  # r itself didn't mix
+    assert converged(stuck_r) is False

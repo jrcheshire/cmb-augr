@@ -17,10 +17,17 @@ from __future__ import annotations
 from augr.likelihood.gaussian import GaussianLikelihood
 from augr.likelihood.hl import HLLikelihood, hamimeche_lewis_likelihood
 from augr.likelihood.nuts import (
+    chain_e_bfmi,
+    chain_ess,
+    chain_rhat,
     constrain,
+    converged,
+    diagnostics_summary,
     draw_fisher_init,
+    draw_fisher_inits,
     marginal_sigma,
     run_nuts,
+    run_nuts_chains,
 )
 from augr.likelihood.ordering import (
     SpectrumLayout,
@@ -54,12 +61,19 @@ __all__ = [
     "SignalSpectrumModel",
     "SpectrumLayout",
     "SpectrumModel",
+    "chain_e_bfmi",
+    "chain_ess",
+    "chain_rhat",
     "constrain",
+    "converged",
+    "diagnostics_summary",
     "draw_fisher_init",
+    "draw_fisher_inits",
     "hamimeche_lewis_likelihood",
     "make_log_posterior",
     "marginal_sigma",
     "matrices_to_spectra",
     "run_nuts",
+    "run_nuts_chains",
     "spectra_to_matrices",
 ]
