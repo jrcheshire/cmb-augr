@@ -126,3 +126,31 @@ def test_grouping_validation() -> None:
         grouped_allocation(inst, PICO_TIERS[:-1])  # drops the high-ν tier
     with pytest.raises(ValueError, match="matched no instrument channels"):
         grouped_allocation(inst, (*PICO_TIERS, (1000.0, 1200.0)))  # phantom group
+
+
+def test_allocation_carries_knee_from_channels() -> None:
+    """Per-band 1/f knee/slope are copied from the reference Channels (default white)."""
+    inst = pico_like()
+    alloc = grouped_allocation(inst, PICO_TIERS)
+    np.testing.assert_array_equal(
+        np.asarray(alloc.knee_ell), [float(ch.knee_ell) for ch in inst.channels]
+    )
+    np.testing.assert_array_equal(
+        np.asarray(alloc.alpha_knee), [float(ch.alpha_knee) for ch in inst.channels]
+    )
+    assert alloc.knee_ell.shape == (alloc.n_chan,)
+    # Reference presets are white, so this is inert until an instrument sets a knee.
+    np.testing.assert_array_equal(np.asarray(alloc.knee_ell), 0.0)
+
+
+def test_allocation_carries_nonzero_knee() -> None:
+    """A knee set on the instrument's Channels propagates onto the allocation."""
+    import dataclasses
+
+    inst = pico_like()
+    chans = tuple(
+        dataclasses.replace(ch, knee_ell=50.0, alpha_knee=1.5) for ch in inst.channels
+    )
+    alloc = grouped_allocation(dataclasses.replace(inst, channels=chans), PICO_TIERS)
+    np.testing.assert_allclose(np.asarray(alloc.knee_ell), 50.0)
+    np.testing.assert_allclose(np.asarray(alloc.alpha_knee), 1.5)

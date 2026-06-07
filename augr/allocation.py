@@ -96,6 +96,14 @@ class GroupedAllocation:
     net, eta
         Per-channel NET [μK√s] and total efficiency, shape ``(n_chan,)``. Held at
         the reference values (allocation moves detectors, not per-detector noise).
+    knee_ell, alpha_knee
+        Per-channel 1/f knee multipole and slope, shape ``(n_chan,)``, copied from
+        the reference ``Channel``s. Allocation-*independent* (a per-detector/readout
+        property, not a focal-plane-budget lever), so they are carried as static
+        fields here rather than returned by :func:`band_params`. Feed them to
+        :func:`augr.compsep_sims.assemble_band_maps` (``knee_ell=`` / ``alpha_knee=``)
+        to give the map-domain noise a 1/f tilt; the reference presets default to
+        ``knee_ell = 0`` (pure white) so this is inert until an instrument sets it.
     group_fraction_baseline
         Baseline group fraction ``φ_g`` of the conserved budget, shape
         ``(n_groups,)`` (sums to 1).
@@ -113,6 +121,8 @@ class GroupedAllocation:
     n_det_baseline: jnp.ndarray
     net: jnp.ndarray
     eta: jnp.ndarray
+    knee_ell: jnp.ndarray
+    alpha_knee: jnp.ndarray
     group_fraction_baseline: jnp.ndarray
     baseline_logits: jnp.ndarray
     mission_years: float
@@ -169,6 +179,8 @@ def grouped_allocation(
     n_det_base = jnp.array([float(ch.n_detectors) for ch in instrument.channels])
     net = jnp.array([float(ch.net_per_detector) for ch in instrument.channels])
     eta = jnp.array([float(ch.efficiency.total) for ch in instrument.channels])
+    knee_ell = jnp.array([float(ch.knee_ell) for ch in instrument.channels])
+    alpha_knee = jnp.array([float(ch.alpha_knee) for ch in instrument.channels])
     nu = jnp.array(freqs)
 
     # Per-band weight in the conserved budget: area ∝ n_det · cell_area ∝ n_det/ν².
@@ -185,6 +197,8 @@ def grouped_allocation(
         n_det_baseline=n_det_base,
         net=net,
         eta=eta,
+        knee_ell=knee_ell,
+        alpha_knee=alpha_knee,
         group_fraction_baseline=group_fraction,
         baseline_logits=jnp.log(group_fraction),
         mission_years=float(instrument.mission_duration_years),
