@@ -103,7 +103,7 @@ def main() -> None:
         f"lmax={args.lmax}  m_bias={args.m_bias}"
     )
     print("=" * 66)
-    print(f"  GNILC m per needlet band:   {gres.m_per_band}")
+    print(f"  GNILC m per needlet band:   {tuple(int(x) for x in gres.m_per_band)}")
     print("  template/oracle ratio by ℓ-band [GNILC ÷ oracle]:")
     for lo, hi in [(4, 10), (10, 20), (20, 40), (40, 70), (70, 110)]:
         b = (ell >= lo) & (ell < hi)

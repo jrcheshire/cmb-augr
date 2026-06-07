@@ -16,9 +16,10 @@ Algorithm (per needlet band ``j``, over the active channels; matches BROOM ``gil
 2. Whiten and eigendecompose ``M = R_n^{-1/2} R R_n^{-1/2}`` → eigenvalues ``λ`` (the
    nuisance/CMB modes sit at ``λ ≈ 1``, the foreground modes at ``λ > 1``).
 3. Choose the foreground subspace dimension ``m`` by the eigenvalue AIC
-   ``A(m) = 2m + Σ_{k≥m}(λ_k − ln λ_k − 1)`` (Carones Eq. 3.5). This discrete selection
-   is computed on ``stop_gradient(λ)`` (host callback) and frozen for the backward pass —
-   the data-dependent analog of the static beam-band-limit mask in :mod:`augr.nilc`.
+   ``A(m) = 2m + Σ_{k≥m}(λ_k − ln λ_k − 1)`` (Carones Eq. 3.5), in pure JAX (no host
+   callback). The discrete ``m`` is frozen for the backward pass via ``stop_gradient`` on
+   the selector mask — the data-dependent analog of the static beam-band-limit mask in
+   :mod:`augr.nilc`.
 4. The GNILC foreground-estimator matrix (BROOM ``W = F(FᵀR⁻¹F)⁻¹FᵀR⁻¹`` with
    ``F = R_n^{1/2}U_s``) collapses for the no-CMB-deprojection case to the fixed-shape
    spectral form ``W = R_n^{1/2} P_s R_n^{-1/2}``, where ``P_s = Σ_{k<m} u_k u_kᵀ`` is the
@@ -106,29 +107,25 @@ def _matsqrt_pair(cov: jax.Array) -> tuple[jax.Array, jax.Array]:
     return half, ihalf
 
 
-def _aic_m_host(lam_desc: np.ndarray) -> np.int32:
+def _aic_m(lam_desc: jax.Array) -> jax.Array:
     """Eigenvalue-AIC foreground-subspace dimension (Carones Eq. 3.5 / BROOM ``_get_gilc_m``).
 
-    ``A(m) = 2m + Σ_{k≥m}(λ_k − ln λ_k − 1)``, ``m = argmin A``. Host (numpy) side of the
-    discrete, non-differentiable selection; called via :func:`jax.pure_callback` on
-    ``stop_gradient(λ)`` so it never enters the backward pass.
+    ``A(m) = 2m + Σ_{k≥m}(λ_k − ln λ_k − 1)``, ``m = argmin_m A`` over ``m ∈ [0, n]``.
+    Pure JAX (suffix cumulative-sum + ``argmin``), so it traces / jits / vmaps with **no
+    host callback** — ``jax.pure_callback`` under ``jax.grad`` deadlocks on some platforms,
+    and the callback is unnecessary here: the discrete ``m`` is non-differentiable and is
+    frozen downstream by ``stop_gradient`` on the selector mask anyway. ``lam_desc`` is the
+    descending eigenvalues, shape ``(..., n)``; returns the integer ``m``, shape ``(...,)``
+    (a leading batch is supported for per-pixel localization).
     """
-    lam = np.maximum(np.asarray(lam_desc, dtype=np.float64), 1e-12)
+    lam = jnp.maximum(lam_desc, 1e-12)
     n = lam.shape[-1]
-    a_m = np.empty(n + 1)
-    for i in range(n):
-        a_m[i] = 2.0 * i + np.sum(lam[i:] - np.log(lam[i:]) - 1.0)
-    a_m[n] = 2.0 * n
-    return np.int32(np.argmin(a_m))
-
-
-def _aic_m(lam_desc: jax.Array) -> jax.Array:
-    """Traced wrapper for :func:`_aic_m_host` (stop-gradient, int32 scalar)."""
-    return jax.pure_callback(
-        _aic_m_host,
-        jax.ShapeDtypeStruct((), jnp.int32),
-        jax.lax.stop_gradient(lam_desc),
-    )
+    g = lam - jnp.log(lam) - 1.0  # (..., n)
+    suffix = jnp.flip(jnp.cumsum(jnp.flip(g, axis=-1), axis=-1), axis=-1)  # Σ_{k≥m}, m=0..n-1
+    a_head = 2.0 * jnp.arange(n, dtype=lam.dtype) + suffix  # A(m), m=0..n-1
+    a_last = 2.0 * n * jnp.ones((*lam.shape[:-1], 1), dtype=lam.dtype)  # A(n) = 2n
+    a_m = jnp.concatenate([a_head, a_last], axis=-1)  # (..., n+1)
+    return jnp.argmin(a_m, axis=-1)
 
 
 def _gnilc_fg_estimator(
@@ -154,7 +151,8 @@ def _gnilc_fg_estimator(
     n = m_mat.shape[-1]
     m = _aic_m(lam_desc) + int(m_bias)
     # 0/1 selector for the top-m foreground eigenvectors; frozen (discrete selection).
-    p = jax.lax.stop_gradient((jnp.arange(n) < m).astype(m_mat.dtype))
+    # m[..., None] keeps this correct under a leading per-pixel batch.
+    p = jax.lax.stop_gradient((jnp.arange(n) < m[..., None]).astype(m_mat.dtype))
     proj = (u_desc * p) @ u_desc.swapaxes(-1, -2)  # Σ_{k<m} u_k u_kᵀ
     w = cn_half @ proj @ cn_ihalf
     return w, m
@@ -184,7 +182,8 @@ class GNILCResult:
     lmax, nside, n_iter
         Transform configuration (so passives project identically).
     m_per_band
-        AIC foreground-subspace dimension per needlet band (diagnostic).
+        AIC foreground-subspace dimension per needlet band (diagnostic), as JAX int
+        scalars (concrete in eager use; cast with ``int(...)`` for display).
     """
 
     nilc_weights: jax.Array
@@ -195,7 +194,7 @@ class GNILCResult:
     lmax: int
     nside: int
     n_iter: int
-    m_per_band: tuple[int, ...]
+    m_per_band: tuple[jax.Array, ...]
 
     def _project(self, weights: jax.Array, band_qu: jax.Array) -> jax.Array:
         b_alm, _ = common_resolution_b_alm(
@@ -282,7 +281,9 @@ def build_gnilc(
         # v_active = w_NILC (active) propagated through the GNILC FG estimator W.
         v_active = w_nilc[j][idx_j] @ w_mat  # (n_active,)
         v_rows.append(jnp.zeros(n_band).at[idx_j].set(v_active))
-        m_per_band.append(int(m))
+        # Keep the AIC m as a JAX scalar (no int() — build_gnilc is traced under
+        # jax.grad of the residual template); concrete in eager use, cast by callers.
+        m_per_band.append(m)
     v = jnp.stack(v_rows, axis=0)  # (J, n_band)
 
     return GNILCResult(
