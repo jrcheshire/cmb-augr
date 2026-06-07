@@ -201,6 +201,22 @@ def _ridge(cov: jax.Array, ridge: float) -> jax.Array:
     return cov + ridge * scale[..., None, None] * eye
 
 
+def _gaussian_smooth_map(
+    x: jax.Array, fwhm_arcmin: float, *, lmax: int, nside: int, n_iter: int
+) -> jax.Array:
+    """Spatial Gaussian smoothing of a real map ``x (npix,)`` to FWHM ``fwhm_arcmin``.
+
+    ``map2alm`` (spin-0) → multiply by the Gaussian ``b_ℓ`` → ``synthesis``. Shared by
+    the localized-covariance paths of :func:`_localized_weights` (NILC) and the
+    constrained-moment NILC (:mod:`augr.cmilc`) / localized GNILC, so there is one
+    validated implementation of the per-pixel covariance localization.
+    """
+    ells = jnp.arange(lmax + 1, dtype=float)
+    gauss = beam_bl(ells, fwhm_arcmin)
+    alm = map2alm(x[None, :], 0, lmax, nside, n_iter)
+    return synthesis(almxfl(alm, gauss, lmax), 0, lmax, nside)[0]
+
+
 def _needlet_channel_mask(
     needlet_bands: jax.Array,
     beam_fwhm_arcmin,
@@ -279,12 +295,9 @@ def _localized_weights(
     each needlet band; excluded channels get weight 0.
     """
     n_j, n_band, _npix = beta.shape
-    ells = jnp.arange(lmax + 1, dtype=float)
-    gauss = beam_bl(ells, localization_fwhm_arcmin)
 
     def smooth(x):  # spatial Gaussian smoothing of a real map (npix,)
-        alm = map2alm(x[None, :], 0, lmax, nside, n_iter)
-        return synthesis(almxfl(alm, gauss, lmax), 0, lmax, nside)[0]
+        return _gaussian_smooth_map(x, localization_fwhm_arcmin, lmax=lmax, nside=nside, n_iter=n_iter)
 
     ws = []
     for j in range(n_j):
