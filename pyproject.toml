@@ -54,8 +54,9 @@ testpaths = ["tests"]
 # Dump all-thread tracebacks if any test runs > this many seconds (catches a hung
 # test's C-level stack even when the GIL is held in a network/IO wait). Set below the
 # `test` task's --timeout so the stack is printed first, then the pytest-timeout thread
-# method hard-kills the worker. Diagnostic only; no gate test runs this long when green.
-faulthandler_timeout = 90
+# method hard-kills the worker. Generous vs the slowest gate test (~10s local / ~45s on
+# the 2-core CI runner) so only genuine hangs trip it, never a legitimately heavy test.
+faulthandler_timeout = 150
 markers = [
     "slow: heavy tests excluded from the per-PR gate, run serially in the weekly/local suite — full-sky Wigner 3j delensing iterations, 200k-sample Monte Carlo crosschecks, and PySM-foreground compsep sims. The PySM tests download sky templates over the network on a cold cache, which must NOT happen under the parallel CI runner (concurrent cold downloads hang the worker); keep any `fg_model != None` test marked. Run with `pytest -m slow` or unfiltered.",
 ]
@@ -96,7 +97,7 @@ pyyaml = "*"
 cmb-augr = { path = ".", editable = true }
 
 [tool.pixi.tasks]
-test = { cmd = "pytest tests/ -m 'not slow' -n auto --maxprocesses=8 --timeout=120 --timeout-method=thread --max-worker-restart=0 -ra", env = { AUGR_DELENS_WORKERS = "1", AUGR_SHT_NTHREADS = "1", OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1" } }
+test = { cmd = "pytest tests/ -m 'not slow' -n auto --maxprocesses=8 --timeout=180 --timeout-method=thread --max-worker-restart=0 -ra", env = { AUGR_DELENS_WORKERS = "1", AUGR_SHT_NTHREADS = "1", OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1" } }
 test-slow = "pytest tests/ -v -m slow"
 test-all = { depends-on = ["test", "test-slow"] }
 validate-pico = "python scripts/validate_pico.py"
