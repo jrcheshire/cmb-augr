@@ -22,7 +22,10 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The fast suite runs ~16 min on the 2-core runner and grows with the
+    # package; 45 min leaves margin. Per-test hangs are caught far sooner by
+    # pytest-timeout (--timeout in the `test` task), so this isn't masking one.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
