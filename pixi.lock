@@ -6542,6 +6542,7 @@ packages:
   - ducc0 ; extra == 'compsep'
   - pysm3 ; extra == 'compsep'
   - blackjax ; extra == 'sampling'
+  - optax ; extra == 'sampling'
   - jupyterlab ; extra == 'notebooks'
   - ipykernel ; extra == 'notebooks'
   - matplotlib ; extra == 'notebooks'
