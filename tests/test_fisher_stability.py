@@ -54,6 +54,14 @@ from augr.optimize import make_optimization_context, sigma_r_from_channels
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
 
+# Whole module is `slow`: these are PICO-class (21-channel, moment-FG, jacfwd over
+# ~20 params, multiple full Fisher evals) and BLAS-bound. In the parallel fast CI
+# gate on a 2-core runner they can't win — multithreaded BLAS oversubscribes the two
+# xdist workers, single-threaded BLAS makes them too slow (>300s). So they run in the
+# serial weekly `test-all` (multithreaded, untimed) instead of the per-PR fast gate.
+# (The expensive module-scope fixtures rebuilt per xdist worker compounded it.)
+pytestmark = pytest.mark.slow
+
 # ---------------------------------------------------------------------------
 # Shared module-scope fixtures
 # ---------------------------------------------------------------------------
