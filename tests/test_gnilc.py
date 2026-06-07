@@ -27,7 +27,7 @@ BEAMS = (60.0, 40.0, 30.0, 25.0)
 W_INV = jnp.array([5.0e-4, 8.0e-5, 8.0e-5, 3.0e-4])
 
 
-def _sim(nside: int, lmax: int, *, seed: int = 1, r_in: float = 0.0, fg_model: str = "d1s1"):
+def _sim(nside: int, lmax: int, *, seed: int = 1, r_in: float = 0.0, fg_model: str | None = "d1s1"):
     """Beamed sky + total/noise component map sets for a small multi-band sim."""
     sky = generate_band_sky(
         FREQS,
@@ -97,10 +97,17 @@ def test_gnilc_estimator_m_bias_shifts_dimension() -> None:
 
 
 # --- residual template: reasonable on its own ------------------------------
+#
+# These build a realistic PySM (d1s1) sky, which downloads sky templates over the
+# network on a cold cache -- so they carry `slow` (excluded from the parallel per-PR
+# gate; run serially in the weekly/local suite). The network-free GNILC end-to-end
+# smoke kept in the gate is test_gnilc_noise_term_vanishes_for_zero_noise below.
 
 
+@pytest.mark.slow
 def test_gnilc_template_positive_and_tracks_oracle() -> None:
     """At m_bias=1 the template is positive and tracks the oracle to O(1) across ℓ."""
+    pytest.importorskip("pysm3")
     nside, lmax = 64, 128
     sky, total, noise = _sim(nside, lmax)
     ells, cl, res = gnilc_residual_template(
@@ -127,11 +134,13 @@ def test_gnilc_template_positive_and_tracks_oracle() -> None:
     assert np.all((ratios > 0.4) & (ratios < 2.5)), ratios
 
 
+@pytest.mark.slow
 def test_gnilc_template_cmb_suppressed() -> None:
     """The template carries little CMB: the CMB leaking through the composed weights is a
     small fraction of the foreground template. (m_bias=1 leaks more CMB than pure AIC —
     the leakage Carones' paired depro_cmb=0 removes; deferred to v2, so this checks it is
     small relative to the FG residual rather than zero.)"""
+    pytest.importorskip("pysm3")
     nside, lmax = 64, 128
     sky, total, noise = _sim(nside, lmax)
     res = build_gnilc(total, sky.cmb_qu + noise, BEAMS, lmax=lmax, nside=nside, m_bias=1)
@@ -143,9 +152,14 @@ def test_gnilc_template_cmb_suppressed() -> None:
 
 
 def test_gnilc_noise_term_vanishes_for_zero_noise() -> None:
-    """The Eq. 3.7 noise-debias term is exactly zero when the noise input is zero."""
+    """The Eq. 3.7 noise-debias term is exactly zero when the noise input is zero.
+
+    Network-free GNILC end-to-end smoke kept in the per-PR gate: `fg_model=None` so no
+    PySM templates are fetched, but build_gnilc still exercises the full needlet /
+    common-resolution / weight / recompose wiring.
+    """
     nside, lmax = 32, 64
-    sky, total, noise = _sim(nside, lmax)
+    sky, total, noise = _sim(nside, lmax, fg_model=None)
     res = build_gnilc(total, sky.cmb_qu + noise, BEAMS, lmax=lmax, nside=nside, m_bias=1)
     zero = jnp.zeros_like(total)
     nres = np.asarray(alm2cl(res.fg_residual_alm(zero), lmax))
@@ -155,7 +169,9 @@ def test_gnilc_noise_term_vanishes_for_zero_noise() -> None:
 # --- differentiability (gates the eigh-degeneracy risk) --------------------
 
 
+@pytest.mark.slow
 def test_gnilc_template_differentiable_in_noise() -> None:
+    pytest.importorskip("pysm3")
     nside, lmax = 32, 64
     sky = generate_band_sky(
         FREQS,

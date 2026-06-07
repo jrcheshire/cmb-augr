@@ -22,10 +22,11 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
-    # The fast suite runs ~16 min on the 2-core runner and grows with the
-    # package; 45 min leaves margin. Per-test hangs are caught far sooner by
-    # pytest-timeout (--timeout in the `test` task), so this isn't masking one.
-    timeout-minutes: 45
+    # Fast suite only (slow Wigner/MC + PySM-foreground compsep tests are marked
+    # `slow` and run in the weekly job). Per-test hangs are bounded by pytest-timeout
+    # (--timeout / --timeout-method=thread / --max-worker-restart=0 in the `test`
+    # task), so this job cap is just a backstop, not the hang guard.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
