@@ -51,6 +51,10 @@ include = ["augr*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Dump all-thread tracebacks if any test runs > this many seconds (catches a hung
+# test's C-level stack even when the GIL is held in a deadlock — the pytest-timeout
+# thread method then hard-kills the worker at --timeout). Diagnostic; harmless when green.
+faulthandler_timeout = 150
 markers = [
     "slow: tests that take O(minutes) — full-sky Wigner 3j delensing iterations and 200k-sample Monte Carlo crosschecks. Excluded from default CI; run with `pytest -m slow` or unfiltered.",
 ]
@@ -91,7 +95,7 @@ pyyaml = "*"
 cmb-augr = { path = ".", editable = true }
 
 [tool.pixi.tasks]
-test = { cmd = "pytest tests/ -m 'not slow' -n auto --maxprocesses=8 --timeout=300 --timeout-method=signal -ra", env = { AUGR_DELENS_WORKERS = "1", AUGR_SHT_NTHREADS = "1", OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1" } }
+test = { cmd = "pytest tests/ -m 'not slow' -n auto --maxprocesses=8 --timeout=180 --timeout-method=thread --max-worker-restart=0 -v -ra", env = { AUGR_DELENS_WORKERS = "1", AUGR_SHT_NTHREADS = "1", OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1" } }
 test-slow = "pytest tests/ -v -m slow"
 test-all = { depends-on = ["test", "test-slow"] }
 validate-pico = "python scripts/validate_pico.py"
