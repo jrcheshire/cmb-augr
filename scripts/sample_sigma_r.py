@@ -37,10 +37,12 @@ from augr.likelihood import (
     PositivityTransform,
     SignalSpectrumModel,
     constrain,
-    draw_fisher_init,
+    converged,
+    diagnostics_summary,
+    draw_fisher_inits,
     make_log_posterior,
     marginal_sigma,
-    run_nuts,
+    run_nuts_chains,
 )
 from augr.signal import SignalModel, flatten_params
 from augr.spectra import CMBSpectra
@@ -79,12 +81,18 @@ def sigma_r_nuts(
     fixed,
     key,
     *,
+    num_chains: int,
     num_warmup: int,
     num_samples: int,
     target_accept: float,
     positive,
 ):
-    """Marginal σ(r) from NUTS on the given likelihood's Asimov posterior."""
+    """Marginal σ(r) + convergence diagnostics from multi-chain NUTS.
+
+    Returns ``(sigma_r, diagnostics)`` where ``diagnostics`` is the dict from
+    :func:`augr.likelihood.diagnostics_summary` (R-hat / ESS / E-BFMI /
+    divergences) — the gate for whether the σ(r) is trustworthy enough to quote.
+    """
     free_names = [n for n in signal_model.parameter_names if n not in fixed]
     prior = GaussianPrior.from_priors(free_names, fid, DEFAULT_PRIORS)
     transform = PositivityTransform.from_names(free_names, positive_params=positive)
@@ -95,8 +103,8 @@ def sigma_r_nuts(
     x_fid = post.fiducial_full[post.free_idx]
 
     init_key, run_key = jax.random.split(key)
-    u0 = draw_fisher_init(x_fid, fisher_cov, transform, init_key, scale=1.0)
-    positions, info = run_nuts(
+    u0 = draw_fisher_inits(x_fid, fisher_cov, transform, init_key, num_chains)
+    positions, info = run_nuts_chains(
         post.log_prob,
         u0,
         run_key,
@@ -106,8 +114,8 @@ def sigma_r_nuts(
     )
     constrained = constrain(positions, transform)
     sigma_r = marginal_sigma(constrained, post.free_names, "r")
-    n_div = int(jnp.sum(info.is_divergent))
-    return sigma_r, n_div
+    diag = diagnostics_summary(positions, info, post.free_names)
+    return sigma_r, diag
 
 
 def main() -> None:
@@ -117,6 +125,7 @@ def main() -> None:
     p.add_argument("--delta-ell", type=int, default=10)
     p.add_argument("--f-sky", type=float, default=0.6)
     p.add_argument("--r-fid", type=float, default=0.0)
+    p.add_argument("--num-chains", type=int, default=4)
     p.add_argument("--num-warmup", type=int, default=1000)
     p.add_argument("--num-samples", type=int, default=4000)
     p.add_argument("--target-accept", type=float, default=0.9)
@@ -144,7 +153,7 @@ def main() -> None:
     hl = HLLikelihood.from_forecast(sm, inst, fid_vec)
 
     key_g, key_h = jax.random.split(jax.random.PRNGKey(args.seed))
-    sigma_g, ndiv_g = sigma_r_nuts(
+    sigma_g, diag_g = sigma_r_nuts(
         gauss,
         model,
         sm,
@@ -152,12 +161,13 @@ def main() -> None:
         fid,
         fixed,
         key_g,
+        num_chains=args.num_chains,
         num_warmup=args.num_warmup,
         num_samples=args.num_samples,
         target_accept=args.target_accept,
         positive=positive,
     )
-    sigma_h, ndiv_h = sigma_r_nuts(
+    sigma_h, diag_h = sigma_r_nuts(
         hl,
         model,
         sm,
@@ -165,29 +175,44 @@ def main() -> None:
         fid,
         fixed,
         key_h,
+        num_chains=args.num_chains,
         num_warmup=args.num_warmup,
         num_samples=args.num_samples,
         target_accept=args.target_accept,
         positive=positive,
     )
 
+    def _diag_line(diag: dict) -> str:
+        verdict = "✓ converged" if converged(diag) else "✗ NOT converged — do not quote σ(r)"
+        return (
+            f"R̂(r)={diag['r_hat']['r']:.3f}  R̂_max={diag['r_hat_max']:.3f}  "
+            f"ESS(r)={diag['ess']['r']:.0f}  E-BFMI_min={diag['e_bfmi_min']:.2f}  "
+            f"div={diag['n_divergent']}/{diag['n_total']}  →  {verdict}"
+        )
+
     print(
         f"\nAsimov forecast: ell=[{args.ell_min},{args.ell_max}] Δℓ={args.delta_ell} "
-        f"f_sky={args.f_sky} r_fid={args.r_fid}  ({sm.n_bins} bins)"
+        f"f_sky={args.f_sky} r_fid={args.r_fid}  ({sm.n_bins} bins, "
+        f"{args.num_chains}×{args.num_samples} samples)"
     )
-    print("-" * 60)
+    print("-" * 64)
     print(f"  σ(r) Fisher (Knox)        : {sigma_fisher:.4e}")
     print(
         f"  σ(r) Gaussian-NUTS        : {sigma_g:.4e}   "
-        f"({sigma_g / sigma_fisher - 1:+.1%} vs Fisher, {ndiv_g} div)"
+        f"({sigma_g / sigma_fisher - 1:+.1%} vs Fisher)"
     )
+    print(f"      {_diag_line(diag_g)}")
     print(
         f"  σ(r) Hamimeche-Lewis-NUTS : {sigma_h:.4e}   "
-        f"({sigma_h / sigma_fisher - 1:+.1%} vs Fisher, {ndiv_h} div)"
+        f"({sigma_h / sigma_fisher - 1:+.1%} vs Fisher)"
     )
-    print("-" * 60)
+    print(f"      {_diag_line(diag_h)}")
+    print("-" * 64)
     print(f"  HL widening over Gaussian : {sigma_h / sigma_g - 1:+.1%}")
-    print(f"  (Gaussian-NUTS parity     : {sigma_g / sigma_fisher - 1:+.1%})\n")
+    print(f"  (Gaussian-NUTS parity     : {sigma_g / sigma_fisher - 1:+.1%})")
+    print(
+        "  Convergence gate: R̂(r) < 1.01, E-BFMI > 0.3, divergences ≪ 1% → σ(r) is trustworthy.\n"
+    )
 
 
 if __name__ == "__main__":
