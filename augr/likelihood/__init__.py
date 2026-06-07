@@ -47,6 +47,11 @@ from augr.likelihood.prior import (
     GaussianPrior,
     PositivityTransform,
 )
+from augr.likelihood.profile import (
+    FisherAtMLE,
+    compute_fisher_at_mle,
+    compute_profile_sigma,
+)
 from augr.likelihood.protocols import (
     BinnedSpectra,
     Likelihood,
@@ -58,6 +63,7 @@ from augr.likelihood.protocols import (
 __all__ = [
     "DEFAULT_POSITIVE_PARAMS",
     "BinnedSpectra",
+    "FisherAtMLE",
     "GaussianLikelihood",
     "GaussianPrior",
     "HLLikelihood",
@@ -73,6 +79,8 @@ __all__ = [
     "chain_e_bfmi",
     "chain_ess",
     "chain_rhat",
+    "compute_fisher_at_mle",
+    "compute_profile_sigma",
     "constrain",
     "converged",
     "diagnostics_summary",
