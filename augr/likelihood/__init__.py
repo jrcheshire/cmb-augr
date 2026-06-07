@@ -16,6 +16,13 @@ from __future__ import annotations
 
 from augr.likelihood.gaussian import GaussianLikelihood
 from augr.likelihood.hl import HLLikelihood, hamimeche_lewis_likelihood
+from augr.likelihood.mle import (
+    MLEResult,
+    MLESearchResult,
+    make_dithered_starts,
+    run_mle,
+    run_mle_search,
+)
 from augr.likelihood.nuts import (
     chain_e_bfmi,
     chain_ess,
@@ -55,6 +62,8 @@ __all__ = [
     "GaussianPrior",
     "HLLikelihood",
     "Likelihood",
+    "MLEResult",
+    "MLESearchResult",
     "PositivityTransform",
     "Posterior",
     "Prior",
@@ -70,9 +79,12 @@ __all__ = [
     "draw_fisher_init",
     "draw_fisher_inits",
     "hamimeche_lewis_likelihood",
+    "make_dithered_starts",
     "make_log_posterior",
     "marginal_sigma",
     "matrices_to_spectra",
+    "run_mle",
+    "run_mle_search",
     "run_nuts",
     "run_nuts_chains",
     "spectra_to_matrices",

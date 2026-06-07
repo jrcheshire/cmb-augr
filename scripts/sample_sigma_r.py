@@ -15,6 +15,10 @@ construction). Requires the ``[sampling]`` extra (blackjax).
 Example::
 
     pixi run python scripts/sample_sigma_r.py --ell-min 2 --ell-max 200 --f-sky 0.6
+
+Pass ``--init-from-mle`` to locate the mode by L-BFGS multistart and start the
+chains in a small dither cloud around it (a more robust init than the ~1σ Fisher
+draws), reporting the MLE point alongside the sampled σ(r).
 """
 
 from __future__ import annotations
@@ -40,8 +44,10 @@ from augr.likelihood import (
     converged,
     diagnostics_summary,
     draw_fisher_inits,
+    make_dithered_starts,
     make_log_posterior,
     marginal_sigma,
+    run_mle_search,
     run_nuts_chains,
 )
 from augr.signal import SignalModel, flatten_params
@@ -86,12 +92,18 @@ def sigma_r_nuts(
     num_samples: int,
     target_accept: float,
     positive,
+    init_from_mle: bool = False,
 ):
     """Marginal σ(r) + convergence diagnostics from multi-chain NUTS.
 
-    Returns ``(sigma_r, diagnostics)`` where ``diagnostics`` is the dict from
+    Returns ``(sigma_r, diagnostics, mle_info)``. ``diagnostics`` is the dict from
     :func:`augr.likelihood.diagnostics_summary` (R-hat / ESS / E-BFMI /
     divergences) — the gate for whether the σ(r) is trustworthy enough to quote.
+    ``mle_info`` is ``None`` unless ``init_from_mle`` is set, in which case the
+    chains are started from a small dither cloud around the L-BFGS multistart MLE
+    (a more robust init than the ~1σ Fisher draws, which occasionally freeze a
+    chain in the foreground-index banana) and ``mle_info`` reports the located
+    mode's r-value and convergence flags.
     """
     free_names = [n for n in signal_model.parameter_names if n not in fixed]
     prior = GaussianPrior.from_priors(free_names, fid, DEFAULT_PRIORS)
@@ -102,8 +114,29 @@ def sigma_r_nuts(
     fisher_cov = jnp.asarray(np.linalg.inv(np.asarray(ff.compute())))  # free-param order
     x_fid = post.fiducial_full[post.free_idx]
 
-    init_key, run_key = jax.random.split(key)
-    u0 = draw_fisher_inits(x_fid, fisher_cov, transform, init_key, num_chains)
+    init_key, mle_key, run_key = jax.random.split(key, 3)
+
+    mle_info = None
+    if init_from_mle:
+        # Locate the mode by L-BFGS multistart from modest (0.3σ) Fisher-cov
+        # draws — small enough that amplitudes rarely flip sign into the unbounded
+        # foreground sqrt-NaN region, so the nan-safe best-of-n returns a clean
+        # mode. Then disperse the chains in a small cloud (½σ) around it; dither
+        # widths are valid in the unconstrained space under the identity transform.
+        mle_inits = draw_fisher_inits(x_fid, fisher_cov, transform, init_key, num_chains, scale=0.3)
+        mle = run_mle_search(post.log_prob, mle_inits)
+        dither = 0.5 * jnp.sqrt(jnp.diag(fisher_cov))
+        u0 = make_dithered_starts(mle.best.x, dither, num_chains, mle_key)
+        r_idx = list(post.free_names).index("r")
+        mle_info = {
+            "r": float(constrain(mle.best.x[None, :], transform)[0, r_idx]),
+            "n_iter": int(mle.best.n_iter),
+            "converged": bool(mle.best.converged),
+            "grad_norm": float(mle.best.grad_norm),
+        }
+    else:
+        u0 = draw_fisher_inits(x_fid, fisher_cov, transform, init_key, num_chains)
+
     positions, info = run_nuts_chains(
         post.log_prob,
         u0,
@@ -115,7 +148,7 @@ def sigma_r_nuts(
     constrained = constrain(positions, transform)
     sigma_r = marginal_sigma(constrained, post.free_names, "r")
     diag = diagnostics_summary(positions, info, post.free_names)
-    return sigma_r, diag
+    return sigma_r, diag, mle_info
 
 
 def main() -> None:
@@ -135,6 +168,12 @@ def main() -> None:
         help="softplus-bound the non-negative amplitudes (changes their marginals; "
         "off by default so Gaussian-NUTS matches the unbounded Fisher).",
     )
+    p.add_argument(
+        "--init-from-mle",
+        action="store_true",
+        help="locate the mode by L-BFGS multistart and start the NUTS chains in a "
+        "small dither cloud around it, instead of ~1σ Fisher draws at the fiducial.",
+    )
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
     positive = DEFAULT_POSITIVE_PARAMS if args.bound_amplitudes else frozenset()
@@ -153,7 +192,7 @@ def main() -> None:
     hl = HLLikelihood.from_forecast(sm, inst, fid_vec)
 
     key_g, key_h = jax.random.split(jax.random.PRNGKey(args.seed))
-    sigma_g, diag_g = sigma_r_nuts(
+    sigma_g, diag_g, mle_g = sigma_r_nuts(
         gauss,
         model,
         sm,
@@ -166,8 +205,9 @@ def main() -> None:
         num_samples=args.num_samples,
         target_accept=args.target_accept,
         positive=positive,
+        init_from_mle=args.init_from_mle,
     )
-    sigma_h, diag_h = sigma_r_nuts(
+    sigma_h, diag_h, mle_h = sigma_r_nuts(
         hl,
         model,
         sm,
@@ -180,6 +220,7 @@ def main() -> None:
         num_samples=args.num_samples,
         target_accept=args.target_accept,
         positive=positive,
+        init_from_mle=args.init_from_mle,
     )
 
     def _diag_line(diag: dict) -> str:
@@ -197,6 +238,18 @@ def main() -> None:
     )
     print("-" * 64)
     print(f"  σ(r) Fisher (Knox)        : {sigma_fisher:.4e}")
+    if args.init_from_mle:
+        print("  MLE (L-BFGS multistart; chains then dithered around the mode):")
+        for label, mi in (("Gaussian", mle_g), ("Hamimeche-Lewis", mle_h)):
+            print(
+                f"    {label:>15}: r_MLE={mi['r']:+.4e}  (fid={args.r_fid:+.4e}, "
+                f"Δ={abs(mi['r'] - args.r_fid):.1e})  n_iter={mi['n_iter']}  "
+                f"converged={mi['converged']}  |grad|={mi['grad_norm']:.1e}"
+            )
+        print(
+            "    (HL |grad| may read NaN — the HL gradient is undefined at the exact "
+            "Asimov optimum; see augr.likelihood.mle.)"
+        )
     print(
         f"  σ(r) Gaussian-NUTS        : {sigma_g:.4e}   "
         f"({sigma_g / sigma_fisher - 1:+.1%} vs Fisher)"
