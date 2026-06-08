@@ -51,8 +51,11 @@ oracle (true FG through the NILC weights) to O(1) across ℓ. This matches Caron
 documented ``m_bias=[0,1,1,1]`` (+1 mode at the FG-relevant needlet scales), so the
 user-facing defaults here are **``m_bias=1``**.
 
-Scope (v1): **global** per-needlet-band weights (with ``m_bias=1`` this is adequate — the
-template is faithful without per-pixel domains); ``depro_cmb`` (explicit CMB deprojection)
+Scope: **global** per-needlet-band weights by default (with ``m_bias=1`` the template is
+faithful without per-pixel domains); opt-in **per-pixel localization** via
+``localization_fwhm_arcmin`` lets the AIC dimension and weights adapt to the local sky —
+the foreground subspace rises where the spectral index varies (e.g. near the Galactic
+plane), at the cost of per-pixel ``eigh``. ``depro_cmb`` (explicit CMB deprojection)
 deferred — the foreground-subspace projector already suppresses CMB to the ~few-percent
 level. B-only, full-sky, same conventions as :mod:`augr.nilc`. Requires the ``[compsep]``
 extra (ducc0) for the SHTs.
@@ -68,7 +71,9 @@ import numpy as np
 
 from .instrument import beam_bl
 from .nilc import (
+    _gaussian_smooth_map,
     _global_weights,
+    _localized_weights,
     _needlet_channel_mask,
     _ridge,
     combine_needlets,
@@ -98,10 +103,14 @@ def alm2cl(alm: jax.Array, lmax: int) -> jax.Array:
 
 
 def _matsqrt_pair(cov: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Symmetric ``(cov^{1/2}, cov^{-1/2})`` of a symmetric PD matrix via ``eigh``."""
+    """Symmetric ``(cov^{1/2}, cov^{-1/2})`` of a symmetric PD matrix via ``eigh``.
+
+    Batches over a leading per-pixel dimension (``cov (npix, n, n)``)."""
     s, V = jnp.linalg.eigh(0.5 * (cov + cov.swapaxes(-1, -2)))
     s = jnp.maximum(s, jnp.finfo(cov.dtype).tiny)
-    sqrt_s = jnp.sqrt(s)
+    # ``[..., None, :]`` scales the eigenvector columns (identity for the 2-D case),
+    # so the column-scaling broadcasts under a leading per-pixel batch.
+    sqrt_s = jnp.sqrt(s)[..., None, :]
     half = (V * sqrt_s) @ V.swapaxes(-1, -2)
     ihalf = (V / sqrt_s) @ V.swapaxes(-1, -2)
     return half, ihalf
@@ -136,7 +145,8 @@ def _gnilc_fg_estimator(
     ``W = R_n^{1/2} P_s R_n^{-1/2}`` with ``P_s`` the projector onto the top-``m``
     whitened eigenvectors (``m`` from the AIC, frozen for the backward pass). Applied to a
     channel-stacked map it returns the per-channel foreground estimate. Differentiable in
-    ``cov_total`` / ``cov_nuis``.
+    ``cov_total`` / ``cov_nuis``. Batches over a leading per-pixel dimension
+    (``cov_* (npix, n, n)`` → ``W (npix, n, n)``, ``m (npix,)``) for localized GNILC.
     """
     r = _ridge(cov_total, ridge)
     r_n = _ridge(cov_nuis, ridge)
@@ -145,17 +155,44 @@ def _gnilc_fg_estimator(
     m_mat = cn_ihalf @ r @ cn_ihalf
     m_mat = 0.5 * (m_mat + m_mat.swapaxes(-1, -2))
     lam, u = jnp.linalg.eigh(m_mat)  # ascending
-    lam_desc = lam[::-1]
-    u_desc = u[:, ::-1]  # eigenvectors ordered by descending eigenvalue
+    # Descending reorder, batch-safe over a leading per-pixel dim: flip the eigenvalue
+    # axis and the eigenvector-column axis (eigh returns columns ``u[..., :, i]``).
+    lam_desc = jnp.flip(lam, axis=-1)
+    u_desc = jnp.flip(u, axis=-1)
 
     n = m_mat.shape[-1]
     m = _aic_m(lam_desc) + int(m_bias)
     # 0/1 selector for the top-m foreground eigenvectors; frozen (discrete selection).
     # m[..., None] keeps this correct under a leading per-pixel batch.
     p = jax.lax.stop_gradient((jnp.arange(n) < m[..., None]).astype(m_mat.dtype))
-    proj = (u_desc * p) @ u_desc.swapaxes(-1, -2)  # Σ_{k<m} u_k u_kᵀ
+    # p[..., None, :] scales the eigenvector columns (identity for the 2-D global case).
+    proj = (u_desc * p[..., None, :]) @ u_desc.swapaxes(-1, -2)  # Σ_{k<m} u_k u_kᵀ
     w = cn_half @ proj @ cn_ihalf
     return w, m
+
+
+def _localized_cov(beta_active, localization_fwhm_arcmin, *, lmax, nside, n_iter):
+    """Per-pixel Gaussian-localized covariance ``(npix, n_act, n_act)`` from the active
+    needlet coefficient maps, via the shared :func:`augr.nilc._gaussian_smooth_map`
+    (same construction as :func:`augr.nilc._localized_weights`)."""
+    n_act = beta_active.shape[0]
+    rows = [
+        jnp.stack(
+            [
+                _gaussian_smooth_map(
+                    beta_active[i] * beta_active[k],
+                    localization_fwhm_arcmin,
+                    lmax=lmax,
+                    nside=nside,
+                    n_iter=n_iter,
+                )
+                for k in range(n_act)
+            ],
+            axis=0,
+        )
+        for i in range(n_act)
+    ]
+    return jnp.moveaxis(jnp.stack(rows, axis=0), 2, 0)  # (npix, n_act, n_act)
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +209,8 @@ class GNILCResult:
     nilc_weights
         NILC CMB ILC weights ``w`` from the total data, shape ``(J, n_band)``.
     residual_weights
-        Composed foreground-residual weights ``v_j = w_jᵀ W_j``, shape ``(J, n_band)``.
+        Composed foreground-residual weights ``v_j = w_jᵀ W_j``, shape ``(J, n_band)``
+        (global) or ``(J, n_band, npix)`` (localized).
         ``combine_needlets(residual_weights, β)`` is the foreground residual in the
         cleaned map.
     needlet_bands
@@ -183,7 +221,7 @@ class GNILCResult:
         Transform configuration (so passives project identically).
     m_per_band
         AIC foreground-subspace dimension per needlet band (diagnostic), as JAX int
-        scalars (concrete in eager use; cast with ``int(...)`` for display).
+        scalars (global) or ``(npix,)`` maps (localized); concrete in eager use.
     """
 
     nilc_weights: jax.Array
@@ -231,6 +269,7 @@ def build_gnilc(
     lmax: int,
     nside: int,
     needlet_peaks=None,
+    localization_fwhm_arcmin: float | None = None,
     m_bias: int = 1,
     ridge: float = 1e-10,
     n_iter: int = 3,
@@ -243,6 +282,19 @@ def build_gnilc(
     map set whose covariance whitens the GNILC eigenproblem. ``m_bias`` defaults to 1
     (one mode beyond the AIC), which is needed for a faithful residual template and
     matches Carones 2025 — see the module docstring. Pass ``m_bias=0`` for pure AIC.
+
+    ``localization_fwhm_arcmin`` (``None`` → global, the default): when finite, the
+    covariances, the AIC dimension ``m``, the foreground estimator ``W`` and the NILC CMB
+    weights are all computed **per pixel** from a Gaussian-localized covariance (FWHM
+    ``localization_fwhm_arcmin``), so the foreground subspace adapts to the local sky — it
+    rises where the spectral index varies (e.g. near the Galactic plane). ``m_per_band``
+    then holds a per-pixel ``(npix,)`` map per band instead of a scalar, and
+    ``residual_weights`` is ``(J, n_band, npix)``. Per-pixel ``eigh`` is heavy at high
+    nside (cf. the localized-covariance memory note); validate at modest nside. The
+    localized path is **forward-only**: the per-pixel top-``m`` eigenvector projector is
+    non-smooth at eigenvalue crossings (faint-FG pixels sit near them), so its gradient is
+    unreliable (NaN on a foreground-free sky, ~tens-of-% off finite differences with
+    foregrounds) — use the global path for gradient-based optimization.
     """
     check_band_limit(lmax, nside)
     beams = tuple(float(b) for b in beam_fwhm_arcmin)
@@ -265,7 +317,19 @@ def build_gnilc(
     beta_nuis = needlet_beta(b_nuis, bands, lmax=lmax, nside=nside)
 
     active = _needlet_channel_mask(bands, beams, common, lmax, beam_band_limit)
-    w_nilc = _global_weights(beta_tot, ridge, active)  # (J, n_band) NILC CMB weights
+    localized = localization_fwhm_arcmin is not None
+    if localized:
+        w_nilc = _localized_weights(
+            beta_tot,
+            localization_fwhm_arcmin,
+            lmax=lmax,
+            nside=nside,
+            n_iter=n_iter,
+            ridge=ridge,
+            active=active,
+        )  # (J, n_band, npix) per-pixel NILC CMB weights
+    else:
+        w_nilc = _global_weights(beta_tot, ridge, active)  # (J, n_band) NILC CMB weights
 
     n_j, n_band, npix = beta_tot.shape
     v_rows = []
@@ -275,16 +339,30 @@ def build_gnilc(
         idx_j = jnp.asarray(idx)
         bt = beta_tot[j][idx]  # (n_active, npix)
         bn = beta_nuis[j][idx]
-        cov_t = (bt @ bt.T) / npix
-        cov_n = (bn @ bn.T) / npix
-        w_mat, m = _gnilc_fg_estimator(cov_t, cov_n, m_bias=m_bias, ridge=ridge)
-        # v_active = w_NILC (active) propagated through the GNILC FG estimator W.
-        v_active = w_nilc[j][idx_j] @ w_mat  # (n_active,)
-        v_rows.append(jnp.zeros(n_band).at[idx_j].set(v_active))
-        # Keep the AIC m as a JAX scalar (no int() — build_gnilc is traced under
-        # jax.grad of the residual template); concrete in eager use, cast by callers.
+        if localized:
+            cov_t = _localized_cov(
+                bt, localization_fwhm_arcmin, lmax=lmax, nside=nside, n_iter=n_iter
+            )
+            cov_n = _localized_cov(
+                bn, localization_fwhm_arcmin, lmax=lmax, nside=nside, n_iter=n_iter
+            )
+            w_mat, m = _gnilc_fg_estimator(
+                cov_t, cov_n, m_bias=m_bias, ridge=ridge
+            )  # (npix,n,n),(npix,)
+            # Compose per pixel: v(p) = w_NILC(p) · W(p) over the active channels.
+            v_active = jnp.einsum("np,pnm->pm", w_nilc[j][idx_j], w_mat)  # (npix, n_active)
+            v_rows.append(jnp.zeros((n_band, npix)).at[idx_j].set(v_active.T))  # (n_band, npix)
+        else:
+            cov_t = (bt @ bt.T) / npix
+            cov_n = (bn @ bn.T) / npix
+            w_mat, m = _gnilc_fg_estimator(cov_t, cov_n, m_bias=m_bias, ridge=ridge)
+            # v_active = w_NILC (active) propagated through the GNILC FG estimator W.
+            v_active = w_nilc[j][idx_j] @ w_mat  # (n_active,)
+            v_rows.append(jnp.zeros(n_band).at[idx_j].set(v_active))
+        # Keep the AIC m as a JAX array (no int() — build_gnilc is traced under jax.grad
+        # of the residual template); per-band scalar (global) or (npix,) map (localized).
         m_per_band.append(m)
-    v = jnp.stack(v_rows, axis=0)  # (J, n_band)
+    v = jnp.stack(v_rows, axis=0)  # (J, n_band) global or (J, n_band, npix) localized
 
     return GNILCResult(
         nilc_weights=w_nilc,
@@ -308,6 +386,7 @@ def gnilc_residual_template(
     lmax: int,
     nside: int,
     needlet_peaks=None,
+    localization_fwhm_arcmin: float | None = None,
     m_bias: int = 1,
     ridge: float = 1e-10,
     n_iter: int = 3,
@@ -331,9 +410,9 @@ def gnilc_residual_template(
     total_qu, cmb_qu, noise_qu
         Total / CMB-only / noise-only per-band Q/U map sets, shape ``(n_band, 2, npix)``.
         The nuisance covariance uses ``cmb_qu + noise_qu``.
-    beam_fwhm_arcmin, lmax, nside, needlet_peaks, m_bias, ridge, n_iter, beam_band_limit,
-    common_fwhm_arcmin
-        As in :func:`build_gnilc`.
+    beam_fwhm_arcmin, lmax, nside, needlet_peaks, localization_fwhm_arcmin, m_bias, ridge,
+    n_iter, beam_band_limit, common_fwhm_arcmin
+        As in :func:`build_gnilc` (``localization_fwhm_arcmin`` finite → per-pixel GNILC).
     f_sky
         Sky fraction (1/f_sky correction on the spectra).
     return_result
@@ -351,6 +430,7 @@ def gnilc_residual_template(
         lmax=lmax,
         nside=nside,
         needlet_peaks=needlet_peaks,
+        localization_fwhm_arcmin=localization_fwhm_arcmin,
         m_bias=m_bias,
         ridge=ridge,
         n_iter=n_iter,
