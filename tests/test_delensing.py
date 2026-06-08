@@ -259,8 +259,14 @@ class TestResidualLimits:
 # -----------------------------------------------------------------------
 
 class TestIterativeDelensing:
+    @pytest.mark.slow
     def test_convergence(self, spectra, noise):
-        """Iteration should converge (A_lens_eff stable by iteration 3)."""
+        """Iteration should converge (A_lens_eff stable by iteration 3).
+
+        Slow: flat-sky iterate_delensing at l_max_qe=1000, n_iter=5 is ~25s locally
+        and >90s on the 2-core CI runner (its fullsky sibling is already marked slow).
+        The lighter test_result_shape below stays in the gate as the iterate smoke.
+        """
         result = iterate_delensing(
             spectra, noise["tt"], noise["ee"], noise["bb"],
             L_max=1000, l_max_qe=1000, n_phi=64, n_iter=5,
