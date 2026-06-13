@@ -411,3 +411,50 @@ def knox_sigma_from_measured_spectrum(
     nu = _nu_b(bin_edges, f_sky)
     var = (m_kk * m_pp + m_kp**2) / nu
     return jnp.sqrt(var)
+
+
+def mc_bandpower_covariance(bandpowers: jnp.ndarray, *, hartlap: bool = True) -> jnp.ndarray:
+    """Monte-Carlo sample covariance of binned bandpowers across sims.
+
+    The empirical counterpart to the analytic Knox covariance, for the
+    cut-sky / masked-Wiener path where the bandpower covariance (including the
+    mask-dependent E→B leakage variance) is estimated from a sim ensemble rather
+    than the Gaussian S+N model. Feed the result to
+    :class:`~augr.fisher.FisherForecast` via ``external_covariance=``.
+
+    Args:
+        bandpowers:
+            ``(n_sims, n_data)`` per-sim bandpowers, where ``n_data`` is the
+            flattened data-vector length (``n_spec × n_bins``; just ``n_bins``
+            for a single cleaned-map spectrum). These should be the *debiased*
+            estimator outputs (so their mean is the data vector the Fisher fits).
+        hartlap:
+            When True (default), scale the sample covariance by
+            ``1 / h`` with the Hartlap factor ``h = (n_sims − n_data − 2) /
+            (n_sims − 1)`` (Hartlap+ 2007, arXiv:astro-ph/0608064), so that the
+            inverse formed downstream — ``Cov⁻¹ = h · Cov_sample⁻¹`` — is the
+            *unbiased* precision matrix. A finite sim ensemble biases the naive
+            inverse-Wishart precision high by ``1/h``; this undoes it.
+
+    Returns:
+        ``(n_data, n_data)`` covariance to invert in the Fisher.
+
+    Raises:
+        ValueError: if ``hartlap`` and ``n_sims ≤ n_data + 2`` (the factor is
+            non-positive — the sample covariance is rank-deficient / its inverse
+            is not even biased-but-finite; use more sims or fewer bins).
+    """
+    x = jnp.asarray(bandpowers)
+    if x.ndim != 2:
+        raise ValueError(f"bandpowers must be 2-D (n_sims, n_data); got shape {x.shape}")
+    n_sims, n_data = x.shape
+    resid = x - jnp.mean(x, axis=0, keepdims=True)
+    cov = (resid.T @ resid) / (n_sims - 1)
+    if hartlap:
+        if n_sims <= n_data + 2:
+            raise ValueError(
+                f"Hartlap correction needs n_sims > n_data + 2; got n_sims={n_sims}, "
+                f"n_data={n_data}. Use more sims, fewer bins, or hartlap=False.")
+        h = (n_sims - n_data - 2) / (n_sims - 1)
+        cov = cov / h
+    return cov

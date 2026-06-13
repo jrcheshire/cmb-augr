@@ -196,6 +196,17 @@ class FisherForecast:
                         If the source pipeline returned a noise auto-
                         spectrum from a beam-smoothed map, divide by
                         B_ell^2 first (see augr.instrument.beam_bl).
+        external_covariance: Optional full (n_data, n_data) bandpower
+                        covariance, n_data = n_spec * n_bins. When provided,
+                        the Knox covariance assembly is bypassed entirely and
+                        this matrix is inverted directly (via the same
+                        prewhitened full solve as BPWF mode). Use for the
+                        cut-sky / masked-Wiener path where the covariance —
+                        including the mask-dependent E->B leakage variance — is
+                        estimated by Monte Carlo (see
+                        covariance.mc_bandpower_covariance). Mutually exclusive
+                        with external_noise_bb; supersedes the
+                        requires_external_noise / measured-BPWF guards.
     """
 
     def __init__(self,
@@ -204,12 +215,33 @@ class FisherForecast:
                  fiducial_params: dict[str, float],
                  priors: dict[str, float] | None = None,
                  fixed_params: list[str] | None = None,
-                 external_noise_bb: jnp.ndarray | None = None):
+                 external_noise_bb: jnp.ndarray | None = None,
+                 external_covariance: jnp.ndarray | None = None):
         self._signal = signal_model
         self._instrument = instrument
         self._fiducial = dict(fiducial_params)
         self._priors = priors or {}
         self._fixed = set(fixed_params or [])
+
+        # external_covariance supplies the full (n_data, n_data) bandpower
+        # covariance directly (e.g. a Monte-Carlo sample covariance from the
+        # cut-sky masked-Wiener path), superseding the analytic Knox / external-
+        # noise paths and their guards. Mutually exclusive with external_noise_bb.
+        self._external_covariance = None
+        if external_covariance is not None:
+            if external_noise_bb is not None:
+                raise ValueError(
+                    "Pass either external_noise_bb or external_covariance, not "
+                    "both: external_covariance already specifies the full "
+                    "bandpower covariance.")
+            ext_cov = jnp.asarray(external_covariance)
+            n_data = len(signal_model.freq_pairs) * signal_model.n_bins
+            if ext_cov.shape != (n_data, n_data):
+                raise ValueError(
+                    f"external_covariance has shape {ext_cov.shape}; expected "
+                    f"({n_data}, {n_data}) = (n_spec × n_bins)² to match the "
+                    f"flattened data vector.")
+            self._external_covariance = ext_cov
 
         if external_noise_bb is not None:
             external_noise_bb = jnp.asarray(external_noise_bb)
@@ -220,6 +252,9 @@ class FisherForecast:
                     f"external_noise_bb has shape {external_noise_bb.shape}; "
                     f"expected ({n_chan}, {n_ells}) to match the instrument "
                     f"channel count and the SignalModel ell grid.")
+        elif self._external_covariance is not None:
+            # Full covariance supplied directly — no noise model or guard needed.
+            pass
         elif getattr(instrument, "requires_external_noise", False):
             # Presets like cleaned_map_instrument carry placeholder NET / beam
             # values and would silently produce a nonsensical analytic Fisher
@@ -296,7 +331,11 @@ class FisherForecast:
         # the per-bin block-diagonal solve is unavailable. Build the full
         # (n_data, n_data) covariance via the per-ℓ Knox sum and do one
         # eigh-based solve.
-        if self._signal.has_measured_bpwf:
+        if self._external_covariance is not None:
+            # Full covariance supplied directly (e.g. MC sample covariance from
+            # the cut-sky masked-Wiener path); same full solve as BPWF mode.
+            F = _fisher_from_full(J, self._external_covariance)
+        elif self._signal.has_measured_bpwf:
             # __init__ already enforced external_noise_bb is not None when
             # has_measured_bpwf is True (the BPWF/beam-deconvolution
             # contract).
@@ -454,7 +493,10 @@ class FisherForecast:
         J_full = self._signal.jacobian(params)          # (n_data, n_all)
         J_free = J_full[:, self._free_idx]              # (n_data, n_free)
 
-        if self._signal.has_measured_bpwf:
+        if self._external_covariance is not None:
+            cinv_dd = _cinv_d_full(self._external_covariance, dd)  # (n_data,)
+            u = J_free.T @ cinv_dd                        # (n_free,)
+        elif self._signal.has_measured_bpwf:
             # BPWF mode: bins couple, full covariance solve.
             cov_full = bandpower_covariance_full_from_noise(
                 self._signal, self._external_noise_bb,
@@ -648,11 +690,15 @@ class FisherForecast:
         sigma_fid = jnp.sqrt(jnp.diag(self.inverse))   # (n_free,)
 
         # Covariance held at fiducial; build once.
-        use_full = self._signal.has_measured_bpwf
+        use_full = self._signal.has_measured_bpwf or self._external_covariance is not None
         if use_full:
-            cov_full = bandpower_covariance_full_from_noise(
-                self._signal, self._external_noise_bb,
-                self._instrument.f_sky, params_fid_full)
+            cov_full = (
+                self._external_covariance
+                if self._external_covariance is not None
+                else bandpower_covariance_full_from_noise(
+                    self._signal, self._external_noise_bb,
+                    self._instrument.f_sky, params_fid_full)
+            )
             cov_blocks = None
         else:
             if self._external_noise_bb is not None:
