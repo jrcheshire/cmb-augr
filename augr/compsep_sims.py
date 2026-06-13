@@ -200,6 +200,24 @@ def cmb_b_alm(spectra: CMBSpectra, r_in: float, lmax: int, *, seed: int = 0) -> 
     return jnp.asarray(b_alm)
 
 
+def cmb_e_alm(cl_ee: jax.Array, lmax: int, *, seed: int = 0) -> jax.Array:
+    """Draw a Gaussian CMB E-mode alm from ``cl_ee`` [healpy packing].
+
+    Companion to :func:`cmb_b_alm` for the cut-sky validation sims (E→B leakage
+    purity / fidelity), where a realistic *lensed* EE source dominates the
+    ambiguous-mode leakage. ``cl_ee`` is the EE power on ``ℓ = 0..lmax`` — use
+    ``augr.delensing.load_lensing_spectra().cl_ee_len``. The realization is fixed
+    by ``seed`` (CRN); E and B are drawn independently (TE/EB correlation is out
+    of scope, matching the B-only sim's Gaussian-field approximation).
+    """
+    import healpy as hp
+
+    cl = np.clip(np.asarray(cl_ee)[: lmax + 1], 0.0, None)
+    np.random.seed(int(seed) & 0xFFFFFFFF)  # noqa: NPY002 - healpy.synalm uses the global RNG
+    e_alm = hp.synalm(cl, lmax=lmax, new=True)
+    return jnp.asarray(e_alm)
+
+
 def _beam_qu_from_eb(
     alm_e: jax.Array, alm_b: jax.Array, fwhm_arcmin: float, lmax: int, nside: int
 ) -> jax.Array:
@@ -208,6 +226,19 @@ def _beam_qu_from_eb(
     e_beamed = almxfl(jnp.asarray(alm_e), bl, lmax)
     b_beamed = almxfl(jnp.asarray(alm_b), bl, lmax)
     return synthesis(jnp.stack([e_beamed, b_beamed], axis=0), 2, lmax, nside)
+
+
+def cmb_eb_qu(
+    alm_e: jax.Array, alm_b: jax.Array, fwhm_arcmin: float, lmax: int, nside: int
+) -> jax.Array:
+    """Beam a single E/B alm pair → ``(2, npix)`` Q/U [HEALPix-internal].
+
+    Single-map (one effective beam) CMB realization for the cut-sky estimator
+    validation, as opposed to the per-band :func:`cmb_band_qu`. Pass a zero
+    ``alm_b`` for an **E-only** sky (the E→B leakage / purity-null source) or a
+    zero ``alm_e`` for a **B-only** sky (the transfer-function source).
+    """
+    return _beam_qu_from_eb(alm_e, alm_b, fwhm_arcmin, lmax, nside)
 
 
 def cmb_band_qu(
