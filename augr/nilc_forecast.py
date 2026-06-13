@@ -35,13 +35,10 @@ from dataclasses import dataclass
 import jax.numpy as jnp
 import numpy as np
 
-from .config import DEFAULT_PRIORS_POST_COMPSEP, cleaned_map_instrument
-from .fisher import FisherForecast
-from .foregrounds import NullForegroundModel
+from .cleaning import CleanerResult
+from .forecast import forecast_from_spectra
 from .instrument import beam_bl
-from .nilc import NILCResult, common_resolution_b_alm
-from .signal import SignalModel
-from .spectra import CMBSpectra
+from .nilc import common_resolution_b_alm
 
 
 def cl_bb(b_alm, lmax: int, b_alm2=None, f_sky: float = 1.0) -> np.ndarray:
@@ -85,7 +82,7 @@ class NILCSpectra:
 
 
 def nilc_spectra(
-    result: NILCResult,
+    result: CleanerResult,
     *,
     total_qu,
     noise_qu,
@@ -154,7 +151,7 @@ def nilc_spectra(
     )
 
 
-def nilc_leakage_correlation(result: NILCResult, fg_qu, *, f_sky: float = 1.0):
+def nilc_leakage_correlation(result: CleanerResult, fg_qu, *, f_sky: float = 1.0):
     """Cross-correlation ρ_ℓ between the cleaned FG residual and the input FG.
 
     Projects the FG-only maps through the ILC weights, then correlates the cleaned
@@ -216,9 +213,10 @@ def nilc_forecast(
 ) -> dict:
     """σ(r) variants + the FG-leakage bias Δr from a :class:`NILCSpectra`.
 
-    Mirrors ``validate_carones.run_fisher_variants``: ``cleaned_map_instrument`` +
-    ``NullForegroundModel`` + a residual-template ``SignalModel``, with ``nl_post``
-    as beam-free ``external_noise_bb``.
+    A thin shim over :func:`augr.forecast.forecast_from_spectra`: unpacks the
+    ``NILCSpectra`` (``nl_post`` → beam-free ``external_noise_bb``,
+    ``cl_residual_fg`` → the ``A_res`` template, ``transfer`` reported / optionally
+    applied) and returns the legacy dict via :meth:`ForecastResult.as_dict`.
 
     ``delta_r`` is the linear bias on the *baseline* fit's r induced by the
     unmodelled residual (debias-OFF, primary). The flat / Gaussian-A_res σ(r) are
@@ -226,99 +224,27 @@ def nilc_forecast(
 
     ``delensed_bb`` / ``delensed_bb_ells`` (optional): a self-consistent residual
     lensing ``C_ℓ^{BB}`` (e.g. ``iterate_delensing(...).cl_bb_res`` on its ``ls``
-    grid) to use in place of the ``A_lens`` lensing multiplier — the same hook as
-    ``validate_carones.run_fisher_variants(delensed_bb=...)``. ``delensed_bb_ells``
+    grid) to use in place of the ``A_lens`` lensing multiplier. ``delensed_bb_ells``
     must span ``[ell_min, ell_max]``. Without it the forecast sits on the full
     lensing-B floor (fine for the lensing-independent Δr, but it inflates σ(r)).
 
     Returns a dict of printable scalars (σ(r) baseline/flat/gauss, σ(A_res),
     delta_r, transfer_mean, the (r, A_res) condition number, and the inputs used).
     """
-    if a_res_prior is None:
-        a_res_prior = DEFAULT_PRIORS_POST_COMPSEP["A_res"]
-    if (delensed_bb is None) != (delensed_bb_ells is None):
-        raise ValueError("delensed_bb and delensed_bb_ells must be supplied together.")
-
-    nl_post = np.asarray(spectra.nl_post)
-    cl_fg = np.asarray(spectra.cl_residual_fg)
-    band = (spectra.ells >= ell_min) & (spectra.ells <= ell_max)
-    transfer_mean = float(np.mean(spectra.transfer[band]))
-    if apply_transfer and transfer_mean > 0:
-        nl_post = nl_post / transfer_mean
-        cl_fg = cl_fg / transfer_mean
-
-    inst = cleaned_map_instrument(f_sky=f_sky)
-    cmb = CMBSpectra()
-
-    def _signal(with_template):
-        kw = dict(
-            instrument=inst,
-            foreground_model=NullForegroundModel(),
-            cmb_spectra=cmb,
-            ell_min=ell_min,
-            ell_max=ell_max,
-            delta_ell=delta_ell,
-            ell_per_bin_below=ell_per_bin_below,
-        )
-        if with_template:
-            kw["residual_template_cl"] = jnp.asarray(cl_fg)
-            kw["residual_template_ells"] = jnp.asarray(spectra.ells, dtype=float)
-        if delensed_bb is not None:
-            kw["delensed_bb"] = jnp.asarray(delensed_bb)
-            kw["delensed_bb_ells"] = jnp.asarray(delensed_bb_ells, dtype=float)
-        return SignalModel(**kw)
-
-    baseline = _signal(with_template=False)
-    nl_interp = jnp.interp(
-        baseline.ells, jnp.asarray(spectra.ells, dtype=float), jnp.asarray(nl_post)
-    )
-    external_noise_bb = nl_interp[None, :]
-
-    fid_base = {"r": r_fid, "A_lens": 1.0}
-    fisher_baseline = FisherForecast(
-        baseline, inst, fid_base, priors={}, fixed_params=[], external_noise_bb=external_noise_bb
-    )
-    fisher_baseline.compute()
-
-    signal = _signal(with_template=True)
-    fid = {**fid_base, "A_res": 1.0}
-    fisher_flat = FisherForecast(
-        signal, inst, fid, priors={}, fixed_params=[], external_noise_bb=external_noise_bb
-    )
-    fisher_flat.compute()
-    fisher_gauss = FisherForecast(
-        signal,
-        inst,
-        fid,
-        priors={"A_res": a_res_prior},
-        fixed_params=[],
-        external_noise_bb=external_noise_bb,
-    )
-    fisher_gauss.compute()
-
-    # Δr (debias-OFF): bias on the baseline fit from the unmodelled residual.
-    # truth = baseline + residual template at A_res=1; ΔD = the binned residual.
-    delta = fisher_baseline.bias_from_truth_model(signal, fid)
-
-    # (r, A_res) marginalized condition number, as in validate_carones. A zero
-    # residual template (no FG) leaves A_res unconstrained -> F singular -> inf.
-    F = np.asarray(fisher_flat.fisher_matrix)
-    names = fisher_flat.free_parameter_names
-    ix = np.array([names.index("r"), names.index("A_res")])
-    try:
-        cond = float(np.linalg.cond(np.linalg.inv(F)[np.ix_(ix, ix)]))
-    except np.linalg.LinAlgError:
-        cond = float("inf")
-
-    return {
-        "sigma_r_baseline": fisher_baseline.sigma("r"),
-        "sigma_r_flat": fisher_flat.sigma("r"),
-        "sigma_r_gauss": fisher_gauss.sigma("r"),
-        "sigma_A_res_flat": fisher_flat.sigma("A_res"),
-        "sigma_A_res_gauss": fisher_gauss.sigma("A_res"),
-        "delta_r": delta["r"],
-        "transfer_mean": transfer_mean,
-        "cond_r_Ares": cond,
-        "a_res_prior": a_res_prior,
-        "r_fid": r_fid,
-    }
+    return forecast_from_spectra(
+        nl_ells=spectra.ells,
+        nl_post=spectra.nl_post,
+        template_ells=spectra.ells,
+        template_cl=spectra.cl_residual_fg,
+        f_sky=f_sky,
+        transfer=spectra.transfer,
+        r_fid=r_fid,
+        ell_min=ell_min,
+        ell_max=ell_max,
+        delta_ell=delta_ell,
+        ell_per_bin_below=ell_per_bin_below,
+        a_res_prior=a_res_prior,
+        apply_transfer=apply_transfer,
+        delensed_bb=delensed_bb,
+        delensed_bb_ells=delensed_bb_ells,
+    ).as_dict()
