@@ -13,6 +13,7 @@ from augr.covariance import (
     bandpower_covariance_full,
     bandpower_covariance_full_from_noise,
     knox_sigma_from_measured_spectrum,
+    mc_bandpower_covariance,
 )
 from augr.foregrounds import GaussianForegroundModel
 from augr.instrument import Channel, Instrument, ScalarEfficiency
@@ -623,3 +624,53 @@ def test_knox_sigma_matches_blocks_auto_variance(signal_model, two_chan_instrume
     np.testing.assert_allclose(
         np.asarray(sigma**2), np.asarray(expected_var), rtol=1e-10
     )
+
+
+# -----------------------------------------------------------------------
+# mc_bandpower_covariance (Monte-Carlo sample covariance + Hartlap)
+# -----------------------------------------------------------------------
+
+
+def test_mc_bandpower_covariance_shape_and_symmetry():
+    rng = np.random.default_rng(0)
+    bp = jnp.asarray(rng.standard_normal((200, 6)))
+    cov = mc_bandpower_covariance(bp, hartlap=False)
+    assert cov.shape == (6, 6)
+    np.testing.assert_allclose(np.asarray(cov), np.asarray(cov).T, rtol=1e-12)
+
+
+def test_mc_bandpower_covariance_hartlap_scaling():
+    """hartlap=True scales the sample covariance by 1/h."""
+    rng = np.random.default_rng(1)
+    n_sims, n_data = 50, 6
+    bp = jnp.asarray(rng.standard_normal((n_sims, n_data)))
+    cov_raw = mc_bandpower_covariance(bp, hartlap=False)
+    cov_h = mc_bandpower_covariance(bp, hartlap=True)
+    h = (n_sims - n_data - 2) / (n_sims - 1)
+    np.testing.assert_allclose(np.asarray(cov_h), np.asarray(cov_raw) / h, rtol=1e-12)
+
+
+def test_mc_bandpower_covariance_recovers_known_cov():
+    """Sample covariance (no Hartlap) recovers a known input covariance."""
+    rng = np.random.default_rng(2)
+    n_data = 4
+    a = rng.standard_normal((n_data, n_data))
+    c_true = a @ a.T + np.eye(n_data)  # SPD
+    samples = rng.multivariate_normal(np.zeros(n_data), c_true, size=40000)
+    cov = np.asarray(mc_bandpower_covariance(jnp.asarray(samples), hartlap=False))
+    np.testing.assert_allclose(cov, c_true, rtol=0.1, atol=0.05)
+
+
+def test_mc_bandpower_covariance_hartlap_guard():
+    """Raises when n_sims <= n_data + 2 (Hartlap factor non-positive)."""
+    rng = np.random.default_rng(3)
+    bp = jnp.asarray(rng.standard_normal((7, 6)))  # n_sims=7, n_data=6 -> h<=0
+    with pytest.raises(ValueError, match="Hartlap"):
+        mc_bandpower_covariance(bp, hartlap=True)
+    # hartlap=False still works
+    assert mc_bandpower_covariance(bp, hartlap=False).shape == (6, 6)
+
+
+def test_mc_bandpower_covariance_requires_2d():
+    with pytest.raises(ValueError, match="2-D"):
+        mc_bandpower_covariance(jnp.zeros(10))

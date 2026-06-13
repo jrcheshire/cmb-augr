@@ -170,6 +170,12 @@ class HarmonicSky:
     fg_eb_alm
         Per-band foreground E/B alm, shape ``(n_band, 2, n_alm)``, or ``None`` for
         a CMB-only sky.
+    cmb_e_alm
+        CMB E-mode alm, shape ``(n_alm,)``, or ``None`` (default) for a B-only
+        CMB. Set it (via ``harmonic_sky(cl_ee=...)``) when the cleaned map must
+        carry realistic E-modes for cut-sky E→B leakage — e.g. the masked-Wiener
+        forecast. The full-sky B-only forecasts leave it ``None`` (E and B do not
+        mix full-sky, so CMB E is irrelevant there).
     """
 
     freqs_ghz: tuple[float, ...]
@@ -178,6 +184,7 @@ class HarmonicSky:
     r_in: float
     cmb_b_alm: jax.Array
     fg_eb_alm: jax.Array | None
+    cmb_e_alm: jax.Array | None = None
 
     @property
     def n_band(self) -> int:
@@ -242,12 +249,21 @@ def cmb_eb_qu(
 
 
 def cmb_band_qu(
-    b_alm: jax.Array, beam_fwhm_arcmin: tuple[float, ...], lmax: int, nside: int
+    b_alm: jax.Array,
+    beam_fwhm_arcmin: tuple[float, ...],
+    lmax: int,
+    nside: int,
+    *,
+    e_alm: jax.Array | None = None,
 ) -> jax.Array:
-    """Beam the shared CMB B-mode alm per band → ``(n_band, 2, npix)`` Q/U."""
-    zero_e = jnp.zeros_like(b_alm)
+    """Beam the shared CMB E/B alm per band → ``(n_band, 2, npix)`` Q/U.
+
+    ``e_alm`` defaults to zero (B-only CMB, the full-sky-forecast convention);
+    pass a CMB E-mode alm to include E (cut-sky E→B leakage forecasts).
+    """
+    alm_e = jnp.zeros_like(b_alm) if e_alm is None else jnp.asarray(e_alm)
     return jnp.stack(
-        [_beam_qu_from_eb(zero_e, b_alm, fw, lmax, nside) for fw in beam_fwhm_arcmin],
+        [_beam_qu_from_eb(alm_e, b_alm, fw, lmax, nside) for fw in beam_fwhm_arcmin],
         axis=0,
     )
 
@@ -365,6 +381,7 @@ def harmonic_sky(
     fg_model: str | None = "d1s1",
     cmb_seed: int = 0,
     fg_seed: int | None = None,
+    cl_ee: jax.Array | None = None,
 ) -> HarmonicSky:
     """Build the aperture-independent harmonic sky (CMB B alm + per-band FG E/B alm).
 
@@ -375,12 +392,19 @@ def harmonic_sky(
 
     Parameters mirror :func:`generate_band_sky` (minus ``beam_fwhm_arcmin``, which
     is supplied per aperture at the beaming step).
+
+    ``cl_ee`` (optional): when given, also draw a CMB E-mode realization from this
+    EE spectrum (``ℓ = 0..lmax``; use ``delensing.load_lensing_spectra().cl_ee_len``)
+    so the beamed sky carries E for cut-sky E→B leakage. The E draw is seeded by
+    ``cmb_seed + 1`` so E and B are independent realizations sharing the per-sim
+    CRN index. Left ``None`` (default) gives a B-only CMB, unchanged.
     """
     check_band_limit(lmax, nside)
     if fg_seed is None:
         fg_seed = cmb_seed
 
     b_alm = cmb_b_alm(spectra, r_in, lmax, seed=cmb_seed)
+    e_alm = None if cl_ee is None else cmb_e_alm(cl_ee, lmax, seed=cmb_seed + 1)
     fg_eb = (
         None if fg_model is None else _fg_eb_alm(freqs_ghz, fg_model, lmax, nside, fg_seed=fg_seed)
     )
@@ -392,6 +416,7 @@ def harmonic_sky(
         r_in=float(r_in),
         cmb_b_alm=b_alm,
         fg_eb_alm=fg_eb,
+        cmb_e_alm=e_alm,
     )
 
 
@@ -406,7 +431,9 @@ def beam_harmonic_sky(hsky: HarmonicSky, beam_fwhm_arcmin: tuple[float, ...]) ->
             f"beam_fwhm_arcmin has {len(beam_fwhm_arcmin)} entries but the harmonic "
             f"sky has {hsky.n_band} bands."
         )
-    cmb_qu = cmb_band_qu(hsky.cmb_b_alm, beam_fwhm_arcmin, hsky.lmax, hsky.nside)
+    cmb_qu = cmb_band_qu(
+        hsky.cmb_b_alm, beam_fwhm_arcmin, hsky.lmax, hsky.nside, e_alm=hsky.cmb_e_alm
+    )
     if hsky.fg_eb_alm is None:
         fg_qu = jnp.zeros_like(cmb_qu)
     else:
@@ -433,6 +460,7 @@ def generate_band_sky(
     fg_model: str | None = "d1s1",
     cmb_seed: int = 0,
     fg_seed: int | None = None,
+    cl_ee: jax.Array | None = None,
 ) -> BandSky:
     """Build the fixed beamed sky (CMB + optional PySM FG) for all bands.
 
@@ -461,6 +489,10 @@ def generate_band_sky(
         foreground, and (via the JAX key downstream) noise together — fixed across
         apertures, varied across sims. Fixed-template foreground models are
         deterministic and ignore this. See :func:`_seeded_component_config`.
+    cl_ee
+        Optional CMB EE spectrum (ℓ=0..lmax) to also draw CMB E-modes for cut-sky
+        E→B leakage forecasts; ``None`` (default) gives a B-only CMB. See
+        :func:`harmonic_sky`.
     """
     if len(freqs_ghz) != len(beam_fwhm_arcmin):
         raise ValueError("freqs_ghz and beam_fwhm_arcmin must have the same length.")
@@ -473,6 +505,7 @@ def generate_band_sky(
         fg_model=fg_model,
         cmb_seed=cmb_seed,
         fg_seed=fg_seed,
+        cl_ee=cl_ee,
     )
     return beam_harmonic_sky(hsky, beam_fwhm_arcmin)
 

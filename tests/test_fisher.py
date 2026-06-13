@@ -237,6 +237,63 @@ def test_external_noise_matches_analytic(signal_model, instrument):
     assert sigma_r_external == pytest.approx(sigma_r_analytic, rel=1e-6)
 
 
+def test_external_covariance_matches_analytic(signal_model, instrument):
+    """A full covariance assembled from the analytic block-diagonal Knox cov,
+    passed via external_covariance, matches the block-solve sigma(r).
+
+    Validates that the external_covariance full-solve path is consistent with
+    the per-bin block solve (they are the same covariance, two solve routes)."""
+    from augr.covariance import bandpower_covariance_blocks
+    from augr.signal import flatten_params
+
+    priors = {"beta_dust": 0.11, "beta_sync": 0.3}
+    fixed = ["T_dust"]
+
+    fisher_analytic = FisherForecast(
+        signal_model, instrument, FIDUCIAL, priors=priors, fixed_params=fixed,
+    )
+    sigma_r_analytic = fisher_analytic.sigma("r")
+
+    # Assemble the block-diagonal (in ℓ-bin) covariance into the full
+    # (n_data, n_data) matrix, matching the data ordering data[s*n_bins + b].
+    params = flatten_params(FIDUCIAL, signal_model.parameter_names)
+    blocks = np.asarray(bandpower_covariance_blocks(signal_model, instrument, params))
+    n_bins = signal_model.n_bins
+    n_spec = signal_model.n_spectra
+    n_data = n_bins * n_spec
+    full = np.zeros((n_data, n_data))
+    for b in range(n_bins):
+        for s1 in range(n_spec):
+            for s2 in range(n_spec):
+                full[s1 * n_bins + b, s2 * n_bins + b] = blocks[b, s1, s2]
+
+    fisher_external = FisherForecast(
+        signal_model, instrument, FIDUCIAL, priors=priors, fixed_params=fixed,
+        external_covariance=jnp.asarray(full),
+    )
+    assert fisher_external.sigma("r") == pytest.approx(sigma_r_analytic, rel=1e-6)
+
+
+def test_external_covariance_shape_validation(signal_model, instrument):
+    """Wrong-shape external_covariance raises a ValueError."""
+    with pytest.raises(ValueError, match="external_covariance"):
+        FisherForecast(
+            signal_model, instrument, FIDUCIAL, fixed_params=["T_dust"],
+            external_covariance=jnp.zeros((3, 3)),
+        )
+
+
+def test_external_covariance_and_noise_mutually_exclusive(signal_model, instrument):
+    """Passing both external_noise_bb and external_covariance raises."""
+    nl = _analytic_noise_array(signal_model, instrument)
+    n_data = signal_model.n_data
+    with pytest.raises(ValueError, match="either"):
+        FisherForecast(
+            signal_model, instrument, FIDUCIAL, fixed_params=["T_dust"],
+            external_noise_bb=nl, external_covariance=jnp.eye(n_data),
+        )
+
+
 def test_external_noise_bb_shape_validation(signal_model, instrument):
     """Wrong-shape external_noise_bb raises a ValueError."""
     nl_bad = jnp.zeros((99, 99))
