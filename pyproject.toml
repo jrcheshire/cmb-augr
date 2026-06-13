@@ -132,6 +132,6 @@ select = ["E", "F", "W", "I", "N", "B", "UP", "RUF", "NPY", "PD", "SIM"]
 # design, so disable the family wholesale.
 ignore = [
     "E501",
-    "N801", "N802", "N803", "N806",
+    "N801", "N802", "N803", "N806", "N815",
     "RUF001", "RUF002", "RUF003",
 ]

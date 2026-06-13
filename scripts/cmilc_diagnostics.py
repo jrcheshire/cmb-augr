@@ -20,16 +20,14 @@ from __future__ import annotations
 
 import argparse
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
+from augr.cleaning import nilc_cleaner
 from augr.cmilc import CMILC06_MOMENTS, CMILC08_MOMENTS, cmilc_clean
-from augr.compsep_sims import assemble_band_maps, generate_band_sky
 from augr.gnilc import alm2cl
-from augr.nilc import nilc_clean
 from augr.nilc_forecast import nilc_forecast, nilc_spectra
-from augr.spectra import CMBSpectra
+from augr.pipeline import ForecastConfig, clean_sky
 
 # Illustrative wide-band space-mission-like config (not a study design). 8 bands so cMILC08
 # (6 constraints) keeps >=2 DoF for the variance minimization at every needlet band.
@@ -58,26 +56,29 @@ def main() -> None:
     args = p.parse_args()
     moments = _MOMENT_SETS[args.moments]
 
-    sky = generate_band_sky(
-        FREQS,
-        BEAMS,
-        spectra=CMBSpectra(),
-        r_in=args.r_in,
+    loc = args.localization_fwhm
+    cfg = ForecastConfig(
+        freqs_ghz=FREQS,
+        beam_fwhm_arcmin=BEAMS,
+        w_inv=W_INV,
+        cleaner=nilc_cleaner(localization_fwhm_arcmin=loc),
         nside=args.nside,
         lmax=args.lmax,
         fg_model=args.fg_model,
-        cmb_seed=args.seed,
+        r_in=args.r_in,
+        seed=args.seed,
+        f_sky=1.0,
+        r_fid=args.r_in,
+        ell_min=2,
+        ell_max=args.ell_max,
+        delta_ell=10,
     )
-    hit = jnp.ones(12 * args.nside**2)
-    total = assemble_band_maps(sky, W_INV, hit, noise_key=jax.random.PRNGKey(args.seed))
-    noise = total - sky.cmb_qu - sky.fg_qu
+    cleaned = clean_sky(cfg)
+    res_nilc, spec_nilc = cleaned.cleaner_result, cleaned.spectra
 
-    loc = args.localization_fwhm
-    res_nilc = nilc_clean(
-        total, BEAMS, lmax=args.lmax, nside=args.nside, localization_fwhm_arcmin=loc
-    )
+    # cMILC on the same sim maps (one sim, two cleaners).
     res_cmilc, info = cmilc_clean(
-        total,
+        cleaned.total_qu,
         BEAMS,
         FREQS,
         lmax=args.lmax,
@@ -86,13 +87,16 @@ def main() -> None:
         localization_fwhm_arcmin=loc,
         return_diagnostics=True,
     )
+    spec_cmilc = nilc_spectra(
+        res_cmilc,
+        total_qu=cleaned.total_qu,
+        noise_qu=cleaned.noise_qu,
+        fg_qu=cleaned.fg_qu,
+        cmb_qu=cleaned.cmb_qu,
+    )
 
-    spec_kw = dict(total_qu=total, noise_qu=noise, fg_qu=sky.fg_qu, cmb_qu=sky.cmb_qu)
-    spec_nilc = nilc_spectra(res_nilc, **spec_kw)
-    spec_cmilc = nilc_spectra(res_cmilc, **spec_kw)
-
-    fg_nilc = np.asarray(alm2cl(res_nilc.project(sky.fg_qu), args.lmax))
-    fg_cmilc = np.asarray(alm2cl(res_cmilc.project(sky.fg_qu), args.lmax))
+    fg_nilc = np.asarray(alm2cl(res_nilc.project(cleaned.fg_qu), args.lmax))
+    fg_cmilc = np.asarray(alm2cl(res_cmilc.project(cleaned.fg_qu), args.lmax))
     ell = np.arange(args.lmax + 1)
 
     fc_kw = dict(f_sky=1.0, r_fid=args.r_in, ell_min=2, ell_max=args.ell_max, delta_ell=10)

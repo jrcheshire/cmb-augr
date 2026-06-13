@@ -27,14 +27,10 @@ import argparse
 import sys
 from pathlib import Path
 
-import jax.numpy as jnp
 import numpy as np
 
-from augr.config import DEFAULT_PRIORS_POST_COMPSEP, cleaned_map_instrument
-from augr.fisher import FisherForecast
-from augr.foregrounds import NullForegroundModel
-from augr.signal import SignalModel
-from augr.spectra import CMBSpectra
+from augr.config import DEFAULT_PRIORS_POST_COMPSEP
+from augr.forecast import forecast_from_spectra
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -90,91 +86,35 @@ def run_fisher_variants(tres_ells: np.ndarray, tres_bb: np.ndarray,
     ``sigma(r)`` shrinks accordingly. The supplied range must span
     ``[ELL_MIN, ELL_MAX]``; ``iterate_delensing``'s default
     ``ls=[2, 300]`` covers ELL_MAX = 180.
+
+    Thin wrapper over :func:`augr.forecast.forecast_from_spectra` (the shared
+    post-separation forecast core): the noise lives on ``nl_ells`` and the residual
+    template on ``tres_ells`` (different bandpower grids). Returns the original
+    (smaller) key set this script's report and ``plot_broom_showcase`` expect.
     """
-    inst = cleaned_map_instrument(f_sky=f_sky)
-    cmb = CMBSpectra()
-
-    # Baseline SignalModel -- no residual template, just CMB + noise.
-    baseline = SignalModel(
-        instrument=inst,
-        foreground_model=NullForegroundModel(),
-        cmb_spectra=cmb,
-        ell_min=ELL_MIN, ell_max=ELL_MAX,
-        delta_ell=DELTA_ELL, ell_per_bin_below=ELL_PER_BIN_BELOW,
+    res = forecast_from_spectra(
+        nl_ells=nl_ells,
+        nl_post=nl_bb,
+        template_ells=tres_ells,
+        template_cl=tres_bb,
+        f_sky=f_sky,
+        r_fid=0.0,
+        ell_min=ELL_MIN,
+        ell_max=ELL_MAX,
+        delta_ell=DELTA_ELL,
+        ell_per_bin_below=ELL_PER_BIN_BELOW,
+        a_res_prior=a_res_prior,
         delensed_bb=delensed_bb,
         delensed_bb_ells=delensed_bb_ells,
     )
-
-    # Nearest-neighbour extrapolation (jnp.interp default) outside the
-    # BROOM bandpower range -- zero-extrapolation at ell < first bin
-    # center would silently drop noise at the reionization bump where
-    # sigma(r) is most sensitive.
-    nl_interp = jnp.interp(baseline.ells,
-                           jnp.asarray(nl_ells),
-                           jnp.asarray(nl_bb))
-    external_noise_bb = nl_interp[None, :]  # (n_channels=1, n_ells)
-
-    fiducial_base = {"r": 0.0, "A_lens": 1.0}
-    fisher_baseline = FisherForecast(
-        baseline, inst, fiducial_base,
-        priors={}, fixed_params=[],
-        external_noise_bb=external_noise_bb,
-    )
-    fisher_baseline.compute()
-
-    # With residual template.
-    signal = SignalModel(
-        instrument=inst,
-        foreground_model=NullForegroundModel(),
-        cmb_spectra=cmb,
-        ell_min=ELL_MIN, ell_max=ELL_MAX,
-        delta_ell=DELTA_ELL, ell_per_bin_below=ELL_PER_BIN_BELOW,
-        residual_template_cl=tres_bb,
-        residual_template_ells=tres_ells,
-        delensed_bb=delensed_bb,
-        delensed_bb_ells=delensed_bb_ells,
-    )
-    fiducial = {**fiducial_base, "A_res": 1.0}
-
-    fisher_flat = FisherForecast(
-        signal, inst, fiducial,
-        priors={}, fixed_params=[],
-        external_noise_bb=external_noise_bb,
-    )
-    fisher_flat.compute()
-
-    fisher_gauss = FisherForecast(
-        signal, inst, fiducial,
-        priors={"A_res": a_res_prior}, fixed_params=[],
-        external_noise_bb=external_noise_bb,
-    )
-    fisher_gauss.compute()
-
-    # (r, A_res) marginalized condition-number diagnostic.
-    # Taking F[[r,A_res]][:, [r,A_res]] (the 2x2 sub-block of F) would
-    # give the *conditional* Fisher on (r, A_res) with A_lens held fixed
-    # at fiducial, and would under-flag the degeneracy that matters
-    # physically -- which is the (r, A_res) constraint *after*
-    # marginalizing over A_lens. The covariance C = F^-1 naturally
-    # marginalizes out non-selected parameters, and cond(C_sub) equals
-    # cond(F_marg_sub) (cond is invariant under inversion).
-    F = np.asarray(fisher_flat.fisher_matrix)
-    names = fisher_flat.free_parameter_names
-    r_idx = names.index("r")
-    a_idx = names.index("A_res")
-    C = np.linalg.inv(F)
-    ix = np.array([r_idx, a_idx])
-    C_sub = C[np.ix_(ix, ix)]
-    cond = np.linalg.cond(C_sub)
-
     return {
-        "sigma_r_baseline": fisher_baseline.sigma("r"),
-        "sigma_r_flat": fisher_flat.sigma("r"),
-        "sigma_r_gauss": fisher_gauss.sigma("r"),
-        "sigma_A_res_flat": fisher_flat.sigma("A_res"),
-        "sigma_A_res_gauss": fisher_gauss.sigma("A_res"),
-        "cond_r_Ares": cond,
-        "a_res_prior": a_res_prior,
+        "sigma_r_baseline": res.sigma_r_baseline,
+        "sigma_r_flat": res.sigma_r_flat,
+        "sigma_r_gauss": res.sigma_r_gauss,
+        "sigma_A_res_flat": res.sigma_A_res_flat,
+        "sigma_A_res_gauss": res.sigma_A_res_gauss,
+        "cond_r_Ares": res.cond_r_Ares,
+        "a_res_prior": res.a_res_prior,
     }
 
 

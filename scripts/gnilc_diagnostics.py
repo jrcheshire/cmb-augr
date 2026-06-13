@@ -21,16 +21,14 @@ from __future__ import annotations
 import argparse
 import dataclasses
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
-from augr.compsep_sims import assemble_band_maps, generate_band_sky
+from augr.cleaning import nilc_cleaner
 from augr.gnilc import alm2cl, gnilc_residual_template
 from augr.instrument import beam_bl
-from augr.nilc import nilc_clean
-from augr.nilc_forecast import nilc_forecast, nilc_spectra
-from augr.spectra import CMBSpectra
+from augr.nilc_forecast import nilc_forecast
+from augr.pipeline import ForecastConfig, clean_sky
 
 # Illustrative wide-band space-mission-like configuration (not a study design).
 FREQS = (30.0, 44.0, 95.0, 150.0, 280.0, 353.0)
@@ -49,29 +47,32 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
-    sky = generate_band_sky(
-        FREQS,
-        BEAMS,
-        spectra=CMBSpectra(),
-        r_in=args.r_in,
+    # NILC clean + spectra (post-NILC noise + the *oracle* FG residual template).
+    cfg = ForecastConfig(
+        freqs_ghz=FREQS,
+        beam_fwhm_arcmin=BEAMS,
+        w_inv=W_INV,
+        cleaner=nilc_cleaner(),
         nside=args.nside,
         lmax=args.lmax,
         fg_model=args.fg_model,
-        cmb_seed=args.seed,
+        r_in=args.r_in,
+        seed=args.seed,
+        f_sky=1.0,
+        r_fid=args.r_in,
+        ell_min=2,
+        ell_max=args.ell_max,
+        delta_ell=10,
+        ell_per_bin_below=30,
     )
-    hit = jnp.ones(12 * args.nside**2)
-    total = assemble_band_maps(sky, W_INV, hit, noise_key=jax.random.PRNGKey(args.seed))
-    noise = total - sky.cmb_qu - sky.fg_qu
-
-    # NILC clean + spectra (post-NILC noise + the *oracle* FG residual template).
-    res = nilc_clean(total, BEAMS, lmax=args.lmax, nside=args.nside)
-    spec = nilc_spectra(res, total_qu=total, noise_qu=noise, fg_qu=sky.fg_qu, cmb_qu=sky.cmb_qu)
+    cleaned = clean_sky(cfg)
+    res, spec = cleaned.cleaner_result, cleaned.spectra
 
     # In-house GNILC residual template (data-driven), on the same ℓ grid + beam.
     ells_g, cl_g, gres = gnilc_residual_template(
-        total,
-        sky.cmb_qu,
-        noise,
+        cleaned.total_qu,
+        cleaned.cmb_qu,
+        cleaned.noise_qu,
         BEAMS,
         lmax=args.lmax,
         nside=args.nside,
@@ -94,7 +95,7 @@ def main() -> None:
     # Template shape agreement vs the oracle (amplitude is absorbed by A_res).
     ell = np.asarray(ells_g)
     bl2 = np.maximum(np.asarray(beam_bl(ell.astype(float), res.common_fwhm_arcmin)) ** 2, 1e-8)
-    oracle = np.asarray(alm2cl(gres.nilc_clean_alm(sky.fg_qu), args.lmax)) / bl2
+    oracle = np.asarray(alm2cl(gres.nilc_clean_alm(cleaned.fg_qu), args.lmax)) / bl2
     gnilc = np.asarray(cl_g)
 
     print("=" * 66)
