@@ -44,6 +44,7 @@ camb = ["camb"]
 broom = ["cmbroom", "pyyaml"]
 compsep = ["ducc0", "pysm3"]
 sampling = ["blackjax", "optax"]
+masking = ["jaxht>=0.1.2"]
 notebooks = ["jupyterlab", "ipykernel", "matplotlib"]
 
 [tool.setuptools.packages.find]
@@ -84,6 +85,11 @@ ipykernel = "*"
 ipython = "*"
 ruff = "*"
 pytest-timeout = ">=2.1"
+# NaMaster (conda-forge) — non-differentiable; used only as a gated cross-check
+# in the masked-Wiener validation suite (tests importorskip it). Conda-only:
+# the PyPI `pymaster` builds from source against gsl/fftw/cfitsio, so it is
+# deliberately NOT exposed as a pip extra.
+namaster = "*"
 
 [tool.pixi.pypi-dependencies]
 jax = ">=0.4"
@@ -91,6 +97,7 @@ jaxlib = ">=0.4"
 equinox = ">=0.11"
 blackjax = "*"
 optax = "*"
+jaxht = ">=0.1.2"
 pywigxjpf = "*"
 cmbroom = "*"
 pyyaml = "*"
