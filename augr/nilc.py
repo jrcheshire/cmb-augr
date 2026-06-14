@@ -47,7 +47,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .instrument import beam_bl
+from .instrument import ARCMIN_TO_RAD, beam_bl
 from .sht import almxfl, check_band_limit, map2alm, synthesis, synthesis_pol
 
 # ---------------------------------------------------------------------------
@@ -55,8 +55,8 @@ from .sht import almxfl, check_band_limit, map2alm, synthesis, synthesis_pol
 # ---------------------------------------------------------------------------
 
 
-def cosine_needlet_bands(lmax: int, peaks) -> jax.Array:
-    """Cosine-needlet bandpass windows ``h_j(ℓ)``, shape ``(J, lmax+1)``.
+def cosine_needlet_bands(lmax: int, peaks) -> np.ndarray:
+    """Cosine-needlet bandpass windows ``h_j(ℓ)``, shape ``(J, lmax+1)`` (numpy).
 
     ``peaks`` is an increasing sequence of ``J`` peak multipoles. Band 0 is flat
     (=1) below ``peaks[0]`` then cosine-tapers to ``peaks[1]``; the last band rises
@@ -84,7 +84,12 @@ def cosine_needlet_bands(lmax: int, peaks) -> jax.Array:
         else:  # cosine falling edge [pj, right]
             mask = (ell >= pj) & (ell <= right)
             h[j, mask] = np.cos(np.pi / 2 * (ell[mask] - pj) / (right - pj))
-    return jnp.asarray(h)
+    # NumPy (not jnp): the windows are static (lmax/peaks only, never the maps,
+    # never differentiated). Keeping them concrete lets the cleaner body run under
+    # jax.jit / lax.map -- `_needlet_channel_mask` does `np.asarray(needlet_bands)`,
+    # which fails on a tracer. almxfl/synthesis promote the numpy constant to the
+    # device, so the differentiable map path is unchanged. (lax.map + jit gate.)
+    return np.asarray(h)
 
 
 def default_needlet_peaks(lmax: int, n_bands: int = 6) -> list[int]:
@@ -252,8 +257,20 @@ def _gaussian_smooth_map(
     return synthesis(almxfl(alm, gauss, lmax), 0, lmax, nside)[0]
 
 
+def _beam_bl_np(ells: np.ndarray, fwhm_arcmin: float) -> np.ndarray:
+    """NumPy Gaussian beam ``B_ℓ`` -- static-config twin of :func:`instrument.beam_bl`.
+
+    Used only inside :func:`_needlet_channel_mask`, which must stay pure-numpy so
+    the cleaner body runs under ``jax.jit`` / ``lax.map`` (the jnp-based
+    ``beam_bl`` returns a tracer there). Same formula / ``ARCMIN_TO_RAD`` constant,
+    so the values match ``beam_bl`` to fp64.
+    """
+    sigma = fwhm_arcmin * ARCMIN_TO_RAD / np.sqrt(8.0 * np.log(2.0))
+    return np.exp(-ells * (ells + 1.0) * sigma**2 / 2.0)
+
+
 def _needlet_channel_mask(
-    needlet_bands: jax.Array,
+    needlet_bands: np.ndarray,
     beam_fwhm_arcmin,
     common_fwhm_arcmin: float,
     lmax: int,
@@ -275,8 +292,8 @@ def _needlet_channel_mask(
     affect differentiability with respect to the maps / allocation.
     """
     nb = np.asarray(needlet_bands)
-    ells = jnp.arange(lmax + 1, dtype=float)
-    bl_common = np.asarray(beam_bl(ells, common_fwhm_arcmin))
+    ells = np.arange(lmax + 1, dtype=float)
+    bl_common = _beam_bl_np(ells, common_fwhm_arcmin)
     beams = [float(b) for b in beam_fwhm_arcmin]
     n_j = nb.shape[0]
     mask = np.zeros((n_j, len(beams)), dtype=bool)
@@ -285,7 +302,7 @@ def _needlet_channel_mask(
         ell_hi = int(support[-1]) if support.size else 0
         bc = max(float(bl_common[ell_hi]), 1e-30)
         for b, fwhm in enumerate(beams):
-            bl_band = float(np.asarray(beam_bl(jnp.asarray([float(ell_hi)]), fwhm))[0])
+            bl_band = float(_beam_bl_np(np.array([float(ell_hi)]), fwhm)[0])
             mask[j, b] = (bl_band / bc) >= threshold
     return mask
 

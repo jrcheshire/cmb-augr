@@ -47,13 +47,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from . import masking as mk
 from .cleaning import Cleaner
-from .compsep_sims import assemble_band_maps, beam_harmonic_sky, harmonic_sky
+from .compsep_sims import BandSky, assemble_band_maps, beam_harmonic_sky, harmonic_sky
 from .covariance import mc_bandpower_covariance
 from .instrument import beam_bl
 from .parallel import parallel_map
@@ -401,44 +402,51 @@ def mc_cutsky_bandpowers(
 # absorbed by the transfer ``F_b``, not a bias), the standard CRN treatment.
 
 
-@dataclass(frozen=True)
-class CutskyMCContext:
+class CutskyMCContext(eqx.Module):
     """Eager, design-independent precompute for :func:`mc_cutsky_cov_traced`.
 
     Holds the non-traceable, ``w_inv``-independent pieces of the cut-sky MC so the
     traced forward only carries the noise -> clean -> spectrum path. Built by
     :func:`make_cutsky_mc_context`; passed (un-differentiated) to
     :func:`mc_cutsky_cov_traced`.
+
+    An ``eqx.Module`` (pytree): the array fields + the batched ``band_skies`` /
+    ``noise_keys`` are traced leaves, the binning / resolution / loop config are
+    ``static`` (in the treedef). So the whole context can be passed as a traced
+    argument to a jitted ``mc_cutsky_cov_traced`` -- different CRN ensembles share
+    one compiled executable -- and the ``band_skies`` leaves carry the leading
+    sim axis that :func:`mc_cutsky_cov_traced`'s ``lax.map`` iterates.
     """
 
-    band_skies: tuple  # one beamed BandSky per sim (PySM/synalm baked in, beams concrete)
-    noise_keys: tuple  # one PRNGKey per sim (CRN; fixed across the gradient)
-    beam_fwhm_arcmin: tuple  # concrete per-band beams (for the cleaner's common resolution)
+    band_skies: BandSky  # batched BandSky (array leaves carry a leading sim axis)
+    noise_keys: jax.Array  # (n_sims, 2) stacked PRNGKeys (CRN; fixed across the gradient)
+    beam_fwhm_arcmin: tuple = eqx.field(static=True)  # concrete per-band beams
     inv_noise: jax.Array
     cl_ee_prior: jax.Array
     cl_bb_prior: jax.Array
     bin_matrix: jax.Array
-    ell_min: int
+    ell_min: int = eqx.field(static=True)
     true_bb_binned: jax.Array
     hit_map: jax.Array
     knee_ell: jax.Array | None
-    alpha_knee: float
-    nside: int
-    lmax: int
-    max_iter: int
-    tol: float
-    n_sims: int
-    var_pix_ref: float
-    f_sky: float
+    alpha_knee: float = eqx.field(static=True)
+    nside: int = eqx.field(static=True)
+    lmax: int = eqx.field(static=True)
+    max_iter: int = eqx.field(static=True)
+    tol: float = eqx.field(static=True)
+    n_sims: int = eqx.field(static=True)
+    var_pix_ref: float = eqx.field(static=True)
+    f_sky: float = eqx.field(static=True)
 
 
-@dataclass(frozen=True)
-class CutskyMCTraced:
+class CutskyMCTraced(eqx.Module):
     """Output of :func:`mc_cutsky_cov_traced` — the differentiable analogue of
     :class:`CutskyMC`, with all fields as traced ``jnp`` arrays (no ``np.asarray``).
 
-    Feed :attr:`covariance` to ``optimize.sigma_r_from_external_cov`` (or
-    ``FisherForecast(external_covariance=...)`` for the forward value).
+    An ``eqx.Module`` (pytree) so ``mc_cutsky_cov_traced`` can be ``jax.jit``-ed
+    (its output must be a pytree). Feed :attr:`covariance` to
+    ``optimize.sigma_r_from_external_cov`` (or ``FisherForecast(external_covariance=...)``
+    for the forward value).
     """
 
     covariance: jax.Array
@@ -446,8 +454,8 @@ class CutskyMCTraced:
     transfer: jax.Array
     leakage: jax.Array
     mean_bandpower: jax.Array
-    f_sky: float
-    n_sims: int
+    f_sky: float = eqx.field(static=True)
+    n_sims: int = eqx.field(static=True)
 
 
 def make_cutsky_mc_context(
@@ -513,8 +521,13 @@ def make_cutsky_mc_context(
         return beam_harmonic_sky(hsky, beam_fwhm_arcmin)
 
     seeds = list(range(int(base_seed), int(base_seed) + int(n_sims)))
-    band_skies = tuple(_beamed_sky(s) for s in seeds)
-    noise_keys = tuple(jax.random.PRNGKey(int(s)) for s in seeds)
+    # Stack the per-sim ensemble into ONE batched BandSky (the cmb_qu/fg_qu leaves
+    # get a leading sim axis; the static fields are shared) + stacked keys, so the
+    # traced forward can lax.map over the sim axis instead of Python-unrolling the
+    # cleaner n_sims times (O(1) compile, scan-accumulated memory -> higher n_sims).
+    _band_sky_tuple = tuple(_beamed_sky(s) for s in seeds)
+    band_skies = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *_band_sky_tuple)
+    noise_keys = jnp.stack([jax.random.PRNGKey(int(s)) for s in seeds], axis=0)
 
     # var_pix_ref: frozen filter knob from one setup clean at the fiducial w_inv
     # (matches mc_cutsky_bandpowers; uses the base_seed + n_sims setup sim).
@@ -535,6 +548,29 @@ def make_cutsky_mc_context(
         var_pix_ref = float(jnp.mean((cn[0] ** 2 + cn[1] ** 2)[obs]) / 2.0)
 
     inv_noise = mk.inv_noise_map(hit_map, var_pix_ref, mask=mask)
+
+    # Pre-warm jht's wiener-path lru_caches CONCRETELY, eagerly, before the traced
+    # forward runs. jht <= 0.1.3 caches device-array geometry / index tables
+    # (healpix._prepare, masked._dof_layout / _prior_ell_index); if those are first
+    # populated INSIDE mc_cutsky_cov_traced's lax.map (a scan trace) they hold
+    # tracers that then leak (UnexpectedTracerError). One eager wiener call at this
+    # (nside, lmax, spin=2) fills them with concrete arrays the scan reuses. The
+    # var_pix setup above only runs the cleaner (no wiener), so it does not warm
+    # them. TODO(jht): drop once jht hardens these caches to numpy (the existing
+    # _recursion._wigner_seed_np convention); branch jc/wiener-cache-numpy has the
+    # masked.py half done, healpix._prepare pending.
+    cutsky_bb_bandpower(
+        jnp.zeros((2, npix)),
+        inv_noise,
+        cl_ee_prior,
+        cl_bb_prior,
+        bin_matrix=jnp.asarray(bin_matrix),
+        ell_min=int(ell_min),
+        nside=int(nside),
+        lmax=int(lmax),
+        max_iter=int(max_iter),
+        tol=float(tol),
+    )
 
     return CutskyMCContext(
         band_skies=band_skies,
@@ -576,12 +612,14 @@ def mc_cutsky_cov_traced(
     ``jax.grad``-able map-based σ(r). Select the on-device jht SHT backend
     (``with sht.sht_backend("jht"): ...``) to run the whole thing on a GPU.
 
-    The per-sim loop is a Python unroll over ``ctx.n_sims`` (the cleaner's
-    ``while_loop`` map2alm iteration does not ``vmap`` cleanly); keep ``n_sims`` and
-    ``nside`` modest for a design-grade gradient (the unroll holds all sims' maps
-    live). The straight-through gradient flows through a *sample* covariance, so it
-    carries Monte-Carlo noise — characterise grad std vs ``n_sims`` before trusting a
-    descent step (see the plan's Phase 2 verification).
+    The per-sim loop is a ``jax.lax.map`` (sequential scan, no ``batch_size``) over
+    the batched ``ctx.band_skies`` -- the cleaner body is traced once, so compile is
+    O(1) in ``n_sims`` and the scan accumulates outputs instead of holding an
+    ``n_sims``-deep unroll live. Scan (not ``vmap``) so the cleaner's inner
+    ``while_loop`` map2alm iteration runs per sim. The straight-through gradient
+    flows through a *sample* covariance, so it carries Monte-Carlo noise --
+    characterise grad std vs ``n_sims`` before trusting a descent step (see the
+    plan's Phase 2 verification).
     """
     w_inv = jnp.asarray(w_inv)
     bp_kw = dict(
@@ -622,10 +660,14 @@ def mc_cutsky_cov_traced(
         )
         return rec_full, rec_b, rec_e
 
-    recs = [_one(bs, k) for bs, k in zip(ctx.band_skies, ctx.noise_keys, strict=True)]
-    rec_full = jnp.stack([r[0] for r in recs], axis=0)
-    rec_b = jnp.stack([r[1] for r in recs], axis=0)
-    rec_e = jnp.stack([r[2] for r in recs], axis=0)
+    # Sequential scan over the sim axis (lax.map, no batch_size): the cleaner body
+    # is traced ONCE and reused per sim -- O(1) compile in n_sims, scan-accumulated
+    # outputs (no live n_sims-deep unroll). Scan, not vmap, so the cleaner's inner
+    # map2alm while_loop runs per sim. ctx.band_skies is a batched BandSky (leading
+    # sim axis on its leaves); lax.map slices it back to a per-sim BandSky.
+    rec_full, rec_b, rec_e = jax.lax.map(
+        lambda bk: _one(bk[0], bk[1]), (ctx.band_skies, ctx.noise_keys)
+    )
 
     transfer = mk.transfer_function(rec_b, ctx.true_bb_binned)
     leakage = mk.leakage_template(rec_e)
