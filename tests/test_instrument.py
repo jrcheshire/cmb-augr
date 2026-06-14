@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from augr.bandpass import Bandpass
 from augr.instrument import (
     ARCMIN_TO_RAD,
     L2_EFFICIENCY,
@@ -12,11 +13,45 @@ from augr.instrument import (
     Instrument,
     ScalarEfficiency,
     beam_bl,
+    channel_bandpass,
     deconvolve_noise_bb,
     noise_nl,
     noise_nl_matrix,
     white_noise_power,
 )
+
+
+def _channel(**kw):
+    base = dict(nu_ghz=150.0, n_detectors=100, net_per_detector=300.0,
+                beam_fwhm_arcmin=20.0)
+    base.update(kw)
+    return Channel(**base)
+
+
+def test_channel_defaults_monochromatic():
+    """New fields default to the monochromatic (band-center) limit."""
+    ch = _channel()
+    assert ch.fractional_bandwidth == 0.0
+    assert ch.bandpass is None
+    assert channel_bandpass(ch) is None
+
+
+def test_channel_bandpass_tophat_from_fractional_bandwidth():
+    """A positive fractional bandwidth yields a top-hat centered on the band."""
+    ch = _channel(fractional_bandwidth=0.25)
+    bp = channel_bandpass(ch)
+    assert bp is not None
+    assert not bp.is_monochromatic
+    assert abs(float(bp.nu_center_ghz) - 150.0) < 1e-9
+
+
+def test_channel_bandpass_explicit_profile_wins():
+    """An explicit Bandpass overrides the fractional-bandwidth top-hat."""
+    prof = Bandpass.from_profile(
+        jnp.array([140.0, 150.0, 160.0]), jnp.array([1.0, 2.0, 1.0])
+    )
+    ch = _channel(fractional_bandwidth=0.25, bandpass=prof)
+    assert channel_bandpass(ch) is prof
 
 # -----------------------------------------------------------------------
 # ScalarEfficiency

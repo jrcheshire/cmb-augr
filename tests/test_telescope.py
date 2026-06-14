@@ -370,6 +370,20 @@ class TestToInstrument:
         freqs = [ch.nu_ghz for ch in inst.channels]
         assert freqs == sorted(freqs)
 
+    def test_fractional_bandwidth_persisted(self):
+        """to_instrument carries the BandSpec fractional bandwidth onto Channel."""
+        design = TelescopeDesign(
+            focal_plane=FocalPlaneSpec(aperture_m=1.5, f_number=2.0,
+                                       fp_diameter_m=0.4),
+            thermal=ThermalSpec(),
+            pixel_groups=(
+                PixelGroup(bands=(BandSpec(150.0, fractional_bandwidth=0.3),),
+                           area_fraction=1.0),
+            ),
+        )
+        ch = to_instrument(design).channels[0]
+        assert abs(ch.fractional_bandwidth - 0.3) < 1e-12
+
     def test_all_channels_positive(self):
         """All channels have positive NET, n_detectors, and beam."""
         inst = to_instrument(probe_design())

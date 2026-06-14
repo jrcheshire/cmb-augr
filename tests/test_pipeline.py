@@ -19,6 +19,7 @@ from augr.cleaning import cmilc_cleaner, nilc_cleaner
 from augr.cmilc import CMILC06_MOMENTS
 from augr.compsep_sims import assemble_band_maps, generate_band_sky
 from augr.forecast import ForecastResult
+from augr.instrument import Channel, Instrument, white_noise_power
 from augr.nilc import nilc_clean
 from augr.nilc_forecast import nilc_forecast, nilc_spectra
 from augr.pipeline import ForecastConfig, ResidualTemplateSource, SpectrumSource, run_forecast
@@ -48,6 +49,66 @@ def _nilc_config(**over) -> ForecastConfig:
     )
     base.update(over)
     return ForecastConfig(**base)
+
+
+def _mono_instrument(f_sky: float = 1.0, *, fractional_bandwidth: float = 0.0) -> Instrument:
+    chans = tuple(
+        Channel(
+            nu_ghz=f,
+            n_detectors=100,
+            net_per_detector=300.0,
+            beam_fwhm_arcmin=b,
+            fractional_bandwidth=fractional_bandwidth,
+        )
+        for f, b in zip(FREQS, BEAMS, strict=True)
+    )
+    return Instrument(channels=chans, mission_duration_years=3.0, f_sky=f_sky)
+
+
+def test_from_instrument_populates_fields() -> None:
+    inst = _mono_instrument(f_sky=0.6)
+    cfg = ForecastConfig.from_instrument(
+        inst, nilc_cleaner(needlet_peaks=PEAKS), nside=NSIDE, lmax=LMAX
+    )
+    assert cfg.freqs_ghz == FREQS
+    assert cfg.beam_fwhm_arcmin == BEAMS
+    assert cfg.f_sky == 0.6
+    assert cfg.bandpasses is None  # monochromatic instrument
+    expected_w = tuple(float(white_noise_power(c, 3.0, 0.6)) for c in inst.channels)
+    np.testing.assert_allclose(cfg.w_inv, expected_w, rtol=1e-12)
+
+
+def test_from_instrument_finite_bandwidth_builds_bandpasses() -> None:
+    inst = _mono_instrument(f_sky=1.0, fractional_bandwidth=0.25)
+    cfg = ForecastConfig.from_instrument(
+        inst, nilc_cleaner(needlet_peaks=PEAKS), nside=NSIDE, lmax=LMAX
+    )
+    assert cfg.bandpasses is not None
+    assert len(cfg.bandpasses) == len(FREQS)
+    assert all(bp is not None and not bp.is_monochromatic for bp in cfg.bandpasses)
+
+
+def test_from_instrument_monochromatic_byte_identical_to_loose() -> None:
+    """A monochromatic instrument reproduces the equivalent loose-tuple forecast."""
+    inst = _mono_instrument(f_sky=1.0)
+    w_inv_derived = tuple(
+        float(white_noise_power(c, inst.mission_duration_years, 1.0)) for c in inst.channels
+    )
+    cfg_inst = ForecastConfig.from_instrument(
+        inst,
+        nilc_cleaner(needlet_peaks=PEAKS),
+        nside=NSIDE,
+        lmax=LMAX,
+        fg_model=None,
+        r_in=0.01,
+        seed=0,
+        **FC_KW,
+    )
+    cfg_loose = _nilc_config(w_inv=w_inv_derived)
+    assert cfg_inst.bandpasses is None
+    out_inst = run_forecast(cfg_inst)
+    out_loose = run_forecast(cfg_loose)
+    assert out_inst.sigma_r_baseline == out_loose.sigma_r_baseline
 
 
 def test_run_forecast_returns_forecast_result() -> None:

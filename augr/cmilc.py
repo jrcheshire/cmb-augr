@@ -60,6 +60,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import units
+from .bandpass import Bandpass
 from .config import FIDUCIAL_BK15
 from .nilc import (
     NILCResult,
@@ -89,7 +90,11 @@ CMILC06_MOMENTS: tuple[str, ...] = ("f_dust", "f_sync", "dbeta_dust")
 # ---------------------------------------------------------------------------
 
 
-def _moment_columns(nu: jax.Array, fiducial: Mapping[str, float]) -> dict[str, jax.Array]:
+def _moment_columns(
+    nu: jax.Array,
+    fiducial: Mapping[str, float],
+    bandpasses: Sequence[Bandpass | None] | None = None,
+) -> dict[str, jax.Array]:
     """Moment SED columns at frequencies ``nu`` (GHz), in CMB thermodynamic units.
 
     Each column is the baseline SED times the corresponding :mod:`augr.units`
@@ -97,18 +102,43 @@ def _moment_columns(nu: jax.Array, fiducial: Mapping[str, float]) -> dict[str, j
     per-column normalization is immaterial to the deprojection (which fixes only each
     column's *span*), so the convenient ``units`` normalization (SEDs = 1 at ν_ref) is used
     directly — and keeps a single in-repo source of truth for the SED forms.
+
+    If ``bandpasses`` is given (one ``Bandpass`` per band, ``None`` entries = the
+    monochromatic band-center limit), each *whole* moment SED is band-averaged over its
+    bandpass via :func:`augr.units.color_correct`, so cMILC deprojects the effective
+    (color-corrected) SED that the bandpass-integrated sky actually presents. The whole
+    moment SED ``f_X·∂ln f_X`` is averaged, not the factors separately. ``bandpasses=None``
+    (default) keeps the original vectorized monochromatic columns byte-for-byte.
     """
     bd = float(fiducial["beta_dust"])
     td = float(fiducial["T_dust"])
     bs = float(fiducial["beta_sync"])
-    f_dust = units.dust_sed(nu, bd, td)
-    f_sync = units.sync_sed(nu, bs)
+    if bandpasses is None:
+        f_dust = units.dust_sed(nu, bd, td)
+        f_sync = units.sync_sed(nu, bs)
+        return {
+            "f_dust": f_dust,  # zeroth-order dust (modified blackbody)
+            "f_sync": f_sync,  # zeroth-order sync (power law)
+            "dbeta_dust": f_dust * units.dust_sed_deriv_beta(nu),  # ∂_β f_dust = f_dust·ln(ν/ν_d)
+            "dbeta_sync": f_sync * units.sync_sed_deriv_beta(nu),  # ∂_β f_sync = f_sync·ln(ν/ν_s)
+            "dT_dust": f_dust * units.dust_sed_deriv_T(nu, td),  # ∂_T f_dust
+        }
+
+    # Bandpass-integrated: band-average each whole moment SED over its bandpass.
+    sed_fns = {
+        "f_dust": lambda v: units.dust_sed(v, bd, td),
+        "f_sync": lambda v: units.sync_sed(v, bs),
+        "dbeta_dust": lambda v: units.dust_sed(v, bd, td) * units.dust_sed_deriv_beta(v),
+        "dbeta_sync": lambda v: units.sync_sed(v, bs) * units.sync_sed_deriv_beta(v),
+        "dT_dust": lambda v: units.dust_sed(v, bd, td) * units.dust_sed_deriv_T(v, td),
+    }
+    band_bps = [
+        bp if bp is not None else Bandpass.monochromatic(nu[i])
+        for i, bp in enumerate(bandpasses)
+    ]
     return {
-        "f_dust": f_dust,  # zeroth-order dust (modified blackbody)
-        "f_sync": f_sync,  # zeroth-order sync (power law)
-        "dbeta_dust": f_dust * units.dust_sed_deriv_beta(nu),  # ∂_β f_dust = f_dust·ln(ν/ν_d)
-        "dbeta_sync": f_sync * units.sync_sed_deriv_beta(nu),  # ∂_β f_sync = f_sync·ln(ν/ν_s)
-        "dT_dust": f_dust * units.dust_sed_deriv_T(nu, td),  # ∂_T f_dust
+        key: jnp.stack([units.color_correct(fn, bp) for bp in band_bps])
+        for key, fn in sed_fns.items()
     }
 
 
@@ -117,6 +147,7 @@ def moment_sed_vectors(
     *,
     fiducial: Mapping[str, float] = FIDUCIAL_BK15,
     moments: Sequence[str] = CMILC08_MOMENTS,
+    bandpasses: Sequence[Bandpass | None] | None = None,
 ) -> jax.Array:
     """Constrained-ILC mixing matrix ``A``, shape ``(n_band, 1 + len(moments))``.
 
@@ -126,12 +157,22 @@ def moment_sed_vectors(
     frequency, ordered as ``moments``. Pivots default to ``FIDUCIAL_BK15`` (β̄_d=1.6,
     T̄_d=19.6, β̄_s=−3.1); reference frequencies from ``units.NU_{DUST,SYNC}_REF_GHZ``.
 
+    If ``bandpasses`` (one ``Bandpass`` per band, ``None`` = monochromatic) is supplied,
+    the moment SED columns are band-averaged (color-corrected) over each bandpass so they
+    match the bandpass-integrated sky; the CMB column stays flat (a flat SED band-averages
+    to 1). ``bandpasses=None`` is the original monochromatic behavior, byte-for-byte.
+
     The returned ``A`` is constant in the data, so the cMILC weights are differentiable in
-    the data covariance (the maps); ``A`` is itself differentiable in ``freqs`` / pivots if
-    those are passed as traced arrays.
+    the data covariance (the maps); ``A`` is itself differentiable in ``freqs`` / pivots /
+    bandpass band centers + widths if those are passed as traced arrays (use
+    ``Bandpass.smooth_tophat`` for clean band-center/bandwidth gradients).
     """
     nu = jnp.asarray(freqs, dtype=float)
-    cols = _moment_columns(nu, fiducial)
+    if bandpasses is not None and len(bandpasses) != nu.shape[0]:
+        raise ValueError(
+            f"bandpasses (len {len(bandpasses)}) must match freqs (len {nu.shape[0]})."
+        )
+    cols = _moment_columns(nu, fiducial, bandpasses)
     unknown = [m for m in moments if m not in cols]
     if unknown:
         raise ValueError(f"unknown moment key(s) {unknown}; available: {sorted(cols)}")
@@ -250,6 +291,7 @@ def cmilc_clean(
     nside,
     moments=CMILC08_MOMENTS,
     fiducial=FIDUCIAL_BK15,
+    bandpasses=None,
     needlet_peaks=None,
     localization_fwhm_arcmin=None,
     common_fwhm_arcmin=None,
@@ -279,6 +321,11 @@ def cmilc_clean(
     fiducial
         Fiducial spectral parameters (pivots) for the moment SEDs (default
         ``FIDUCIAL_BK15``).
+    bandpasses
+        Optional per-band ``Bandpass`` (one per ``freqs`` entry, ``None`` =
+        monochromatic). When given, the moment SED columns are band-averaged
+        (color-corrected) to match a bandpass-integrated sky. ``None`` (default)
+        is the monochromatic band-center behavior, byte-identical to before.
     clean_e
         ``False`` (default) → B-only, byte-identical to before. ``True`` → additionally
         run an independent constrained-ILC solve on the E modes (same mixing matrix
@@ -301,6 +348,10 @@ def cmilc_clean(
         raise ValueError(
             f"freqs (len {len(freqs)}) and beam_fwhm_arcmin (len {len(beams)}) must both be n_band."
         )
+    if bandpasses is not None and len(bandpasses) != len(freqs):
+        raise ValueError(
+            f"bandpasses (len {len(bandpasses)}) must match freqs (len {len(freqs)})."
+        )
     if needlet_peaks is None:
         needlet_peaks = default_needlet_peaks(lmax)
     needlet_bands = cosine_needlet_bands(lmax, needlet_peaks)
@@ -316,7 +367,9 @@ def cmilc_clean(
         )
     active = _needlet_channel_mask(needlet_bands, beams, common_fwhm, lmax, beam_band_limit)
 
-    A = moment_sed_vectors(freqs, fiducial=fiducial, moments=moments)  # (n_band, 1 + n_moments)
+    A = moment_sed_vectors(
+        freqs, fiducial=fiducial, moments=moments, bandpasses=bandpasses
+    )  # (n_band, 1 + n_moments)
     e = jnp.zeros(A.shape[1]).at[0].set(1.0)
 
     def _cilc_weights(beta_field):

@@ -7,7 +7,15 @@ on traced values). Frequencies in GHz, temperatures in K, spectra in μK².
 Unit convention: CMB thermodynamic temperature units throughout.
 """
 
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
 import jax.numpy as jnp
+
+if TYPE_CHECKING:
+    from augr.bandpass import Bandpass
 
 # ---------------------------------------------------------------------------
 # Physical constants (SI)
@@ -185,3 +193,47 @@ def sync_sed_deriv_c(nu_ghz: float,
     """
     ln_ratio = jnp.log(nu_ghz / nu_ref_ghz)
     return ln_ratio ** 2
+
+
+# ---------------------------------------------------------------------------
+# Bandpass color correction
+# ---------------------------------------------------------------------------
+
+def color_correct(sed_fn: Callable[..., jnp.ndarray], bandpass: Bandpass,
+                  **sed_kwargs) -> jnp.ndarray:
+    """Band-average a CMB-thermodynamic SED over an instrument bandpass.
+
+    Returns the effective per-band value of ``sed_fn`` (a μK_CMB SED such as
+    ``dust_sed`` / ``sync_sed`` or a moment SED ``f_X · ∂ln f_X``), integrated
+    over ``bandpass`` with the *same* weighting PySM applies when it builds the
+    bandpass-integrated sky:
+
+        f_band = ∫ f(ν) g(ν) dν / ∫ g(ν) dν,    g(ν) = w(ν) · ν² · rj_to_cmb(ν)
+
+    Derivation of the kernel g (traced through PySM 3.4.2
+    ``utils.normalize_weights`` + ``utils.bandpass_unit_conversion`` +
+    ``Sky.get_emission``): PySM integrates the *RJ* emission with weights
+    ``∝ w·(uK_RJ→Jy/sr) ∝ w·ν²`` and then converts the result to μK_CMB by the
+    factor ``∫w·(uK_RJ→Jy/sr) / ∫w·(uK_CMB→Jy/sr)``. A μK_CMB SED ``f(ν)``
+    corresponds to RJ emission ``f(ν)·rj_to_cmb(ν)`` (μK_CMB→μK_RJ multiplies by
+    ``rj_to_cmb``); using ``(uK_CMB→Jy/sr) = rj_to_cmb·(uK_RJ→Jy/sr)`` the two
+    integrals collapse to the weighted average above with ``g = w·ν²·rj_to_cmb``.
+    The ``ν²`` proportionality of the RJ brightness factor is exact here and any
+    constant prefactor cancels in the ratio. The monochromatic limit then gives
+    ``f(ν)·rj_to_cmb·cmb_to_rj = f(ν)`` as it must. This identity is locked
+    numerically against PySM's own ``bandpass_unit_conversion`` in
+    ``tests/test_units.py`` (the ``cmb_to_rj`` form is a tempting but wrong
+    double-inversion — the cross-check exists to catch it).
+
+    Differentiable in ``bandpass.nu_center_ghz`` and (for ``smooth_tophat``)
+    ``fractional_bandwidth`` — see ``bandpass.Bandpass`` for the scope note.
+
+    The monochromatic (single-point) limit returns ``sed_fn(nu_center)`` exactly,
+    matching the legacy band-center evaluation.
+    """
+    if bandpass.is_monochromatic:
+        return sed_fn(bandpass.nu_center_ghz, **sed_kwargs)
+    nu = bandpass.nu_ghz
+    g = bandpass.weights * nu**2 * rj_to_cmb(nu)
+    f = sed_fn(nu, **sed_kwargs)
+    return jnp.trapezoid(f * g, nu) / jnp.trapezoid(g, nu)

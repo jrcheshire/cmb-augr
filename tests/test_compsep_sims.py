@@ -16,12 +16,14 @@ pytest.importorskip("ducc0")
 
 import healpy as hp
 
+from augr.bandpass import Bandpass
 from augr.compsep_sims import (
     BandSky,
     assemble_band_maps,
     beam_harmonic_sky,
     generate_band_sky,
     harmonic_sky,
+    pysm_fg_iqu,
 )
 from augr.instrument import beam_bl
 from augr.spectra import CMBSpectra
@@ -177,6 +179,35 @@ def test_generate_band_sky_with_pysm_foregrounds() -> None:
     ells = np.arange(lmax + 1)
     band = (ells >= 10) & (ells <= 50)
     assert bb30[band].sum() > bb100[band].sum()
+
+
+@pytest.mark.slow
+def test_pysm_fg_iqu_monochromatic_bandpass_matches_default() -> None:
+    """A per-band single-point Bandpass reproduces the monochromatic FG maps."""
+    pytest.importorskip("pysm3")
+    nside = 16
+    freqs = (30.0, 100.0)
+    base = pysm_fg_iqu(freqs, "d1s1", nside, fg_seed=0)
+    bps = [Bandpass.monochromatic(f) for f in freqs]
+    mono = pysm_fg_iqu(freqs, "d1s1", nside, fg_seed=0, bandpasses=bps)
+    np.testing.assert_allclose(mono, base, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.slow
+def test_pysm_fg_iqu_tophat_changes_amplitude_but_stays_correlated() -> None:
+    """A finite top-hat color-corrects the FG amplitude; the pattern stays correlated."""
+    pytest.importorskip("pysm3")
+    nside = 16
+    freqs = (30.0, 100.0)
+    base = pysm_fg_iqu(freqs, "d1s1", nside, fg_seed=0)
+    bps = [Bandpass.tophat(f, 0.3) for f in freqs]
+    bp_iqu = pysm_fg_iqu(freqs, "d1s1", nside, fg_seed=0, bandpasses=bps)
+    assert np.all(np.isfinite(bp_iqu))
+    assert not np.allclose(bp_iqu, base)
+    # Bandpass integration of a near-fixed-SED template is ~a per-pixel rescale, so
+    # the spatial pattern stays highly correlated with the monochromatic map.
+    corr = np.corrcoef(bp_iqu[0, 1].ravel(), base[0, 1].ravel())[0, 1]
+    assert corr > 0.99
 
 
 # --- foreground seed reproducibility (CRN for the aperture sweep) -----------

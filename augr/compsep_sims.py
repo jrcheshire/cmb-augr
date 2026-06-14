@@ -45,12 +45,15 @@ path; the CMB-only and noise paths need just healpy + ducc0.
 from __future__ import annotations
 
 import copy
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from . import units
+from .bandpass import Bandpass
 from .instrument import beam_bl
 from .noise_sims import correlated_noise_maps, noise_maps
 from .sht import almxfl, check_band_limit, synthesis
@@ -301,8 +304,58 @@ def _seeded_component_config(fg_model: str, fg_seed: int) -> dict:
     return config
 
 
+def _emission_iqu_mono(sky, nu_ghz: float, u) -> np.ndarray:
+    """Monochromatic PySM emission at ``nu_ghz`` → ``(3, npix)`` μK_CMB."""
+    emission = sky.get_emission(nu_ghz * u.GHz)
+    emission = emission.to(u.uK_CMB, equivalencies=u.cmb_equivalencies(nu_ghz * u.GHz))
+    return np.asarray(emission.value, dtype=np.float64)
+
+
+def _trapz_weights(x: np.ndarray) -> np.ndarray:
+    """Per-sample weights ``t`` such that ``np.trapezoid(y, x) == sum(t * y)``."""
+    x = np.asarray(x, dtype=np.float64)
+    tw = np.empty_like(x)
+    tw[0] = 0.5 * (x[1] - x[0])
+    tw[-1] = 0.5 * (x[-1] - x[-2])
+    if x.size > 2:
+        tw[1:-1] = 0.5 * (x[2:] - x[:-2])
+    return tw
+
+
+def _emission_iqu_bandpass(sky, bp: Bandpass, u) -> np.ndarray:
+    """Bandpass-integrated PySM emission over ``bp`` → ``(3, npix)`` μK_CMB.
+
+    Evaluates the *monochromatic* μK_CMB emission at each bandpass grid point (the
+    working PySM path — PySM 3.4.2's own bandpass integrator calls ``np.trapz``,
+    removed in numpy 2.0) and band-averages the maps with the *same* RJ-power
+    kernel as :func:`augr.units.color_correct`,
+
+        map_band = ∫ map(ν) g(ν) dν / ∫ g(ν) dν ,   g(ν) = w(ν)·ν²·rj_to_cmb(ν) ,
+
+    via the trapezoidal rule. Using the identical kernel guarantees the sky the
+    cleaners see is consistent with cMILC's color-corrected deprojection SEDs.
+    """
+    nu = np.asarray(bp.nu_ghz, dtype=np.float64)
+    g = (
+        np.asarray(bp.weights, dtype=np.float64)
+        * nu**2
+        * np.asarray(units.rj_to_cmb(nu), dtype=np.float64)
+    )
+    coef = _trapz_weights(nu) * g
+    acc = None
+    for nu_i, c_i in zip(nu, coef, strict=True):
+        m = _emission_iqu_mono(sky, float(nu_i), u)
+        acc = c_i * m if acc is None else acc + c_i * m
+    return acc / coef.sum()
+
+
 def pysm_fg_iqu(
-    freqs_ghz: tuple[float, ...], fg_model: str, nside: int, *, fg_seed: int = 0
+    freqs_ghz: tuple[float, ...],
+    fg_model: str,
+    nside: int,
+    *,
+    fg_seed: int = 0,
+    bandpasses: Sequence[Bandpass | None] | None = None,
 ) -> np.ndarray:
     """PySM Galactic foreground I/Q/U per band [μK_CMB], shape ``(n_band, 3, npix)``.
 
@@ -310,32 +363,50 @@ def pysm_fg_iqu(
     :func:`fg_band_qu`. ``fg_model`` is a key of :data:`_FG_PRESETS`. ``fg_seed``
     fixes any stochastic small-scale realization (e.g. ``s6``) for reproducibility
     and common random numbers; see :func:`_seeded_component_config`.
+
+    ``bandpasses`` (optional, one ``Bandpass`` per band; ``None`` entries =
+    monochromatic band-center evaluation) bandpass-integrates each band's emission
+    via :func:`_emission_iqu_bandpass`. ``bandpasses=None`` (default) is the
+    monochromatic path, byte-identical to before.
     """
     if fg_model not in _FG_PRESETS:
         raise ValueError(f"unknown fg_model {fg_model!r}; expected one of {sorted(_FG_PRESETS)}")
+    if bandpasses is not None and len(bandpasses) != len(freqs_ghz):
+        raise ValueError(
+            f"bandpasses (len {len(bandpasses)}) must match freqs_ghz (len {len(freqs_ghz)})."
+        )
     pysm3, u = _require_pysm()
     sky = pysm3.Sky(nside=int(nside), component_config=_seeded_component_config(fg_model, fg_seed))
     npix = 12 * int(nside) ** 2
     out = np.empty((len(freqs_ghz), 3, npix), dtype=np.float64)
     for i, nu in enumerate(freqs_ghz):
-        emission = sky.get_emission(nu * u.GHz)
-        emission = emission.to(u.uK_CMB, equivalencies=u.cmb_equivalencies(nu * u.GHz))
-        out[i] = np.asarray(emission.value, dtype=np.float64)
+        bp = None if bandpasses is None else bandpasses[i]
+        if bp is None or bp.is_monochromatic:
+            out[i] = _emission_iqu_mono(sky, nu, u)
+        else:
+            out[i] = _emission_iqu_bandpass(sky, bp, u)
     return out
 
 
 def _fg_eb_alm(
-    freqs_ghz: tuple[float, ...], fg_model: str, lmax: int, nside: int, *, fg_seed: int = 0
+    freqs_ghz: tuple[float, ...],
+    fg_model: str,
+    lmax: int,
+    nside: int,
+    *,
+    fg_seed: int = 0,
+    bandpasses: Sequence[Bandpass | None] | None = None,
 ) -> jax.Array:
     """PySM foregrounds analyzed per band → E/B alm ``(n_band, 2, n_alm)``.
 
     The aperture-independent half of the foreground path: PySM emission + healpy
     quadrature analysis. The beam (aperture-dependent) is applied later by
-    :func:`_beam_fg_eb`.
+    :func:`_beam_fg_eb`. ``bandpasses`` (per-band, optional) bandpass-integrates the
+    emission; see :func:`pysm_fg_iqu`.
     """
     import healpy as hp
 
-    iqu = pysm_fg_iqu(freqs_ghz, fg_model, nside, fg_seed=fg_seed)
+    iqu = pysm_fg_iqu(freqs_ghz, fg_model, nside, fg_seed=fg_seed, bandpasses=bandpasses)
     eb = []
     for i in range(len(freqs_ghz)):
         # healpy quadrature analysis (allocation-independent → need not be diff'able)
@@ -365,9 +436,10 @@ def fg_band_qu(
     nside: int,
     *,
     fg_seed: int = 0,
+    bandpasses: Sequence[Bandpass | None] | None = None,
 ) -> jax.Array:
     """PySM foregrounds, analyzed and beamed per band → ``(n_band, 2, npix)`` Q/U."""
-    fg_eb = _fg_eb_alm(freqs_ghz, fg_model, lmax, nside, fg_seed=fg_seed)
+    fg_eb = _fg_eb_alm(freqs_ghz, fg_model, lmax, nside, fg_seed=fg_seed, bandpasses=bandpasses)
     return _beam_fg_eb(fg_eb, beam_fwhm_arcmin, lmax, nside)
 
 
@@ -382,6 +454,7 @@ def harmonic_sky(
     cmb_seed: int = 0,
     fg_seed: int | None = None,
     cl_ee: jax.Array | None = None,
+    bandpasses: Sequence[Bandpass | None] | None = None,
 ) -> HarmonicSky:
     """Build the aperture-independent harmonic sky (CMB B alm + per-band FG E/B alm).
 
@@ -398,6 +471,9 @@ def harmonic_sky(
     so the beamed sky carries E for cut-sky E→B leakage. The E draw is seeded by
     ``cmb_seed + 1`` so E and B are independent realizations sharing the per-sim
     CRN index. Left ``None`` (default) gives a B-only CMB, unchanged.
+
+    ``bandpasses`` (optional, per-band ``Bandpass``) bandpass-integrates the
+    foreground emission; ``None`` (default) is the monochromatic band-center path.
     """
     check_band_limit(lmax, nside)
     if fg_seed is None:
@@ -406,7 +482,11 @@ def harmonic_sky(
     b_alm = cmb_b_alm(spectra, r_in, lmax, seed=cmb_seed)
     e_alm = None if cl_ee is None else cmb_e_alm(cl_ee, lmax, seed=cmb_seed + 1)
     fg_eb = (
-        None if fg_model is None else _fg_eb_alm(freqs_ghz, fg_model, lmax, nside, fg_seed=fg_seed)
+        None
+        if fg_model is None
+        else _fg_eb_alm(
+            freqs_ghz, fg_model, lmax, nside, fg_seed=fg_seed, bandpasses=bandpasses
+        )
     )
 
     return HarmonicSky(
@@ -461,6 +541,7 @@ def generate_band_sky(
     cmb_seed: int = 0,
     fg_seed: int | None = None,
     cl_ee: jax.Array | None = None,
+    bandpasses: Sequence[Bandpass | None] | None = None,
 ) -> BandSky:
     """Build the fixed beamed sky (CMB + optional PySM FG) for all bands.
 
@@ -493,6 +574,9 @@ def generate_band_sky(
         Optional CMB EE spectrum (ℓ=0..lmax) to also draw CMB E-modes for cut-sky
         E→B leakage forecasts; ``None`` (default) gives a B-only CMB. See
         :func:`harmonic_sky`.
+    bandpasses
+        Optional per-band ``Bandpass`` to bandpass-integrate the foreground
+        emission; ``None`` (default) is the monochromatic band-center path.
     """
     if len(freqs_ghz) != len(beam_fwhm_arcmin):
         raise ValueError("freqs_ghz and beam_fwhm_arcmin must have the same length.")
@@ -506,6 +590,7 @@ def generate_band_sky(
         cmb_seed=cmb_seed,
         fg_seed=fg_seed,
         cl_ee=cl_ee,
+        bandpasses=bandpasses,
     )
     return beam_harmonic_sky(hsky, beam_fwhm_arcmin)
 

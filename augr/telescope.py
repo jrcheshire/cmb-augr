@@ -477,6 +477,7 @@ def to_instrument(design: TelescopeDesign) -> Instrument:
                 efficiency=design.efficiency,
                 knee_ell=design.knee_ell,
                 alpha_knee=design.alpha_knee,
+                fractional_bandwidth=band.fractional_bandwidth,
             ))
 
     # Sort by frequency (convention matching config.py presets)

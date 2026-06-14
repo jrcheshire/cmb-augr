@@ -19,6 +19,7 @@ import pytest
 pytest.importorskip("ducc0")
 
 from augr import units
+from augr.bandpass import Bandpass
 from augr.cmilc import (
     CMILC06_MOMENTS,
     CMILC08_MOMENTS,
@@ -56,6 +57,57 @@ def _sim(nside: int, lmax: int, *, seed: int = 1, r_in: float = 0.0, fg_model=No
     total = assemble_band_maps(sky, W_INV, hit, noise_key=jax.random.PRNGKey(seed))
     noise = total - sky.cmb_qu - sky.fg_qu
     return sky, total, noise
+
+
+# ---------------------------------------------------------------------------
+# Bandpass color correction of the moment SED columns
+# ---------------------------------------------------------------------------
+
+def test_moment_sed_vectors_monochromatic_bandpasses_match_default():
+    """A per-band monochromatic Bandpass reproduces the band-center mixing matrix."""
+    A0 = np.asarray(moment_sed_vectors(FREQS))
+    bps = [Bandpass.monochromatic(f) for f in FREQS]
+    A1 = np.asarray(moment_sed_vectors(FREQS, bandpasses=bps))
+    np.testing.assert_allclose(A1, A0, rtol=1e-12, atol=1e-12)
+
+
+def test_moment_sed_vectors_cmb_column_stays_flat_under_bandpass():
+    """The CMB constraint column stays exactly 1 (flat SED band-averages to 1)."""
+    bps = [Bandpass.tophat(f, 0.25) for f in FREQS]
+    A = np.asarray(moment_sed_vectors(FREQS, bandpasses=bps))
+    np.testing.assert_allclose(A[:, 0], 1.0, rtol=1e-12)
+
+
+def test_moment_sed_vectors_tophat_shifts_fg_columns():
+    """A finite top-hat color-corrects (moves) the foreground moment columns."""
+    A0 = np.asarray(moment_sed_vectors(FREQS))
+    bps = [Bandpass.tophat(f, 0.30) for f in FREQS]
+    A1 = np.asarray(moment_sed_vectors(FREQS, bandpasses=bps))
+    assert not np.allclose(A1[:, 1:], A0[:, 1:])
+
+
+def test_moment_sed_vectors_bandpass_length_mismatch_raises():
+    with pytest.raises(ValueError, match="bandpasses"):
+        moment_sed_vectors(FREQS, bandpasses=[Bandpass.tophat(FREQS[0], 0.25)])
+
+
+def test_moment_sed_vectors_grad_through_bandpass_centers():
+    """jax.grad flows through the color-corrected mixing matrix w.r.t. band centers.
+
+    The differentiable color-correction *primitive* (decision 3): grad of the cMILC
+    SED columns w.r.t. band center/width. End-to-end map-based compsep optimization is
+    a separate, forward-only frontier (see bandpass.py scope note).
+    """
+
+    def total_A(centers):
+        bps = [Bandpass.smooth_tophat(c, 0.25) for c in centers]
+        return jnp.sum(moment_sed_vectors(centers, bandpasses=bps))
+
+    centers = jnp.asarray(FREQS, dtype=float)
+    g = jax.grad(total_A)(centers)
+    assert g.shape == centers.shape
+    assert jnp.all(jnp.isfinite(g))
+    assert jnp.any(g != 0.0)
 
 
 def _band_mean(cl: np.ndarray, lo: int, hi: int) -> float:
@@ -208,6 +260,45 @@ def test_cmilc_reduces_fg_residual_vs_nilc() -> None:
     cmilc_band = _band_mean(fg_cmilc, 30, 100)
     assert cmilc_band > 0
     assert cmilc_band < 0.5 * nilc_band, (cmilc_band, nilc_band, cmilc_band / nilc_band)
+
+
+@pytest.mark.slow
+def test_cmilc_bandpass_matched_beats_mismatched() -> None:
+    """On a bandpass-integrated dust sky, color-corrected cMILC SEDs leave a smaller FG
+    residual than band-center (mismatched) SEDs — the sky↔SED consistency backstop for the
+    Stage-2 PySM kernel cross-check. cMILC nulls the SED it is given; if the columns are the
+    color-corrected ones the bandpass sky actually presents, the deprojection is exact and
+    the residual is below the band-center mismatch."""
+    pytest.importorskip("pysm3")
+    nside, lmax = 64, 128
+    bps = [Bandpass.tophat(f, 0.4) for f in FREQS]
+    sky = generate_band_sky(
+        FREQS,
+        BEAMS,
+        spectra=CMBSpectra(),
+        r_in=0.0,
+        nside=nside,
+        lmax=lmax,
+        fg_model="d10",
+        cmb_seed=1,
+        bandpasses=bps,
+    )
+    hit = jnp.ones(12 * nside * nside)
+    total = assemble_band_maps(sky, W_INV, hit, noise_key=jax.random.PRNGKey(1))
+
+    res_matched = cmilc_clean(
+        total, BEAMS, FREQS, lmax=lmax, nside=nside, moments=CMILC08_MOMENTS, bandpasses=bps
+    )
+    res_mismatch = cmilc_clean(
+        total, BEAMS, FREQS, lmax=lmax, nside=nside, moments=CMILC08_MOMENTS, bandpasses=None
+    )
+    fg_matched = np.asarray(alm2cl(res_matched.project(sky.fg_qu), lmax))
+    fg_mismatch = np.asarray(alm2cl(res_mismatch.project(sky.fg_qu), lmax))
+    assert np.all(np.isfinite(fg_matched))
+    matched_band = _band_mean(fg_matched, 30, 100)
+    mismatch_band = _band_mean(fg_mismatch, 30, 100)
+    assert matched_band > 0
+    assert matched_band < mismatch_band, (matched_band, mismatch_band)
 
 
 # --- differentiability (gates the per-band eigh/solve degeneracy risk) ------
