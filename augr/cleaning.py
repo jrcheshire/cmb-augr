@@ -147,6 +147,7 @@ def cmilc_cleaner(
     *,
     moments: tuple[str, ...] = CMILC08_MOMENTS,
     fiducial=FIDUCIAL_BK15,
+    bandpasses=None,
     needlet_peaks=None,
     localization_fwhm_arcmin: float | None = None,
     common_fwhm_arcmin: float | None = None,
@@ -163,6 +164,8 @@ def cmilc_cleaner(
     bit-identical to :func:`augr.cmilc.cmilc_clean` with the same arguments
     (``return_diagnostics`` is left ``False`` so it yields a bare
     :class:`augr.nilc.NILCResult`). Pass ``clean_e=True`` for the spin-2 Q/U cleaner.
+    Pass ``bandpasses`` (per-band ``Bandpass``) to color-correct the moment SEDs for a
+    bandpass-integrated sky; ``None`` (default) is the monochromatic band-center behavior.
     """
 
     def _cleaner(band_qu, beam_fwhm_arcmin, *, lmax, nside):
@@ -174,6 +177,7 @@ def cmilc_cleaner(
             nside=nside,
             moments=moments,
             fiducial=fiducial,
+            bandpasses=bandpasses,
             needlet_peaks=needlet_peaks,
             localization_fwhm_arcmin=localization_fwhm_arcmin,
             common_fwhm_arcmin=common_fwhm_arcmin,
