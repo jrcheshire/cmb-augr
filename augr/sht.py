@@ -1,18 +1,29 @@
-"""sht.py — differentiable HEALPix spherical-harmonic transforms (ducc0 backend).
+"""sht.py — differentiable HEALPix spherical-harmonic transforms (ducc0 + jht backends).
 
-Wraps ``ducc0.sht.experimental.synthesis`` / ``adjoint_synthesis`` via
-``jax.pure_callback`` + ``jax.custom_vjp``, giving JAX-traceable, reverse-mode
-differentiable SHTs on the HEALPix RING grid for spin-0 (T) and spin-2 (Q/U ↔ E/B).
+JAX-traceable, reverse-mode differentiable SHTs on the HEALPix RING grid for
+spin-0 (T) and spin-2 (Q/U ↔ E/B), behind a public API (:func:`synthesis`,
+:func:`adjoint_synthesis`, :func:`map2alm`, :func:`synthesis_pol`) that dispatches
+to one of two backends.
 
-Why ducc0 and not a JAX-native SHT
-----------------------------------
-``s2fft`` (the leading JAX-native candidate) has a structural defect in its
-HEALPix spin-2 *inverse* transform as of v1.4.0 (the current PyPI release):
-multi-mode polarization error of several percent and per-mode failures of
-O(10–28%) for ``m < ℓ``. A B-mode component-separation pipeline lives or dies on
-spin-2 accuracy, so we route through ducc0 (correct, fast) and accept the
-``pure_callback`` boundary. ``jax-healpy`` delegates SHTs to ``s2fft`` and
-inherits the same defect, so it is not an alternative.
+Backends (ducc0 default, jht optional)
+--------------------------------------
+Selected by :func:`set_sht_backend` / the :func:`sht_backend` context manager /
+the ``AUGR_SHT_BACKEND`` env var (default ``"ducc"``):
+
+* **ducc0** (default) — ``ducc0.sht.experimental`` via ``jax.pure_callback`` +
+  hand-written ``jax.custom_vjp``. Correct and fast on CPU up to the HEALPix grid
+  limit (``lmax ≈ 3·nside − 1``); but the ``pure_callback`` is a host hop, so it
+  does NOT run on a GPU — under ``jax.jit`` it round-trips device→host→device.
+* **jht** (``pip install jaxht``) — native-JAX spin-0/2 SHTs (pure JAX, no C++),
+  so every transform runs on CUDA with no code change and is differentiated by
+  JAX directly (no ``custom_vjp``). Validated bit-for-bit against the ducc backend
+  to fp64 (~1e-14) on synthesis / adjoint, spin-0 and spin-2. Use it for the GPU /
+  end-to-end-differentiable map path. Its validated regime is ``lmax ≲ 1.5·nside``
+  (it raises above that) — narrower than ducc, so ducc stays the default for
+  high-band-limit forward production runs.
+
+``s2fft`` (the other JAX-native candidate) has a structural spin-2 HEALPix
+*inverse* defect as of v1.4.0, so it is not used; jht is the JAX-native backend.
 
 Differentiation convention
 ---------------------------
@@ -49,6 +60,7 @@ from __future__ import annotations
 
 import os
 import warnings
+from contextlib import contextmanager
 from functools import lru_cache, partial
 
 import jax
@@ -56,7 +68,7 @@ import jax.numpy as jnp
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# ducc0 lazy import (optional [compsep] dependency)
+# backend imports (ducc0: [compsep] extra; jht: [masking] extra / main dep)
 # ---------------------------------------------------------------------------
 
 
@@ -76,6 +88,68 @@ def _require_ducc():
             "or, in the development env:\n"
             "    pixi add ducc0"
         ) from exc
+
+
+def _require_jht():
+    """Import jht or raise a helpful error pointing at the jaxht dependency."""
+    try:
+        import jht
+
+        return jht
+    except ImportError as exc:  # pragma: no cover - exercised only without jht
+        raise ImportError(
+            "augr.sht jht backend requires 'jht' (PyPI distribution 'jaxht'). "
+            "Install it with:\n"
+            "    pip install 'cmb-augr[masking]'\n"
+            "or, in the development env:\n"
+            "    pixi add --pypi 'jaxht>=0.1.2'"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# backend selection (ducc default, jht for the GPU / differentiable map path)
+# ---------------------------------------------------------------------------
+
+_VALID_BACKENDS = ("ducc", "jht")
+_BACKEND = os.environ.get("AUGR_SHT_BACKEND", "ducc").lower()
+if _BACKEND not in _VALID_BACKENDS:  # pragma: no cover - guards a typo'd env var
+    raise ValueError(
+        f"AUGR_SHT_BACKEND={_BACKEND!r} is not a valid SHT backend; "
+        f"expected one of {_VALID_BACKENDS}."
+    )
+
+
+def get_sht_backend() -> str:
+    """Return the active SHT backend (``"ducc"`` or ``"jht"``)."""
+    return _BACKEND
+
+
+def set_sht_backend(name: str) -> None:
+    """Set the active SHT backend process-wide (``"ducc"`` or ``"jht"``).
+
+    The choice is static config, read by :func:`synthesis` / :func:`adjoint_synthesis`
+    at trace time — it is not a traced value, so it is safe under ``jax.jit`` /
+    ``jax.grad`` (the chosen branch is baked into the compiled graph). For scoped
+    switching prefer the :func:`sht_backend` context manager.
+    """
+    global _BACKEND
+    name = name.lower()
+    if name not in _VALID_BACKENDS:
+        raise ValueError(
+            f"unknown SHT backend {name!r}; expected one of {_VALID_BACKENDS}."
+        )
+    _BACKEND = name
+
+
+@contextmanager
+def sht_backend(name: str):
+    """Context manager: temporarily switch the SHT backend, then restore it."""
+    prev = get_sht_backend()
+    set_sht_backend(name)
+    try:
+        yield
+    finally:
+        set_sht_backend(prev)
 
 
 # ---------------------------------------------------------------------------
@@ -314,21 +388,11 @@ def _jax_convention_vjp_adjsynth(alm_cot: jax.Array, lmax: int) -> jax.Array:
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4))
-def synthesis(alm: jax.Array, spin: int, lmax: int, nside: int, nthreads: int = 0) -> jax.Array:
-    """HEALPix synthesis ``alm → map``, JAX-traceable and reverse-mode differentiable.
+def _synthesis_ducc(alm: jax.Array, spin: int, lmax: int, nside: int, nthreads: int = 0) -> jax.Array:
+    """ducc0-backend HEALPix synthesis ``alm → map`` (pure_callback + custom_vjp).
 
-    Parameters
-    ----------
-    alm
-        Complex alm, shape ``(ncomp, Nlm)`` with ``Nlm = alm_size(lmax)``.
-        ``ncomp=1`` for ``spin=0``; ``ncomp=2`` (E-like, B-like) for ``spin>0``.
-    spin, lmax, nside, nthreads
-        Spin of the transform; max multipole; HEALPix RING nside; ducc thread
-        count (0 = all hardware threads).
-
-    Returns
-    -------
-    Real map, shape ``(nmaps, Npix)`` with ``nmaps=1`` (spin 0) or ``2`` (spin>0).
+    The differentiable ducc primitive behind the public :func:`synthesis`
+    dispatcher; see it for the array conventions.
     """
     return _synthesis_raw(alm, spin, lmax, nside, nthreads)
 
@@ -342,25 +406,17 @@ def _synthesis_bwd(spin, lmax, nside, nthreads, _res, map_cot):
     return (_jax_convention_vjp_synth(raw, lmax),)
 
 
-synthesis.defvjp(_synthesis_fwd, _synthesis_bwd)
+_synthesis_ducc.defvjp(_synthesis_fwd, _synthesis_bwd)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3, 4))
-def adjoint_synthesis(
+def _adjoint_synthesis_ducc(
     m: jax.Array, spin: int, lmax: int, nside: int, nthreads: int = 0
 ) -> jax.Array:
-    """Adjoint of HEALPix synthesis ``Yᵀ m`` (NOT ``map2alm``), differentiable.
+    """ducc0-backend adjoint synthesis ``Yᵀ m`` (NOT ``map2alm``), differentiable.
 
-    Parameters
-    ----------
-    m
-        Real map, shape ``(nmaps, Npix)`` (``nmaps=1`` spin 0, ``2`` spin>0).
-    spin, lmax, nside, nthreads
-        As in :func:`synthesis`.
-
-    Returns
-    -------
-    Complex alm, shape ``(ncomp, Nlm)``.
+    The differentiable ducc primitive behind the public :func:`adjoint_synthesis`
+    dispatcher; see it for the array conventions.
     """
     return _adjoint_synthesis_raw(m, spin, lmax, nside, nthreads)
 
@@ -374,7 +430,99 @@ def _adjoint_synthesis_bwd(spin, lmax, nside, nthreads, _res, alm_cot):
     return (_synthesis_raw(modified, spin, lmax, nside, nthreads),)
 
 
-adjoint_synthesis.defvjp(_adjoint_synthesis_fwd, _adjoint_synthesis_bwd)
+_adjoint_synthesis_ducc.defvjp(_adjoint_synthesis_fwd, _adjoint_synthesis_bwd)
+
+
+# ---------------------------------------------------------------------------
+# jht backend (native-JAX; differentiated by JAX directly, no custom_vjp)
+# ---------------------------------------------------------------------------
+
+
+def _synthesis_jht(alm: jax.Array, spin: int, lmax: int, nside: int) -> jax.Array:
+    """jht-backend synthesis ``alm → map``; matches the ducc primitive's shapes.
+
+    jht uses bare ``(Nlm,)`` / ``(Npix,)`` arrays for spin 0; this wrapper adds /
+    strips the leading size-1 axis so the public ``(ncomp, ...)`` contract holds.
+    Spin 2 ``(2, Nlm) → (2, Npix)`` passes straight through. Convention parity
+    with the ducc primitive is validated to fp64 in ``tests/test_sht.py``.
+
+    Gradient convention note: jht is differentiated by JAX natively (no
+    ``custom_vjp``), and its VJP returns the *ambient* complex cotangent — it does
+    NOT project the m=0 coefficient onto the real axis the way the ducc primitive's
+    hand-written VJP does. So ``jax.grad`` w.r.t. a *free* complex alm differs
+    between backends on exactly one non-physical DOF: ``Im(alm[m=0])`` (zero by the
+    real-sky reality constraint). All physical DOFs (m>0, and ``Re(alm[m=0])``)
+    agree to fp64. This never bites the map-based pipeline, where every alm is
+    produced by ``map2alm`` from a real map (real m=0); parameterize a free sky by
+    real DOFs (jht's ``real_to_alm`` / ``alm_to_real``) if you need m=0-imaginary
+    gradients to agree.
+    """
+    jht = _require_jht()
+    if int(spin) == 0:
+        return jht.synthesis(alm[0], nside=int(nside), lmax=int(lmax), spin=0)[None, :]
+    return jht.synthesis(alm, nside=int(nside), lmax=int(lmax), spin=int(spin))
+
+
+def _adjoint_synthesis_jht(m: jax.Array, spin: int, lmax: int, nside: int) -> jax.Array:
+    """jht-backend adjoint synthesis ``Yᵀ m``; matches the ducc primitive's shapes."""
+    jht = _require_jht()
+    if int(spin) == 0:
+        return jht.adjoint_synthesis(m[0], nside=int(nside), lmax=int(lmax), spin=0)[None, :]
+    return jht.adjoint_synthesis(m, nside=int(nside), lmax=int(lmax), spin=int(spin))
+
+
+# ---------------------------------------------------------------------------
+# public dispatchers (route to the active backend)
+# ---------------------------------------------------------------------------
+
+
+def synthesis(alm: jax.Array, spin: int, lmax: int, nside: int, nthreads: int = 0) -> jax.Array:
+    """HEALPix synthesis ``alm → map``, JAX-traceable and reverse-mode differentiable.
+
+    Dispatches to the active backend (:func:`get_sht_backend`): ducc0
+    (``pure_callback`` + ``custom_vjp``, CPU) or jht (native JAX, GPU-capable).
+
+    Parameters
+    ----------
+    alm
+        Complex alm, shape ``(ncomp, Nlm)`` with ``Nlm = alm_size(lmax)``.
+        ``ncomp=1`` for ``spin=0``; ``ncomp=2`` (E-like, B-like) for ``spin>0``.
+    spin, lmax, nside
+        Spin of the transform; max multipole; HEALPix RING nside.
+    nthreads
+        ducc thread count (0 = all hardware threads); ignored by the jht backend
+        (XLA manages threading).
+
+    Returns
+    -------
+    Real map, shape ``(nmaps, Npix)`` with ``nmaps=1`` (spin 0) or ``2`` (spin>0).
+    """
+    if _BACKEND == "jht":
+        return _synthesis_jht(alm, spin, lmax, nside)
+    return _synthesis_ducc(alm, spin, lmax, nside, nthreads)
+
+
+def adjoint_synthesis(
+    m: jax.Array, spin: int, lmax: int, nside: int, nthreads: int = 0
+) -> jax.Array:
+    """Adjoint of HEALPix synthesis ``Yᵀ m`` (NOT ``map2alm``), differentiable.
+
+    Dispatches to the active backend (:func:`get_sht_backend`).
+
+    Parameters
+    ----------
+    m
+        Real map, shape ``(nmaps, Npix)`` (``nmaps=1`` spin 0, ``2`` spin>0).
+    spin, lmax, nside, nthreads
+        As in :func:`synthesis`.
+
+    Returns
+    -------
+    Complex alm, shape ``(ncomp, Nlm)``.
+    """
+    if _BACKEND == "jht":
+        return _adjoint_synthesis_jht(m, spin, lmax, nside)
+    return _adjoint_synthesis_ducc(m, spin, lmax, nside, nthreads)
 
 
 # ---------------------------------------------------------------------------

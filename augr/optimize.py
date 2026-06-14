@@ -38,7 +38,7 @@ from dataclasses import dataclass
 import jax.numpy as jnp
 
 from augr.covariance import bandpower_covariance_blocks_from_noise
-from augr.fisher import _fisher_from_blocks
+from augr.fisher import _fisher_from_blocks, _fisher_from_full
 from augr.instrument import Instrument, noise_nl_continuous
 from augr.signal import SignalModel, flatten_params
 from augr.telescope import (
@@ -65,6 +65,9 @@ class OptimizationContext:
     Attributes:
         signal_model: Pre-built SignalModel (defines frequencies, binning).
         J_blocks:     Jacobian reshaped to (n_bins, n_spec, n_free).
+        J:            Full Jacobian (n_data, n_free), n_data = n_spec * n_bins
+                      (the un-blocked form for the dense external-covariance solve
+                      in sigma_r_from_external_cov).
         fiducial_params: Flat parameter array for signal evaluation.
         prior_diag:   1/sigma^2 for each free parameter (0 = no prior).
         r_idx:        Index of 'r' in the free parameter list.
@@ -77,6 +80,7 @@ class OptimizationContext:
     """
     signal_model: SignalModel
     J_blocks: jnp.ndarray
+    J: jnp.ndarray
     fiducial_params: jnp.ndarray
     prior_diag: jnp.ndarray
     r_idx: int
@@ -161,6 +165,7 @@ def make_optimization_context(
     return OptimizationContext(
         signal_model=sig,
         J_blocks=J_blocks,
+        J=J,
         fiducial_params=params,
         prior_diag=prior_diag,
         r_idx=r_idx,
@@ -241,6 +246,56 @@ def sigma_r_from_channels(
     F = F + jnp.diag(ctx.prior_diag)
 
     # Invert and extract sigma(r)
+    F_inv = jnp.linalg.inv(F)
+    return jnp.sqrt(F_inv[ctx.r_idx, ctx.r_idx])
+
+
+def sigma_r_from_external_cov(
+    external_covariance: jnp.ndarray,
+    ctx: OptimizationContext,
+) -> jnp.ndarray:
+    """Differentiable sigma(r) from a full bandpower covariance (cut-sky / MC path).
+
+    The jnp-returning analogue of
+    ``FisherForecast(external_covariance=...).sigma("r")``: builds
+    ``F = Jᵀ C⁻¹ J`` via the same prewhitened dense solve
+    (``fisher._fisher_from_full``), adds Gaussian priors on the diagonal,
+    inverts, and returns ``sqrt((F⁻¹)_{rr})`` as a JAX scalar — no ``float()``
+    boundary, so it is differentiable in ``external_covariance``.
+
+    This is the *consumer* end of the end-to-end map-based optimization: the
+    covariance is the output of the cut-sky masked-Wiener Monte-Carlo stage
+    (:func:`augr.spectrum_stages.mc_cutsky_bandpowers`), itself a function of
+    the instrument design. Composing this with that traced stage gives a
+    ``jax.grad``-able σ(r) through component separation. The analytic
+    block-diagonal counterpart is :func:`sigma_r_from_channels`.
+
+    The Jacobian ``ctx.J`` is structural (it depends on the cleaned-map
+    ``SignalModel`` — frequencies, binning, residual template — not on the
+    covariance), so it is pre-computed once and held fixed; only the noise →
+    covariance path carries the design dependence, exactly as in
+    :func:`sigma_r_from_channels`.
+
+    Args:
+        external_covariance: full ``(n_data, n_data)`` bandpower covariance,
+            ``n_data = n_spec × n_bins`` (just ``n_bins`` for a single cleaned
+            map), on the same binning as ``ctx.signal_model``. E.g.
+            ``mc_cutsky_bandpowers(...).covariance``.
+        ctx: ``OptimizationContext`` built on the cleaned-map ``SignalModel``
+            (the residual-template / ``NullForegroundModel`` forecast); supplies
+            ``J``, ``prior_diag``, and ``r_idx``.
+
+    Returns:
+        Scalar sigma(r).
+
+    Note:
+        Routes through ``fisher._fisher_from_full`` — the same prewhitened dense
+        solve as ``FisherForecast(external_covariance=...).compute()`` — so the
+        two paths agree to fp64 precision (the optimize path simply keeps the
+        result as a JAX array instead of casting to ``float`` in ``sigma()``).
+    """
+    F = _fisher_from_full(ctx.J, jnp.asarray(external_covariance))
+    F = F + jnp.diag(ctx.prior_diag)
     F_inv = jnp.linalg.inv(F)
     return jnp.sqrt(F_inv[ctx.r_idx, ctx.r_idx])
 
