@@ -378,6 +378,7 @@ class TestWigner3j:
 # -----------------------------------------------------------------------
 
 class TestFullSkyKernel:
+    @pytest.mark.slow
     def test_matches_camb_low_ell(self, spectra):
         """Full-sky kernel reproduces CAMB BB at l=5,10,20 within 1%.
 
