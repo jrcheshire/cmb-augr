@@ -24,7 +24,7 @@ from augr.nilc import (
     needlet_beta,
     nilc_clean,
 )
-from augr.sht import _m_of_alm, alm_size
+from augr.sht import _m_of_alm, alm_size, map2alm
 from augr.spectra import CMBSpectra
 
 
@@ -186,6 +186,78 @@ def test_needlet_channel_mask_excludes_coarse_at_fine_bands() -> None:
     assert mask[:, 1].all()  # finest channel (= common beam) active in every band
     assert mask[0, 0]  # coarse channel resolves the low-ℓ band
     assert not mask[-1, 0]  # ... but is excluded from the finest band
+
+
+# --- spin-2 Q/U cleaner (clean_e=True) -------------------------------------
+
+
+def _eb_sky(beams, *, nside, lmax, seed=0):
+    """CMB E+B BandSky + white noise through the given beams (non-degenerate E cov)."""
+    from augr.delensing import load_lensing_spectra
+
+    cl_ee = jnp.clip(load_lensing_spectra().cl_ee_len[: lmax + 1], 0.0, None)
+    sky = generate_band_sky(
+        tuple(100.0 + 10.0 * i for i in range(len(beams))),
+        tuple(beams),
+        spectra=CMBSpectra(),
+        r_in=0.05,
+        nside=nside,
+        lmax=lmax,
+        fg_model=None,
+        cmb_seed=seed,
+        cl_ee=cl_ee,
+    )
+    return assemble_band_maps(
+        sky, jnp.array([1.0e-4] * len(beams)), jnp.ones(sky.npix), noise_key=jax.random.PRNGKey(seed)
+    )
+
+
+def test_clean_e_default_off_and_b_leg_byte_identical() -> None:
+    """clean_e defaults off (no E products); turning it on does not move the B leg."""
+    nside, lmax, peaks = 32, 48, [8, 24, 48]
+    beams = [30.0, 12.0]
+    maps = _eb_sky(beams, nside=nside, lmax=lmax)
+    r0 = nilc_clean(maps, beams, lmax=lmax, nside=nside, needlet_peaks=peaks)
+    assert r0.cleaned_e_alm is None and r0.weights_e is None
+    r1 = nilc_clean(maps, beams, lmax=lmax, nside=nside, needlet_peaks=peaks, clean_e=True)
+    assert r1.cleaned_e_alm is not None and r1.weights_e is not None
+    np.testing.assert_array_equal(
+        np.asarray(r1.cleaned_b_alm), np.asarray(r0.cleaned_b_alm)
+    )  # B leg unchanged by clean_e
+    np.testing.assert_array_equal(np.asarray(r1.weights), np.asarray(r0.weights))
+
+
+def test_cleaned_qu_roundtrip() -> None:
+    """map2alm(spin=2) of cleaned_qu recovers the stored cleaned E/B alm."""
+    nside, lmax, peaks = 32, 48, [8, 24, 48]
+    beams = [30.0, 12.0]
+    res = nilc_clean(_eb_sky(beams, nside=nside, lmax=lmax), beams, lmax=lmax, nside=nside,
+                     needlet_peaks=peaks, clean_e=True)
+    qu = res.cleaned_qu()
+    assert qu.shape == (2, 12 * nside * nside)
+    eb = map2alm(qu, 2, lmax, nside, 5)
+    for rec, ref in ((eb[0], res.cleaned_e_alm), (eb[1], res.cleaned_b_alm)):
+        relerr = float(np.linalg.norm(np.asarray(rec - ref)) / np.linalg.norm(np.asarray(ref)))
+        assert relerr < 1e-3
+
+
+def test_e_ilc_weights_sum_to_one() -> None:
+    """The independent E-mode ILC weights satisfy the CMB constraint aᵀw_E = 1."""
+    nside, lmax, peaks = 32, 48, [8, 24, 48]
+    beams = [30.0, 12.0]
+    res = nilc_clean(_eb_sky(beams, nside=nside, lmax=lmax), beams, lmax=lmax, nside=nside,
+                     needlet_peaks=peaks, clean_e=True)
+    np.testing.assert_allclose(np.asarray(jnp.sum(res.weights_e, axis=1)), 1.0, atol=1e-8)
+
+
+def test_cleaned_qu_and_project_e_raise_without_clean_e() -> None:
+    nside, lmax = 32, 48
+    beams = [30.0, 12.0]
+    res = nilc_clean(_eb_sky(beams, nside=nside, lmax=lmax), beams, lmax=lmax, nside=nside)
+    with pytest.raises(ValueError, match="clean_e"):
+        res.cleaned_qu()
+    with pytest.raises(ValueError, match="clean_e"):
+        res.project_e(_eb_sky(beams, nside=nside, lmax=lmax))
 
 
 def test_band_limit_keeps_weights_finite_at_extreme_beam_ratio() -> None:

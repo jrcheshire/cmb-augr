@@ -21,7 +21,7 @@ from augr.compsep_sims import assemble_band_maps, generate_band_sky
 from augr.forecast import ForecastResult
 from augr.nilc import nilc_clean
 from augr.nilc_forecast import nilc_forecast, nilc_spectra
-from augr.pipeline import ForecastConfig, ResidualTemplateSource, run_forecast
+from augr.pipeline import ForecastConfig, ResidualTemplateSource, SpectrumSource, run_forecast
 from augr.spectra import CMBSpectra
 
 NSIDE, LMAX = 32, 48
@@ -88,6 +88,35 @@ def test_run_forecast_matches_manual_nilc_spine() -> None:
 
 def test_run_forecast_cmilc_cleaner_runs() -> None:
     cfg = _nilc_config(cleaner=cmilc_cleaner(FREQS, moments=CMILC06_MOMENTS, needlet_peaks=PEAKS))
+    out = run_forecast(cfg)
+    assert np.isfinite(out.sigma_r_baseline) and out.sigma_r_baseline > 0
+
+
+@pytest.mark.slow
+def test_run_forecast_cutsky_mc_runs() -> None:
+    """The CUTSKY_MC spectrum source runs end-to-end and gives a finite σ(r).
+
+    Exercises the spin-2 cleaner → masked-Wiener MC covariance → Fisher path through
+    run_forecast (fg_model=None keeps it pysm-free; the heavy MC ensemble makes it slow).
+    The MC mechanics are gated finely in test_spectrum_stages; this is the integration.
+    """
+    pytest.importorskip("jht")
+    from augr import masking as mk
+
+    nside, lmax = 32, 48
+    mask = mk.galactic_mask(nside, 0.6)
+    cfg = _nilc_config(
+        cleaner=nilc_cleaner(needlet_peaks=PEAKS, clean_e=True),
+        nside=nside,
+        lmax=lmax,
+        ell_max=40,
+        delta_ell=20,
+        ell_per_bin_below=2,  # few bins → satisfies the Hartlap floor at modest n_sims
+        spectrum_source=SpectrumSource.CUTSKY_MC,
+        mask=mask,
+        n_sims_mc=12,
+        base_seed_mc=0,
+    )
     out = run_forecast(cfg)
     assert np.isfinite(out.sigma_r_baseline) and out.sigma_r_baseline > 0
 
