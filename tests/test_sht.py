@@ -18,6 +18,7 @@ pytest.importorskip("ducc0")
 import healpy as hp
 
 from augr.sht import (
+    _default_backend,
     _ell_of_alm,
     _m_of_alm,
     _resolve_nthreads,
@@ -248,19 +249,24 @@ def _random_alm_p(seed: int, ncomp: int = 1) -> np.ndarray:
 
 
 class TestBackendSelector:
-    def test_default_is_ducc(self) -> None:
-        assert get_sht_backend() == "ducc"
+    def test_default_matches_device(self) -> None:
+        # Device-aware default: jht on GPU/TPU, ducc on CPU. The env var overrides.
+        assert get_sht_backend() == _default_backend()
+        if jax.default_backend() == "cpu":
+            assert _default_backend() == "ducc"
 
     def test_context_manager_restores(self) -> None:
-        assert get_sht_backend() == "ducc"
-        with sht_backend("jht"):
-            assert get_sht_backend() == "jht"
-        assert get_sht_backend() == "ducc"
+        start = get_sht_backend()
+        other = "jht" if start == "ducc" else "ducc"
+        with sht_backend(other):
+            assert get_sht_backend() == other
+        assert get_sht_backend() == start
 
     def test_invalid_backend_raises_and_leaves_state(self) -> None:
+        start = get_sht_backend()
         with pytest.raises(ValueError, match="unknown SHT backend"):
             set_sht_backend("s2fft")
-        assert get_sht_backend() == "ducc"  # failed set must not change the backend
+        assert get_sht_backend() == start  # failed set must not change the backend
 
 
 class TestBackendParity:

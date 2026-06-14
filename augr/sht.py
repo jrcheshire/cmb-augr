@@ -5,22 +5,25 @@ spin-0 (T) and spin-2 (Q/U ↔ E/B), behind a public API (:func:`synthesis`,
 :func:`adjoint_synthesis`, :func:`map2alm`, :func:`synthesis_pol`) that dispatches
 to one of two backends.
 
-Backends (ducc0 default, jht optional)
---------------------------------------
+Backends (device-aware default: jht on GPU/TPU, ducc on CPU)
+------------------------------------------------------------
 Selected by :func:`set_sht_backend` / the :func:`sht_backend` context manager /
-the ``AUGR_SHT_BACKEND`` env var (default ``"ducc"``):
+the ``AUGR_SHT_BACKEND`` env var. With no override the default is chosen by JAX's
+default device (see :func:`_default_backend`): jht on a GPU/TPU (where ducc cannot
+run), ducc on CPU (where it is ~100x faster):
 
-* **ducc0** (default) — ``ducc0.sht.experimental`` via ``jax.pure_callback`` +
+* **ducc0** (CPU default) — ``ducc0.sht.experimental`` via ``jax.pure_callback`` +
   hand-written ``jax.custom_vjp``. Correct and fast on CPU up to the HEALPix grid
   limit (``lmax ≈ 3·nside − 1``); but the ``pure_callback`` is a host hop, so it
   does NOT run on a GPU — under ``jax.jit`` it round-trips device→host→device.
-* **jht** (``pip install jaxht``) — native-JAX spin-0/2 SHTs (pure JAX, no C++),
-  so every transform runs on CUDA with no code change and is differentiated by
-  JAX directly (no ``custom_vjp``). Validated bit-for-bit against the ducc backend
-  to fp64 (~1e-14) on synthesis / adjoint, spin-0 and spin-2. Use it for the GPU /
-  end-to-end-differentiable map path. Its validated regime is ``lmax ≲ 1.5·nside``
-  (it raises above that) — narrower than ducc, so ducc stays the default for
-  high-band-limit forward production runs.
+  Also needed when ``lmax > 1.5·nside`` (jht raises there).
+* **jht** (``pip install jaxht``, GPU/TPU default) — native-JAX spin-0/2 SHTs (pure
+  JAX, no C++), so every transform runs on CUDA with no code change and is
+  differentiated by JAX directly (no ``custom_vjp``). Validated bit-for-bit against
+  the ducc backend to fp64 on synthesis / adjoint, spin-0 and spin-2, through high
+  band limit (``lmax ≈ 4000`` at ``nside = 4096``). Its support is ``lmax ≲
+  1.5·nside`` (it raises above that); within that range it is the trustworthy GPU /
+  end-to-end-differentiable map backend.
 
 ``s2fft`` (the other JAX-native candidate) has a structural spin-2 HEALPix
 *inverse* defect as of v1.4.0, so it is not used; jht is the JAX-native backend.
@@ -102,7 +105,7 @@ def _require_jht():
             "Install it with:\n"
             "    pip install 'cmb-augr[masking]'\n"
             "or, in the development env:\n"
-            "    pixi add --pypi 'jaxht>=0.1.2'"
+            "    pixi add --pypi 'jaxht>=0.1.3'"
         ) from exc
 
 
@@ -111,7 +114,24 @@ def _require_jht():
 # ---------------------------------------------------------------------------
 
 _VALID_BACKENDS = ("ducc", "jht")
-_BACKEND = os.environ.get("AUGR_SHT_BACKEND", "ducc").lower()
+
+
+def _default_backend() -> str:
+    """Default SHT backend, chosen by JAX's default device.
+
+    jht is native-JAX, so it runs on GPU/TPU (where ducc's host callback cannot)
+    and is validated bit-for-bit against ducc to high band limit (``lmax ~ 4000``
+    at ``nside = 4096``); on CPU ducc is ~100x faster, so prefer ducc there. The
+    ``AUGR_SHT_BACKEND`` env var overrides this. Defensive: any failure probing the
+    device falls back to ducc rather than breaking import.
+    """
+    try:
+        return "jht" if jax.default_backend() != "cpu" else "ducc"
+    except Exception:  # pragma: no cover - never fail import on a device probe
+        return "ducc"
+
+
+_BACKEND = os.environ.get("AUGR_SHT_BACKEND", _default_backend()).lower()
 if _BACKEND not in _VALID_BACKENDS:  # pragma: no cover - guards a typo'd env var
     raise ValueError(
         f"AUGR_SHT_BACKEND={_BACKEND!r} is not a valid SHT backend; "

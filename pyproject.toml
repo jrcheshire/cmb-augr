@@ -44,7 +44,7 @@ camb = ["camb"]
 broom = ["cmbroom", "pyyaml"]
 compsep = ["ducc0", "pysm3"]
 sampling = ["blackjax", "optax"]
-masking = ["jaxht>=0.1.2"]
+masking = ["jaxht>=0.1.3"]
 notebooks = ["jupyterlab", "ipykernel", "matplotlib"]
 
 [tool.setuptools.packages.find]
@@ -97,7 +97,7 @@ jaxlib = ">=0.4"
 equinox = ">=0.11"
 blackjax = "*"
 optax = "*"
-jaxht = ">=0.1.2"
+jaxht = ">=0.1.3"
 pywigxjpf = "*"
 cmbroom = "*"
 pyyaml = "*"
