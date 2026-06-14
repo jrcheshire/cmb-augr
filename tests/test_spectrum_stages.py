@@ -124,6 +124,7 @@ def _run_mc(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_b
     )
 
 
+@pytest.mark.slow
 def test_mc_cutsky_bandpowers_shapes_and_covariance() -> None:
     res = _run_mc(12)
     n_bins = res.transfer.shape[0]
@@ -136,6 +137,7 @@ def test_mc_cutsky_bandpowers_shapes_and_covariance() -> None:
     assert res.var_pix_ref > 0
 
 
+@pytest.mark.slow
 def test_mc_hartlap_guard_raises_for_too_few_sims() -> None:
     # n_bins = 3 here, so n_sims = 4 <= n_bins + 2 trips the Hartlap guard.
     with pytest.raises(ValueError, match="Hartlap"):
