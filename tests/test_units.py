@@ -1,11 +1,16 @@
 """Tests for units.py."""
 
+import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
 
+from augr.bandpass import Bandpass
 from augr.units import (
     NU_DUST_REF_GHZ,
     NU_SYNC_REF_GHZ,
     cmb_to_rj,
+    color_correct,
     dust_sed,
     dust_sed_deriv_beta,
     dust_sed_deriv_T,
@@ -181,3 +186,103 @@ def test_sync_deriv_c_is_log_ratio_squared():
         val = sync_sed_deriv_c(nu)
         expected = jnp.log(nu / NU_SYNC_REF_GHZ) ** 2
         assert abs(val - expected) < 1e-10
+
+
+# ---------------------------------------------------------------------------
+# Bandpass color correction
+# ---------------------------------------------------------------------------
+
+def test_color_correct_flat_sed_is_unity():
+    """A flat SED (CMB column) band-averages to exactly 1 for any bandpass."""
+    bp = Bandpass.tophat(150.0, 0.25)
+    val = color_correct(lambda nu: jnp.ones_like(nu), bp)
+    assert abs(float(val) - 1.0) < 1e-12
+
+
+def test_color_correct_monochromatic_recovers_scalar():
+    """A single-point bandpass reproduces the band-center evaluation exactly."""
+    bp = Bandpass.monochromatic(150.0)
+    cc = color_correct(dust_sed, bp, beta_d=1.6, T_d=19.6)
+    mono = dust_sed(150.0, beta_d=1.6, T_d=19.6)
+    assert abs(float(cc) - float(mono)) < 1e-12
+
+
+def test_color_correct_within_band_extremes():
+    """Band-averaged dust SED lies between its band-edge values (monotone rise)."""
+    nu0, f = 150.0, 0.25
+    bp = Bandpass.tophat(nu0, f)
+    cc = color_correct(dust_sed, bp, beta_d=1.6, T_d=19.6)
+    lo = dust_sed(nu0 * (1 - f / 2), beta_d=1.6, T_d=19.6)
+    hi = dust_sed(nu0 * (1 + f / 2), beta_d=1.6, T_d=19.6)
+    assert float(lo) < float(cc) < float(hi)
+
+
+def test_color_correct_grad_wrt_nu_center():
+    """d(band-averaged dust SED)/d(nu_center) matches central finite difference."""
+    def cc(nu_c):
+        return color_correct(
+            lambda nu: dust_sed(nu, 1.6, 19.6), Bandpass.smooth_tophat(nu_c, 0.25)
+        )
+
+    g = jax.grad(cc)(150.0)
+    h = 1e-2
+    fd = (cc(150.0 + h) - cc(150.0 - h)) / (2 * h)
+    assert jnp.isfinite(g)
+    assert abs(float(g) - float(fd)) / abs(float(fd)) < 1e-4
+    # Same under jit.
+    g_jit = jax.jit(jax.grad(cc))(150.0)
+    assert abs(float(g_jit) - float(g)) / abs(float(g)) < 1e-4
+
+
+def test_color_correct_grad_wrt_frac_bw_finite():
+    """Gradient flows w.r.t. fractional bandwidth via the smooth weights."""
+    def cc(f):
+        return color_correct(
+            lambda nu: dust_sed(nu, 1.6, 19.6), Bandpass.smooth_tophat(150.0, f)
+        )
+
+    g = jax.grad(cc)(0.25)
+    assert jnp.isfinite(g)
+
+
+def test_color_correct_matches_pysm():
+    """Kernel cross-check: color_correct reproduces PySM's bandpass integration.
+
+    Build the μK_CMB band value the way PySM does — integrate the RJ emission
+    (dust_sed · cmb_to_rj) with PySM-normalized weights, then convert to μK_CMB
+    via PySM's bandpass_unit_conversion — and confirm color_correct matches it.
+    Pure-numeric (no Sky build / network). Guards the g = w·ν²·cmb_to_rj kernel.
+    """
+    pytest.importorskip("pysm3")
+    import pysm3.units as pu
+    from pysm3.utils import bandpass_unit_conversion, normalize_weights
+
+    # PySM 3.4.2's normalize_weights / bandpass_unit_conversion call np.trapz,
+    # removed in numpy 2.0. Shim it locally so we can use them as ground truth.
+    # (Production avoids these functions entirely — compsep_sims band-averages
+    # monochromatic maps with this same kernel; see pysm_fg_iqu.)
+    had_trapz = hasattr(np, "trapz")
+    if not had_trapz:
+        np.trapz = np.trapezoid  # noqa: NPY201  (shim PySM's removed call)
+    try:
+        for nu0, f in [(150.0, 0.25), (95.0, 0.30), (30.0, 0.20), (353.0, 0.25)]:
+            bp = Bandpass.tophat(nu0, f, n_quad=64)
+            nu = np.asarray(bp.nu_ghz)
+            weights = np.asarray(bp.weights)
+
+            # PySM ground truth: RJ emission integrated with PySM-normalized
+            # weights, then unit-converted to μK_CMB as Sky.get_emission does.
+            # A μK_CMB SED maps to μK_RJ emission via rj_to_cmb.
+            m_rj = np.asarray(dust_sed(nu, 1.6, 19.6)) * np.asarray(rj_to_cmb(nu))
+            w_n = normalize_weights(nu, weights)
+            i_rj = np.trapezoid(m_rj * w_n, nu)
+            factor = bandpass_unit_conversion(
+                nu * pu.GHz, weights, pu.uK_CMB, pu.uK_RJ
+            ).value
+            pysm_band = i_rj * factor
+
+            cc = float(color_correct(dust_sed, bp, beta_d=1.6, T_d=19.6))
+            assert abs(cc - pysm_band) / abs(pysm_band) < 1e-3, (nu0, f, cc, pysm_band)
+    finally:
+        if not had_trapz:
+            del np.trapz  # noqa: NPY201  (remove the shim)
