@@ -46,8 +46,8 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Sequence
-from dataclasses import dataclass
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -103,8 +103,7 @@ def _require_pysm():
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class BandSky:
+class BandSky(eqx.Module):
     """Beam-smoothed, allocation-independent per-band sky maps [μK_CMB].
 
     Holds the fixed pieces of a CRN sim: the CMB B-mode realization and the PySM
@@ -130,11 +129,11 @@ class BandSky:
         foreground model was requested.
     """
 
-    freqs_ghz: tuple[float, ...]
-    beam_fwhm_arcmin: tuple[float, ...]
-    nside: int
-    lmax: int
-    r_in: float
+    freqs_ghz: tuple[float, ...] = eqx.field(static=True)
+    beam_fwhm_arcmin: tuple[float, ...] = eqx.field(static=True)
+    nside: int = eqx.field(static=True)
+    lmax: int = eqx.field(static=True)
+    r_in: float = eqx.field(static=True)
     cmb_qu: jax.Array
     fg_qu: jax.Array
 
@@ -147,8 +146,7 @@ class BandSky:
         return 12 * self.nside**2
 
 
-@dataclass(frozen=True)
-class HarmonicSky:
+class HarmonicSky(eqx.Module):
     """Aperture-independent harmonic-space sky: CMB B alm + per-band FG E/B alm.
 
     The expensive, aperture-independent part of a sim -- the CMB realization and
@@ -181,10 +179,10 @@ class HarmonicSky:
         mix full-sky, so CMB E is irrelevant there).
     """
 
-    freqs_ghz: tuple[float, ...]
-    nside: int
-    lmax: int
-    r_in: float
+    freqs_ghz: tuple[float, ...] = eqx.field(static=True)
+    nside: int = eqx.field(static=True)
+    lmax: int = eqx.field(static=True)
+    r_in: float = eqx.field(static=True)
     cmb_b_alm: jax.Array
     fg_eb_alm: jax.Array | None
     cmb_e_alm: jax.Array | None = None

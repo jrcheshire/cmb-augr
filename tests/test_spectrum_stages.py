@@ -211,20 +211,26 @@ def _traced_setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per
 def test_traced_matches_forward_covariance() -> None:
     """mc_cutsky_cov_traced reproduces mc_cutsky_bandpowers at the fiducial w_inv.
 
-    Same seeds, same math; the traced path differs only in plumbing (precomputed
-    sky + jnp unrolled loop vs process-pool + per-sim sky build + np.asarray), so
-    the covariance and debiased bandpowers should match to fp64."""
+    Same seeds, same math; the traced path differs only in execution structure
+    (precomputed batched sky + ``lax.map`` scan vs process-pool + per-sim build).
+    The two therefore agree only to the wiener CG tolerance (default 1e-8), not to
+    fp64: ``scan`` and the python loop fuse differently in XLA, and that ~fp-level
+    difference is amplified through the CG solve. A tol sweep confirms the agreement
+    tracks the CG tol -- max rel diff 1.0e-6 / 9.6e-9 / 3.3e-11 at wiener tol
+    1e-8 / 1e-10 / 1e-12 -- so rtol=1e-5 (~10x margin over the observed 1.0e-6) is
+    the right gate; a real bug would be %-level. (The internal-consistency check
+    ``test_driver_matches_raw_w_inv_path`` still holds traced-vs-traced to 1e-12.)"""
     ctx, cleaner = _traced_setup(12)
     traced = mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner)
     fwd = _run_mc(12)
     np.testing.assert_allclose(
-        np.asarray(traced.covariance), np.asarray(fwd.covariance), rtol=1e-8, atol=0.0
+        np.asarray(traced.covariance), np.asarray(fwd.covariance), rtol=1e-5, atol=1e-16
     )
     np.testing.assert_allclose(
         np.asarray(traced.debiased_bandpowers),
         np.asarray(fwd.debiased_bandpowers),
-        rtol=1e-8,
-        atol=0.0,
+        rtol=1e-5,
+        atol=1e-16,
     )
     assert traced.f_sky == pytest.approx(fwd.f_sky)
 
