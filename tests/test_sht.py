@@ -18,6 +18,7 @@ pytest.importorskip("ducc0")
 import healpy as hp
 
 from augr.sht import (
+    _default_backend,
     _ell_of_alm,
     _m_of_alm,
     _resolve_nthreads,
@@ -25,7 +26,10 @@ from augr.sht import (
     alm_size,
     band_limit,
     check_band_limit,
+    get_sht_backend,
     map2alm,
+    set_sht_backend,
+    sht_backend,
     synthesis,
     synthesis_pol,
 )
@@ -221,3 +225,121 @@ def test_synthesis_result_invariant_to_thread_count(monkeypatch) -> None:
     monkeypatch.setenv("AUGR_SHT_NTHREADS", "1")
     out1 = np.asarray(synthesis(alm, 0, LMAX, NSIDE))
     np.testing.assert_allclose(out0, out1, rtol=1e-12, atol=1e-13)
+
+
+# --- backend switch: jht vs ducc parity ------------------------------------
+
+pytest.importorskip("jht")
+
+# jht's band-limit ceiling is lmax <= 1.5*nside (it raises above), narrower than
+# ducc's grid limit, so the parity config sits at the ceiling.
+_NS_P = 64
+_LMAX_P = 96  # = 1.5 * 64
+_NLM_P = alm_size(_LMAX_P)
+
+
+def _random_alm_p(seed: int, ncomp: int = 1) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    a = (rng.standard_normal((ncomp, _NLM_P)) + 1j * rng.standard_normal((ncomp, _NLM_P))).astype(
+        np.complex128
+    )
+    m0 = _m_of_alm(_LMAX_P) == 0
+    a[:, m0] = a[:, m0].real
+    return a
+
+
+class TestBackendSelector:
+    def test_default_matches_device(self) -> None:
+        # Device-aware default: jht on GPU/TPU, ducc on CPU. The env var overrides.
+        assert get_sht_backend() == _default_backend()
+        if jax.default_backend() == "cpu":
+            assert _default_backend() == "ducc"
+
+    def test_context_manager_restores(self) -> None:
+        start = get_sht_backend()
+        other = "jht" if start == "ducc" else "ducc"
+        with sht_backend(other):
+            assert get_sht_backend() == other
+        assert get_sht_backend() == start
+
+    def test_invalid_backend_raises_and_leaves_state(self) -> None:
+        start = get_sht_backend()
+        with pytest.raises(ValueError, match="unknown SHT backend"):
+            set_sht_backend("s2fft")
+        assert get_sht_backend() == start  # failed set must not change the backend
+
+
+class TestBackendParity:
+    """The jht backend matches ducc to fp64 — the swap is numerically exact.
+
+    Validated to ~1e-14 in a standalone probe; the gate here is rtol=1e-10.
+    Convention parity (alm packing, spin-2 (E,B)->(Q,U) sign, normalization) is
+    what these assert.
+    """
+
+    @staticmethod
+    def _both(fn):
+        with sht_backend("ducc"):
+            d = np.asarray(fn())
+        with sht_backend("jht"):
+            j = np.asarray(fn())
+        return d, j
+
+    def test_synthesis_spin0(self) -> None:
+        alm = jnp.asarray(_random_alm_p(seed=0, ncomp=1))
+        d, j = self._both(lambda: synthesis(alm, 0, _LMAX_P, _NS_P))
+        np.testing.assert_allclose(j, d, rtol=1e-10, atol=1e-12)
+
+    def test_synthesis_spin2(self) -> None:
+        alm = jnp.asarray(_random_alm_p(seed=1, ncomp=2))
+        d, j = self._both(lambda: synthesis(alm, 2, _LMAX_P, _NS_P))
+        # ducc0 (C++) vs jht (JAX recursion) agree to ~4e-12 absolute on maps of
+        # magnitude ~50; per-element rtol blows up only at near-zero-crossing
+        # pixels, so the absolute floor carries the gate. Still catches O(1)
+        # convention bugs (wrong (E,B)->(Q,U) sign / normalization).
+        np.testing.assert_allclose(j, d, rtol=1e-7, atol=1e-9)
+
+    def test_adjoint_spin0(self) -> None:
+        m = jnp.asarray(np.random.default_rng(5).standard_normal((1, 12 * _NS_P**2)))
+        d, j = self._both(lambda: adjoint_synthesis(m, 0, _LMAX_P, _NS_P))
+        np.testing.assert_allclose(j, d, rtol=1e-10, atol=1e-12)
+
+    def test_adjoint_spin2(self) -> None:
+        m = jnp.asarray(np.random.default_rng(6).standard_normal((2, 12 * _NS_P**2)))
+        d, j = self._both(lambda: adjoint_synthesis(m, 2, _LMAX_P, _NS_P))
+        np.testing.assert_allclose(j, d, rtol=1e-10, atol=1e-12)
+
+    def test_map2alm_inherits_backend(self) -> None:
+        """map2alm composes synthesis+adjoint, so both backends are bit-identical."""
+        alm = jnp.asarray(_random_alm_p(seed=2, ncomp=2))
+
+        def _recover(backend):
+            with sht_backend(backend):
+                mp = synthesis(alm, 2, _LMAX_P, _NS_P)
+                return np.asarray(map2alm(mp, 2, _LMAX_P, _NS_P, n_iter=3))
+
+        np.testing.assert_allclose(_recover("jht"), _recover("ducc"), rtol=1e-10, atol=1e-12)
+
+    def test_grad_parity_through_real_roundtrip(self) -> None:
+        """The pipeline-relevant gradient (through map->alm->map on a REAL map)
+        matches between backends.
+
+        A direct gradient w.r.t. a free complex alm differs between backends on
+        ONE non-physical degree of freedom: the imaginary part of the m=0
+        coefficient (zero by the real-sky reality constraint). ducc's custom_vjp
+        projects it to zero; jht's native AD returns the ambient complex cotangent.
+        The physical DOFs (m>0 full complex, m=0 real part) agree to ~1e-9. That
+        m=0-imaginary DOF never appears in the map-based pipeline, where every alm
+        is produced by map2alm from a real map (real m=0), so the real map ->
+        alm -> map gradient the cleaners actually backprop through matches cleanly
+        and sidesteps the convention entirely."""
+        m = jnp.asarray(np.random.default_rng(8).standard_normal((2, 12 * _NS_P**2)))
+
+        def scalar(x, backend):
+            with sht_backend(backend):
+                alm = map2alm(x, 2, _LMAX_P, _NS_P, n_iter=3)
+                return jnp.sum(synthesis(alm, 2, _LMAX_P, _NS_P) ** 2)
+
+        g_d = jax.grad(lambda x: scalar(x, "ducc"))(m)
+        g_j = jax.grad(lambda x: scalar(x, "jht"))(m)
+        np.testing.assert_allclose(np.asarray(g_j), np.asarray(g_d), rtol=1e-7, atol=1e-9)

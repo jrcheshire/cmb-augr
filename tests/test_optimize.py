@@ -5,13 +5,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from augr.config import FIDUCIAL_BK15, simple_probe
+from augr.config import FIDUCIAL_BK15, cleaned_map_instrument, simple_probe
 from augr.covariance import (
     bandpower_covariance_blocks,
     bandpower_covariance_blocks_from_noise,
 )
 from augr.fisher import FisherForecast
-from augr.foregrounds import GaussianForegroundModel
+from augr.foregrounds import GaussianForegroundModel, NullForegroundModel
 from augr.instrument import (
     noise_nl,
     noise_nl_continuous,
@@ -22,6 +22,7 @@ from augr.optimize import (
     make_optimization_context,
     sigma_r_from_channels,
     sigma_r_from_design,
+    sigma_r_from_external_cov,
 )
 from augr.signal import SignalModel, flatten_params
 from augr.spectra import CMBSpectra
@@ -319,3 +320,86 @@ class TestDesignLevel:
         grads = jax.grad(loss)(area_fracs)
         assert jnp.all(jnp.isfinite(grads)), f"Non-finite gradients: {grads}"
         assert jnp.any(grads != 0.0), "All gradients are zero"
+
+
+# -----------------------------------------------------------------------
+# Step 8: External-covariance sigma(r) (cut-sky masked-Wiener MC consumer)
+# -----------------------------------------------------------------------
+
+class TestExternalCovSigmaR:
+    """sigma_r_from_external_cov: the jnp-returning sigma(r) for the dense
+    external-covariance path (cut-sky masked-Wiener Monte-Carlo covariance),
+    the differentiable consumer end of the end-to-end map-based optimization."""
+
+    @pytest.fixture(scope="class")
+    def cleaned_ctx(self):
+        inst = cleaned_map_instrument(f_sky=0.6)
+        ctx = make_optimization_context(
+            inst,
+            NullForegroundModel(),
+            CMBSpectra(),
+            {"r": 0.0, "A_lens": 1.0},
+            priors={},
+            fixed_params=[],
+            ell_min=2, ell_max=30, delta_ell=5, ell_per_bin_below=2,
+        )
+        return ctx, inst
+
+    @staticmethod
+    def _random_cov(n_data, seed=0):
+        """A well-conditioned symmetric positive-definite (n_data, n_data) cov."""
+        rng = np.random.default_rng(seed)
+        A = rng.standard_normal((n_data, n_data))
+        return jnp.asarray(A @ A.T + n_data * np.eye(n_data))
+
+    def test_matches_fisher_forecast(self, cleaned_ctx):
+        """fp64 parity with FisherForecast(external_covariance=...).sigma('r').
+
+        Both route through the same prewhitened dense solve
+        (fisher._fisher_from_full); the optimize path just keeps the JAX array
+        instead of casting to float in sigma()."""
+        ctx, inst = cleaned_ctx
+        n_data = len(ctx.signal_model.freq_pairs) * ctx.signal_model.n_bins
+        cov = self._random_cov(n_data)
+
+        ff = FisherForecast(
+            ctx.signal_model, inst, {"r": 0.0, "A_lens": 1.0},
+            priors={}, fixed_params=[], external_covariance=cov,
+        )
+        ff.compute()
+        sigma_ref = ff.sigma("r")
+        sigma_opt = float(sigma_r_from_external_cov(cov, ctx))
+        np.testing.assert_allclose(sigma_opt, sigma_ref, rtol=1e-10)
+
+    def test_gradient_finite_and_matches_fd(self, cleaned_ctx):
+        """jax.grad w.r.t. a covariance scaling is finite, matches central FD,
+        and hits the closed form: with priors off, scaling cov by s scales F by
+        1/s, so sigma(r)(s) = sigma0 * sqrt(s) and d(sigma_r)/ds|_{s=1} = sigma0/2."""
+        ctx, _ = cleaned_ctx
+        n_data = len(ctx.signal_model.freq_pairs) * ctx.signal_model.n_bins
+        cov0 = self._random_cov(n_data)
+
+        def loss(s):
+            return sigma_r_from_external_cov(s * cov0, ctx)
+
+        sigma0 = float(loss(1.0))
+        g = float(jax.grad(loss)(1.0))
+        assert np.isfinite(g)
+
+        h = 1e-4
+        g_fd = (float(loss(1.0 + h)) - float(loss(1.0 - h))) / (2 * h)
+        np.testing.assert_allclose(g, g_fd, rtol=1e-4)
+        # Closed form (priors off): grad = sigma0 / 2.
+        np.testing.assert_allclose(g, 0.5 * sigma0, rtol=1e-6)
+
+    def test_jit(self, cleaned_ctx):
+        """Runs under jax.jit — the traceability prerequisite shared with grad."""
+        from functools import partial
+
+        ctx, _ = cleaned_ctx
+        n_data = len(ctx.signal_model.freq_pairs) * ctx.signal_model.n_bins
+        cov = self._random_cov(n_data)
+        jitted = jax.jit(partial(sigma_r_from_external_cov, ctx=ctx))
+        out = jitted(cov)
+        assert jnp.isfinite(out)
+        assert float(out) > 0

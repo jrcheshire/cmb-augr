@@ -27,7 +27,13 @@ from augr.foregrounds import NullForegroundModel
 from augr.instrument import beam_bl
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
-from augr.spectrum_stages import beamed_prior, cutsky_bb_bandpower, mc_cutsky_bandpowers
+from augr.spectrum_stages import (
+    beamed_prior,
+    cutsky_bb_bandpower,
+    make_cutsky_mc_context,
+    mc_cutsky_bandpowers,
+    mc_cutsky_cov_traced,
+)
 
 FREQS = (90.0, 150.0, 220.0)
 BEAMS = (40.0, 30.0, 20.0)
@@ -165,3 +171,99 @@ def test_purity_null_through_cleaner() -> None:
     assert np.max(ratio) < 0.1, (
         f"E->B leakage not sub-dominant: max leak/floor = {np.max(ratio):.3e}"
     )
+
+
+# --- differentiable (jax.grad-in-w_inv) cut-sky MC ---------------------------
+
+
+def _traced_setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2):
+    """Build a CutskyMCContext + cleaner mirroring _run_mc's tiny CMB-only config."""
+    cl_ee, cl_bb = _priors(lmax)
+    bm = _bin_matrix(2, ell_max, delta_ell, ell_per_bin_below)
+    true_b = mk.bin_spectrum(
+        jnp.clip(CMBSpectra().cl_bb(jnp.arange(lmax + 1, dtype=float), 0.0), 0.0, None), bm, 2
+    )
+    cleaner = nilc_cleaner(clean_e=True)
+    ctx = make_cutsky_mc_context(
+        cleaner=cleaner,
+        freqs_ghz=FREQS,
+        beam_fwhm_arcmin=BEAMS,
+        w_inv=W_INV,
+        nside=nside,
+        lmax=lmax,
+        mask=mk.galactic_mask(nside, 0.6),
+        cl_ee=cl_ee,
+        cl_bb_prior_unbeamed=cl_bb,
+        bin_matrix=bm,
+        ell_min=2,
+        true_bb_binned=true_b,
+        n_sims=n_sims,
+        base_seed=0,
+        fg_model=None,
+        r_in=0.0,
+    )
+    return ctx, cleaner
+
+
+@pytest.mark.slow
+def test_traced_matches_forward_covariance() -> None:
+    """mc_cutsky_cov_traced reproduces mc_cutsky_bandpowers at the fiducial w_inv.
+
+    Same seeds, same math; the traced path differs only in plumbing (precomputed
+    sky + jnp unrolled loop vs process-pool + per-sim sky build + np.asarray), so
+    the covariance and debiased bandpowers should match to fp64."""
+    ctx, cleaner = _traced_setup(12)
+    traced = mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner)
+    fwd = _run_mc(12)
+    np.testing.assert_allclose(
+        np.asarray(traced.covariance), np.asarray(fwd.covariance), rtol=1e-8, atol=0.0
+    )
+    np.testing.assert_allclose(
+        np.asarray(traced.debiased_bandpowers),
+        np.asarray(fwd.debiased_bandpowers),
+        rtol=1e-8,
+        atol=0.0,
+    )
+    assert traced.f_sky == pytest.approx(fwd.f_sky)
+
+
+@pytest.mark.slow
+def test_traced_sigma_r_grad_in_w_inv() -> None:
+    """End-to-end jax.grad of the map-based sigma(r) w.r.t. w_inv: finite, FD-matched.
+
+    The crown-jewel path: w_inv -> cut-sky MC compsep -> sample covariance ->
+    sigma_r_from_external_cov. CRN is fixed (ctx.noise_keys), so autodiff and the
+    central finite difference see the same sims and must agree."""
+    import jax
+
+    from augr.optimize import make_optimization_context, sigma_r_from_external_cov
+
+    ctx, cleaner = _traced_setup(12)
+    opt_ctx = make_optimization_context(
+        cleaned_map_instrument(f_sky=0.6),
+        NullForegroundModel(),
+        CMBSpectra(),
+        {"r": 0.0, "A_lens": 1.0},
+        priors={},
+        fixed_params=[],
+        ell_min=2,
+        ell_max=24,
+        delta_ell=8,
+        ell_per_bin_below=2,
+    )
+
+    def loss(w):
+        cov = mc_cutsky_cov_traced(w, ctx, cleaner).covariance
+        return sigma_r_from_external_cov(cov, opt_ctx)
+
+    w0 = jnp.asarray(W_INV)
+    s0 = float(loss(w0))
+    assert np.isfinite(s0) and s0 > 0
+
+    g = jax.grad(loss)(w0)
+    assert bool(jnp.all(jnp.isfinite(g)))
+
+    # Central FD on the first band (CRN-fixed => autodiff and FD use identical sims).
+    h = 0.05 * float(w0[0])
+    g_fd0 = (float(loss(w0.at[0].add(h))) - float(loss(w0.at[0].add(-h)))) / (2 * h)
+    np.testing.assert_allclose(float(g[0]), g_fd0, rtol=0.05)
