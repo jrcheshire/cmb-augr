@@ -62,8 +62,8 @@ class ForecastResult:
 
 def forecast_from_spectra(
     *,
-    nl_ells,
-    nl_post,
+    nl_ells=None,
+    nl_post=None,
     template_ells,
     template_cl,
     f_sky: float,
@@ -77,6 +77,7 @@ def forecast_from_spectra(
     apply_transfer: bool = False,
     delensed_bb=None,
     delensed_bb_ells=None,
+    external_covariance=None,
 ) -> ForecastResult:
     """σ(r) variants + Δr from beam-free cleaned-map noise + residual-template spectra.
 
@@ -90,7 +91,18 @@ def forecast_from_spectra(
     ----------
     nl_ells, nl_post
         Beam-free post-separation noise ``N_ℓ^{BB}`` and its multipoles →
-        ``external_noise_bb`` (interpolated onto the ``SignalModel`` grid).
+        ``external_noise_bb`` (interpolated onto the ``SignalModel`` grid). Required
+        for the analytic-Knox path; ignored (and may be ``None``) when
+        ``external_covariance`` is supplied.
+    external_covariance
+        Optional full ``(n_bins, n_bins)`` bandpower covariance (e.g. the cut-sky
+        masked-Wiener Monte-Carlo covariance from
+        :func:`augr.spectrum_stages.mc_cutsky_bandpowers`). When given, the analytic
+        Knox / ``external_noise_bb`` path is bypassed for *all three* Fisher variants
+        (and the Δr bias) — the same covariance applies to the baseline and the
+        ``A_res`` models since they share the binning. The masked-Wiener transfer is
+        already folded into the debiased bandpowers' covariance, so ``transfer`` /
+        ``apply_transfer`` are ignored in this mode (no double-counting).
     template_ells, template_cl
         Beam-free residual-foreground ``ΔC_ℓ`` and its multipoles → the ``A_res``
         template and the Δr truth-vs-fit mismatch.
@@ -110,18 +122,30 @@ def forecast_from_spectra(
         a_res_prior = DEFAULT_PRIORS_POST_COMPSEP["A_res"]
     if (delensed_bb is None) != (delensed_bb_ells is None):
         raise ValueError("delensed_bb and delensed_bb_ells must be supplied together.")
+    use_external_cov = external_covariance is not None
+    if not use_external_cov and nl_post is None:
+        raise ValueError(
+            "forecast_from_spectra needs nl_post (the post-separation noise spectrum) "
+            "for the analytic-Knox path, or an external_covariance for the cut-sky "
+            "Monte-Carlo path."
+        )
 
-    nl_ells_arr = np.asarray(nl_ells)
-    nl = np.asarray(nl_post)
     tcl = np.asarray(template_cl)
-    if transfer is None:
+    if use_external_cov:
+        # The masked-Wiener transfer is already in the MC covariance; do not apply a
+        # (separate) signal-loss transfer here, and there is no nl to interpolate.
         transfer_mean = 1.0
     else:
-        band = (nl_ells_arr >= ell_min) & (nl_ells_arr <= ell_max)
-        transfer_mean = float(np.mean(np.asarray(transfer)[band]))
-    if apply_transfer and transfer_mean > 0:
-        nl = nl / transfer_mean
-        tcl = tcl / transfer_mean
+        nl_ells_arr = np.asarray(nl_ells)
+        nl = np.asarray(nl_post)
+        if transfer is None:
+            transfer_mean = 1.0
+        else:
+            band = (nl_ells_arr >= ell_min) & (nl_ells_arr <= ell_max)
+            transfer_mean = float(np.mean(np.asarray(transfer)[band]))
+        if apply_transfer and transfer_mean > 0:
+            nl = nl / transfer_mean
+            tcl = tcl / transfer_mean
 
     inst = cleaned_map_instrument(f_sky=f_sky)
     cmb = CMBSpectra()
@@ -145,20 +169,25 @@ def forecast_from_spectra(
         return SignalModel(**kw)
 
     baseline = _signal(with_template=False)
-    nl_interp = jnp.interp(baseline.ells, jnp.asarray(nl_ells_arr, dtype=float), jnp.asarray(nl))
-    external_noise_bb = nl_interp[None, :]
+    if use_external_cov:
+        # Same (n_bins, n_bins) covariance for baseline and A_res models (shared bins);
+        # FisherForecast validates the shape against the data-vector length.
+        cov_kw = {"external_covariance": jnp.asarray(external_covariance)}
+    else:
+        nl_interp = jnp.interp(
+            baseline.ells, jnp.asarray(nl_ells_arr, dtype=float), jnp.asarray(nl)
+        )
+        cov_kw = {"external_noise_bb": nl_interp[None, :]}
 
     fid_base = {"r": r_fid, "A_lens": 1.0}
     fisher_baseline = FisherForecast(
-        baseline, inst, fid_base, priors={}, fixed_params=[], external_noise_bb=external_noise_bb
+        baseline, inst, fid_base, priors={}, fixed_params=[], **cov_kw
     )
     fisher_baseline.compute()
 
     signal = _signal(with_template=True)
     fid = {**fid_base, "A_res": 1.0}
-    fisher_flat = FisherForecast(
-        signal, inst, fid, priors={}, fixed_params=[], external_noise_bb=external_noise_bb
-    )
+    fisher_flat = FisherForecast(signal, inst, fid, priors={}, fixed_params=[], **cov_kw)
     fisher_flat.compute()
     fisher_gauss = FisherForecast(
         signal,
@@ -166,7 +195,7 @@ def forecast_from_spectra(
         fid,
         priors={"A_res": a_res_prior},
         fixed_params=[],
-        external_noise_bb=external_noise_bb,
+        **cov_kw,
     )
     fisher_gauss.compute()
 

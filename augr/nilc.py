@@ -48,7 +48,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .instrument import beam_bl
-from .sht import almxfl, check_band_limit, map2alm, synthesis
+from .sht import almxfl, check_band_limit, map2alm, synthesis, synthesis_pol
 
 # ---------------------------------------------------------------------------
 # cosine needlet bands
@@ -128,6 +128,41 @@ def common_resolution_b_alm(
         ratio = bl_common / jnp.maximum(bl_band, 1e-30)
         out.append(almxfl(eb[1], ratio, lmax))
     return jnp.stack(out, axis=0), float(common_fwhm_arcmin)
+
+
+def common_resolution_eb(
+    band_qu: jax.Array,
+    beam_fwhm_arcmin,
+    *,
+    lmax: int,
+    nside: int,
+    n_iter: int = 3,
+    common_fwhm_arcmin: float | None = None,
+) -> tuple[jax.Array, jax.Array, float]:
+    """Per-band Q/U → common-resolution E *and* B alm, each shape ``(n_band, Nlm)``.
+
+    The spin-2 companion to :func:`common_resolution_b_alm`: one ``map2alm(spin=2)``
+    per band yields both E and B, each deconvolved from its band beam and reconvolved
+    to ``common_fwhm_arcmin`` (default: the finest band's beam). Returns ``(e_alm,
+    b_alm, common_fwhm)``. Used by the spin-2 Q/U cleaner (``clean_e=True``) so the
+    cut-sky masked-Wiener estimator has a cleaned Q/U map to act on; the B-only path
+    keeps using :func:`common_resolution_b_alm` unchanged (byte-identical, and without
+    paying for the unused E leg).
+    """
+    beams = [float(b) for b in beam_fwhm_arcmin]
+    if common_fwhm_arcmin is None:
+        common_fwhm_arcmin = min(beams)
+    ells = jnp.arange(lmax + 1, dtype=float)
+    bl_common = beam_bl(ells, common_fwhm_arcmin)
+    out_e = []
+    out_b = []
+    for qu_b, fwhm_b in zip(band_qu, beams, strict=True):
+        eb = map2alm(qu_b, 2, lmax, nside, n_iter)  # (2, Nlm) = (E, B)
+        bl_band = beam_bl(ells, fwhm_b)
+        ratio = bl_common / jnp.maximum(bl_band, 1e-30)
+        out_e.append(almxfl(eb[0], ratio, lmax))
+        out_b.append(almxfl(eb[1], ratio, lmax))
+    return jnp.stack(out_e, axis=0), jnp.stack(out_b, axis=0), float(common_fwhm_arcmin)
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +373,14 @@ class NILCResult:
         Per-band input beams and the common resolution they were brought to.
     lmax, nside, n_iter
         Transform configuration (so passives are projected identically).
+    cleaned_e_alm, weights_e
+        The spin-2 (Q/U cleaner) extension, populated only when the cleaner is run
+        with ``clean_e=True`` (both ``None`` otherwise — the default B-only result is
+        unchanged). ``cleaned_e_alm`` is the cleaned E-mode alm at the common
+        resolution from an independent E-mode ILC solve (its own empirical
+        covariance / constrained system), and ``weights_e`` are the E-mode needlet
+        weights (so passive E maps project identically via :meth:`project_e`). With
+        both legs present, :meth:`cleaned_qu` builds the cut-sky cleaned Q/U map.
     """
 
     cleaned_b_alm: jax.Array
@@ -348,6 +391,8 @@ class NILCResult:
     lmax: int
     nside: int
     n_iter: int
+    cleaned_e_alm: jax.Array | None = None
+    weights_e: jax.Array | None = None
 
     def project(self, passive_band_qu: jax.Array) -> jax.Array:
         """Apply the stored weights to another map set → its cleaned B alm.
@@ -373,6 +418,58 @@ class NILCResult:
             n_iter=self.n_iter,
         )
 
+    def project_e(self, passive_band_qu: jax.Array) -> jax.Array:
+        """Apply the stored E-mode weights to another map set → its cleaned E alm.
+
+        The E-mode companion to :meth:`project`; requires the cleaner to have been run
+        with ``clean_e=True`` (``weights_e`` is otherwise ``None``). Used to project
+        passive (noise-only / FG-only / CMB-only) E content through the same E ILC.
+        """
+        if self.weights_e is None:
+            raise ValueError(
+                "this NILCResult has no E-mode weights (cleaner run without "
+                "clean_e=True); cannot project E."
+            )
+        e_alm, _b_alm, _fwhm = common_resolution_eb(
+            passive_band_qu,
+            self.beam_fwhm_arcmin,
+            lmax=self.lmax,
+            nside=self.nside,
+            n_iter=self.n_iter,
+            common_fwhm_arcmin=self.common_fwhm_arcmin,
+        )
+        beta = needlet_beta(e_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside)
+        return combine_needlets(
+            self.weights_e,
+            beta,
+            self.needlet_bands,
+            lmax=self.lmax,
+            nside=self.nside,
+            n_iter=self.n_iter,
+        )
+
+    def cleaned_qu(self) -> jax.Array:
+        """Cleaned Q/U map ``(2, npix)`` at the common resolution from cleaned E and B.
+
+        Requires ``clean_e=True`` at clean time. This is the spin-2 cleaned map the
+        cut-sky masked-Wiener estimator (:mod:`augr.masking`) consumes. Both E and B
+        sit at the common resolution ``B_c``, so the estimator's signal priors must be
+        beamed by ``B_c`` (the transfer then absorbs ``B_c²`` on debias).
+        """
+        if self.cleaned_e_alm is None:
+            raise ValueError(
+                "this NILCResult has no cleaned E alm (cleaner run without "
+                "clean_e=True); cannot build a Q/U map."
+            )
+        _t, q, u = synthesis_pol(
+            jnp.zeros_like(self.cleaned_e_alm),
+            self.cleaned_e_alm,
+            self.cleaned_b_alm,
+            lmax=self.lmax,
+            nside=self.nside,
+        )
+        return jnp.stack([q, u], axis=0)
+
 
 def nilc_clean(
     band_qu: jax.Array,
@@ -386,6 +483,7 @@ def nilc_clean(
     n_iter: int = 3,
     ridge: float = 1e-10,
     beam_band_limit: float = 0.1,
+    clean_e: bool = False,
 ) -> NILCResult:
     """Run the differentiable empirical needlet ILC on per-band Q/U maps.
 
@@ -418,6 +516,13 @@ def nilc_clean(
         — the fix for the small-aperture / high-ℓ covariance blow-up. At low lmax
         every channel resolves every band, so the mask is all-True and this is a
         no-op.
+    clean_e
+        ``False`` (default) → the B-only cleaner, byte-identical to before
+        (``cleaned_e_alm`` / ``weights_e`` left ``None``). ``True`` → additionally run
+        an *independent* E-mode ILC (its own empirical covariance, same needlet bands
+        and active-channel mask) so :meth:`NILCResult.cleaned_qu` can build the cut-sky
+        cleaned Q/U map for the masked-Wiener spectrum stage. Roughly doubles the clean
+        cost (a second needlet decomposition + weight solve + recompose).
 
     Returns
     -------
@@ -429,22 +534,33 @@ def nilc_clean(
         needlet_peaks = default_needlet_peaks(lmax)
     needlet_bands = cosine_needlet_bands(lmax, needlet_peaks)
 
-    b_alm, common_fwhm = common_resolution_b_alm(
-        band_qu,
-        beams,
-        lmax=lmax,
-        nside=nside,
-        n_iter=n_iter,
-        common_fwhm_arcmin=common_fwhm_arcmin,
-    )
-    beta = needlet_beta(b_alm, needlet_bands, lmax=lmax, nside=nside)
+    if clean_e:
+        e_alm, b_alm, common_fwhm = common_resolution_eb(
+            band_qu,
+            beams,
+            lmax=lmax,
+            nside=nside,
+            n_iter=n_iter,
+            common_fwhm_arcmin=common_fwhm_arcmin,
+        )
+    else:
+        e_alm = None
+        b_alm, common_fwhm = common_resolution_b_alm(
+            band_qu,
+            beams,
+            lmax=lmax,
+            nside=nside,
+            n_iter=n_iter,
+            common_fwhm_arcmin=common_fwhm_arcmin,
+        )
 
     active = _needlet_channel_mask(needlet_bands, beams, common_fwhm, lmax, beam_band_limit)
-    if localization_fwhm_arcmin is None:
-        weights = _global_weights(beta, ridge, active)
-    else:
-        weights = _localized_weights(
-            beta,
+
+    def _weights(beta_field):
+        if localization_fwhm_arcmin is None:
+            return _global_weights(beta_field, ridge, active)
+        return _localized_weights(
+            beta_field,
             localization_fwhm_arcmin,
             lmax=lmax,
             nside=nside,
@@ -453,7 +569,19 @@ def nilc_clean(
             active=active,
         )
 
+    beta = needlet_beta(b_alm, needlet_bands, lmax=lmax, nside=nside)
+    weights = _weights(beta)
     cleaned = combine_needlets(weights, beta, needlet_bands, lmax=lmax, nside=nside, n_iter=n_iter)
+
+    cleaned_e = None
+    weights_e = None
+    if clean_e:
+        beta_e = needlet_beta(e_alm, needlet_bands, lmax=lmax, nside=nside)
+        weights_e = _weights(beta_e)
+        cleaned_e = combine_needlets(
+            weights_e, beta_e, needlet_bands, lmax=lmax, nside=nside, n_iter=n_iter
+        )
+
     return NILCResult(
         cleaned_b_alm=cleaned,
         weights=weights,
@@ -463,4 +591,6 @@ def nilc_clean(
         lmax=int(lmax),
         nside=int(nside),
         n_iter=int(n_iter),
+        cleaned_e_alm=cleaned_e,
+        weights_e=weights_e,
     )

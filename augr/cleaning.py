@@ -20,11 +20,14 @@ What is *not* a cleaner here, deliberately:
   consumes a single already-cleaned Q/U map and returns a power spectrum. It sits
   downstream of a cleaner, in the spectrum stage.
 
-Future extension (the deferred masking / E-B work): a spin-2 **Q/U cleaner** that
-outputs a cut-sky cleaned Q/U map for :func:`augr.masking.masked_wiener_bb` will
-extend :class:`CleanerResult` *additively* — a ``cleaned_qu`` accessor plus a
-Q/U-consuming spectrum stage — so this protocol is the seam that work slots into,
-not something it has to redesign.
+Spin-2 (Q/U) extension: passing ``clean_e=True`` to either factory runs an
+additional independent E-mode ILC, so the result exposes the *optional* spin-2
+surface — ``cleaned_qu()`` (the cut-sky cleaned Q/U map
+:func:`augr.masking.masked_wiener_bb` consumes), ``project_e`` (project passive E
+through the E weights), and the ``cleaned_e_alm`` / ``weights_e`` fields. These are
+deliberately **not** part of the :class:`CleanerResult` Protocol body (that would
+break ``runtime_checkable`` for the default B-only results, whose ``cleaned_e_alm``
+is ``None``); a Q/U-consuming spectrum stage feature-detects ``cleaned_qu`` instead.
 """
 
 from __future__ import annotations
@@ -111,12 +114,14 @@ def nilc_cleaner(
     n_iter: int = 3,
     ridge: float = 1e-10,
     beam_band_limit: float = 0.1,
+    clean_e: bool = False,
 ) -> Cleaner:
     """A blind-NILC :class:`Cleaner`; kwargs are forwarded to :func:`augr.nilc.nilc_clean`.
 
     The returned callable is bit-identical to calling ``nilc_clean`` directly with
     the same arguments — it only fixes the uniform ``(band_qu, beams, *, lmax,
-    nside)`` call site so NILC and cMILC are interchangeable in a driver.
+    nside)`` call site so NILC and cMILC are interchangeable in a driver. Pass
+    ``clean_e=True`` for the spin-2 Q/U cleaner (a ``cleaned_qu()``-capable result).
     """
 
     def _cleaner(band_qu, beam_fwhm_arcmin, *, lmax, nside):
@@ -131,6 +136,7 @@ def nilc_cleaner(
             n_iter=n_iter,
             ridge=ridge,
             beam_band_limit=beam_band_limit,
+            clean_e=clean_e,
         )
 
     return _cleaner
@@ -147,6 +153,7 @@ def cmilc_cleaner(
     n_iter: int = 3,
     ridge: float = 1e-10,
     beam_band_limit: float = 0.1,
+    clean_e: bool = False,
 ) -> Cleaner:
     """A cMILC :class:`Cleaner`; ``freqs``/``moments`` are bound here, the rest forwarded.
 
@@ -155,7 +162,7 @@ def cmilc_cleaner(
     ``(band_qu, beams, *, lmax, nside)`` call site. The returned callable is
     bit-identical to :func:`augr.cmilc.cmilc_clean` with the same arguments
     (``return_diagnostics`` is left ``False`` so it yields a bare
-    :class:`augr.nilc.NILCResult`).
+    :class:`augr.nilc.NILCResult`). Pass ``clean_e=True`` for the spin-2 Q/U cleaner.
     """
 
     def _cleaner(band_qu, beam_fwhm_arcmin, *, lmax, nside):
@@ -173,6 +180,7 @@ def cmilc_cleaner(
             n_iter=n_iter,
             ridge=ridge,
             beam_band_limit=beam_band_limit,
+            clean_e=clean_e,
         )
 
     return _cleaner

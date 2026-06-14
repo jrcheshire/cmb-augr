@@ -68,6 +68,7 @@ from .nilc import (
     _ridge,
     combine_needlets,
     common_resolution_b_alm,
+    common_resolution_eb,
     cosine_needlet_bands,
     default_needlet_peaks,
     needlet_beta,
@@ -255,6 +256,7 @@ def cmilc_clean(
     n_iter=3,
     ridge=1e-10,
     beam_band_limit=0.1,
+    clean_e=False,
     return_diagnostics=False,
 ):
     """Constrained-moment needlet ILC on per-band Q/U maps → :class:`augr.nilc.NILCResult`.
@@ -277,6 +279,12 @@ def cmilc_clean(
     fiducial
         Fiducial spectral parameters (pivots) for the moment SEDs (default
         ``FIDUCIAL_BK15``).
+    clean_e
+        ``False`` (default) → B-only, byte-identical to before. ``True`` → additionally
+        run an independent constrained-ILC solve on the E modes (same mixing matrix
+        ``A`` — moment SEDs are frequency scalings, identical for E and B — and the same
+        active-channel mask) so :meth:`augr.nilc.NILCResult.cleaned_qu` can build the
+        cut-sky cleaned Q/U map for the masked-Wiener spectrum stage.
     return_diagnostics
         If True, return ``(result, info)`` where ``info`` carries the mixing matrix, the
         moment list, the constraint count, and the per-band retained-column count (the
@@ -297,20 +305,25 @@ def cmilc_clean(
         needlet_peaks = default_needlet_peaks(lmax)
     needlet_bands = cosine_needlet_bands(lmax, needlet_peaks)
 
-    b_alm, common_fwhm = common_resolution_b_alm(
-        band_qu, beams, lmax=lmax, nside=nside, n_iter=n_iter, common_fwhm_arcmin=common_fwhm_arcmin
-    )
-    beta = needlet_beta(b_alm, needlet_bands, lmax=lmax, nside=nside)
+    if clean_e:
+        e_alm, b_alm, common_fwhm = common_resolution_eb(
+            band_qu, beams, lmax=lmax, nside=nside, n_iter=n_iter, common_fwhm_arcmin=common_fwhm_arcmin
+        )
+    else:
+        e_alm = None
+        b_alm, common_fwhm = common_resolution_b_alm(
+            band_qu, beams, lmax=lmax, nside=nside, n_iter=n_iter, common_fwhm_arcmin=common_fwhm_arcmin
+        )
     active = _needlet_channel_mask(needlet_bands, beams, common_fwhm, lmax, beam_band_limit)
 
     A = moment_sed_vectors(freqs, fiducial=fiducial, moments=moments)  # (n_band, 1 + n_moments)
     e = jnp.zeros(A.shape[1]).at[0].set(1.0)
 
-    if localization_fwhm_arcmin is None:
-        weights, cols = _global_cilc_weights(beta, A, e, ridge, active)
-    else:
-        weights, cols = _localized_cilc_weights(
-            beta,
+    def _cilc_weights(beta_field):
+        if localization_fwhm_arcmin is None:
+            return _global_cilc_weights(beta_field, A, e, ridge, active)
+        return _localized_cilc_weights(
+            beta_field,
             A,
             e,
             localization_fwhm_arcmin,
@@ -321,7 +334,19 @@ def cmilc_clean(
             active=active,
         )
 
+    beta = needlet_beta(b_alm, needlet_bands, lmax=lmax, nside=nside)
+    weights, cols = _cilc_weights(beta)
     cleaned = combine_needlets(weights, beta, needlet_bands, lmax=lmax, nside=nside, n_iter=n_iter)
+
+    cleaned_e = None
+    weights_e = None
+    if clean_e:
+        beta_e = needlet_beta(e_alm, needlet_bands, lmax=lmax, nside=nside)
+        weights_e, _cols_e = _cilc_weights(beta_e)
+        cleaned_e = combine_needlets(
+            weights_e, beta_e, needlet_bands, lmax=lmax, nside=nside, n_iter=n_iter
+        )
+
     result = NILCResult(
         cleaned_b_alm=cleaned,
         weights=weights,
@@ -331,6 +356,8 @@ def cmilc_clean(
         lmax=int(lmax),
         nside=int(nside),
         n_iter=int(n_iter),
+        cleaned_e_alm=cleaned_e,
+        weights_e=weights_e,
     )
     if return_diagnostics:
         info = {

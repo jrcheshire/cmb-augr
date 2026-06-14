@@ -79,3 +79,19 @@ def test_cmilc_cleaner_matches_cmilc_clean() -> None:
     via = cmilc_cleaner(FREQS, needlet_peaks=PEAKS)(band_qu, BEAMS, lmax=LMAX, nside=NSIDE)
     assert isinstance(via, CleanerResult)
     np.testing.assert_array_equal(np.asarray(via.cleaned_b_alm), np.asarray(direct.cleaned_b_alm))
+
+
+@pytest.mark.parametrize("factory", ["nilc", "cmilc"])
+def test_cleaner_clean_e_exposes_qu_surface(factory) -> None:
+    """clean_e=True still yields a CleanerResult, and now a (2, npix) cleaned Q/U map."""
+    pytest.importorskip("ducc0")
+    band_qu = _random_band_qu()
+    cleaner = (
+        nilc_cleaner(needlet_peaks=PEAKS, clean_e=True)
+        if factory == "nilc"
+        else cmilc_cleaner(FREQS, needlet_peaks=PEAKS, clean_e=True)
+    )
+    res = cleaner(band_qu, BEAMS, lmax=LMAX, nside=NSIDE)
+    assert isinstance(res, CleanerResult)  # B-only protocol still satisfied
+    assert res.cleaned_e_alm is not None and res.weights_e is not None
+    assert res.cleaned_qu().shape == (2, 12 * NSIDE * NSIDE)
