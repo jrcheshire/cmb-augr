@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -27,8 +28,12 @@ from .cleaning import Cleaner, CleanerResult
 from .compsep_sims import assemble_band_maps, generate_band_sky
 from .forecast import ForecastResult, forecast_from_spectra
 from .gnilc import gnilc_residual_template
+from .instrument import Instrument, bandpasses_from_instrument, white_noise_power
 from .nilc_forecast import NILCSpectra, nilc_spectra
 from .spectra import CMBSpectra
+
+if TYPE_CHECKING:
+    from .bandpass import Bandpass
 
 
 class SpectrumSource(Enum):
@@ -87,6 +92,10 @@ class ForecastConfig:
     r_in: float = 0.0
     seed: int = 0
     hit_map: jax.Array | None = None
+    # per-band bandpass for foreground color correction (sky + cMILC SEDs); None →
+    # monochromatic band-center evaluation, byte-identical to before. Build from an
+    # Instrument via ForecastConfig.from_instrument (single source of truth).
+    bandpasses: tuple[Bandpass | None, ...] | None = None
     # residual-template source
     residual_source: ResidualTemplateSource = ResidualTemplateSource.ORACLE
     gnilc_m_bias: int = 1
@@ -113,6 +122,62 @@ class ForecastConfig:
     cl_ee_prior: jax.Array | None = None
     cl_bb_prior: jax.Array | None = None
     mc_workers: int = 1
+
+    @classmethod
+    def from_instrument(
+        cls,
+        instrument: Instrument,
+        cleaner: Cleaner,
+        *,
+        nside: int,
+        lmax: int,
+        f_sky: float | None = None,
+        w_inv: tuple[float, ...] | None = None,
+        **kwargs,
+    ) -> ForecastConfig:
+        """Build a config from an :class:`augr.instrument.Instrument` (single source of truth).
+
+        Derives ``freqs_ghz``, ``beam_fwhm_arcmin``, ``bandpasses`` (per
+        :func:`augr.instrument.bandpasses_from_instrument`), and ``w_inv`` (per
+        :func:`augr.instrument.white_noise_power`, so the bandwidth→NET→``w_inv``
+        link stays consistent) from the instrument's channels. ``f_sky`` defaults to
+        ``instrument.f_sky``. Any other :class:`ForecastConfig` knob is forwarded via
+        ``kwargs``.
+
+        A fully-monochromatic instrument yields ``bandpasses=None`` → the byte-identical
+        legacy path. For a cMILC forecast, build the cleaner with the matching bandpasses
+        so the sky and the deprojection SEDs share one source, e.g.::
+
+            bps = bandpasses_from_instrument(inst)
+            freqs = tuple(c.nu_ghz for c in inst.channels)
+            cfg = ForecastConfig.from_instrument(
+                inst, cmilc_cleaner(freqs, bandpasses=bps), nside=nside, lmax=lmax)
+
+        (NILC / GNILC are blind, so a plain ``nilc_cleaner()`` already matches.)
+        """
+        chans = instrument.channels
+        fsky = float(instrument.f_sky) if f_sky is None else float(f_sky)
+        freqs = tuple(float(c.nu_ghz) for c in chans)
+        beams = tuple(float(c.beam_fwhm_arcmin) for c in chans)
+        bps = bandpasses_from_instrument(instrument)
+        if w_inv is None:
+            w_inv = tuple(
+                float(white_noise_power(c, instrument.mission_duration_years, fsky))
+                for c in chans
+            )
+        else:
+            w_inv = tuple(float(x) for x in w_inv)
+        return cls(
+            freqs_ghz=freqs,
+            beam_fwhm_arcmin=beams,
+            w_inv=w_inv,
+            cleaner=cleaner,
+            nside=nside,
+            lmax=lmax,
+            f_sky=fsky,
+            bandpasses=bps,
+            **kwargs,
+        )
 
 
 @dataclass(frozen=True)
@@ -152,6 +217,7 @@ def clean_sky(config: ForecastConfig) -> CleanedSky:
         lmax=config.lmax,
         fg_model=config.fg_model,
         cmb_seed=config.seed,
+        bandpasses=config.bandpasses,
     )
     hit_map = jnp.ones(sky.npix) if config.hit_map is None else config.hit_map
     total = assemble_band_maps(
@@ -304,6 +370,7 @@ def forecast_cleaned_cutsky_mc(cleaned: CleanedSky, config: ForecastConfig) -> F
         hit_map=config.hit_map,
         var_pix_ref=config.var_pix_ref,
         workers=config.mc_workers,
+        bandpasses=config.bandpasses,
     )
 
     return forecast_from_spectra(

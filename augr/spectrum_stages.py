@@ -184,6 +184,7 @@ def _build_sim(
     hit_map,
     knee_ell,
     alpha_knee,
+    bandpasses=None,
 ):
     """One sim's beamed sky + total band maps. Returns ``(sky, total)``."""
     hsky = harmonic_sky(
@@ -195,6 +196,7 @@ def _build_sim(
         fg_model=fg_model,
         cmb_seed=int(seed),
         cl_ee=cl_ee,
+        bandpasses=bandpasses,
     )
     sky = beam_harmonic_sky(hsky, tuple(beam_fwhm_arcmin))
     total = assemble_band_maps(
@@ -234,6 +236,7 @@ def mc_cutsky_bandpowers(
     tol: float = 1e-8,
     workers: int = 1,
     spectra: CMBSpectra | None = None,
+    bandpasses=None,
 ) -> CutskyMC:
     """Run the cut-sky masked-Wiener MC ensemble → debiased bandpowers + covariance.
 
@@ -281,6 +284,9 @@ def mc_cutsky_bandpowers(
         a module-level cleaner).
     spectra
         ``CMBSpectra`` provider (default: a fresh ``CMBSpectra()``).
+    bandpasses
+        Optional per-band ``Bandpass`` to bandpass-integrate the foreground sims
+        (match the cleaner's color-corrected SEDs); ``None`` → monochromatic.
     """
     spectra = CMBSpectra() if spectra is None else spectra
     freqs_ghz = tuple(float(f) for f in freqs_ghz)
@@ -304,6 +310,7 @@ def mc_cutsky_bandpowers(
         hit_map=hit_map,
         knee_ell=knee_ell,
         alpha_knee=alpha_knee,
+        bandpasses=bandpasses,
     )
 
     # var_pix_ref: per-pixel noise variance of a representative cleaned map (filter
