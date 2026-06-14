@@ -21,6 +21,8 @@ from dataclasses import dataclass
 
 import jax.numpy as jnp
 
+from augr.bandpass import Bandpass
+
 # -----------------------------------------------------------------------
 # Constants
 # -----------------------------------------------------------------------
@@ -130,6 +132,15 @@ class Channel:
         alpha_knee:        1/f noise spectral index in multipole space.
                            N_ℓ ∝ (ℓ_knee/ℓ)^alpha_knee at ℓ < ℓ_knee.
         efficiency:        Scalar efficiency factors for this channel.
+        fractional_bandwidth: Δν/ν for this band. 0.0 (default) means the
+                           band is treated monochromatically (the band-center
+                           limit) everywhere downstream; a positive value lets
+                           ``channel_bandpass`` build a top-hat for
+                           bandpass-integrated component separation. Does not
+                           affect the analytic Fisher path.
+        bandpass:          Explicit measured / asymmetric ``Bandpass`` profile.
+                           Overrides ``fractional_bandwidth`` when set; ``None``
+                           (default) falls back to the top-hat derivation.
     """
     nu_ghz: float
     n_detectors: int
@@ -138,6 +149,37 @@ class Channel:
     knee_ell: float = 0.0
     alpha_knee: float = 1.0
     efficiency: ScalarEfficiency = L2_EFFICIENCY
+    fractional_bandwidth: float = 0.0
+    bandpass: Bandpass | None = None
+
+
+def channel_bandpass(channel: Channel) -> Bandpass | None:
+    """Resolve the effective bandpass for a channel (single source of truth).
+
+    Returns the explicit ``channel.bandpass`` if set; otherwise a top-hat from
+    ``channel.fractional_bandwidth`` if that is positive; otherwise ``None``
+    (monochromatic — the band-center limit). Consumers treat ``None`` as the
+    legacy delta-function behavior.
+    """
+    if channel.bandpass is not None:
+        return channel.bandpass
+    if channel.fractional_bandwidth > 0.0:
+        return Bandpass.tophat(channel.nu_ghz, channel.fractional_bandwidth)
+    return None
+
+
+def bandpasses_from_instrument(
+    instrument: Instrument,
+) -> tuple[Bandpass | None, ...] | None:
+    """Per-channel bandpasses, or ``None`` if every channel is monochromatic.
+
+    Returns ``tuple(channel_bandpass(ch) ...)``; collapses to ``None`` when all
+    channels are monochromatic so downstream consumers take the byte-identical
+    legacy path. Use this to build a cMILC cleaner whose color-corrected SEDs match
+    the bandpass-integrated sky from the same instrument.
+    """
+    bps = tuple(channel_bandpass(ch) for ch in instrument.channels)
+    return None if all(b is None for b in bps) else bps
 
 
 @dataclass(frozen=True)
