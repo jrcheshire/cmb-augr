@@ -219,8 +219,14 @@ def almxfl(alm: jax.Array, fl: jax.Array, lmax: int) -> jax.Array:
 
     Used to apply beam / needlet-band window functions ``B(ℓ)`` / ``h_j(ℓ)``
     on alms. Differentiable in both ``alm`` and ``fl``.
+
+    ``ell`` is kept as a NumPy index (not ``jnp``): ``fl[ell]`` then works for both
+    a jnp ``fl`` (jnp gather) and a numpy ``fl`` (numpy gather), the latter under
+    ``jax.jit`` / ``lax.map`` too -- a jnp ``ell`` would force numpy ``fl`` through
+    ``numpy[tracer]`` and raise. Static-index gather, so differentiability in
+    ``alm`` / ``fl`` is unchanged.
     """
-    ell = jnp.asarray(_ell_of_alm(lmax))
+    ell = _ell_of_alm(lmax)
     return alm * fl[ell]
 
 
