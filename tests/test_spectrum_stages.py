@@ -275,3 +275,26 @@ def test_traced_sigma_r_grad_in_w_inv() -> None:
     h = 0.05 * float(w0[0])
     g_fd0 = (float(loss(w0.at[0].add(h))) - float(loss(w0.at[0].add(-h)))) / (2 * h)
     np.testing.assert_allclose(float(g[0]), g_fd0, rtol=0.05)
+
+
+@pytest.mark.slow
+def test_traced_cov_jit_matches_eager() -> None:
+    """mc_cutsky_cov_traced is jax.jit-able, including with *traced* beams.
+
+    The jnp + stop_gradient needlet-channel mask removes the last ``np.asarray``/
+    ``float()`` boundary in the cleaner body, so the whole map path (sky beaming ->
+    clean -> masked-Wiener -> sample covariance) compiles. jit vs eager agree to the
+    XLA-fusion / wiener-CG floor (the GPU enabler)."""
+    import jax
+
+    ctx, cleaner = _traced_setup(8)
+    w0 = jnp.asarray(W_INV)
+    bf = jnp.asarray(BEAMS)
+    bp = jnp.ones(len(BEAMS))
+
+    def cov_of(w, a, b):
+        return mc_cutsky_cov_traced(w, ctx, cleaner, beam_fwhm=a, beam_p=b).covariance
+
+    cov_eager = cov_of(w0, bf, bp)
+    cov_jit = jax.jit(cov_of)(w0, bf, bp)
+    np.testing.assert_allclose(np.asarray(cov_jit), np.asarray(cov_eager), rtol=1e-6, atol=1e-30)

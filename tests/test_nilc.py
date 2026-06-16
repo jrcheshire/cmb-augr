@@ -16,7 +16,10 @@ pytest.importorskip("ducc0")
 
 from augr.compsep_sims import assemble_band_maps, generate_band_sky
 from augr.nilc import (
+    _ilc_weights_from_cov,
+    _ilc_weights_masked,
     _needlet_channel_mask,
+    _ridge,
     combine_needlets,
     common_resolution_b_alm,
     cosine_needlet_bands,
@@ -186,6 +189,55 @@ def test_needlet_channel_mask_excludes_coarse_at_fine_bands() -> None:
     assert mask[:, 1].all()  # finest channel (= common beam) active in every band
     assert mask[0, 0]  # coarse channel resolves the low-ℓ band
     assert not mask[-1, 0]  # ... but is excluded from the finest band
+
+
+def _rand_spd(seed, n, n_samp=200):
+    """Random SPD covariance (n, n)."""
+    x = np.random.default_rng(seed).standard_normal((n, n_samp))
+    return jnp.asarray((x @ x.T) / n_samp)
+
+
+def test_ilc_weights_masked_all_active_byte_identical():
+    """All-active mask reproduces the plain ridge+ILC solve byte-for-byte."""
+    cov = _rand_spd(0, 5)
+    m = jnp.ones(5)
+    w_masked = _ilc_weights_masked(cov, m, 1e-10)
+    w_plain = _ilc_weights_from_cov(_ridge(cov, 1e-10))
+    np.testing.assert_array_equal(np.asarray(w_masked), np.asarray(w_plain))
+
+
+def test_ilc_weights_masked_matches_active_only_gather():
+    """Forced-exclusion: the masked solve == the explicit active-channel gather to fp64,
+    with inactive weights exactly 0 and the CMB constraint Σ_active w = 1 preserved."""
+    cov = _rand_spd(1, 6)
+    ridge = 1e-10
+    m = jnp.array([1.0, 0.0, 1.0, 1.0, 0.0, 1.0])
+    idx = np.array([0, 2, 3, 5])
+
+    w = _ilc_weights_masked(cov, m, ridge)
+
+    # reference: solve over the active sub-block only, then scatter back
+    cov_aa = cov[np.ix_(idx, idx)]
+    w_active = _ilc_weights_from_cov(_ridge(cov_aa, ridge))
+    w_ref = np.zeros(6)
+    w_ref[idx] = np.asarray(w_active)
+
+    np.testing.assert_allclose(np.asarray(w), w_ref, rtol=1e-10, atol=1e-12)
+    np.testing.assert_array_equal(np.asarray(w)[[1, 4]], 0.0)  # inactive → exactly 0
+    assert abs(float(jnp.sum(m * w)) - 1.0) < 1e-12  # CMB preserved over active
+
+
+def test_ilc_weights_masked_batched_pixel():
+    """The masked solve is batch-safe over a leading pixel axis (localized path)."""
+    rng = np.random.default_rng(2)
+    npix, n_band = 5, 4
+    x = rng.standard_normal((npix, n_band, 50))
+    cov = jnp.asarray(np.einsum("pbi,pci->pbc", x, x) / 50.0)
+    m = jnp.broadcast_to(jnp.array([1.0, 1.0, 0.0, 1.0]), (npix, n_band))
+    w = _ilc_weights_masked(cov, m, 1e-10)
+    assert w.shape == (npix, n_band)
+    np.testing.assert_array_equal(np.asarray(w)[:, 2], 0.0)  # inactive band → 0 every pixel
+    np.testing.assert_allclose(np.asarray(jnp.sum(m * w, axis=-1)), 1.0, rtol=1e-10)
 
 
 # --- spin-2 Q/U cleaner (clean_e=True) -------------------------------------

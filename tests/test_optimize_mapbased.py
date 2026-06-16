@@ -30,7 +30,11 @@ from augr.delensing import load_lensing_spectra
 from augr.foregrounds import NullForegroundModel
 from augr.instrument import white_noise_power
 from augr.optimize import make_optimization_context, sigma_r_from_external_cov
-from augr.optimize_mapbased import sigma_r_from_noise_design, w_inv_from_noise_design
+from augr.optimize_mapbased import (
+    sigma_r_from_beam_design,
+    sigma_r_from_noise_design,
+    w_inv_from_noise_design,
+)
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
 from augr.spectrum_stages import make_cutsky_mc_context, mc_cutsky_cov_traced
@@ -223,3 +227,46 @@ def test_noise_design_grad_finite_and_fd_matched() -> None:
         float(loss(n_det, net, eta, years + h_yr)) - float(loss(n_det, net, eta, years - h_yr))
     ) / (2 * h_yr)
     np.testing.assert_allclose(float(g_years), g_fd_years, rtol=0.05)
+
+
+@pytest.mark.slow
+def test_beam_design_grad_finite_and_fd_matched() -> None:
+    """End-to-end jax.grad of map-based sigma(r) w.r.t. the per-band beams: FD-matched.
+
+    Differentiates through the per-band FWHM and the shape exponent ``p`` (beamed
+    in-trace). CRN is fixed (mc_ctx.noise_keys), so autodiff and the central finite
+    difference see the same sims and must agree. Also checks that at the reference beams
+    (FWHM = BEAMS, p = 1) the beam-design path reproduces the frozen noise-only path —
+    i.e. moving the beaming into the trace did not change the value."""
+    mc_ctx, opt_ctx, cleaner = _setup(12)
+    w_inv = w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, mc_ctx.f_sky
+    )
+    fwhm = jnp.asarray(BEAMS)
+    p = jnp.ones(len(BEAMS))
+
+    def loss(bf, bp):
+        return sigma_r_from_beam_design(
+            bf, bp, w_inv=w_inv, mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner
+        )
+
+    s0 = float(loss(fwhm, p))
+    assert np.isfinite(s0) and s0 > 0
+
+    # Reference beams reproduce the noise-only (frozen-beam) path to fp64.
+    cov_ref = mc_cutsky_cov_traced(w_inv, mc_ctx, cleaner).covariance
+    s_ref = float(sigma_r_from_external_cov(cov_ref, opt_ctx))
+    np.testing.assert_allclose(s0, s_ref, rtol=1e-9)
+
+    g_fwhm, g_p = jax.grad(loss, argnums=(0, 1))(fwhm, p)
+    assert bool(jnp.all(jnp.isfinite(g_fwhm)))
+    assert bool(jnp.all(jnp.isfinite(g_p)))
+
+    # Central FD on band-0 FWHM and band-0 shape exponent (CRN-fixed => identical sims).
+    h = 0.05 * float(fwhm[0])
+    g_fd_fwhm0 = (float(loss(fwhm.at[0].add(h), p)) - float(loss(fwhm.at[0].add(-h), p))) / (2 * h)
+    np.testing.assert_allclose(float(g_fwhm[0]), g_fd_fwhm0, rtol=0.05)
+
+    hp = 0.05
+    g_fd_p0 = (float(loss(fwhm, p.at[0].add(hp))) - float(loss(fwhm, p.at[0].add(-hp)))) / (2 * hp)
+    np.testing.assert_allclose(float(g_p[0]), g_fd_p0, rtol=0.05)
