@@ -549,29 +549,6 @@ def make_cutsky_mc_context(
 
     inv_noise = mk.inv_noise_map(hit_map, var_pix_ref, mask=mask)
 
-    # Pre-warm jht's wiener-path lru_caches CONCRETELY, eagerly, before the traced
-    # forward runs. jht <= 0.1.3 caches device-array geometry / index tables
-    # (healpix._prepare, masked._dof_layout / _prior_ell_index); if those are first
-    # populated INSIDE mc_cutsky_cov_traced's lax.map (a scan trace) they hold
-    # tracers that then leak (UnexpectedTracerError). One eager wiener call at this
-    # (nside, lmax, spin=2) fills them with concrete arrays the scan reuses. The
-    # var_pix setup above only runs the cleaner (no wiener), so it does not warm
-    # them. TODO(jht): drop once jht hardens these caches to numpy (the existing
-    # _recursion._wigner_seed_np convention); branch jc/wiener-cache-numpy has the
-    # masked.py half done, healpix._prepare pending.
-    cutsky_bb_bandpower(
-        jnp.zeros((2, npix)),
-        inv_noise,
-        cl_ee_prior,
-        cl_bb_prior,
-        bin_matrix=jnp.asarray(bin_matrix),
-        ell_min=int(ell_min),
-        nside=int(nside),
-        lmax=int(lmax),
-        max_iter=int(max_iter),
-        tol=float(tol),
-    )
-
     return CutskyMCContext(
         band_skies=band_skies,
         noise_keys=noise_keys,
