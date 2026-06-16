@@ -162,8 +162,7 @@ class ForecastConfig:
         bps = bandpasses_from_instrument(instrument)
         if w_inv is None:
             w_inv = tuple(
-                float(white_noise_power(c, instrument.mission_duration_years, fsky))
-                for c in chans
+                float(white_noise_power(c, instrument.mission_duration_years, fsky)) for c in chans
             )
         else:
             w_inv = tuple(float(x) for x in w_inv)
@@ -298,15 +297,18 @@ def forecast_cleaned(cleaned: CleanedSky, config: ForecastConfig) -> ForecastRes
     )
 
 
-def forecast_cleaned_cutsky_mc(cleaned: CleanedSky, config: ForecastConfig) -> ForecastResult:
-    """Cut-sky forecast tail: masked-Wiener MC covariance + the shared residual template.
+def cutsky_mc_bandpowers(cleaned: CleanedSky, config: ForecastConfig):
+    """Run the cut-sky masked-Wiener MC ensemble + select the residual template.
 
-    Reuses ``cleaned`` only for the residual-foreground template (so the σ(r) here is
-    apples-to-apples with :func:`forecast_cleaned`: identical ``A_res`` template and
-    Fisher Jacobian). The covariance comes from a fresh spin-2-cleaner Monte-Carlo
-    ensemble through the masked-Wiener estimator
-    (:func:`augr.spectrum_stages.mc_cutsky_bandpowers`). ``config.f_sky`` is the realized
-    ``⟨mask⟩`` (set by :func:`run_forecast`).
+    The shared front half of :func:`forecast_cleaned_cutsky_mc`: builds the
+    throwaway cleaned-map ``SignalModel`` (for the Fisher binning), the lensing
+    priors, and the realized-mask MC ensemble
+    (:func:`augr.spectrum_stages.mc_cutsky_bandpowers`), and selects the
+    residual-foreground template. Returns ``(mc, template_ells, template_cl)``, so
+    both the Gaussian-Fisher tail (:func:`forecast_cleaned_cutsky_mc`) and the
+    Bayesian HL tail (``scripts/cutsky_hl_headline.py`` via
+    :func:`augr.likelihood.hl_forecast_from_cutsky_mc`) consume one identical
+    ensemble + template.
     """
     from . import masking as mk
     from .config import cleaned_map_instrument
@@ -372,7 +374,20 @@ def forecast_cleaned_cutsky_mc(cleaned: CleanedSky, config: ForecastConfig) -> F
         workers=config.mc_workers,
         bandpasses=config.bandpasses,
     )
+    return mc, template_ells, cl_residual_fg
 
+
+def forecast_cleaned_cutsky_mc(cleaned: CleanedSky, config: ForecastConfig) -> ForecastResult:
+    """Cut-sky forecast tail: masked-Wiener MC covariance + the shared residual template.
+
+    Reuses ``cleaned`` only for the residual-foreground template (so the σ(r) here is
+    apples-to-apples with :func:`forecast_cleaned`: identical ``A_res`` template and
+    Fisher Jacobian). The covariance comes from a fresh spin-2-cleaner Monte-Carlo
+    ensemble through the masked-Wiener estimator
+    (:func:`augr.spectrum_stages.mc_cutsky_bandpowers`). ``config.f_sky`` is the realized
+    ``⟨mask⟩`` (set by :func:`run_forecast`).
+    """
+    mc, template_ells, cl_residual_fg = cutsky_mc_bandpowers(cleaned, config)
     return forecast_from_spectra(
         template_ells=template_ells,
         template_cl=cl_residual_fg,

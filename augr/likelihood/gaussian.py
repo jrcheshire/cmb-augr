@@ -46,3 +46,28 @@ class GaussianLikelihood(eqx.Module):
         cov_inv = _dense_cov_inv(bandpower_covariance_full(signal_model, instrument, fid))
         data = signal_model.data_vector(fid)
         return cls(cov_inv=cov_inv, data=data)
+
+    @classmethod
+    def from_external(
+        cls,
+        signal_model,
+        fiducial_params: jax.Array,
+        covariance: jax.Array,
+    ) -> GaussianLikelihood:
+        """Build the Asimov Gaussian likelihood from a precomputed external covariance.
+
+        Mirrors :meth:`from_forecast` but takes a precomputed ``(n_data, n_data)``
+        bandpower covariance (e.g. the cut-sky masked-Wiener Monte-Carlo
+        covariance ``augr.spectrum_stages.CutskyMC.covariance``) instead of
+        building the analytic Knox covariance. The Gaussian mean is the Asimov
+        signal ``signal_model.data_vector(fid)``; the post-separation noise lives
+        in the covariance — matching the Gaussian-Fisher
+        ``forecast_from_spectra(external_covariance=...)`` path, whose curvature
+        this reproduces exactly (the parity check for the cut-sky bridge).
+        """
+        import jax.numpy as jnp
+
+        fid = jnp.asarray(fiducial_params)
+        cov_inv = _dense_cov_inv(jnp.asarray(covariance))
+        data = signal_model.data_vector(fid)
+        return cls(cov_inv=cov_inv, data=data)

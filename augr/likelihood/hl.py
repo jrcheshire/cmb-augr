@@ -42,7 +42,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from augr.likelihood.ordering import SpectrumLayout, matrices_to_spectra
+from augr.likelihood.ordering import SpectrumLayout, matrices_to_spectra, spectra_to_matrices
 from augr.likelihood.protocols import BinnedSpectra
 
 # Eigenvalue floor relative to the largest eigenvalue per bin: below this an
@@ -210,5 +210,50 @@ class HLLikelihood(eqx.Module):
             c_fl_12=c_fl_12,
             data_matrices=m_full,
             noise_matrices=noise,
+            layout=layout,
+        )
+
+    @classmethod
+    def from_external(
+        cls,
+        signal_model,
+        fiducial_params: jax.Array,
+        total_bandpower: jax.Array,
+        covariance: jax.Array,
+    ) -> HLLikelihood:
+        """Build the Asimov HL likelihood from external MC bandpowers + covariance.
+
+        Mirrors :meth:`from_forecast` but sources the total (signal + noise +
+        residual) fiducial bandpower and the dense ``M_f`` from precomputed
+        Monte-Carlo outputs (e.g. ``augr.spectrum_stages.CutskyMC.mean_bandpower``
+        / ``.covariance``) rather than the analytic Knox builders.
+
+        The HL "data" ``Ĉ`` is the total Asimov bandpower ``total_bandpower``; the
+        fiducial noise floor is recovered as ``N_b = total - data_vector(fid)``.
+        This relies on the masked-Wiener debias *not* subtracting a noise bias, so
+        ``mean_bandpower`` is the total signal + noise + residual (see
+        ``augr.masking.debias_bandpower``). The model each call is
+        ``data_vector(theta) + N_b``, so at the fiducial ``model = total`` and the
+        HL residual ``X_g`` vanishes — the likelihood peaks at the fiducial by
+        construction, with **no change to the forward model**.
+
+        ``total_bandpower`` is the flat ``(n_data,)`` data vector in
+        ``signal_model.freq_pairs`` order (``n_data = n_bins`` for a single cleaned
+        field); ``covariance`` is the matching ``(n_data, n_data)`` bandpower
+        covariance.
+        """
+        fid = jnp.asarray(fiducial_params)
+        total = jnp.asarray(total_bandpower)
+        layout = SpectrumLayout.from_freq_pairs(signal_model.freq_pairs, signal_model.n_bins)
+        noise_vec = total - signal_model.data_vector(fid)
+        data_matrices = spectra_to_matrices(total, layout)  # (M, M, n_bins): Ĉ = total S+N
+        noise_matrices = spectra_to_matrices(noise_vec, layout)
+        c_fl_12 = jnp.moveaxis(_eigh_sqrtm(jnp.moveaxis(data_matrices, 2, 0)), 0, 2)
+        m_f_inv = _dense_cov_inv(jnp.asarray(covariance))
+        return cls(
+            m_f_inv=m_f_inv,
+            c_fl_12=c_fl_12,
+            data_matrices=data_matrices,
+            noise_matrices=noise_matrices,
             layout=layout,
         )
