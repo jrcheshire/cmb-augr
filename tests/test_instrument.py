@@ -1,5 +1,6 @@
 """Tests for instrument.py."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -190,6 +191,45 @@ def test_beam_sigma_value():
     fwhm_rad = 30.0 * float(ARCMIN_TO_RAD)
     sigma = fwhm_rad / np.sqrt(8.0 * np.log(2.0))
     assert abs(sigma - 3.706e-3) < 1e-5
+
+
+def test_beam_bl_p1_byte_identical_to_gaussian():
+    """p=1 reproduces the plain Gaussian beam exactly (the back-compat default)."""
+    ells = jnp.arange(0, 600, dtype=float)
+    np.testing.assert_array_equal(
+        np.asarray(beam_bl(ells, fwhm_arcmin=20.0)),
+        np.asarray(beam_bl(ells, fwhm_arcmin=20.0, p=1.0)),
+    )
+
+
+def test_beam_bl_p_below_one_fattens_high_ell_wings():
+    """p<1 rolls off more slowly at high ℓ (x>1): less suppression there."""
+    # x = ℓ(ℓ+1)σ²/2 crosses 1 near ℓ~380 for a 30' beam; ℓ=500 is in the wing.
+    bl_gauss = float(beam_bl(jnp.array([500.0]), fwhm_arcmin=30.0, p=1.0)[0])
+    bl_fat = float(beam_bl(jnp.array([500.0]), fwhm_arcmin=30.0, p=0.5)[0])
+    assert bl_fat > bl_gauss
+
+
+def test_beam_bl_grad_in_p_finite_at_low_ell():
+    """∂B_ℓ/∂p must be finite at ℓ=0,1 (the x=0 NaN guard)."""
+    ells = jnp.arange(0, 10, dtype=float)  # includes ℓ=0 where x=0
+
+    def loss(p):
+        return jnp.sum(beam_bl(ells, 30.0, p))
+
+    g = jax.grad(loss)(1.0)
+    assert jnp.isfinite(g)
+
+
+def test_beam_bl_grad_in_fwhm_finite():
+    """∂B_ℓ/∂FWHM is finite across ℓ for the generalized form."""
+    ells = jnp.arange(0, 200, dtype=float)
+
+    def loss(fwhm):
+        return jnp.sum(beam_bl(ells, fwhm, 0.8))
+
+    g = jax.grad(loss)(20.0)
+    assert jnp.isfinite(g)
 
 
 def test_deconvolve_noise_bb_roundtrip():

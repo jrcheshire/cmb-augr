@@ -93,11 +93,17 @@ class Cleaner(Protocol):
         self,
         band_qu: jax.Array,
         beam_fwhm_arcmin,
+        beam_shape_p=None,
         *,
         lmax: int,
         nside: int,
     ) -> CleanerResult:
-        """Clean per-band Q/U maps ``(n_band, 2, npix)`` → :class:`CleanerResult`."""
+        """Clean per-band Q/U maps ``(n_band, 2, npix)`` → :class:`CleanerResult`.
+
+        ``beam_shape_p`` is the optional per-band beam shape exponent (``None`` →
+        Gaussian); it sits alongside ``beam_fwhm_arcmin`` so both flow as differentiable
+        beam design knobs through the cleaner.
+        """
         ...
 
 
@@ -124,10 +130,11 @@ def nilc_cleaner(
     ``clean_e=True`` for the spin-2 Q/U cleaner (a ``cleaned_qu()``-capable result).
     """
 
-    def _cleaner(band_qu, beam_fwhm_arcmin, *, lmax, nside):
+    def _cleaner(band_qu, beam_fwhm_arcmin, beam_shape_p=None, *, lmax, nside):
         return nilc_clean(
             band_qu,
             beam_fwhm_arcmin,
+            beam_shape_p,
             lmax=lmax,
             nside=nside,
             needlet_peaks=needlet_peaks,
@@ -168,11 +175,12 @@ def cmilc_cleaner(
     bandpass-integrated sky; ``None`` (default) is the monochromatic band-center behavior.
     """
 
-    def _cleaner(band_qu, beam_fwhm_arcmin, *, lmax, nside):
+    def _cleaner(band_qu, beam_fwhm_arcmin, beam_shape_p=None, *, lmax, nside):
         return cmilc_clean(
             band_qu,
             beam_fwhm_arcmin,
             freqs,
+            beam_shape_p=beam_shape_p,
             lmax=lmax,
             nside=nside,
             moments=moments,

@@ -227,17 +227,22 @@ def cmb_e_alm(cl_ee: jax.Array, lmax: int, *, seed: int = 0) -> jax.Array:
 
 
 def _beam_qu_from_eb(
-    alm_e: jax.Array, alm_b: jax.Array, fwhm_arcmin: float, lmax: int, nside: int
+    alm_e: jax.Array, alm_b: jax.Array, fwhm_arcmin: float, lmax: int, nside: int, p: float = 1.0
 ) -> jax.Array:
-    """E/B alm → beam-smoothed Q/U map, shape ``(2, npix)`` [HEALPix-internal]."""
-    bl = beam_bl(jnp.arange(lmax + 1, dtype=float), fwhm_arcmin)
+    """E/B alm → beam-smoothed Q/U map, shape ``(2, npix)`` [HEALPix-internal].
+
+    The beam is the generalized Gaussian ``beam_bl(ℓ, fwhm_arcmin, p)`` (``p=1`` →
+    ordinary Gaussian). Both ``fwhm_arcmin`` and ``p`` flow as ``jnp`` so the beaming
+    is differentiable when they are traced design knobs.
+    """
+    bl = beam_bl(jnp.arange(lmax + 1, dtype=float), fwhm_arcmin, p)
     e_beamed = almxfl(jnp.asarray(alm_e), bl, lmax)
     b_beamed = almxfl(jnp.asarray(alm_b), bl, lmax)
     return synthesis(jnp.stack([e_beamed, b_beamed], axis=0), 2, lmax, nside)
 
 
 def cmb_eb_qu(
-    alm_e: jax.Array, alm_b: jax.Array, fwhm_arcmin: float, lmax: int, nside: int
+    alm_e: jax.Array, alm_b: jax.Array, fwhm_arcmin: float, lmax: int, nside: int, p: float = 1.0
 ) -> jax.Array:
     """Beam a single E/B alm pair → ``(2, npix)`` Q/U [HEALPix-internal].
 
@@ -246,7 +251,7 @@ def cmb_eb_qu(
     ``alm_b`` for an **E-only** sky (the E→B leakage / purity-null source) or a
     zero ``alm_e`` for a **B-only** sky (the transfer-function source).
     """
-    return _beam_qu_from_eb(alm_e, alm_b, fwhm_arcmin, lmax, nside)
+    return _beam_qu_from_eb(alm_e, alm_b, fwhm_arcmin, lmax, nside, p)
 
 
 def cmb_band_qu(
@@ -256,15 +261,23 @@ def cmb_band_qu(
     nside: int,
     *,
     e_alm: jax.Array | None = None,
+    beam_shape_p=None,
 ) -> jax.Array:
     """Beam the shared CMB E/B alm per band → ``(n_band, 2, npix)`` Q/U.
 
     ``e_alm`` defaults to zero (B-only CMB, the full-sky-forecast convention);
     pass a CMB E-mode alm to include E (cut-sky E→B leakage forecasts).
+    ``beam_shape_p`` (per-band shape exponent, default ``None`` → Gaussian) sits
+    alongside the per-band FWHM.
     """
     alm_e = jnp.zeros_like(b_alm) if e_alm is None else jnp.asarray(e_alm)
+    n_band = len(beam_fwhm_arcmin)
+    ps = [1.0] * n_band if beam_shape_p is None else beam_shape_p
     return jnp.stack(
-        [_beam_qu_from_eb(alm_e, b_alm, fw, lmax, nside) for fw in beam_fwhm_arcmin],
+        [
+            _beam_qu_from_eb(alm_e, b_alm, fw, lmax, nside, p)
+            for fw, p in zip(beam_fwhm_arcmin, ps, strict=True)
+        ],
         axis=0,
     )
 
@@ -414,13 +427,19 @@ def _fg_eb_alm(
 
 
 def _beam_fg_eb(
-    fg_eb_alm: jax.Array, beam_fwhm_arcmin: tuple[float, ...], lmax: int, nside: int
+    fg_eb_alm: jax.Array,
+    beam_fwhm_arcmin: tuple[float, ...],
+    lmax: int,
+    nside: int,
+    beam_shape_p=None,
 ) -> jax.Array:
     """Beam precomputed per-band FG E/B alm → ``(n_band, 2, npix)`` Q/U."""
+    n_band = len(beam_fwhm_arcmin)
+    ps = [1.0] * n_band if beam_shape_p is None else beam_shape_p
     return jnp.stack(
         [
-            _beam_qu_from_eb(fg_eb_alm[i, 0], fg_eb_alm[i, 1], fw, lmax, nside)
-            for i, fw in enumerate(beam_fwhm_arcmin)
+            _beam_qu_from_eb(fg_eb_alm[i, 0], fg_eb_alm[i, 1], fw, lmax, nside, p)
+            for i, (fw, p) in enumerate(zip(beam_fwhm_arcmin, ps, strict=True))
         ],
         axis=0,
     )
@@ -435,10 +454,11 @@ def fg_band_qu(
     *,
     fg_seed: int = 0,
     bandpasses: Sequence[Bandpass | None] | None = None,
+    beam_shape_p=None,
 ) -> jax.Array:
     """PySM foregrounds, analyzed and beamed per band → ``(n_band, 2, npix)`` Q/U."""
     fg_eb = _fg_eb_alm(freqs_ghz, fg_model, lmax, nside, fg_seed=fg_seed, bandpasses=bandpasses)
-    return _beam_fg_eb(fg_eb, beam_fwhm_arcmin, lmax, nside)
+    return _beam_fg_eb(fg_eb, beam_fwhm_arcmin, lmax, nside, beam_shape_p=beam_shape_p)
 
 
 def harmonic_sky(
@@ -498,11 +518,25 @@ def harmonic_sky(
     )
 
 
-def beam_harmonic_sky(hsky: HarmonicSky, beam_fwhm_arcmin: tuple[float, ...]) -> BandSky:
+def beam_harmonic_sky(
+    hsky: HarmonicSky,
+    beam_fwhm_arcmin: tuple[float, ...],
+    beam_shape_p=None,
+    *,
+    beam_fwhm_ref: tuple[float, ...] | None = None,
+) -> BandSky:
     """Beam an aperture-independent :class:`HarmonicSky` at one aperture → :class:`BandSky`.
 
     The only aperture-dependent step. Cheap relative to :func:`harmonic_sky`, so an
     aperture sweep at fixed sim calls this once per diameter on a shared ``hsky``.
+    ``beam_shape_p`` (per-band shape exponent, ``None`` → Gaussian) accompanies the
+    per-band FWHM and is fully differentiable along with it.
+
+    ``beam_fwhm_arcmin`` may be **traced** (a beam design knob). Because
+    :class:`BandSky` stores the FWHMs as a *static* metadata field (never read in the
+    map math — :func:`assemble_band_maps` uses only ``cmb_qu`` / ``fg_qu``), a concrete
+    ``beam_fwhm_ref`` must then be supplied for that field; it defaults to
+    ``beam_fwhm_arcmin`` for the concrete (sweep) call.
     """
     if len(beam_fwhm_arcmin) != hsky.n_band:
         raise ValueError(
@@ -510,15 +544,23 @@ def beam_harmonic_sky(hsky: HarmonicSky, beam_fwhm_arcmin: tuple[float, ...]) ->
             f"sky has {hsky.n_band} bands."
         )
     cmb_qu = cmb_band_qu(
-        hsky.cmb_b_alm, beam_fwhm_arcmin, hsky.lmax, hsky.nside, e_alm=hsky.cmb_e_alm
+        hsky.cmb_b_alm,
+        beam_fwhm_arcmin,
+        hsky.lmax,
+        hsky.nside,
+        e_alm=hsky.cmb_e_alm,
+        beam_shape_p=beam_shape_p,
     )
     if hsky.fg_eb_alm is None:
         fg_qu = jnp.zeros_like(cmb_qu)
     else:
-        fg_qu = _beam_fg_eb(hsky.fg_eb_alm, beam_fwhm_arcmin, hsky.lmax, hsky.nside)
+        fg_qu = _beam_fg_eb(
+            hsky.fg_eb_alm, beam_fwhm_arcmin, hsky.lmax, hsky.nside, beam_shape_p=beam_shape_p
+        )
+    ref = beam_fwhm_arcmin if beam_fwhm_ref is None else beam_fwhm_ref
     return BandSky(
         freqs_ghz=hsky.freqs_ghz,
-        beam_fwhm_arcmin=tuple(float(f) for f in beam_fwhm_arcmin),
+        beam_fwhm_arcmin=tuple(float(f) for f in ref),
         nside=hsky.nside,
         lmax=hsky.lmax,
         r_in=hsky.r_in,
@@ -540,6 +582,7 @@ def generate_band_sky(
     fg_seed: int | None = None,
     cl_ee: jax.Array | None = None,
     bandpasses: Sequence[Bandpass | None] | None = None,
+    beam_shape_p=None,
 ) -> BandSky:
     """Build the fixed beamed sky (CMB + optional PySM FG) for all bands.
 
@@ -590,7 +633,7 @@ def generate_band_sky(
         cl_ee=cl_ee,
         bandpasses=bandpasses,
     )
-    return beam_harmonic_sky(hsky, beam_fwhm_arcmin)
+    return beam_harmonic_sky(hsky, beam_fwhm_arcmin, beam_shape_p)
 
 
 # ---------------------------------------------------------------------------

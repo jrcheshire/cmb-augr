@@ -230,21 +230,32 @@ def white_noise_power(channel: Channel,
     return net_pol_sq * omega_survey / (channel.n_detectors * eta * t_obs)
 
 
-def beam_bl(ells: jnp.ndarray, fwhm_arcmin: float) -> jnp.ndarray:
-    """Gaussian beam transfer function B_ℓ.
+def beam_bl(ells: jnp.ndarray, fwhm_arcmin: float, p: float = 1.0) -> jnp.ndarray:
+    """Generalized-Gaussian beam transfer function B_ℓ.
 
-    B_ℓ = exp(-ℓ(ℓ+1) σ_beam² / 2)
-    σ_beam = FWHM / √(8 ln 2)
+    B_ℓ = exp(-(x)^p),  x = ℓ(ℓ+1) σ_beam² / 2,  σ_beam = FWHM / √(8 ln 2)
+
+    The shape exponent ``p`` is a simple, optics-agnostic stand-in for the true
+    beam profile (the design study's optics are TBD). ``p = 1`` is the ordinary
+    Gaussian beam (byte-identical to the previous single-argument form); ``p < 1``
+    fattens the high-ℓ wings (slower roll-off), ``p > 1`` sharpens them. Both
+    ``fwhm_arcmin`` and ``p`` are differentiable knobs.
 
     Args:
         ells:          1-D array of multipole values.
         fwhm_arcmin:   Beam FWHM [arcmin].
+        p:             Shape exponent (default 1.0 → Gaussian).
 
     Returns:
         B_ℓ array of same shape as ells.
     """
     sigma_beam = fwhm_arcmin * ARCMIN_TO_RAD / jnp.sqrt(8.0 * jnp.log(2.0))
-    return jnp.exp(-ells * (ells + 1.0) * sigma_beam**2 / 2.0)
+    x = ells * (ells + 1.0) * sigma_beam**2 / 2.0
+    # Double-`where` guard so ∂B_ℓ/∂p is finite at x = 0 (ℓ = 0): x^p has
+    # ∂/∂p = x^p·ln x → 0·(-∞) = NaN there, which would poison jax.grad even
+    # though the forward value (B_0 = 1) is well defined.
+    x_safe = jnp.where(x > 0.0, x, 1.0)
+    return jnp.exp(-jnp.where(x > 0.0, x_safe**p, 0.0))
 
 
 def deconvolve_noise_bb(noise_convolved: jnp.ndarray,

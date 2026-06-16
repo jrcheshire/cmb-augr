@@ -299,6 +299,7 @@ def cmilc_clean(
     ridge=1e-10,
     beam_band_limit=0.1,
     clean_e=False,
+    beam_shape_p=None,
     return_diagnostics=False,
 ):
     """Constrained-moment needlet ILC on per-band Q/U maps → :class:`augr.nilc.NILCResult`.
@@ -342,7 +343,11 @@ def cmilc_clean(
     :class:`augr.nilc.NILCResult`, or ``(NILCResult, dict)`` if ``return_diagnostics``.
     """
     check_band_limit(lmax, nside)
+    # cMILC still uses the concrete-beam gather solve (the masked-covariance constrained
+    # solve for *traced* beams is a follow-up); beams/p are floats here. They are still
+    # threaded so cMILC honors the per-band shape exponent for concrete beams.
     beams = tuple(float(b) for b in beam_fwhm_arcmin)
+    ps = None if beam_shape_p is None else tuple(float(p) for p in beam_shape_p)
     freqs = tuple(float(f) for f in freqs)
     if len(freqs) != len(beams):
         raise ValueError(
@@ -358,14 +363,28 @@ def cmilc_clean(
 
     if clean_e:
         e_alm, b_alm, common_fwhm = common_resolution_eb(
-            band_qu, beams, lmax=lmax, nside=nside, n_iter=n_iter, common_fwhm_arcmin=common_fwhm_arcmin
+            band_qu,
+            beams,
+            lmax=lmax,
+            nside=nside,
+            n_iter=n_iter,
+            common_fwhm_arcmin=common_fwhm_arcmin,
+            beam_shape_p=ps,
         )
     else:
         e_alm = None
         b_alm, common_fwhm = common_resolution_b_alm(
-            band_qu, beams, lmax=lmax, nside=nside, n_iter=n_iter, common_fwhm_arcmin=common_fwhm_arcmin
+            band_qu,
+            beams,
+            lmax=lmax,
+            nside=nside,
+            n_iter=n_iter,
+            common_fwhm_arcmin=common_fwhm_arcmin,
+            beam_shape_p=ps,
         )
-    active = _needlet_channel_mask(needlet_bands, beams, common_fwhm, lmax, beam_band_limit)
+    active = _needlet_channel_mask(
+        needlet_bands, beams, common_fwhm, lmax, beam_band_limit, beam_shape_p=ps
+    )
 
     A = moment_sed_vectors(
         freqs, fiducial=fiducial, moments=moments, bandpasses=bandpasses
@@ -411,6 +430,7 @@ def cmilc_clean(
         n_iter=int(n_iter),
         cleaned_e_alm=cleaned_e,
         weights_e=weights_e,
+        beam_shape_p=ps,
     )
     if return_diagnostics:
         info = {

@@ -25,6 +25,13 @@ straight-through gradient usable for descent?" -- with two diagnostics:
       let the ensemble be a traced arg is the Phase 2 compile follow-up), so this
       sweep is deliberately small.
 
+  --mode beam:
+      The beam-lever sensitivity diagnostic (NOT an optimizer -- a free FWHM has no
+      cost penalty and would run to 0). Reports the per-band partials
+      d sigma(r)/d FWHM and d sigma(r)/d p (which bands' beams move sigma(r)) and the
+      MC-stability (resultant R, per-component CoV) of the beam gradient direction
+      across CRN ensembles, via optimize_mapbased.sigma_r_from_beam_design.
+
 Tiny CMB-only config (nside=16, no PySM) so the diagnostic is cheap; the gradient
 mechanism is foreground-independent. The scientifically interesting FG-driven
 allocation needs fg_model="d1s1" at higher nside (heavier) -- deferred to a real
@@ -33,6 +40,7 @@ run. Pin BLAS/OMP to 1 thread for reproducible single-core timing.
 Usage:
     pixi run python scripts/mapbased_grad_characterization.py --mode demo
     pixi run python scripts/mapbased_grad_characterization.py --mode stability --n-batches 4
+    pixi run python scripts/mapbased_grad_characterization.py --mode beam --n-batches 3
     pixi run python scripts/mapbased_grad_characterization.py --mode both --backend jht
 """
 
@@ -53,7 +61,11 @@ from augr.config import cleaned_map_instrument
 from augr.delensing import load_lensing_spectra
 from augr.foregrounds import NullForegroundModel
 from augr.optimize import make_optimization_context
-from augr.optimize_mapbased import sigma_r_from_noise_design, w_inv_from_noise_design
+from augr.optimize_mapbased import (
+    sigma_r_from_beam_design,
+    sigma_r_from_noise_design,
+    w_inv_from_noise_design,
+)
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
 from augr.spectrum_stages import make_cutsky_mc_context
@@ -198,6 +210,72 @@ def run_stability(args, var_pix_ref):
     print("  MC-stable at this n_sims and the straight-through gradient is usable.")
 
 
+# --- mode: beam --------------------------------------------------------------
+
+
+def run_beam(args, var_pix_ref):
+    """grad sigma(r) wrt the per-band beams (FWHM + shape p) on n_batches CRN ensembles.
+
+    A *sensitivity* diagnostic, NOT an optimizer: a free FWHM has no cost penalty and an
+    unconstrained descent would run to 0 (the f_sky->0 footgun analog), so we report the
+    per-band partials d sigma(r)/d FWHM and d sigma(r)/d p and the MC-stability of the
+    descent direction (over the concatenated [fwhm, p] vector) across independent CRN
+    ensembles -- which bands' beams actually move sigma(r), and whether the gradient is
+    MC-stable at this n_sims."""
+    w_inv = w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, F_SKY
+    )
+    fwhm0 = jnp.asarray(BEAMS)
+    p0 = jnp.ones(len(BEAMS))
+    grads = []  # concatenated [d/dfwhm, d/dp] per batch
+    g_fwhm_rows, g_p_rows, sigmas = [], [], []
+    for b in range(args.n_batches):
+        base_seed = 1000 * (b + 1)
+        t0 = time.time()
+        mc_ctx, opt_ctx, cleaner = build_contexts(
+            base_seed, args.n_sims, nside=args.nside, lmax=args.lmax, var_pix_ref=var_pix_ref
+        )
+
+        def loss(bf, bp, mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner):
+            return sigma_r_from_beam_design(
+                bf, bp, w_inv=w_inv, mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner
+            )
+
+        s, (g_fwhm, g_p) = jax.value_and_grad(loss, argnums=(0, 1))(fwhm0, p0)
+        g_fwhm, g_p = np.asarray(g_fwhm), np.asarray(g_p)
+        grads.append(np.concatenate([g_fwhm, g_p]))
+        g_fwhm_rows.append(g_fwhm)
+        g_p_rows.append(g_p)
+        sigmas.append(float(s))
+        print(
+            f"  batch {b} (seed {base_seed}): sigma(r)={float(s):.4e}  "
+            f"d/dFWHM={g_fwhm}  d/dp={g_p}  [{time.time() - t0:.0f}s]"
+        )
+
+    grads = np.stack(grads)  # (B, 2*n_band)
+    sigmas = np.array(sigmas)
+    units = grads / np.linalg.norm(grads, axis=1, keepdims=True)
+    mean_unit = units.mean(axis=0)
+    resultant = np.linalg.norm(mean_unit)
+    cov_per_comp = grads.std(axis=0) / np.maximum(np.abs(grads.mean(axis=0)), 1e-300)
+
+    print("\n=== beam sensitivity + gradient direction stability ===")
+    print(f"  n_sims={args.n_sims}  n_batches={args.n_batches}  nside={args.nside}")
+    print(f"  bands (GHz): {FREQS}   reference FWHM (arcmin): {BEAMS}")
+    print(
+        f"  sigma(r) across batches:  mean={sigmas.mean():.4e}  "
+        f"std/mean={sigmas.std() / sigmas.mean():.3f}"
+    )
+    print(f"  mean d sigma(r)/d FWHM [per band, 1/arcmin]: {np.stack(g_fwhm_rows).mean(axis=0)}")
+    print(f"  mean d sigma(r)/d p    [per band]:           {np.stack(g_p_rows).mean(axis=0)}")
+    print(f"  resultant length R (1=aligned): {resultant:.4f}")
+    print(f"  per-component CoV (std/|mean|): {cov_per_comp}")
+    print("  interpretation: the per-band partials say which beams move sigma(r) (a")
+    print("  negative d/dFWHM means a finer beam helps); R near 1 + small CoV => the")
+    print("  beam gradient is MC-stable at this n_sims. (No cost model: this is a")
+    print("  sensitivity readout, not a beam optimizer.)")
+
+
 # --- mode: demo --------------------------------------------------------------
 
 
@@ -221,10 +299,10 @@ def run_demo(args, var_pix_ref):
             cleaner=cleaner,
         )
 
-    # Training ensemble (fixed CRN). Eager value_and_grad -- the map-based sigma(r)
-    # is jax.grad-able but NOT jax.jit-able (nilc._needlet_channel_mask does
-    # np.asarray on a jnp-built needlet-band array; concrete under eager grad,
-    # a tracer under jit). jit-compat is the GPU/jit workstream, not this run.
+    # Training ensemble (fixed CRN). Eager value_and_grad here; the map-based sigma(r)
+    # is now also jax.jit-able (the jnp + stop_gradient needlet-channel mask removed the
+    # last np.asarray/float boundary), so this can run under jit on a GPU -- kept eager
+    # for this small CPU diagnostic.
     print("Building training ensemble (eager value_and_grad) ...")
     t0 = time.time()
     mc_ctx, opt_ctx, cleaner = build_contexts(
@@ -294,7 +372,7 @@ def run_demo(args, var_pix_ref):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=["demo", "stability", "both"], default="demo")
+    p.add_argument("--mode", choices=["demo", "stability", "beam", "both"], default="demo")
     p.add_argument("--n-sims", type=int, default=12)
     p.add_argument("--nside", type=int, default=16)
     p.add_argument("--lmax", type=int, default=24)
@@ -320,6 +398,9 @@ def main():
     if args.mode in ("stability", "both"):
         print("\n########## MODE: stability ##########")
         run_stability(args, var_pix_ref)
+    if args.mode == "beam":
+        print("\n########## MODE: beam ##########")
+        run_beam(args, var_pix_ref)
 
 
 if __name__ == "__main__":

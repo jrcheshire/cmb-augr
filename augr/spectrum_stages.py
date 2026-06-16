@@ -54,7 +54,7 @@ import numpy as np
 
 from . import masking as mk
 from .cleaning import Cleaner
-from .compsep_sims import BandSky, assemble_band_maps, beam_harmonic_sky, harmonic_sky
+from .compsep_sims import HarmonicSky, assemble_band_maps, beam_harmonic_sky, harmonic_sky
 from .covariance import mc_bandpower_covariance
 from .instrument import beam_bl
 from .parallel import parallel_map
@@ -385,21 +385,23 @@ def mc_cutsky_bandpowers(
 # optimization. It splits the work at the traceability boundary:
 #
 #   * :func:`make_cutsky_mc_context` (EAGER) does the non-traceable, design-
-#     independent work ONCE: the per-sim HarmonicSky -> beamed BandSky ensemble
-#     (PySM emission + synalm draws + per-band beaming) and the frozen Wiener-filter
-#     ``inv_noise`` (a fiducial ``var_pix_ref``). Beams are concrete here.
-#   * :func:`mc_cutsky_cov_traced` (TRACED) runs noise -> clean -> masked-Wiener ->
-#     bandpowers -> debias -> sample covariance in-trace, all ``jnp``, as a function
-#     of the per-band noise amplitude ``w_inv``. Compose it with
+#     independent work ONCE: the per-sim **unbeamed** HarmonicSky ensemble (PySM
+#     emission + synalm draws) and the frozen Wiener-filter ``inv_noise`` (a fiducial
+#     ``var_pix_ref``). Beaming is deferred to the traced forward.
+#   * :func:`mc_cutsky_cov_traced` (TRACED) beams the sky in-trace, then runs noise ->
+#     clean -> masked-Wiener -> bandpowers -> debias -> sample covariance, all
+#     ``jnp``, as a function of the per-band noise amplitude ``w_inv`` AND the per-band
+#     beams (FWHM + shape ``p``). Compose it with
 #     ``optimize.sigma_r_from_external_cov`` for a ``jax.grad``-able map-based σ(r).
 #
-# The differentiable lever here is ``w_inv`` (set by NET / n_det / efficiency /
-# mission_years / f_sky). **Beams are held concrete** (see the plan's beam-path
-# constraint: the cleaner's needlet-channel mask is discrete in beams, and
-# ``common_resolution_*`` ``float()`` the beams) — so aperture / band-center
-# optimization stays on the analytic path for now. ``var_pix_ref`` is frozen at the
-# fiducial design (a filter knob; a mismatch only de-tunes the Wiener filter and is
-# absorbed by the transfer ``F_b``, not a bias), the standard CRN treatment.
+# The differentiable levers here are ``w_inv`` (set by NET / n_det / efficiency /
+# mission_years / f_sky) and the per-band **beams** (``beam_fwhm`` / ``beam_p``,
+# default to the frozen reference for the noise-only path). The cleaner's discrete
+# needlet-channel mask is handled by a jnp + ``stop_gradient`` mask (exact forward,
+# frozen jump), so the beams flow the gradient. ``var_pix_ref`` and the Wiener prior
+# are frozen at the reference design (filter knobs; a mismatch only de-tunes the
+# filter and is absorbed by the transfer ``F_b``, not a bias) — the standard CRN
+# treatment, here also covering the beam dependence of the filter.
 
 
 class CutskyMCContext(eqx.Module):
@@ -410,17 +412,26 @@ class CutskyMCContext(eqx.Module):
     :func:`make_cutsky_mc_context`; passed (un-differentiated) to
     :func:`mc_cutsky_cov_traced`.
 
-    An ``eqx.Module`` (pytree): the array fields + the batched ``band_skies`` /
+    An ``eqx.Module`` (pytree): the array fields + the batched ``harmonic_skies`` /
     ``noise_keys`` are traced leaves, the binning / resolution / loop config are
     ``static`` (in the treedef). So the whole context can be passed as a traced
     argument to a jitted ``mc_cutsky_cov_traced`` -- different CRN ensembles share
-    one compiled executable -- and the ``band_skies`` leaves carry the leading
+    one compiled executable -- and the ``harmonic_skies`` leaves carry the leading
     sim axis that :func:`mc_cutsky_cov_traced`'s ``lax.map`` iterates.
+
+    The ensemble is stored **unbeamed** (per-sim :class:`HarmonicSky` E/B alm) so
+    the per-band beaming runs *inside* the traced forward — that is what makes the
+    beams (FWHM + shape ``p``) differentiable design knobs alongside ``w_inv``.
+    ``beam_fwhm_arcmin`` / ``beam_shape_p`` are the concrete *reference* beams (used
+    for the frozen ``var_pix_ref`` filter and as the default when a beam design is
+    not supplied to :func:`mc_cutsky_cov_traced`).
     """
 
-    band_skies: BandSky  # batched BandSky (array leaves carry a leading sim axis)
+    harmonic_skies: HarmonicSky  # batched HarmonicSky (unbeamed; leaves carry a sim axis)
     noise_keys: jax.Array  # (n_sims, 2) stacked PRNGKeys (CRN; fixed across the gradient)
-    beam_fwhm_arcmin: tuple = eqx.field(static=True)  # concrete per-band beams
+    beam_fwhm_arcmin: tuple = eqx.field(static=True)  # concrete reference per-band beams
+    # concrete reference shape exponents (None = Gaussian)
+    beam_shape_p: tuple | None = eqx.field(static=True)
     inv_noise: jax.Array
     cl_ee_prior: jax.Array
     cl_bb_prior: jax.Array
@@ -484,14 +495,18 @@ def make_cutsky_mc_context(
     tol: float = 1e-8,
     spectra: CMBSpectra | None = None,
     bandpasses=None,
+    beam_shape_p=None,
 ) -> CutskyMCContext:
-    """Eager precompute for the differentiable cut-sky MC (beams held concrete).
+    """Eager precompute for the differentiable cut-sky MC.
 
-    Builds, once, the per-sim ``HarmonicSky`` -> beamed ``BandSky`` ensemble (the
-    non-traceable PySM emission + ``synalm`` draws + per-band beaming) plus the
-    Wiener-filter ``inv_noise`` at a frozen ``var_pix_ref``, and packs the binning /
-    prior statics. The result feeds :func:`mc_cutsky_cov_traced`, which is
-    ``jax.grad``-able in ``w_inv``.
+    Builds, once, the per-sim **unbeamed** :class:`HarmonicSky` ensemble (the
+    non-traceable PySM emission + ``synalm`` draws) plus the Wiener-filter
+    ``inv_noise`` at a frozen ``var_pix_ref``, and packs the binning / prior statics.
+    The per-band beaming is deferred to the *traced* forward
+    (:func:`mc_cutsky_cov_traced`) so the beams (FWHM + shape ``p``) are
+    differentiable design knobs in addition to ``w_inv``; ``beam_fwhm_arcmin`` /
+    ``beam_shape_p`` here are the concrete *reference* beams (the frozen filter +
+    the default when no beam design is supplied to the traced forward).
 
     Parameters mirror :func:`mc_cutsky_bandpowers`; ``w_inv`` here is the *fiducial*
     per-band noise power used to set ``var_pix_ref`` (the traced forward varies
@@ -500,14 +515,15 @@ def make_cutsky_mc_context(
     spectra = CMBSpectra() if spectra is None else spectra
     freqs_ghz = tuple(float(f) for f in freqs_ghz)
     beam_fwhm_arcmin = tuple(float(b) for b in beam_fwhm_arcmin)
+    beam_shape_p = None if beam_shape_p is None else tuple(float(p) for p in beam_shape_p)
     npix = 12 * int(nside) ** 2
     hit_map = jnp.ones(npix) if hit_map is None else jnp.asarray(hit_map)
     common_fwhm = float(min(beam_fwhm_arcmin))
     cl_ee_prior = beamed_prior(cl_ee, common_fwhm, lmax)
     cl_bb_prior = beamed_prior(cl_bb_prior_unbeamed, common_fwhm, lmax)
 
-    def _beamed_sky(seed: int):
-        hsky = harmonic_sky(
+    def _hsky(seed: int) -> HarmonicSky:
+        return harmonic_sky(
             freqs_ghz,
             spectra=spectra,
             r_in=float(r_in),
@@ -518,21 +534,20 @@ def make_cutsky_mc_context(
             cl_ee=cl_ee,
             bandpasses=bandpasses,
         )
-        return beam_harmonic_sky(hsky, beam_fwhm_arcmin)
 
     seeds = list(range(int(base_seed), int(base_seed) + int(n_sims)))
-    # Stack the per-sim ensemble into ONE batched BandSky (the cmb_qu/fg_qu leaves
-    # get a leading sim axis; the static fields are shared) + stacked keys, so the
-    # traced forward can lax.map over the sim axis instead of Python-unrolling the
+    # Stack the per-sim ensemble into ONE batched (unbeamed) HarmonicSky (the alm
+    # leaves get a leading sim axis; the static fields are shared) + stacked keys, so
+    # the traced forward can lax.map over the sim axis instead of Python-unrolling the
     # cleaner n_sims times (O(1) compile, scan-accumulated memory -> higher n_sims).
-    _band_sky_tuple = tuple(_beamed_sky(s) for s in seeds)
-    band_skies = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *_band_sky_tuple)
+    _hsky_tuple = tuple(_hsky(s) for s in seeds)
+    harmonic_skies = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *_hsky_tuple)
     noise_keys = jnp.stack([jax.random.PRNGKey(int(s)) for s in seeds], axis=0)
 
-    # var_pix_ref: frozen filter knob from one setup clean at the fiducial w_inv
-    # (matches mc_cutsky_bandpowers; uses the base_seed + n_sims setup sim).
+    # var_pix_ref: frozen filter knob from one setup clean at the fiducial w_inv +
+    # reference beams (matches mc_cutsky_bandpowers; uses the base_seed + n_sims sim).
     if var_pix_ref is None:
-        sky0 = _beamed_sky(base_seed + n_sims)
+        sky0 = beam_harmonic_sky(_hsky(base_seed + n_sims), beam_fwhm_arcmin, beam_shape_p)
         total0 = assemble_band_maps(
             sky0,
             jnp.asarray(w_inv),
@@ -541,7 +556,7 @@ def make_cutsky_mc_context(
             knee_ell=knee_ell,
             alpha_knee=alpha_knee,
         )
-        res0 = cleaner(total0, beam_fwhm_arcmin, lmax=lmax, nside=nside)
+        res0 = cleaner(total0, beam_fwhm_arcmin, beam_shape_p, lmax=lmax, nside=nside)
         noise0 = total0 - sky0.cmb_qu - sky0.fg_qu
         cn = _cleaned_b_qu(res0, noise0) + _cleaned_e_qu(res0, noise0)
         obs = jnp.asarray(mask) > 0
@@ -550,9 +565,10 @@ def make_cutsky_mc_context(
     inv_noise = mk.inv_noise_map(hit_map, var_pix_ref, mask=mask)
 
     return CutskyMCContext(
-        band_skies=band_skies,
+        harmonic_skies=harmonic_skies,
         noise_keys=noise_keys,
         beam_fwhm_arcmin=beam_fwhm_arcmin,
+        beam_shape_p=beam_shape_p,
         inv_noise=inv_noise,
         cl_ee_prior=cl_ee_prior,
         cl_bb_prior=cl_bb_prior,
@@ -576,22 +592,34 @@ def mc_cutsky_cov_traced(
     w_inv: jax.Array,
     ctx: CutskyMCContext,
     cleaner: Cleaner,
+    *,
+    beam_fwhm: jax.Array | None = None,
+    beam_p: jax.Array | None = None,
 ) -> CutskyMCTraced:
-    """Differentiable cut-sky MC bandpower covariance as a function of ``w_inv``.
+    """Differentiable cut-sky MC bandpower covariance as a function of ``w_inv`` (and beams).
 
     The ``jax.grad``-able sibling of :func:`mc_cutsky_bandpowers`: with the per-sim
-    beamed sky ensemble + ``inv_noise`` precomputed in ``ctx`` (beams concrete,
-    ``var_pix_ref`` frozen), this runs noise -> clean -> masked-Wiener ->
-    bandpowers -> debias -> sample covariance entirely in ``jnp``, differentiable in
-    the per-band noise amplitude ``w_inv`` under common random numbers (the
-    ``ctx.noise_keys`` are fixed). Compose with
+    **unbeamed** ``HarmonicSky`` ensemble + ``inv_noise`` precomputed in ``ctx``
+    (``var_pix_ref`` frozen), this beams the sky in-trace, then runs noise -> clean ->
+    masked-Wiener -> bandpowers -> debias -> sample covariance entirely in ``jnp``,
+    differentiable in the per-band noise amplitude ``w_inv`` under common random
+    numbers (the ``ctx.noise_keys`` are fixed). Compose with
     ``optimize.sigma_r_from_external_cov(result.covariance, opt_ctx)`` for a
     ``jax.grad``-able map-based σ(r). Select the on-device jht SHT backend
     (``with sht.sht_backend("jht"): ...``) to run the whole thing on a GPU.
 
+    ``beam_fwhm`` / ``beam_p`` (per-band FWHM [arcmin] / shape exponent) are the
+    optional **beam design knobs**: leave them ``None`` (default) to use the frozen
+    reference beams in ``ctx`` (the noise-only gradient path — the sky is beamed
+    in-trace at the reference, numerically the previously-precomputed sky), or pass
+    them as traced arrays for ``jax.grad`` of σ(r) w.r.t. the beams (via
+    :func:`augr.optimize_mapbased.sigma_r_from_beam_design`). The cleaner's discrete
+    needlet-channel mask is jnp + ``stop_gradient``, so the beam gradient is exact
+    within a mask configuration and frozen across mask-membership jumps.
+
     The per-sim loop is a ``jax.lax.map`` (sequential scan, no ``batch_size``) over
-    the batched ``ctx.band_skies`` -- the cleaner body is traced once, so compile is
-    O(1) in ``n_sims`` and the scan accumulates outputs instead of holding an
+    the batched ``ctx.harmonic_skies`` -- the cleaner body is traced once, so compile
+    is O(1) in ``n_sims`` and the scan accumulates outputs instead of holding an
     ``n_sims``-deep unroll live. Scan (not ``vmap``) so the cleaner's inner
     ``while_loop`` map2alm iteration runs per sim. The straight-through gradient
     flows through a *sample* covariance, so it carries Monte-Carlo noise --
@@ -599,6 +627,11 @@ def mc_cutsky_cov_traced(
     plan's Phase 2 verification).
     """
     w_inv = jnp.asarray(w_inv)
+    # Beam design knobs: default to the frozen reference (the noise-only path, which
+    # then beams in-trace at the reference beams — numerically the precomputed sky).
+    # Supplying beam_fwhm / beam_p makes the beams traced (the beam-design gradient).
+    bf = ctx.beam_fwhm_arcmin if beam_fwhm is None else beam_fwhm
+    bp = ctx.beam_shape_p if beam_p is None else beam_p
     bp_kw = dict(
         bin_matrix=ctx.bin_matrix,
         ell_min=ctx.ell_min,
@@ -608,7 +641,11 @@ def mc_cutsky_cov_traced(
         tol=ctx.tol,
     )
 
-    def _one(band_sky, key):
+    def _one(hsky, key):
+        # Beam the (frozen, unbeamed) per-sim harmonic sky in-trace, so the beams flow
+        # the gradient. The BandSky static beam field carries the concrete reference
+        # (metadata only; assemble_band_maps reads only cmb_qu / fg_qu).
+        band_sky = beam_harmonic_sky(hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin)
         total = assemble_band_maps(
             band_sky,
             w_inv,
@@ -617,7 +654,7 @@ def mc_cutsky_cov_traced(
             knee_ell=ctx.knee_ell,
             alpha_knee=ctx.alpha_knee,
         )
-        result = cleaner(total, ctx.beam_fwhm_arcmin, lmax=ctx.lmax, nside=ctx.nside)
+        result = cleaner(total, bf, bp, lmax=ctx.lmax, nside=ctx.nside)
         rec_full = cutsky_bb_bandpower(
             result.cleaned_qu(), ctx.inv_noise, ctx.cl_ee_prior, ctx.cl_bb_prior, **bp_kw
         )
@@ -640,10 +677,11 @@ def mc_cutsky_cov_traced(
     # Sequential scan over the sim axis (lax.map, no batch_size): the cleaner body
     # is traced ONCE and reused per sim -- O(1) compile in n_sims, scan-accumulated
     # outputs (no live n_sims-deep unroll). Scan, not vmap, so the cleaner's inner
-    # map2alm while_loop runs per sim. ctx.band_skies is a batched BandSky (leading
-    # sim axis on its leaves); lax.map slices it back to a per-sim BandSky.
+    # map2alm while_loop runs per sim. ctx.harmonic_skies is a batched (unbeamed)
+    # HarmonicSky (leading sim axis on its alm leaves); lax.map slices it back to a
+    # per-sim HarmonicSky that `_one` beams in-trace.
     rec_full, rec_b, rec_e = jax.lax.map(
-        lambda bk: _one(bk[0], bk[1]), (ctx.band_skies, ctx.noise_keys)
+        lambda bk: _one(bk[0], bk[1]), (ctx.harmonic_skies, ctx.noise_keys)
     )
 
     transfer = mk.transfer_function(rec_b, ctx.true_bb_binned)

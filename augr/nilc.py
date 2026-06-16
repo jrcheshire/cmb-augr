@@ -47,7 +47,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .instrument import ARCMIN_TO_RAD, beam_bl
+from .instrument import beam_bl
 from .sht import almxfl, check_band_limit, map2alm, synthesis, synthesis_pol
 
 # ---------------------------------------------------------------------------
@@ -112,27 +112,34 @@ def common_resolution_b_alm(
     nside: int,
     n_iter: int = 3,
     common_fwhm_arcmin: float | None = None,
-) -> tuple[jax.Array, float]:
+    beam_shape_p=None,
+) -> tuple[jax.Array, jax.Array]:
     """Per-band Q/U → common-resolution B-mode alm, shape ``(n_band, Nlm)``.
 
-    Each band's B alm is deconvolved from its own beam and reconvolved to
-    ``common_fwhm_arcmin`` (default: the finest band's beam). Returns the stacked
-    B alms and the common FWHM used. The ``B_c/B_ν`` ratio is the noise-inflation
-    factor; choose ``lmax`` so the coarsest beam's ``B_ν(lmax)`` stays representable
-    (a tiny floor guards against division by an underflowed beam).
+    Each band's B alm is deconvolved from its own beam ``B_ν`` (generalized
+    Gaussian, FWHM ``beam_fwhm_arcmin`` and shape exponent ``beam_shape_p`` — see
+    :func:`augr.instrument.beam_bl`) and reconvolved to a **Gaussian** common beam
+    ``B_c`` at ``common_fwhm_arcmin`` (default: the finest band's FWHM). The common
+    beam is the internal reference everything is brought to; it cancels in the final
+    debiased spectrum (the transfer function absorbs ``B_c``), so keeping it Gaussian
+    decouples it from the per-band shape knobs. Returns the stacked B alms and the
+    common FWHM used. Beams are kept ``jnp`` (not ``float``)-ed so the FWHM / shape
+    are differentiable design knobs; concrete inputs are byte-identical to before.
     """
-    beams = [float(b) for b in beam_fwhm_arcmin]
+    beams = jnp.asarray(beam_fwhm_arcmin, dtype=float)
+    n_band = beams.shape[0]
+    ps = jnp.ones(n_band) if beam_shape_p is None else jnp.asarray(beam_shape_p, dtype=float)
     if common_fwhm_arcmin is None:
-        common_fwhm_arcmin = min(beams)
+        common_fwhm_arcmin = jnp.min(beams)
     ells = jnp.arange(lmax + 1, dtype=float)
     bl_common = beam_bl(ells, common_fwhm_arcmin)
     out = []
-    for qu_b, fwhm_b in zip(band_qu, beams, strict=True):
+    for qu_b, fwhm_b, p_b in zip(band_qu, beams, ps, strict=True):
         eb = map2alm(qu_b, 2, lmax, nside, n_iter)  # (2, Nlm) = (E, B)
-        bl_band = beam_bl(ells, fwhm_b)
+        bl_band = beam_bl(ells, fwhm_b, p_b)
         ratio = bl_common / jnp.maximum(bl_band, 1e-30)
         out.append(almxfl(eb[1], ratio, lmax))
-    return jnp.stack(out, axis=0), float(common_fwhm_arcmin)
+    return jnp.stack(out, axis=0), common_fwhm_arcmin
 
 
 def common_resolution_eb(
@@ -143,31 +150,35 @@ def common_resolution_eb(
     nside: int,
     n_iter: int = 3,
     common_fwhm_arcmin: float | None = None,
-) -> tuple[jax.Array, jax.Array, float]:
+    beam_shape_p=None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Per-band Q/U → common-resolution E *and* B alm, each shape ``(n_band, Nlm)``.
 
     The spin-2 companion to :func:`common_resolution_b_alm`: one ``map2alm(spin=2)``
-    per band yields both E and B, each deconvolved from its band beam and reconvolved
-    to ``common_fwhm_arcmin`` (default: the finest band's beam). Returns ``(e_alm,
+    per band yields both E and B, each deconvolved from its band beam (FWHM +
+    ``beam_shape_p``) and reconvolved to the Gaussian common beam
+    ``common_fwhm_arcmin`` (default: the finest band's FWHM). Returns ``(e_alm,
     b_alm, common_fwhm)``. Used by the spin-2 Q/U cleaner (``clean_e=True``) so the
     cut-sky masked-Wiener estimator has a cleaned Q/U map to act on; the B-only path
     keeps using :func:`common_resolution_b_alm` unchanged (byte-identical, and without
     paying for the unused E leg).
     """
-    beams = [float(b) for b in beam_fwhm_arcmin]
+    beams = jnp.asarray(beam_fwhm_arcmin, dtype=float)
+    n_band = beams.shape[0]
+    ps = jnp.ones(n_band) if beam_shape_p is None else jnp.asarray(beam_shape_p, dtype=float)
     if common_fwhm_arcmin is None:
-        common_fwhm_arcmin = min(beams)
+        common_fwhm_arcmin = jnp.min(beams)
     ells = jnp.arange(lmax + 1, dtype=float)
     bl_common = beam_bl(ells, common_fwhm_arcmin)
     out_e = []
     out_b = []
-    for qu_b, fwhm_b in zip(band_qu, beams, strict=True):
+    for qu_b, fwhm_b, p_b in zip(band_qu, beams, ps, strict=True):
         eb = map2alm(qu_b, 2, lmax, nside, n_iter)  # (2, Nlm) = (E, B)
-        bl_band = beam_bl(ells, fwhm_b)
+        bl_band = beam_bl(ells, fwhm_b, p_b)
         ratio = bl_common / jnp.maximum(bl_band, 1e-30)
         out_e.append(almxfl(eb[0], ratio, lmax))
         out_b.append(almxfl(eb[1], ratio, lmax))
-    return jnp.stack(out_e, axis=0), jnp.stack(out_b, axis=0), float(common_fwhm_arcmin)
+    return jnp.stack(out_e, axis=0), jnp.stack(out_b, axis=0), common_fwhm_arcmin
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +252,35 @@ def _ridge(cov: jax.Array, ridge: float) -> jax.Array:
     return cov + ridge * scale[..., None, None] * eye
 
 
+def _ilc_weights_masked(cov: jax.Array, m: jax.Array, ridge: float) -> jax.Array:
+    """ILC weights over the *active* channels of a band, ``(..., n_band)``.
+
+    ``m`` is a ``(..., n_band)`` float 0/1 active mask. Reproduces the active-only
+    solve ``w_A = (C_AA + ridge·d_A·I)⁻¹ 1 / norm`` with inactive ``w = 0`` — but
+    over the full, fixed-shape ``n_band`` covariance so the cleaner stays
+    ``jax.jit``-able and differentiable in the beams (the gather form
+    ``np.nonzero(active)`` needs a *concrete* mask). Build the block-decoupled matrix
+    ``C' = (m⊗m)·C + diag((1-m)·d_A)`` — zero every inactive cross-term and fill the
+    inactive diagonal with the active scale ``d_A = Σ m·diagC / Σ m`` — ridge only the
+    active diagonal, and solve ``C' w = m``. The active block is then identical to the
+    active-only system, the inactive rows decouple to ``w = 0``, and the normalization
+    ``mᵀw`` is the active-only normalization. So the weights match the gather form to
+    fp64, and are byte-identical when the mask is all-active (then ``C' = _ridge(C)``
+    and ``m = 1``).
+    """
+    n_band = cov.shape[-1]
+    eye = jnp.broadcast_to(jnp.eye(n_band), cov.shape)
+    diag_c = jnp.diagonal(cov, axis1=-2, axis2=-1)  # (..., n_band)
+    n_active = jnp.sum(m, axis=-1, keepdims=True)  # (..., 1); ≥1 (finest band always active)
+    d_a = jnp.sum(m * diag_c, axis=-1, keepdims=True) / n_active  # (..., 1) active diagonal scale
+    m_outer = m[..., :, None] * m[..., None, :]  # (..., n_band, n_band)
+    inactive_diag = ((1.0 - m) * d_a)[..., None] * eye  # diag((1-m)·d_A)
+    ridge_diag = (ridge * d_a * m)[..., None] * eye  # ridge on the active diagonal only
+    cov_masked = m_outer * cov + inactive_diag + ridge_diag
+    cinv_m = jnp.linalg.solve(cov_masked, m[..., None])[..., 0]  # (..., n_band)
+    return cinv_m / jnp.sum(m * cinv_m, axis=-1, keepdims=True)
+
+
 def _gaussian_smooth_map(
     x: jax.Array, fwhm_arcmin: float, *, lmax: int, nside: int, n_iter: int
 ) -> jax.Array:
@@ -257,26 +297,16 @@ def _gaussian_smooth_map(
     return synthesis(almxfl(alm, gauss, lmax), 0, lmax, nside)[0]
 
 
-def _beam_bl_np(ells: np.ndarray, fwhm_arcmin: float) -> np.ndarray:
-    """NumPy Gaussian beam ``B_ℓ`` -- static-config twin of :func:`instrument.beam_bl`.
-
-    Used only inside :func:`_needlet_channel_mask`, which must stay pure-numpy so
-    the cleaner body runs under ``jax.jit`` / ``lax.map`` (the jnp-based
-    ``beam_bl`` returns a tracer there). Same formula / ``ARCMIN_TO_RAD`` constant,
-    so the values match ``beam_bl`` to fp64.
-    """
-    sigma = fwhm_arcmin * ARCMIN_TO_RAD / np.sqrt(8.0 * np.log(2.0))
-    return np.exp(-ells * (ells + 1.0) * sigma**2 / 2.0)
-
-
 def _needlet_channel_mask(
     needlet_bands: np.ndarray,
     beam_fwhm_arcmin,
-    common_fwhm_arcmin: float,
+    common_fwhm_arcmin,
     lmax: int,
     threshold: float,
-) -> np.ndarray:
-    """Which channels participate in each needlet band, shape ``(J, n_band)`` bool.
+    *,
+    beam_shape_p=None,
+) -> jax.Array:
+    """Which channels participate in each needlet band, ``(J, n_band)`` float 0/1.
 
     A channel joins needlet band ``j`` only where its beam retains enough support
     relative to the common-resolution beam over the band — specifically
@@ -285,46 +315,53 @@ def _needlet_channel_mask(
     ``B_c/B_ν`` at ``1/threshold`` for any included channel, so a coarse low-ν
     beam is *excluded* from fine needlet bands instead of being deconvolved to
     astronomical noise there (the small-aperture / high-ℓ blow-up). The finest
-    channel is the common beam, so its ratio is 1 and it is active in every band;
+    channel is the common beam, so its ratio is ~1 and it is active in every band;
     every band therefore retains at least one channel.
 
-    The mask depends only on the (static) beams, not the maps, so it does not
-    affect differentiability with respect to the maps / allocation.
+    The upper support edge ``ℓ_hi`` comes from the **static** needlet windows, so it
+    is a plain integer per band. The membership test, however, is a function of the
+    (possibly traced) beams, so the mask is built in ``jnp`` and wrapped in
+    :func:`jax.lax.stop_gradient`: the **forward value is exact at any beam**, while
+    the discrete enter/leave-a-band jump is frozen in the backward pass — the same
+    treatment GNILC gives its subspace dimension ``m`` (:mod:`augr.gnilc`). Returning
+    ``jnp`` (not numpy bool) is also what makes the cleaner body ``jax.jit``-able.
     """
     nb = np.asarray(needlet_bands)
-    ells = np.arange(lmax + 1, dtype=float)
-    bl_common = _beam_bl_np(ells, common_fwhm_arcmin)
-    beams = [float(b) for b in beam_fwhm_arcmin]
     n_j = nb.shape[0]
-    mask = np.zeros((n_j, len(beams)), dtype=bool)
-    for j in range(n_j):
-        support = np.nonzero(nb[j] > 1e-3)[0]
-        ell_hi = int(support[-1]) if support.size else 0
-        bc = max(float(bl_common[ell_hi]), 1e-30)
-        for b, fwhm in enumerate(beams):
-            bl_band = float(_beam_bl_np(np.array([float(ell_hi)]), fwhm)[0])
-            mask[j, b] = (bl_band / bc) >= threshold
-    return mask
+    # Upper support edge per band — set by the static windows, not the beams.
+    ell_hi = np.array(
+        [int(np.nonzero(nb[j] > 1e-3)[0][-1]) if np.any(nb[j] > 1e-3) else 0 for j in range(n_j)],
+        dtype=float,
+    )  # (n_j,)
+    ell_hi_j = jnp.asarray(ell_hi)
+    beams = jnp.asarray(beam_fwhm_arcmin, dtype=float)
+    n_band = beams.shape[0]
+    ps = jnp.ones(n_band) if beam_shape_p is None else jnp.asarray(beam_shape_p, dtype=float)
+    bl_common = jnp.maximum(beam_bl(ell_hi_j, common_fwhm_arcmin), 1e-30)  # (n_j,) Gaussian
+    bl_band = jnp.stack(
+        [beam_bl(ell_hi_j, beams[b], ps[b]) for b in range(n_band)], axis=1
+    )  # (n_j, n_band)
+    ratio = bl_band / bl_common[:, None]
+    mask = jnp.where(ratio >= threshold, 1.0, 0.0)
+    return jax.lax.stop_gradient(mask)
 
 
-def _global_weights(beta: jax.Array, ridge: float, active: np.ndarray) -> jax.Array:
+def _global_weights(beta: jax.Array, ridge: float, active: jax.Array) -> jax.Array:
     """Spatially-constant weights per needlet band, shape ``(J, n_band)``.
 
-    The empirical covariance and ILC solve run over the *active* channels of each
-    needlet band (``active[j]``); excluded channels get weight exactly 0, so their
-    (possibly deconvolution-inflated) maps never enter the cleaned product. The
-    weights are pixel-independent, so they are returned as ``(J, n_band)`` and
+    The empirical covariance is the full cross-band ``C_j = β_jβ_jᵀ / npix``; the
+    per-band float mask ``active[j]`` selects which channels enter the ILC via the
+    fixed-shape masked solve :func:`_ilc_weights_masked` (excluded channels get
+    weight exactly 0, so their deconvolution-inflated maps never enter the cleaned
+    product). The weights are pixel-independent, returned as ``(J, n_band)`` and
     broadcast at apply time (``combine_needlets``) — *not* materialised to
     ``(J, n_band, npix)``, which would be a redundant ~13 GB at nside=1024.
     """
-    n_j, n_band, npix = beta.shape
+    n_j, _n_band, npix = beta.shape
     ws = []
     for j in range(n_j):
-        idx = np.nonzero(active[j])[0]
-        bj = beta[j][idx]  # (n_active, npix)
-        cov = (bj @ bj.T) / npix  # (n_active, n_active)
-        w_active = _ilc_weights_from_cov(_ridge(cov, ridge))  # (n_active,)
-        ws.append(jnp.zeros(n_band).at[jnp.asarray(idx)].set(w_active))  # (n_band,)
+        cov = (beta[j] @ beta[j].T) / npix  # (n_band, n_band)
+        ws.append(_ilc_weights_masked(cov, active[j], ridge))  # (n_band,)
     return jnp.stack(ws, axis=0)  # (J, n_band)
 
 
@@ -336,7 +373,7 @@ def _localized_weights(
     nside: int,
     n_iter: int,
     ridge: float,
-    active: np.ndarray,
+    active: jax.Array,
 ) -> jax.Array:
     """Per-pixel weights from a Gaussian-localized empirical covariance.
 
@@ -344,7 +381,11 @@ def _localized_weights(
     ``localization_fwhm_arcmin``. The localization scale sets the modes-per-domain
     and hence the ILC bias; choose it so domains hold ≫ n_band modes. As in
     :func:`_global_weights`, the per-pixel solve runs over the active channels of
-    each needlet band; excluded channels get weight 0.
+    each needlet band via the masked covariance (excluded channels get weight 0).
+    The full cross-band covariance is formed (all ``n_band²`` smoothed products) so
+    the path is fixed-shape / differentiable in the beams; when masking actually
+    excludes channels this does a little more smoothing work than the old gather,
+    but the localized path is opt-in and the global default is unaffected.
     """
     n_j, n_band, _npix = beta.shape
 
@@ -353,17 +394,15 @@ def _localized_weights(
 
     ws = []
     for j in range(n_j):
-        idx = np.nonzero(active[j])[0]
-        bj = beta[j][idx]  # (n_active, npix)
-        n_act = len(idx)
+        bj = beta[j]  # (n_band, npix) — all channels
         rows = [
-            jnp.stack([smooth(bj[i] * bj[k]) for k in range(n_act)], axis=0) for i in range(n_act)
+            jnp.stack([smooth(bj[i] * bj[k]) for k in range(n_band)], axis=0) for i in range(n_band)
         ]
-        cov = jnp.stack(rows, axis=0)  # (n_active, n_active, npix)
-        cov = jnp.moveaxis(cov, 2, 0)  # (npix, n_active, n_active)
-        w_act = _ilc_weights_from_cov(_ridge(cov, ridge))  # (npix, n_active)
-        w = jnp.zeros((n_band, _npix)).at[jnp.asarray(idx)].set(w_act.T)
-        ws.append(w)  # (n_band, npix)
+        cov = jnp.stack(rows, axis=0)  # (n_band, n_band, npix)
+        cov = jnp.moveaxis(cov, 2, 0)  # (npix, n_band, n_band)
+        m = jnp.broadcast_to(active[j], (cov.shape[0], n_band))  # (npix, n_band)
+        w = _ilc_weights_masked(cov, m, ridge)  # (npix, n_band)
+        ws.append(w.T)  # (n_band, npix)
     return jnp.stack(ws, axis=0)
 
 
@@ -410,6 +449,7 @@ class NILCResult:
     n_iter: int
     cleaned_e_alm: jax.Array | None = None
     weights_e: jax.Array | None = None
+    beam_shape_p: jax.Array | None = None
 
     def project(self, passive_band_qu: jax.Array) -> jax.Array:
         """Apply the stored weights to another map set → its cleaned B alm.
@@ -424,6 +464,7 @@ class NILCResult:
             nside=self.nside,
             n_iter=self.n_iter,
             common_fwhm_arcmin=self.common_fwhm_arcmin,
+            beam_shape_p=self.beam_shape_p,
         )
         beta = needlet_beta(b_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside)
         return combine_needlets(
@@ -454,6 +495,7 @@ class NILCResult:
             nside=self.nside,
             n_iter=self.n_iter,
             common_fwhm_arcmin=self.common_fwhm_arcmin,
+            beam_shape_p=self.beam_shape_p,
         )
         beta = needlet_beta(e_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside)
         return combine_needlets(
@@ -491,6 +533,7 @@ class NILCResult:
 def nilc_clean(
     band_qu: jax.Array,
     beam_fwhm_arcmin,
+    beam_shape_p=None,
     *,
     lmax: int,
     nside: int,
@@ -546,7 +589,9 @@ def nilc_clean(
     :class:`NILCResult`.
     """
     check_band_limit(lmax, nside)
-    beams = tuple(float(b) for b in beam_fwhm_arcmin)
+    beams = jnp.asarray(beam_fwhm_arcmin, dtype=float)
+    n_band = beams.shape[0]
+    ps = jnp.ones(n_band) if beam_shape_p is None else jnp.asarray(beam_shape_p, dtype=float)
     if needlet_peaks is None:
         needlet_peaks = default_needlet_peaks(lmax)
     needlet_bands = cosine_needlet_bands(lmax, needlet_peaks)
@@ -559,6 +604,7 @@ def nilc_clean(
             nside=nside,
             n_iter=n_iter,
             common_fwhm_arcmin=common_fwhm_arcmin,
+            beam_shape_p=ps,
         )
     else:
         e_alm = None
@@ -569,9 +615,12 @@ def nilc_clean(
             nside=nside,
             n_iter=n_iter,
             common_fwhm_arcmin=common_fwhm_arcmin,
+            beam_shape_p=ps,
         )
 
-    active = _needlet_channel_mask(needlet_bands, beams, common_fwhm, lmax, beam_band_limit)
+    active = _needlet_channel_mask(
+        needlet_bands, beams, common_fwhm, lmax, beam_band_limit, beam_shape_p=ps
+    )
 
     def _weights(beta_field):
         if localization_fwhm_arcmin is None:
@@ -610,4 +659,5 @@ def nilc_clean(
         n_iter=int(n_iter),
         cleaned_e_alm=cleaned_e,
         weights_e=weights_e,
+        beam_shape_p=ps,
     )
