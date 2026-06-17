@@ -32,6 +32,7 @@ is ``None``); a Q/U-consuming spectrum stage feature-detects ``cleaned_qu`` inst
 
 from __future__ import annotations
 
+import functools
 from typing import Protocol, runtime_checkable
 
 import jax
@@ -128,25 +129,21 @@ def nilc_cleaner(
     the same arguments — it only fixes the uniform ``(band_qu, beams, *, lmax,
     nside)`` call site so NILC and cMILC are interchangeable in a driver. Pass
     ``clean_e=True`` for the spin-2 Q/U cleaner (a ``cleaned_qu()``-capable result).
+
+    Returned as a ``functools.partial`` of the module-level ``nilc_clean`` (not a local
+    closure), so it is **picklable** — usable as the ``cleaner`` for a spawn-pool
+    ``mc_cutsky_bandpowers(workers > 1)`` run.
     """
-
-    def _cleaner(band_qu, beam_fwhm_arcmin, beam_shape_p=None, *, lmax, nside):
-        return nilc_clean(
-            band_qu,
-            beam_fwhm_arcmin,
-            beam_shape_p,
-            lmax=lmax,
-            nside=nside,
-            needlet_peaks=needlet_peaks,
-            localization_fwhm_arcmin=localization_fwhm_arcmin,
-            common_fwhm_arcmin=common_fwhm_arcmin,
-            n_iter=n_iter,
-            ridge=ridge,
-            beam_band_limit=beam_band_limit,
-            clean_e=clean_e,
-        )
-
-    return _cleaner
+    return functools.partial(
+        nilc_clean,
+        needlet_peaks=needlet_peaks,
+        localization_fwhm_arcmin=localization_fwhm_arcmin,
+        common_fwhm_arcmin=common_fwhm_arcmin,
+        n_iter=n_iter,
+        ridge=ridge,
+        beam_band_limit=beam_band_limit,
+        clean_e=clean_e,
+    )
 
 
 def cmilc_cleaner(

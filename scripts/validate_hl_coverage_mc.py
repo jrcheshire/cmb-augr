@@ -28,10 +28,11 @@ both under-cover => the masking/ILC non-Gaussianity exceeds the HL idealization 
 
 Needs the ``[compsep]`` extra (ducc0; pysm3 for --fg-model). The coverage core itself is
 sampling-free (no NUTS), so no ``[sampling]`` extra. Each test realization is one full
-masked-Wiener clean, so n_test dominates cost. Runs SERIAL (each sim is already
-ducc-multithreaded, ~20 s/sim at nside=64); ``mc_workers > 1`` is currently blocked upstream
-by ``mc_cutsky_bandpowers``'s local per-sim worker (not picklable under the spawn pool), so
-``--workers > 1`` falls back to serial with a warning.
+masked-Wiener clean (~20 s/sim at nside=64), so n_test dominates cost; pass ``--workers N``
+to parallelize the ensemble over a spawn pool (the NILC cleaner is picklable). Workers pin
+BLAS to 1 thread; this driver sets ``DUCC0_NUM_THREADS = cpu_count // workers`` so
+``workers x ducc-threads ~= cpu_count`` (no oversubscription -- see
+``reference_ducc_omp_threading``).
 
 Usage:
     pixi run python scripts/validate_hl_coverage_mc.py --nside 64 --n-train 100 --n-test 300 \
@@ -41,6 +42,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import replace
 
 import jax.numpy as jnp
@@ -48,11 +50,12 @@ import numpy as np
 
 from augr import masking as mk
 from augr import sbc
+from augr.cleaning import nilc_cleaner
 from augr.hit_maps import l2_hit_map
 from augr.likelihood import bandpower_ks
 from augr.likelihood.from_cutsky import build_cutsky_signal_model, build_likelihood
 from augr.likelihood.ordering import SpectrumLayout
-from augr.nilc import nilc_clean
+from augr.parallel import cpu_count
 from augr.pipeline import (
     ForecastConfig,
     ResidualTemplateSource,
@@ -69,43 +72,12 @@ W_INV = (2.0e-4, 1.2e-4, 5.0e-5, 5.0e-5, 1.5e-4)  # uK^2 sr per band
 SEED_STRIDE = 100_000  # disjoint train/test seed blocks (matches augr.design_opt)
 
 
-class PicklableNilcCleaner:
-    """Module-level (picklable) NILC cleaner, bit-equivalent to ``nilc_cleaner(clean_e=True)``.
-
-    The ``nilc_cleaner`` factory returns a local closure (unpicklable under a spawn pool).
-    A picklable cleaner is *necessary* for ``mc_workers > 1`` but not *sufficient*:
-    ``mc_cutsky_bandpowers``'s own per-sim worker is also a local closure, so process-pool
-    parallelism is blocked upstream regardless. Kept module-level anyway so this driver is
-    ready if that worker is ever hoisted (and to avoid the closure entirely).
-    """
-
-    def __init__(self, *, clean_e: bool = True, n_iter: int = 3):
-        self.clean_e = clean_e
-        self.n_iter = n_iter
-
-    def __call__(self, band_qu, beam_fwhm_arcmin, beam_shape_p=None, *, lmax, nside):
-        return nilc_clean(
-            band_qu,
-            beam_fwhm_arcmin,
-            beam_shape_p,
-            lmax=lmax,
-            nside=nside,
-            needlet_peaks=None,
-            localization_fwhm_arcmin=None,
-            common_fwhm_arcmin=None,
-            n_iter=self.n_iter,
-            ridge=1e-10,
-            beam_band_limit=0.1,
-            clean_e=self.clean_e,
-        )
-
-
 def _build_config(args, mask, hit, *, n_sims, base_seed):
     cfg = ForecastConfig(
         freqs_ghz=FREQS,
         beam_fwhm_arcmin=BEAMS,
         w_inv=W_INV,
-        cleaner=PicklableNilcCleaner(clean_e=True),
+        cleaner=nilc_cleaner(clean_e=True),  # picklable (functools.partial) -> mc_workers>1 OK
         nside=args.nside,
         lmax=args.lmax,
         fg_model=None if args.fg_model == "none" else args.fg_model,
@@ -162,11 +134,9 @@ def main() -> None:
     if args.base_seed + args.n_train + 1 >= args.base_seed + SEED_STRIDE:
         raise ValueError("train block overlaps the test block; reduce n_train or raise SEED_STRIDE")
     if args.workers > 1:
-        # mc_cutsky_bandpowers' per-sim worker is a local closure (unpicklable under the
-        # spawn pool), so process-pool parallelism is blocked upstream; run serial.
-        print(f"  WARNING: --workers {args.workers} unsupported upstream (mc_cutsky_bandpowers "
-              f"local worker); running serial (each sim is ducc-multithreaded).")
-        args.workers = 1
+        # ducc reads DUCC0_NUM_THREADS first; set it so workers x ducc-threads ~= cpu_count
+        # (spawn children inherit the parent env). Overrides any pre-set high value.
+        os.environ["DUCC0_NUM_THREADS"] = str(max(1, cpu_count() // args.workers))
 
     npix = 12 * args.nside**2
     hit = jnp.ones(npix) if args.uniform_hits else jnp.asarray(l2_hit_map(args.nside, coord="G"))
