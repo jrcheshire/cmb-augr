@@ -82,7 +82,6 @@ import argparse
 import json
 import time
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -94,6 +93,7 @@ from augr import sht
 from augr.cleaning import nilc_cleaner
 from augr.config import cleaned_map_instrument
 from augr.delensing import load_lensing_spectra
+from augr.design_opt import build_design_objectives, held_out_gain, stochastic_design_descent
 from augr.foregrounds import NullForegroundModel
 from augr.optimize import make_optimization_context
 from augr.optimize_mapbased import (
@@ -231,12 +231,12 @@ SEED_STRIDE = 100_000
 VAL_BASE = SEED_STRIDE  # the single fixed validation ensemble
 
 
-def _train_base(step, n_sims, resample_every):
-    """Rolling train CRN base: a fresh disjoint block every ``resample_every`` steps.
+def _train_base(resample_index, n_sims):
+    """Train CRN base for the ``resample_index``-th re-draw: a fresh disjoint block.
 
     Block k uses seeds ``[k*(n_sims+1), k*(n_sims+1) + n_sims]``; all stay below
     ``VAL_BASE`` (asserted by the caller) so train never collides with val/test."""
-    return (step // resample_every) * (n_sims + 1)
+    return resample_index * (n_sims + 1)
 
 
 def _test_base(i):
@@ -245,14 +245,13 @@ def _test_base(i):
 
 
 def _make_objectives(pieces, n_total):
-    """Return (value_fn, value_and_grad_fn), both ``eqx.filter_jit``-ed over
-    ``(logits, mc_ctx)``.
+    """Return (value_fn, value_and_grad_fn) for the softmax-allocation objective.
 
-    ``mc_ctx`` is a *traced argument* (not closed over), so swapping in a fresh
-    CRN ensemble of the same ``(n_sims, nside, lmax)`` reuses the single compiled
-    executable -- the whole point of re-randomizing CRN cheaply. ``opt_ctx`` /
-    ``cleaner`` are closed over (fixed across the optimization). The gradient is
-    w.r.t. ``logits`` only (the softmax allocation)."""
+    The objective ``sigma(r)(logits, mc_ctx)`` is jitted over ``(logits, mc_ctx)``
+    by :func:`augr.design_opt.build_design_objectives`, so swapping in a fresh CRN
+    ensemble of the same ``(n_sims, nside, lmax)`` reuses the one compiled
+    executable. ``opt_ctx`` / ``cleaner`` are closed over (fixed across the
+    optimization); the gradient is w.r.t. ``logits`` only (the allocation)."""
     opt_ctx = pieces["opt_ctx"]
     cleaner = pieces["cleaner"]
     net0 = jnp.asarray(NET)
@@ -270,19 +269,7 @@ def _make_objectives(pieces, n_total):
             cleaner=cleaner,
         )
 
-    value_fn = eqx.filter_jit(_loss)
-    vg_fn = eqx.filter_jit(eqx.filter_value_and_grad(_loss))
-    return value_fn, vg_fn
-
-
-def _held_out_gains(value_fn, test_ctxs, logits0, logits):
-    """Per-test-ensemble sigma(r) gain [%] of ``logits`` vs the uniform ``logits0``."""
-    gains = []
-    for ctx in test_ctxs:
-        s_u = float(value_fn(jnp.asarray(logits0), ctx))
-        s_o = float(value_fn(jnp.asarray(logits), ctx))
-        gains.append(100.0 * (s_u - s_o) / s_u)
-    return np.array(gains)
+    return build_design_objectives(_loss)
 
 
 # --- mode: stability ---------------------------------------------------------
@@ -417,45 +404,44 @@ def run_beam(args, var_pix_ref):
 def _descent_adam(args, pieces, n_sims, var_pix_ref, value_fn, vg_fn, val_ctx):
     """optax Adam over the softmax logits with RE-RANDOMIZED CRN (lever A).
 
-    A fresh sim ensemble (rolling disjoint ``base_seed``) every
-    ``--resample-every`` steps, so the optimizer never fits a single
-    realization's empirical-ILC-bias noise. The frozen ``var_pix_ref`` keeps the
-    Wiener filter fixed, so re-draws reuse the one compiled forward trace.
-    Returns (history, logits_final, logits_best_on_val, build_s, per_eval_s);
-    ``history`` is (step, sigma_train, sigma_val) at the SAME logits."""
+    Thin wrapper over :func:`augr.design_opt.stochastic_design_descent`: a fresh
+    sim ensemble (rolling disjoint base seed) every ``--resample-every`` steps, so
+    the optimizer never fits a single realization's empirical-ILC-bias noise. The
+    frozen ``var_pix_ref`` keeps the Wiener filter fixed, so re-draws reuse the one
+    compiled forward trace. Returns (history, logits_final, logits_best_on_val,
+    build_s, per_eval_s); ``history`` is (step, sigma_train, sigma_val)."""
     n_band = len(N_DET)
-    max_train_base = _train_base(args.steps - 1, n_sims, args.resample_every)
-    assert max_train_base + n_sims < VAL_BASE, (
-        f"train seed blocks reach {max_train_base + n_sims} >= VAL_BASE={VAL_BASE}; "
-        "reduce --steps / --resample-every span or raise SEED_STRIDE."
+    n_resamples = (args.steps - 1) // args.resample_every
+    assert _train_base(n_resamples, n_sims) + n_sims < VAL_BASE, (
+        f"train seed blocks reach {_train_base(n_resamples, n_sims) + n_sims} >= "
+        f"VAL_BASE={VAL_BASE}; reduce --steps / --resample-every span or raise SEED_STRIDE."
     )
-    logits = jnp.zeros(n_band)
-    opt = optax.adam(args.lr)
-    state = opt.init(logits)
-    history = []
-    best_val, best_logits = np.inf, logits
-    train_ctx = None
-    build_s = 0.0
-    eval_times = []
-    for step in range(args.steps):
-        if step % args.resample_every == 0:
-            t_b = time.time()
-            train_ctx = _mc_ctx(
-                pieces, _train_base(step, n_sims, args.resample_every), n_sims, var_pix_ref
-            )
-            build_s += time.time() - t_b
-        t_e = time.time()
-        s_tr, g = vg_fn(logits, train_ctx)
-        s_tr = float(s_tr)
-        eval_times.append(time.time() - t_e)
-        s_va = float(value_fn(logits, val_ctx))
-        history.append((step, s_tr, s_va))
-        if s_va < best_val:
-            best_val, best_logits = s_va, logits
-        updates, state = opt.update(g, state, logits)
-        logits = optax.apply_updates(logits, updates)
-    per_eval_s = float(np.median(eval_times[1:])) if len(eval_times) > 1 else eval_times[0]
-    return history, np.asarray(logits), np.asarray(best_logits), build_s, per_eval_s
+    result = stochastic_design_descent(
+        value_fn,
+        vg_fn,
+        jnp.zeros(n_band),
+        make_train_ctx=lambda i: _mc_ctx(pieces, _train_base(i, n_sims), n_sims, var_pix_ref),
+        val_ctx=val_ctx,
+        optimizer=optax.adam(args.lr),
+        steps=args.steps,
+        resample_every=args.resample_every,
+    )
+    history = list(
+        zip(
+            result.steps.tolist(),
+            result.train_curve.tolist(),
+            result.val_curve.tolist(),
+            strict=True,
+        )
+    )
+    # build time folds into the (cheap, untracked) per-step ensemble re-draws.
+    return (
+        history,
+        np.asarray(result.params_final),
+        np.asarray(result.params_best),
+        0.0,
+        result.per_eval_s,
+    )
 
 
 def _descent_lbfgs(args, pieces, n_sims, var_pix_ref, value_fn, vg_fn, val_ctx):
@@ -580,8 +566,8 @@ def run_demo(args, var_pix_ref, *, n_sims=None, return_metrics=False):
     val_impr_best = 100.0 * (s_val_unif - s_val_best) / s_val_unif
     n_to_best = int(np.argmin(np.array([h[2] for h in history])))
 
-    gains_final = _held_out_gains(value_fn, test_ctxs, logits0, logits_final)
-    gains_best = _held_out_gains(value_fn, test_ctxs, logits0, logits_best)
+    gains_final = held_out_gain(value_fn, test_ctxs, logits0, logits_final)
+    gains_best = held_out_gain(value_fn, test_ctxs, logits0, logits_best)
     # Generalization gap: how much the validation-claimed improvement of the
     # CONVERGED design overstates its worst-case held-out improvement. Positive =>
     # the design looked better in-protocol than it actually generalizes (overfit).
