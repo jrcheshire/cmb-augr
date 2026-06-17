@@ -270,3 +270,40 @@ def test_beam_design_grad_finite_and_fd_matched() -> None:
     hp = 0.05
     g_fd_p0 = (float(loss(fwhm, p.at[0].add(hp))) - float(loss(fwhm, p.at[0].add(-hp)))) / (2 * hp)
     np.testing.assert_allclose(float(g_p[0]), g_fd_p0, rtol=0.05)
+
+
+@pytest.mark.slow
+def test_noise_design_value_and_grad_jit_matches_eager() -> None:
+    """jit(value_and_grad) reproduces the eager value + gradient.
+
+    The characterization driver's ``--jit`` path wraps the objective in ``jax.jit`` so it
+    compiles once and reuses the executable instead of recompiling the lax.map(NILC-clean)
+    scan on every eval -- the GPU pathology (eager doesn't hit the XLA cache between calls,
+    so each eval re-pays a multi-minute compile). jit must not change the numbers. The
+    gradient tolerance follows the documented jit-vs-eager fp wobble (~1e-5; the fisher
+    stability gate uses 1e-4)."""
+    mc_ctx, opt_ctx, cleaner = _setup(12)
+    n_det = jnp.asarray(N_DET)
+    net = jnp.asarray(NET)
+    eta = jnp.asarray(ETA)
+    years = MISSION_YEARS
+
+    def loss(nd, ne, et, yr):
+        return sigma_r_from_noise_design(
+            nd, ne, et, yr, mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner
+        )
+
+    vg = jax.value_and_grad(loss, argnums=(0, 1, 2, 3))
+    v_e, g_e = vg(n_det, net, eta, years)
+    v_j, g_j = jax.jit(vg)(n_det, net, eta, years)
+
+    np.testing.assert_allclose(float(v_j), float(v_e), rtol=1e-6)
+    # The design-gradient vector agrees to the documented jit-vs-eager fp wobble. Compare
+    # the relative L2 norm of the whole vector rather than per-component rtol: the
+    # weakly-constrained directions are near zero (~1e-7), where per-component rtol
+    # amplifies pure fp-reordering noise (CLAUDE.md: off-diagonals "drift by orders of
+    # magnitude"; the fisher-stability gate is rtol=1e-4 on the aggregate).
+    g_e_vec = np.concatenate([np.asarray(g).ravel() for g in (*g_e[:3], jnp.atleast_1d(g_e[3]))])
+    g_j_vec = np.concatenate([np.asarray(g).ravel() for g in (*g_j[:3], jnp.atleast_1d(g_j[3]))])
+    rel_l2 = float(np.linalg.norm(g_j_vec - g_e_vec) / np.linalg.norm(g_e_vec))
+    assert rel_l2 < 1e-4, f"jit-vs-eager design-gradient rel-L2 = {rel_l2:.2e}"

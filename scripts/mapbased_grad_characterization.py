@@ -335,6 +335,12 @@ def run_demo(args, var_pix_ref, *, n_sims=None, return_metrics=False):
     )
     build_s = time.time() - t_build
     vg = jax.value_and_grad(lambda lg: sigma_of(lg, mc_ctx, opt_ctx, cleaner))
+    # Eager value_and_grad re-traces every call; on GPU the lax.map(NILC-clean) scan is
+    # NOT cached between calls, so each eval pays the (multi-minute) XLA compile again.
+    # jit compiles once and reuses the executable across all L-BFGS / held-out evals --
+    # essential on GPU (where compile dominates), a small win on CPU.
+    if getattr(args, "jit", False):
+        vg = jax.jit(vg)
 
     def scipy_vg(x):
         v, g = vg(jnp.asarray(x))
@@ -515,6 +521,12 @@ def main():
     p.add_argument("--maxiter", type=int, default=12, help="demo: L-BFGS-B max iters / fun-evals")
     p.add_argument("--heldout-seeds", type=int, nargs="+", default=[9001, 9002])
     p.add_argument("--backend", choices=["ducc", "jht"], default="ducc")
+    p.add_argument(
+        "--jit",
+        action="store_true",
+        help="jit the value_and_grad objective (compile once, reuse) -- needed on GPU, "
+        "where the eager path recompiles the lax.map scan (~minutes) every eval.",
+    )
     p.add_argument(
         "--out-prefix", default="grad_char_ladder", help="ladder: JSON/PNG output path prefix"
     )
