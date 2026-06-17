@@ -8,13 +8,20 @@ straight-through gradient usable for descent?" -- with two diagnostics:
 
   --mode demo (decisive, cheaper):
       Optimize the per-band detector allocation under a fixed total budget
-      (n_det = N_total * softmax(logits)). Unlike an unconstrained noise descent
-      (which runs to the n_det -> infinity boundary), a fixed-budget allocation has
-      an interior optimum. The optimization runs at FIXED common random numbers, so
-      the objective is deterministic; the real test is GENERALIZATION -- we then
-      re-evaluate the optimized vs the uniform allocation on independent held-out
-      CRN ensembles. If the optimized allocation is genuinely better on fresh sims
-      (not just on the training sims), the gradient is usable.
+      (n_det = N_total * softmax(logits)); a fixed-budget allocation has an interior
+      optimum (an unconstrained noise descent runs to the n_det -> infinity
+      boundary). Two optimizer protocols (--optimizer):
+        adam  (default): RE-RANDOMIZED-CRN stochastic descent (optax Adam, a fresh
+              sim ensemble every --resample-every steps). The optimizer never sees
+              one realization twice, so it cannot fit a single one's empirical-ILC-
+              bias noise -- the fix for the overfit the fixed-CRN path hit.
+        lbfgs: FIXED-CRN L-BFGS-B baseline; run to convergence on one finite sample
+              it overfits that sample. Kept to exhibit the optimism gap.
+      Both track sigma(r) on a separate VALIDATION ensemble each iterate, keep the
+      best-on-val design (early stopping), and report GENERALIZATION -- held-out
+      gain vs the uniform allocation on independent DISJOINT test ensembles for both
+      the final and the best-on-val design. The straight-through gradient is usable
+      iff the best-on-val design improves every held-out ensemble.
 
   --mode stability:
       Compute grad sigma(r) w.r.t. the per-band NET vector on several independent
@@ -28,13 +35,13 @@ straight-through gradient usable for descent?" -- with two diagnostics:
 
   --mode ladder:
       Sweep ``--n-sims-ladder`` and, at each rung, run the demo descent +
-      held-out generalization, recording train improvement, held-out gain
-      (mean/min), and wall-time (first eval incl. compile, and steady-state
-      per-eval). Writes a JSON + a plot of held-out-gain-vs-n_sims and
-      per-eval-time-vs-n_sims. This is the Phase-2 read-off that gates B.3: the
-      n_sims at which the held-out gap closes (min-gain stabilizes positive), and
-      what one objective/gradient eval costs. Cheap on CPU at small n_sims; the
-      real ladder runs on a GPU (``--backend jht``).
+      held-out generalization, recording held-out gain for the final AND the
+      best-on-val design (mean/min), the optimism gap, and the steady-state
+      per-eval cost. Writes a JSON + a plot of held-out-gain-vs-n_sims (final vs
+      best-on-val) and per-eval-time-vs-n_sims. This is the Phase-2 read-off that
+      gates B.3: whether the design GENERALIZES (best-on-val min-gain > 0) and
+      holds as n_sims rises, and what one value+grad eval costs. Cheap on CPU at
+      small n_sims; the real ladder runs on a GPU (``--backend jht``).
 
   --mode beam:
       The beam-lever sensitivity diagnostic (NOT an optimizer -- a free FWHM has no
@@ -50,11 +57,17 @@ run. Pin BLAS/OMP to 1 thread for reproducible single-core timing.
 
 Usage:
     pixi run python scripts/mapbased_grad_characterization.py --mode demo
+    pixi run python scripts/mapbased_grad_characterization.py --mode demo --optimizer lbfgs
     pixi run python scripts/mapbased_grad_characterization.py --mode stability --n-batches 4
     pixi run python scripts/mapbased_grad_characterization.py --mode beam --n-batches 3
-    pixi run python scripts/mapbased_grad_characterization.py --mode both --backend jht
     pixi run python scripts/mapbased_grad_characterization.py --mode ladder \
         --n-sims-ladder 12 24 48 96 --backend jht
+
+The map-based sigma(r) objective is wrapped in ``eqx.filter_jit`` over
+``(logits, mc_ctx)``, so it compiles ONCE and reuses the executable across all
+descent / validation / held-out evals -- and, crucially, across re-drawn CRN
+ensembles of the same ``(n_sims, nside, lmax)`` (the PR #28 traced ``mc_ctx``).
+That is what makes re-randomizing the CRN every step nearly free.
 
 GPU run (TACC Vista, ``gh`` partition, account JPL-PUB):
     ``pip install jaxht`` (PyPI distribution name; the import is ``jht``) into the
@@ -72,6 +85,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from scipy.optimize import minimize
 
 from augr import masking as mk
@@ -79,6 +93,7 @@ from augr import sht
 from augr.cleaning import nilc_cleaner
 from augr.config import cleaned_map_instrument
 from augr.delensing import load_lensing_spectra
+from augr.design_opt import build_design_objectives, held_out_gain, stochastic_design_descent
 from augr.foregrounds import NullForegroundModel
 from augr.optimize import make_optimization_context
 from augr.optimize_mapbased import (
@@ -120,8 +135,15 @@ def _bin_matrix(ell_min, ell_max, delta_ell, ell_per_bin_below):
     return jnp.asarray(sm.bin_matrix)
 
 
-def build_contexts(base_seed, n_sims, *, nside, lmax, var_pix_ref=None):
-    """Build (mc_ctx, opt_ctx, cleaner) for a CMB-only tiny config at one CRN seed."""
+def _static_pieces(nside, lmax):
+    """Design-INDEPENDENT pieces for the tiny CMB-only config, built once.
+
+    Everything here is fixed across the design optimization: the binning, the
+    E/B priors, the true BB transfer denominator, the cleaner, the fiducial
+    ``w_inv`` (only used to seed ``var_pix_ref``), the analysis mask, and the
+    OptimizationContext. The per-CRN ensemble is built separately by
+    :func:`_mc_ctx` so a stochastic descent can re-draw it cheaply (same shapes
+    reuse the compiled forward trace; only the sky/noise leaves change)."""
     ell_max, delta_ell, ell_per_bin_below = lmax, 8, 2
     cl_ee, cl_bb = _priors(lmax)
     bm = _bin_matrix(2, ell_max, delta_ell, ell_per_bin_below)
@@ -136,25 +158,6 @@ def build_contexts(base_seed, n_sims, *, nside, lmax, var_pix_ref=None):
             jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, F_SKY
         )
     )
-    mc_ctx = make_cutsky_mc_context(
-        cleaner=cleaner,
-        freqs_ghz=FREQS,
-        beam_fwhm_arcmin=BEAMS,
-        w_inv=w_inv_fid,
-        nside=nside,
-        lmax=lmax,
-        mask=mk.galactic_mask(nside, F_SKY),
-        cl_ee=cl_ee,
-        cl_bb_prior_unbeamed=cl_bb,
-        bin_matrix=bm,
-        ell_min=2,
-        true_bb_binned=true_b,
-        n_sims=n_sims,
-        base_seed=base_seed,
-        fg_model=None,
-        r_in=0.0,
-        var_pix_ref=var_pix_ref,
-    )
     opt_ctx = make_optimization_context(
         cleaned_map_instrument(f_sky=F_SKY),
         NullForegroundModel(),
@@ -167,7 +170,106 @@ def build_contexts(base_seed, n_sims, *, nside, lmax, var_pix_ref=None):
         delta_ell=delta_ell,
         ell_per_bin_below=ell_per_bin_below,
     )
-    return mc_ctx, opt_ctx, cleaner
+    return {
+        "cl_ee": cl_ee,
+        "cl_bb": cl_bb,
+        "bm": bm,
+        "true_b": true_b,
+        "cleaner": cleaner,
+        "w_inv_fid": w_inv_fid,
+        "opt_ctx": opt_ctx,
+        "mask": mk.galactic_mask(nside, F_SKY),
+        "nside": nside,
+        "lmax": lmax,
+    }
+
+
+def _mc_ctx(pieces, base_seed, n_sims, var_pix_ref=None):
+    """Build the per-CRN cut-sky MC ensemble at ``base_seed`` from static ``pieces``.
+
+    Pass a frozen ``var_pix_ref`` so the Wiener filter is identical across
+    re-draws -- then the only thing that changes between ensembles of the same
+    ``(n_sims, nside, lmax)`` is the CRN (sky + noise leaves), which the traced
+    forward reuses one compiled executable for."""
+    return make_cutsky_mc_context(
+        cleaner=pieces["cleaner"],
+        freqs_ghz=FREQS,
+        beam_fwhm_arcmin=BEAMS,
+        w_inv=pieces["w_inv_fid"],
+        nside=pieces["nside"],
+        lmax=pieces["lmax"],
+        mask=pieces["mask"],
+        cl_ee=pieces["cl_ee"],
+        cl_bb_prior_unbeamed=pieces["cl_bb"],
+        bin_matrix=pieces["bm"],
+        ell_min=2,
+        true_bb_binned=pieces["true_b"],
+        n_sims=n_sims,
+        base_seed=base_seed,
+        fg_model=None,
+        r_in=0.0,
+        var_pix_ref=var_pix_ref,
+    )
+
+
+def build_contexts(base_seed, n_sims, *, nside, lmax, var_pix_ref=None):
+    """Build (mc_ctx, opt_ctx, cleaner) for a CMB-only tiny config at one CRN seed."""
+    pieces = _static_pieces(nside, lmax)
+    mc_ctx = _mc_ctx(pieces, base_seed, n_sims, var_pix_ref=var_pix_ref)
+    return mc_ctx, pieces["opt_ctx"], pieces["cleaner"]
+
+
+# --- disjoint CRN seed allocator + jitted objectives -------------------------
+#
+# The demo's train / validation / test ensembles must use DISJOINT sim seeds.
+# Each ensemble at ``base`` occupies seeds ``[base, base + n_sims]`` (the
+# n_sims sims + the var_pix_ref setup clean at ``base + n_sims``). Spacing the
+# ensemble bases by ``SEED_STRIDE`` (>> any n_sims) keeps them disjoint. An
+# earlier version spaced the held-out seeds by 1 (9001, 9002, 9003), so at
+# n_sims=48 the "independent" ensembles shared 47/48 sims -- not independent.
+SEED_STRIDE = 100_000
+VAL_BASE = SEED_STRIDE  # the single fixed validation ensemble
+
+
+def _train_base(resample_index, n_sims):
+    """Train CRN base for the ``resample_index``-th re-draw: a fresh disjoint block.
+
+    Block k uses seeds ``[k*(n_sims+1), k*(n_sims+1) + n_sims]``; all stay below
+    ``VAL_BASE`` (asserted by the caller) so train never collides with val/test."""
+    return resample_index * (n_sims + 1)
+
+
+def _test_base(i):
+    """Disjoint base for the i-th held-out TEST ensemble (spaced from train + val)."""
+    return (i + 2) * SEED_STRIDE
+
+
+def _make_objectives(pieces, n_total):
+    """Return (value_fn, value_and_grad_fn) for the softmax-allocation objective.
+
+    The objective ``sigma(r)(logits, mc_ctx)`` is jitted over ``(logits, mc_ctx)``
+    by :func:`augr.design_opt.build_design_objectives`, so swapping in a fresh CRN
+    ensemble of the same ``(n_sims, nside, lmax)`` reuses the one compiled
+    executable. ``opt_ctx`` / ``cleaner`` are closed over (fixed across the
+    optimization); the gradient is w.r.t. ``logits`` only (the allocation)."""
+    opt_ctx = pieces["opt_ctx"]
+    cleaner = pieces["cleaner"]
+    net0 = jnp.asarray(NET)
+    eta0 = jnp.asarray(ETA)
+
+    def _loss(logits, mc_ctx):
+        alloc = n_total * jax.nn.softmax(logits)
+        return sigma_r_from_noise_design(
+            alloc,
+            net0,
+            eta0,
+            MISSION_YEARS,
+            mc_ctx=mc_ctx,
+            opt_ctx=opt_ctx,
+            cleaner=cleaner,
+        )
+
+    return build_design_objectives(_loss)
 
 
 # --- mode: stability ---------------------------------------------------------
@@ -299,130 +401,219 @@ def run_beam(args, var_pix_ref):
 # --- mode: demo --------------------------------------------------------------
 
 
-def run_demo(args, var_pix_ref, *, n_sims=None, return_metrics=False):
-    """Fixed-budget allocation descent + held-out generalization check.
+def _descent_adam(args, pieces, n_sims, var_pix_ref, value_fn, vg_fn, val_ctx):
+    """optax Adam over the softmax logits with RE-RANDOMIZED CRN (lever A).
 
-    ``n_sims`` overrides ``args.n_sims`` (the ladder passes one rung at a time);
-    ``return_metrics`` returns the per-rung dict instead of only printing.
-    """
-    n_sims = args.n_sims if n_sims is None else n_sims
-    n_total = float(sum(N_DET))
-    net0 = jnp.asarray(NET)
-    eta0 = jnp.asarray(ETA)
-
-    def alloc(logits):
-        return n_total * jax.nn.softmax(logits)
-
-    def sigma_of(logits, mc_ctx, opt_ctx, cleaner):
-        return sigma_r_from_noise_design(
-            alloc(logits),
-            net0,
-            eta0,
-            MISSION_YEARS,
-            mc_ctx=mc_ctx,
-            opt_ctx=opt_ctx,
-            cleaner=cleaner,
-        )
-
-    # Training ensemble (fixed CRN). Eager value_and_grad here; the map-based sigma(r)
-    # is now also jax.jit-able (the jnp + stop_gradient needlet-channel mask removed the
-    # last np.asarray/float boundary), so this can run under jit on a GPU -- kept eager
-    # for this small CPU diagnostic.
-    print("Building training ensemble (eager value_and_grad) ...")
-    t_build = time.time()
-    mc_ctx, opt_ctx, cleaner = build_contexts(
-        0, n_sims, nside=args.nside, lmax=args.lmax, var_pix_ref=var_pix_ref
+    Thin wrapper over :func:`augr.design_opt.stochastic_design_descent`: a fresh
+    sim ensemble (rolling disjoint base seed) every ``--resample-every`` steps, so
+    the optimizer never fits a single realization's empirical-ILC-bias noise. The
+    frozen ``var_pix_ref`` keeps the Wiener filter fixed, so re-draws reuse the one
+    compiled forward trace. Returns (history, logits_final, logits_best_on_val,
+    build_s, per_eval_s); ``history`` is (step, sigma_train, sigma_val)."""
+    n_band = len(N_DET)
+    n_resamples = (args.steps - 1) // args.resample_every
+    assert _train_base(n_resamples, n_sims) + n_sims < VAL_BASE, (
+        f"train seed blocks reach {_train_base(n_resamples, n_sims) + n_sims} >= "
+        f"VAL_BASE={VAL_BASE}; reduce --steps / --resample-every span or raise SEED_STRIDE."
     )
-    build_s = time.time() - t_build
-    vg = jax.value_and_grad(lambda lg: sigma_of(lg, mc_ctx, opt_ctx, cleaner))
-    # Eager value_and_grad re-traces every call; on GPU the lax.map(NILC-clean) scan is
-    # NOT cached between calls, so each eval pays the (multi-minute) XLA compile again.
-    # jit compiles once and reuses the executable across all L-BFGS / held-out evals --
-    # essential on GPU (where compile dominates), a small win on CPU.
-    if getattr(args, "jit", False):
-        vg = jax.jit(vg)
+    result = stochastic_design_descent(
+        value_fn,
+        vg_fn,
+        jnp.zeros(n_band),
+        make_train_ctx=lambda i: _mc_ctx(pieces, _train_base(i, n_sims), n_sims, var_pix_ref),
+        val_ctx=val_ctx,
+        optimizer=optax.adam(args.lr),
+        steps=args.steps,
+        resample_every=args.resample_every,
+    )
+    history = list(
+        zip(
+            result.steps.tolist(),
+            result.train_curve.tolist(),
+            result.val_curve.tolist(),
+            strict=True,
+        )
+    )
+    # build time folds into the (cheap, untracked) per-step ensemble re-draws.
+    return (
+        history,
+        np.asarray(result.params_final),
+        np.asarray(result.params_best),
+        0.0,
+        result.per_eval_s,
+    )
+
+
+def _descent_lbfgs(args, pieces, n_sims, var_pix_ref, value_fn, vg_fn, val_ctx):
+    """scipy L-BFGS-B at FIXED CRN (the overfit-prone baseline).
+
+    Deterministic full-batch descent on one finite sample. Kept to exhibit the
+    optimism gap the Adam path closes: validation is tracked per iterate (via the
+    callback) so best-on-val early stopping still applies, but the converged
+    ``res.x`` is the design that fits the training realization. Returns the same
+    tuple as :func:`_descent_adam`."""
+    n_band = len(N_DET)
+    t_b = time.time()
+    train_ctx = _mc_ctx(pieces, 0, n_sims, var_pix_ref)
+    build_s = time.time() - t_b
+    iterates = [np.zeros(n_band)]
+    eval_times = []
 
     def scipy_vg(x):
-        v, g = vg(jnp.asarray(x))
+        t_e = time.time()
+        v, g = vg_fn(jnp.asarray(x), train_ctx)
+        eval_times.append(time.time() - t_e)
         return float(v), np.asarray(g, dtype=np.float64)
 
-    logits0 = np.zeros(3)  # uniform allocation
-    # First eval pays the XLA compile; a second identical eval is the steady-state
-    # value+grad cost (the per-step price B.3's inner design loop pays).
-    t_e0 = time.time()
-    s_uniform_train = scipy_vg(logits0)[0]
-    first_eval_s = time.time() - t_e0
-    t_e1 = time.time()
-    scipy_vg(logits0)
-    per_eval_s = time.time() - t_e1
-    print(
-        f"  uniform allocation: sigma(r)={s_uniform_train:.6e}  "
-        f"[build {build_s:.0f}s, first eval {first_eval_s:.0f}s, steady eval {per_eval_s:.1f}s]"
-    )
+    def cb(xk):
+        iterates.append(np.array(xk))
 
-    # Bound the eval count -- each eager eval is ~40s at n_sims=12, and L-BFGS line
-    # searches can call the objective several times per iteration.
     res = minimize(
         scipy_vg,
-        logits0,
+        iterates[0],
         jac=True,
         method="L-BFGS-B",
+        callback=cb,
         options={"maxiter": args.maxiter, "maxfun": args.maxiter, "ftol": 1e-9, "gtol": 1e-7},
     )
-    logits_opt = res.x
-    alloc_opt = np.asarray(alloc(jnp.asarray(logits_opt)))
-    print(
-        f"  optimized allocation: sigma(r)={res.fun:.6e}  (n_iter={res.nit}, success={res.success})"
+    iterates.append(np.array(res.x))
+    history = []
+    for it, x in enumerate(iterates):
+        s_tr = float(value_fn(jnp.asarray(x), train_ctx))
+        s_va = float(value_fn(jnp.asarray(x), val_ctx))
+        history.append((it, s_tr, s_va))
+    val_curve = np.array([h[2] for h in history])
+    logits_best = iterates[int(np.argmin(val_curve))]
+    per_eval_s = float(np.median(eval_times[1:])) if len(eval_times) > 1 else eval_times[0]
+    return history, np.asarray(res.x), np.asarray(logits_best), build_s, per_eval_s
+
+
+def _plot_ucurve(args, n_sims, history, n_to_best):
+    """Save the train-vs-val sigma(r) U-curve (the overfit made visible)."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+    steps = [h[0] for h in history]
+    fig, ax = plt.subplots(figsize=(5.4, 4.0))
+    ax.plot(steps, [h[1] for h in history], "o-", color="0.5", label="train sigma(r)")
+    ax.plot(steps, [h[2] for h in history], "o-", color="C0", label="val sigma(r)")
+    ax.axvline(history[n_to_best][0], color="C3", ls="--", lw=1.0, label="best-on-val")
+    ax.set_xlabel("iterate")
+    ax.set_ylabel("sigma(r)")
+    ax.set_title(f"{args.optimizer} n_sims={n_sims}: train vs val")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    path = f"{args.out_prefix}_ucurve_{args.optimizer}_n{n_sims}.png"
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
+def run_demo(args, var_pix_ref, *, n_sims=None, return_metrics=False):
+    """Fixed-budget allocation descent with validation-gated early stopping.
+
+    Optimizes the per-band detector allocation (``n_det = N_total *
+    softmax(logits)``) under a fixed total budget. The optimizer is selected by
+    ``--optimizer``:
+
+      adam  (default, lever A): optax Adam with RE-RANDOMIZED CRN -- a fresh sim
+            ensemble every ``--resample-every`` steps. The optimizer never sees
+            the same realization twice, so it cannot fit a single one's
+            empirical-ILC-bias noise; the descent only persists in directions
+            that help on average (the stochastic-approximation protocol a real
+            BOED loop should use).
+
+      lbfgs (baseline): scipy L-BFGS-B at FIXED CRN -- deterministic, fast, and
+            run to convergence on a finite sample it overfits that sample. Kept
+            to exhibit the optimism gap the adam path closes.
+
+    BOTH paths (lever B) track sigma(r) on a separate fixed VALIDATION ensemble
+    each iterate, keep the best-on-val design (early stopping), and report
+    held-out gain on independent disjoint TEST ensembles for BOTH the final and
+    the best-on-val design. ``n_sims`` overrides ``args.n_sims`` (the ladder
+    passes one rung); ``return_metrics`` returns the per-rung dict."""
+    n_sims = args.n_sims if n_sims is None else n_sims
+    n_total = float(sum(N_DET))
+    n_band = len(N_DET)
+    logits0 = np.zeros(n_band)
+
+    pieces = _static_pieces(args.nside, args.lmax)
+    value_fn, vg_fn = _make_objectives(pieces, n_total)
+
+    # Disjoint validation + test ensembles, all sharing the frozen var_pix_ref filter.
+    val_ctx = _mc_ctx(pieces, VAL_BASE, n_sims, var_pix_ref)
+    test_ctxs = [
+        _mc_ctx(pieces, _test_base(i), n_sims, var_pix_ref) for i in range(args.n_test_ensembles)
+    ]
+
+    descent = _descent_adam if args.optimizer == "adam" else _descent_lbfgs
+    print(f"Running {args.optimizer} descent (n_sims={n_sims}) ...")
+    history, logits_final, logits_best, build_s, per_eval_s = descent(
+        args, pieces, n_sims, var_pix_ref, value_fn, vg_fn, val_ctx
     )
-    print(f"  n_det uniform  = {np.asarray(alloc(jnp.asarray(logits0)))}")
-    print(f"  n_det optimized= {alloc_opt}")
-    improvement = 100.0 * (s_uniform_train - res.fun) / s_uniform_train
-    print(f"  TRAIN improvement: {improvement:.2f}%")
 
-    # Generalization: re-evaluate on independent held-out CRN ensembles (eager
-    # forward; each ensemble is a fresh sky set).
-    print("\nGeneralization on held-out CRN ensembles:")
-    gen_rows = []
-    for seed in args.heldout_seeds:
-        t1 = time.time()
-        ho_mc, ho_opt, ho_cl = build_contexts(
-            seed, n_sims, nside=args.nside, lmax=args.lmax, var_pix_ref=var_pix_ref
-        )
-        s_unif = float(sigma_of(jnp.asarray(logits0), ho_mc, ho_opt, ho_cl))
-        s_opt = float(sigma_of(jnp.asarray(logits_opt), ho_mc, ho_opt, ho_cl))
-        gain = 100.0 * (s_unif - s_opt) / s_unif
-        gen_rows.append((seed, s_unif, s_opt, gain))
-        print(
-            f"  seed {seed}: uniform={s_unif:.6e}  optimized={s_opt:.6e}  "
-            f"gain={gain:+.2f}%  [{time.time() - t1:.0f}s]"
-        )
+    def alloc(lg):
+        return np.asarray(n_total * jax.nn.softmax(jnp.asarray(lg)))
 
-    gains = np.array([r[3] for r in gen_rows])
-    print("\n=== demo descent summary ===")
-    print(f"  train improvement: {improvement:+.2f}%")
-    print(f"  held-out gain: mean={gains.mean():+.2f}%  min={gains.min():+.2f}%  (n={len(gains)})")
-    if gains.min() > 0:
-        print("  VERDICT: the optimized allocation is better on EVERY held-out")
-        print("  ensemble => the straight-through gradient found a real optimum, not")
-        print("  CRN overfit. The gradient is usable for design descent.")
+    s_val_unif = float(value_fn(jnp.asarray(logits0), val_ctx))
+    s_val_final = float(value_fn(jnp.asarray(logits_final), val_ctx))
+    s_val_best = float(value_fn(jnp.asarray(logits_best), val_ctx))
+    val_impr_final = 100.0 * (s_val_unif - s_val_final) / s_val_unif
+    val_impr_best = 100.0 * (s_val_unif - s_val_best) / s_val_unif
+    n_to_best = int(np.argmin(np.array([h[2] for h in history])))
+
+    gains_final = held_out_gain(value_fn, test_ctxs, logits0, logits_final)
+    gains_best = held_out_gain(value_fn, test_ctxs, logits0, logits_best)
+    # Generalization gap: how much the validation-claimed improvement of the
+    # CONVERGED design overstates its worst-case held-out improvement. Positive =>
+    # the design looked better in-protocol than it actually generalizes (overfit).
+    # Robust for both paths (min over disjoint test ensembles, not a noisy mean).
+    gen_gap_final = val_impr_final - float(gains_final.min())
+
+    print(f"  steps={len(history)}  [build {build_s:.0f}s, steady eval {per_eval_s:.1f}s]")
+    print(f"  n_det uniform     = {alloc(logits0)}")
+    print(f"  n_det final       = {alloc(logits_final)}")
+    print(f"  n_det best-on-val = {alloc(logits_best)}  (iterate {n_to_best})")
+    print(f"  val improvement:  final={val_impr_final:+.2f}%   best-on-val={val_impr_best:+.2f}%")
+    print(f"  generalization gap (val - held-out min at final): {gen_gap_final:+.2f}%")
+    print("  held-out TEST gain vs uniform:")
+    print(
+        f"    final       : mean={gains_final.mean():+.2f}%  min={gains_final.min():+.2f}%  "
+        f"(n={len(gains_final)})"
+    )
+    print(
+        f"    best-on-val : mean={gains_best.mean():+.2f}%  min={gains_best.min():+.2f}%  "
+        f"(n={len(gains_best)})"
+    )
+    if gains_best.min() > 0:
+        print("  VERDICT: best-on-val design improves EVERY held-out ensemble => the")
+        print("  descent generalizes; the straight-through gradient is usable.")
     else:
-        print("  VERDICT: at least one held-out ensemble did not improve => the MC")
-        print("  noise may be drowning the descent at this n_sims; raise n_sims.")
+        print("  VERDICT: best-on-val held-out gain not all-positive => either no real")
+        print("  design leverage at this config, or the protocol still overfits.")
+
+    _plot_ucurve(args, n_sims, history, n_to_best)
 
     if return_metrics:
         return {
             "n_sims": int(n_sims),
-            "train_improvement_pct": float(improvement),
-            "heldout_gain_mean_pct": float(gains.mean()),
-            "heldout_gain_min_pct": float(gains.min()),
-            "n_heldout": len(gains),
+            "optimizer": args.optimizer,
+            "val_impr_final_pct": float(val_impr_final),
+            "val_impr_best_pct": float(val_impr_best),
+            "gen_gap_final_pct": float(gen_gap_final),
+            "heldout_final_mean_pct": float(gains_final.mean()),
+            "heldout_final_min_pct": float(gains_final.min()),
+            "heldout_best_mean_pct": float(gains_best.mean()),
+            "heldout_best_min_pct": float(gains_best.min()),
+            "n_to_best": n_to_best,
             "build_s": float(build_s),
-            "first_eval_s": float(first_eval_s),
             "per_eval_s": float(per_eval_s),
-            "sigma_uniform_train": float(s_uniform_train),
-            "sigma_opt_train": float(res.fun),
-            "lbfgs_nit": int(res.nit),
-            "lbfgs_success": bool(res.success),
+            "alloc_final": alloc(logits_final).tolist(),
+            "alloc_best": alloc(logits_best).tolist(),
         }
     return None
 
@@ -444,31 +635,40 @@ def run_ladder(args):
 
     print("\n=== n_sims ladder summary ===")
     print(
-        f"  config: nside={args.nside} lmax={args.lmax} maxiter={args.maxiter} "
+        f"  optimizer={args.optimizer} nside={args.nside} lmax={args.lmax} "
         f"backend={sht.get_sht_backend()}"
     )
     print(
-        f"  {'n_sims':>7} {'train%':>8} {'ho_mean%':>9} {'ho_min%':>8} "
-        f"{'eval_s':>8} {'build_s':>8}"
+        f"  {'n_sims':>7} {'ho_fin_min':>10} {'ho_best_min':>11} {'ho_best_mean':>12} "
+        f"{'gen_gap':>9} {'eval_s':>8}"
     )
     for m in rows:
         print(
-            f"  {m['n_sims']:>7d} {m['train_improvement_pct']:>8.1f} "
-            f"{m['heldout_gain_mean_pct']:>9.1f} {m['heldout_gain_min_pct']:>8.1f} "
-            f"{m['per_eval_s']:>8.1f} {m['build_s']:>8.1f}"
+            f"  {m['n_sims']:>7d} {m['heldout_final_min_pct']:>10.1f} "
+            f"{m['heldout_best_min_pct']:>11.1f} {m['heldout_best_mean_pct']:>12.1f} "
+            f"{m['gen_gap_final_pct']:>9.1f} {m['per_eval_s']:>8.1f}"
         )
-    closed = [m["n_sims"] for m in rows if m["heldout_gain_min_pct"] > 0]
+    # Success = best-on-val held-out gain positive on EVERY test ensemble at a rung.
+    closed = [m["n_sims"] for m in rows if m["heldout_best_min_pct"] > 0]
     if closed:
-        print(f"  held-out gap closes (min-gain > 0) at n_sims >= {min(closed)}.")
+        print(f"  best-on-val generalizes (min-gain > 0) at n_sims in {sorted(closed)}.")
     else:
-        print("  held-out gap NOT closed at any rung -- extend the ladder.")
+        print("  best-on-val held-out min-gain <= 0 at every rung -- no clean leverage.")
+    print(
+        "  (compare ho_fin_min vs ho_best_min: a large gap = the converged design "
+        "overfits, early stopping recovers it.)"
+    )
 
     payload = {
         "config": {
+            "optimizer": args.optimizer,
             "nside": args.nside,
             "lmax": args.lmax,
             "maxiter": args.maxiter,
-            "heldout_seeds": list(args.heldout_seeds),
+            "steps": args.steps,
+            "lr": args.lr,
+            "resample_every": args.resample_every,
+            "n_test_ensembles": args.n_test_ensembles,
             "backend": sht.get_sht_backend(),
         },
         "rungs": rows,
@@ -488,12 +688,16 @@ def run_ladder(args):
     ns = [m["n_sims"] for m in rows]
     fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4))
     axL.axhline(0.0, color="0.6", lw=0.8, ls=":")
-    axL.plot(ns, [m["train_improvement_pct"] for m in rows], "o-", color="0.5", label="train")
-    axL.plot(ns, [m["heldout_gain_mean_pct"] for m in rows], "o-", color="C0", label="held-out mean")
-    axL.plot(ns, [m["heldout_gain_min_pct"] for m in rows], "o-", color="C3", label="held-out min")
+    axL.plot(ns, [m["heldout_final_min_pct"] for m in rows], "o-", color="0.5", label="final (min)")
+    axL.plot(
+        ns, [m["heldout_best_mean_pct"] for m in rows], "o-", color="C0", label="best-on-val (mean)"
+    )
+    axL.plot(
+        ns, [m["heldout_best_min_pct"] for m in rows], "o-", color="C3", label="best-on-val (min)"
+    )
     axL.set_xlabel("n_sims")
-    axL.set_ylabel("sigma(r) improvement [%]")
-    axL.set_title("CRN overfit closes as held-out -> train")
+    axL.set_ylabel("held-out sigma(r) gain [%]")
+    axL.set_title(f"{args.optimizer}: does the design generalize?")
     axL.legend(fontsize=8)
     axR.plot(ns, [m["per_eval_s"] for m in rows], "o-", color="C2")
     axR.set_xlabel("n_sims")
@@ -506,7 +710,9 @@ def run_ladder(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=["demo", "stability", "beam", "both", "ladder"], default="demo")
+    p.add_argument(
+        "--mode", choices=["demo", "stability", "beam", "both", "ladder"], default="demo"
+    )
     p.add_argument("--n-sims", type=int, default=12)
     p.add_argument(
         "--n-sims-ladder",
@@ -518,17 +724,33 @@ def main():
     p.add_argument("--nside", type=int, default=16)
     p.add_argument("--lmax", type=int, default=24)
     p.add_argument("--n-batches", type=int, default=4, help="stability: # CRN ensembles")
-    p.add_argument("--maxiter", type=int, default=12, help="demo: L-BFGS-B max iters / fun-evals")
-    p.add_argument("--heldout-seeds", type=int, nargs="+", default=[9001, 9002])
-    p.add_argument("--backend", choices=["ducc", "jht"], default="ducc")
     p.add_argument(
-        "--jit",
-        action="store_true",
-        help="jit the value_and_grad objective (compile once, reuse) -- needed on GPU, "
-        "where the eager path recompiles the lax.map scan (~minutes) every eval.",
+        "--optimizer",
+        choices=["adam", "lbfgs"],
+        default="adam",
+        help="demo: adam = re-randomized-CRN stochastic descent (the fix); "
+        "lbfgs = fixed-CRN baseline (exhibits the optimism gap).",
+    )
+    p.add_argument("--steps", type=int, default=60, help="demo (adam): number of Adam steps")
+    p.add_argument(
+        "--lr", type=float, default=0.05, help="demo (adam): Adam learning rate on logits"
     )
     p.add_argument(
-        "--out-prefix", default="grad_char_ladder", help="ladder: JSON/PNG output path prefix"
+        "--resample-every",
+        type=int,
+        default=1,
+        help="demo (adam): re-draw the train CRN ensemble every K steps (1 = fresh each step).",
+    )
+    p.add_argument("--maxiter", type=int, default=12, help="demo (lbfgs): L-BFGS-B max iters")
+    p.add_argument(
+        "--n-test-ensembles",
+        type=int,
+        default=3,
+        help="demo: # disjoint held-out TEST ensembles for the generalization check.",
+    )
+    p.add_argument("--backend", choices=["ducc", "jht"], default="ducc")
+    p.add_argument(
+        "--out-prefix", default="grad_char_ladder", help="ladder/demo: JSON/PNG output path prefix"
     )
     args = p.parse_args()
 
