@@ -28,7 +28,10 @@ both under-cover => the masking/ILC non-Gaussianity exceeds the HL idealization 
 
 Needs the ``[compsep]`` extra (ducc0; pysm3 for --fg-model). The coverage core itself is
 sampling-free (no NUTS), so no ``[sampling]`` extra. Each test realization is one full
-masked-Wiener clean, so n_test dominates cost; use --workers (the cleaner here is picklable).
+masked-Wiener clean, so n_test dominates cost. Runs SERIAL (each sim is already
+ducc-multithreaded, ~20 s/sim at nside=64); ``mc_workers > 1`` is currently blocked upstream
+by ``mc_cutsky_bandpowers``'s local per-sim worker (not picklable under the spawn pool), so
+``--workers > 1`` falls back to serial with a warning.
 
 Usage:
     pixi run python scripts/validate_hl_coverage_mc.py --nside 64 --n-train 100 --n-test 300 \
@@ -67,11 +70,13 @@ SEED_STRIDE = 100_000  # disjoint train/test seed blocks (matches augr.design_op
 
 
 class PicklableNilcCleaner:
-    """Module-level (picklable) NILC cleaner so ``mc_workers > 1`` works.
+    """Module-level (picklable) NILC cleaner, bit-equivalent to ``nilc_cleaner(clean_e=True)``.
 
-    The ``nilc_cleaner`` factory returns a local closure (unpicklable under the spawn pool).
-    This top-level class is bit-equivalent to ``nilc_cleaner(clean_e=True)`` with augr's
-    default needlet/ridge/beam-band-limit settings.
+    The ``nilc_cleaner`` factory returns a local closure (unpicklable under a spawn pool).
+    A picklable cleaner is *necessary* for ``mc_workers > 1`` but not *sufficient*:
+    ``mc_cutsky_bandpowers``'s own per-sim worker is also a local closure, so process-pool
+    parallelism is blocked upstream regardless. Kept module-level anyway so this driver is
+    ready if that worker is ever hoisted (and to avoid the closure entirely).
     """
 
     def __init__(self, *, clean_e: bool = True, n_iter: int = 3):
@@ -156,6 +161,12 @@ def main() -> None:
         raise ValueError(f"--float may only name A_lens / A_res, got {floated}")
     if args.base_seed + args.n_train + 1 >= args.base_seed + SEED_STRIDE:
         raise ValueError("train block overlaps the test block; reduce n_train or raise SEED_STRIDE")
+    if args.workers > 1:
+        # mc_cutsky_bandpowers' per-sim worker is a local closure (unpicklable under the
+        # spawn pool), so process-pool parallelism is blocked upstream; run serial.
+        print(f"  WARNING: --workers {args.workers} unsupported upstream (mc_cutsky_bandpowers "
+              f"local worker); running serial (each sim is ducc-multithreaded).")
+        args.workers = 1
 
     npix = 12 * args.nside**2
     hit = jnp.ones(npix) if args.uniform_hits else jnp.asarray(l2_hit_map(args.nside, coord="G"))
