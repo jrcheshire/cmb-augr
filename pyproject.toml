@@ -67,9 +67,16 @@ markers = [
 # ---------------------------------------------------------------------------
 [tool.pixi.workspace]
 channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+# The full dev/CI dependency set lives in a `host` feature pinned to the platforms
+# whose niche compiled deps (namaster, camb, ducc0, pysm3, cmbroom, pywigxjpf) have
+# binaries -- so the default environment does NOT try (and fail) to solve aarch64.
+# The aarch64 GPU env (below) uses only the slim `gpu` feature.
+[tool.pixi.feature.host]
 platforms = ["osx-arm64", "linux-64"]
 
-[tool.pixi.dependencies]
+[tool.pixi.feature.host.dependencies]
 python = ">=3.12"
 numpy = ">=1.24"
 scipy = ">=1.10"
@@ -91,7 +98,7 @@ pytest-timeout = ">=2.1"
 # deliberately NOT exposed as a pip extra.
 namaster = "*"
 
-[tool.pixi.pypi-dependencies]
+[tool.pixi.feature.host.pypi-dependencies]
 jax = ">=0.4"
 jaxlib = ">=0.4"
 equinox = ">=0.11"
@@ -102,6 +109,36 @@ pywigxjpf = "*"
 cmbroom = "*"
 pyyaml = "*"
 cmb-augr = { path = ".", editable = true }
+
+# GPU environment for ARM CUDA clusters (TACC Vista `gh` / GH200, H200). A minimal
+# feature -- NOT the full default env -- so the niche compiled conda/sdist deps
+# (camb, namaster, ducc0, pysm3, cmbroom, pywigxjpf) that lack reliable linux-aarch64
+# binaries stay OFF aarch64. jax comes from PyPI here too, so GPU is just the
+# `cuda12` extra (aarch64 wheels exist); the jht SHT backend runs the transforms on
+# the H200, and the map-based CMB-only forecasts need no ducc0/pysm3. Use it with
+# `pixi run -e gpu python scripts/mapbased_grad_characterization.py --mode ladder ...`.
+[tool.pixi.feature.gpu]
+platforms = ["linux-aarch64"]
+
+[tool.pixi.feature.gpu.system-requirements]
+cuda = "12"
+
+[tool.pixi.feature.gpu.dependencies]
+python = ">=3.12"
+numpy = ">=1.24"
+scipy = ">=1.10"
+matplotlib = ">=3.7"
+healpy = ">=1.16"
+
+[tool.pixi.feature.gpu.pypi-dependencies]
+jax = { version = ">=0.4", extras = ["cuda12"] }
+jaxht = ">=0.1.4"
+equinox = ">=0.11"
+cmb-augr = { path = ".", editable = true }
+
+[tool.pixi.environments]
+default = { features = ["host"] }
+gpu = { features = ["gpu"], no-default-feature = true }
 
 [tool.pixi.tasks]
 test = { cmd = "pytest tests/ -m 'not slow' -n auto --maxprocesses=8 --timeout=180 --timeout-method=thread --max-worker-restart=0 -ra", env = { AUGR_DELENS_WORKERS = "1", AUGR_SHT_NTHREADS = "1", OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1" } }
