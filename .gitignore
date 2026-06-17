@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints/
 scripts/_broom_scratch/
+scripts/_vista_scratch/
 plots/
 data/broom_outputs/
 data/hit_maps/

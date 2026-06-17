@@ -20,10 +20,21 @@ straight-through gradient usable for descent?" -- with two diagnostics:
       Compute grad sigma(r) w.r.t. the per-band NET vector on several independent
       CRN ensembles and measure how stable the descent DIRECTION is: the resultant
       length R of the unit gradients (1 = perfectly aligned, 0 = random) and the
-      per-component coefficient of variation. Each ensemble recompiles (the sky
-      arrays are baked as XLA constants -- the lax.map/pytree refactor that would
-      let the ensemble be a traced arg is the Phase 2 compile follow-up), so this
-      sweep is deliberately small.
+      per-component coefficient of variation. The cut-sky MC ensemble is now a
+      *traced* arg (``CutskyMCContext`` is an ``eqx.Module`` whose sim-batched
+      ``harmonic_skies`` / ``noise_keys`` the forward ``lax.map``s over, PR #28), so
+      ensembles of the SAME ``(n_sims, nside, lmax)`` reuse one compiled trace --
+      only a new n_sims / nside recompiles. That is what makes the ladder below cheap.
+
+  --mode ladder:
+      Sweep ``--n-sims-ladder`` and, at each rung, run the demo descent +
+      held-out generalization, recording train improvement, held-out gain
+      (mean/min), and wall-time (first eval incl. compile, and steady-state
+      per-eval). Writes a JSON + a plot of held-out-gain-vs-n_sims and
+      per-eval-time-vs-n_sims. This is the Phase-2 read-off that gates B.3: the
+      n_sims at which the held-out gap closes (min-gain stabilizes positive), and
+      what one objective/gradient eval costs. Cheap on CPU at small n_sims; the
+      real ladder runs on a GPU (``--backend jht``).
 
   --mode beam:
       The beam-lever sensitivity diagnostic (NOT an optimizer -- a free FWHM has no
@@ -42,11 +53,20 @@ Usage:
     pixi run python scripts/mapbased_grad_characterization.py --mode stability --n-batches 4
     pixi run python scripts/mapbased_grad_characterization.py --mode beam --n-batches 3
     pixi run python scripts/mapbased_grad_characterization.py --mode both --backend jht
+    pixi run python scripts/mapbased_grad_characterization.py --mode ladder \
+        --n-sims-ladder 12 24 48 96 --backend jht
+
+GPU run (TACC Vista, ``gh`` partition, account JPL-PUB):
+    ``pip install jaxht`` (PyPI distribution name; the import is ``jht``) into the
+    node Python, then run --mode ladder with --backend jht on one H200. The
+    device-aware SHT backend puts the transforms on the GPU; a minimal sbatch
+    (``-p gh -A JPL-PUB``) lives in the gitignored scratch launch dir.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import time
 
 import jax
@@ -279,8 +299,13 @@ def run_beam(args, var_pix_ref):
 # --- mode: demo --------------------------------------------------------------
 
 
-def run_demo(args, var_pix_ref):
-    """Fixed-budget allocation descent + held-out generalization check."""
+def run_demo(args, var_pix_ref, *, n_sims=None, return_metrics=False):
+    """Fixed-budget allocation descent + held-out generalization check.
+
+    ``n_sims`` overrides ``args.n_sims`` (the ladder passes one rung at a time);
+    ``return_metrics`` returns the per-rung dict instead of only printing.
+    """
+    n_sims = args.n_sims if n_sims is None else n_sims
     n_total = float(sum(N_DET))
     net0 = jnp.asarray(NET)
     eta0 = jnp.asarray(ETA)
@@ -304,10 +329,11 @@ def run_demo(args, var_pix_ref):
     # last np.asarray/float boundary), so this can run under jit on a GPU -- kept eager
     # for this small CPU diagnostic.
     print("Building training ensemble (eager value_and_grad) ...")
-    t0 = time.time()
+    t_build = time.time()
     mc_ctx, opt_ctx, cleaner = build_contexts(
-        0, args.n_sims, nside=args.nside, lmax=args.lmax, var_pix_ref=var_pix_ref
+        0, n_sims, nside=args.nside, lmax=args.lmax, var_pix_ref=var_pix_ref
     )
+    build_s = time.time() - t_build
     vg = jax.value_and_grad(lambda lg: sigma_of(lg, mc_ctx, opt_ctx, cleaner))
 
     def scipy_vg(x):
@@ -315,9 +341,17 @@ def run_demo(args, var_pix_ref):
         return float(v), np.asarray(g, dtype=np.float64)
 
     logits0 = np.zeros(3)  # uniform allocation
+    # First eval pays the XLA compile; a second identical eval is the steady-state
+    # value+grad cost (the per-step price B.3's inner design loop pays).
+    t_e0 = time.time()
     s_uniform_train = scipy_vg(logits0)[0]
+    first_eval_s = time.time() - t_e0
+    t_e1 = time.time()
+    scipy_vg(logits0)
+    per_eval_s = time.time() - t_e1
     print(
-        f"  uniform allocation: sigma(r)={s_uniform_train:.6e}  [first eval {time.time() - t0:.0f}s]"
+        f"  uniform allocation: sigma(r)={s_uniform_train:.6e}  "
+        f"[build {build_s:.0f}s, first eval {first_eval_s:.0f}s, steady eval {per_eval_s:.1f}s]"
     )
 
     # Bound the eval count -- each eager eval is ~40s at n_sims=12, and L-BFGS line
@@ -346,7 +380,7 @@ def run_demo(args, var_pix_ref):
     for seed in args.heldout_seeds:
         t1 = time.time()
         ho_mc, ho_opt, ho_cl = build_contexts(
-            seed, args.n_sims, nside=args.nside, lmax=args.lmax, var_pix_ref=var_pix_ref
+            seed, n_sims, nside=args.nside, lmax=args.lmax, var_pix_ref=var_pix_ref
         )
         s_unif = float(sigma_of(jnp.asarray(logits0), ho_mc, ho_opt, ho_cl))
         s_opt = float(sigma_of(jnp.asarray(logits_opt), ho_mc, ho_opt, ho_cl))
@@ -369,21 +403,130 @@ def run_demo(args, var_pix_ref):
         print("  VERDICT: at least one held-out ensemble did not improve => the MC")
         print("  noise may be drowning the descent at this n_sims; raise n_sims.")
 
+    if return_metrics:
+        return {
+            "n_sims": int(n_sims),
+            "train_improvement_pct": float(improvement),
+            "heldout_gain_mean_pct": float(gains.mean()),
+            "heldout_gain_min_pct": float(gains.min()),
+            "n_heldout": len(gains),
+            "build_s": float(build_s),
+            "first_eval_s": float(first_eval_s),
+            "per_eval_s": float(per_eval_s),
+            "sigma_uniform_train": float(s_uniform_train),
+            "sigma_opt_train": float(res.fun),
+            "lbfgs_nit": int(res.nit),
+            "lbfgs_success": bool(res.success),
+        }
+    return None
+
+
+# --- mode: ladder ------------------------------------------------------------
+
+
+def run_ladder(args):
+    """Sweep n_sims; per rung run the demo descent + held-out check, then write a
+    JSON table + a gap/time-vs-n_sims plot. The Phase-2 read-off gating B.3: the
+    n_sims where the held-out gap closes, and the per-eval cost."""
+    rows = []
+    for n_sims in args.n_sims_ladder:
+        print(f"\n########## ladder rung: n_sims = {n_sims} ##########")
+        # Per-rung var_pix_ref (a filter knob -- self-consistent at each n_sims;
+        # absorbed by the transfer/leakage debias, so it does not bias sigma(r)).
+        cal_ctx, _, _ = build_contexts(0, n_sims, nside=args.nside, lmax=args.lmax)
+        rows.append(run_demo(args, cal_ctx.var_pix_ref, n_sims=n_sims, return_metrics=True))
+
+    print("\n=== n_sims ladder summary ===")
+    print(
+        f"  config: nside={args.nside} lmax={args.lmax} maxiter={args.maxiter} "
+        f"backend={sht.get_sht_backend()}"
+    )
+    print(
+        f"  {'n_sims':>7} {'train%':>8} {'ho_mean%':>9} {'ho_min%':>8} "
+        f"{'eval_s':>8} {'build_s':>8}"
+    )
+    for m in rows:
+        print(
+            f"  {m['n_sims']:>7d} {m['train_improvement_pct']:>8.1f} "
+            f"{m['heldout_gain_mean_pct']:>9.1f} {m['heldout_gain_min_pct']:>8.1f} "
+            f"{m['per_eval_s']:>8.1f} {m['build_s']:>8.1f}"
+        )
+    closed = [m["n_sims"] for m in rows if m["heldout_gain_min_pct"] > 0]
+    if closed:
+        print(f"  held-out gap closes (min-gain > 0) at n_sims >= {min(closed)}.")
+    else:
+        print("  held-out gap NOT closed at any rung -- extend the ladder.")
+
+    payload = {
+        "config": {
+            "nside": args.nside,
+            "lmax": args.lmax,
+            "maxiter": args.maxiter,
+            "heldout_seeds": list(args.heldout_seeds),
+            "backend": sht.get_sht_backend(),
+        },
+        "rungs": rows,
+    }
+    with open(f"{args.out_prefix}.json", "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"\n  wrote {args.out_prefix}.json")
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  (matplotlib unavailable -- skipped plot)")
+        return
+    ns = [m["n_sims"] for m in rows]
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.4))
+    axL.axhline(0.0, color="0.6", lw=0.8, ls=":")
+    axL.plot(ns, [m["train_improvement_pct"] for m in rows], "o-", color="0.5", label="train")
+    axL.plot(ns, [m["heldout_gain_mean_pct"] for m in rows], "o-", color="C0", label="held-out mean")
+    axL.plot(ns, [m["heldout_gain_min_pct"] for m in rows], "o-", color="C3", label="held-out min")
+    axL.set_xlabel("n_sims")
+    axL.set_ylabel("sigma(r) improvement [%]")
+    axL.set_title("CRN overfit closes as held-out -> train")
+    axL.legend(fontsize=8)
+    axR.plot(ns, [m["per_eval_s"] for m in rows], "o-", color="C2")
+    axR.set_xlabel("n_sims")
+    axR.set_ylabel("steady-state value+grad eval [s]")
+    axR.set_title(f"per-eval cost ({sht.get_sht_backend()})")
+    fig.tight_layout()
+    fig.savefig(f"{args.out_prefix}.png", dpi=140)
+    print(f"  wrote {args.out_prefix}.png")
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=["demo", "stability", "beam", "both"], default="demo")
+    p.add_argument("--mode", choices=["demo", "stability", "beam", "both", "ladder"], default="demo")
     p.add_argument("--n-sims", type=int, default=12)
+    p.add_argument(
+        "--n-sims-ladder",
+        type=int,
+        nargs="+",
+        default=[12, 24, 48, 96],
+        help="ladder: n_sims rungs to sweep",
+    )
     p.add_argument("--nside", type=int, default=16)
     p.add_argument("--lmax", type=int, default=24)
     p.add_argument("--n-batches", type=int, default=4, help="stability: # CRN ensembles")
     p.add_argument("--maxiter", type=int, default=12, help="demo: L-BFGS-B max iters / fun-evals")
     p.add_argument("--heldout-seeds", type=int, nargs="+", default=[9001, 9002])
     p.add_argument("--backend", choices=["ducc", "jht"], default="ducc")
+    p.add_argument(
+        "--out-prefix", default="grad_char_ladder", help="ladder: JSON/PNG output path prefix"
+    )
     args = p.parse_args()
 
     sht.set_sht_backend(args.backend)
     print(f"SHT backend: {sht.get_sht_backend()}")
+
+    if args.mode == "ladder":
+        print("\n########## MODE: ladder ##########")
+        run_ladder(args)
+        return
 
     # Freeze var_pix_ref once so the only thing varying across ensembles is the CRN
     # (var_pix_ref is a filter knob; a common value isolates the MC noise we measure).
