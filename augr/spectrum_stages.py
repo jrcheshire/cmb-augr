@@ -88,6 +88,12 @@ class CutskyMC:
         Ensemble size and the per-pixel noise variance used in the Wiener filter's
         ``inv_noise`` (a filter knob; a mismatch only de-tunes the filter, absorbed by
         ``F_b``).
+    rec_full
+        The RAW (pre-debias) per-sim bandpowers ``(n_sims, n_bins)``, before the
+        ``F_b`` / ``leak_b`` correction is applied. Optional (``None`` by default);
+        populated by :func:`mc_cutsky_bandpowers`. Lets a caller cross-debias one
+        ensemble's raw recs with another ensemble's frozen ``transfer`` / ``leakage``
+        (e.g. an SBC train/test split — see ``augr.sbc``).
     """
 
     debiased_bandpowers: np.ndarray
@@ -98,6 +104,7 @@ class CutskyMC:
     f_sky: float
     n_sims: int
     var_pix_ref: float
+    rec_full: np.ndarray | None = None
 
 
 def beamed_prior(cl: jax.Array, common_fwhm_arcmin: float, lmax: int) -> jax.Array:
@@ -369,6 +376,7 @@ def mc_cutsky_bandpowers(
         f_sky=mk.f_sky_of(mask),
         n_sims=int(n_sims),
         var_pix_ref=float(var_pix_ref),
+        rec_full=np.asarray(rec_full),
     )
 
 
