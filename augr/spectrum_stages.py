@@ -45,6 +45,7 @@ beamed by ``B_c`` so the transfer absorbs ``B_c²`` on debias.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import equinox as eqx
@@ -88,6 +89,12 @@ class CutskyMC:
         Ensemble size and the per-pixel noise variance used in the Wiener filter's
         ``inv_noise`` (a filter knob; a mismatch only de-tunes the filter, absorbed by
         ``F_b``).
+    rec_full
+        The RAW (pre-debias) per-sim bandpowers ``(n_sims, n_bins)``, before the
+        ``F_b`` / ``leak_b`` correction is applied. Optional (``None`` by default);
+        populated by :func:`mc_cutsky_bandpowers`. Lets a caller cross-debias one
+        ensemble's raw recs with another ensemble's frozen ``transfer`` / ``leakage``
+        (e.g. an SBC train/test split — see ``augr.sbc``).
     """
 
     debiased_bandpowers: np.ndarray
@@ -98,6 +105,7 @@ class CutskyMC:
     f_sky: float
     n_sims: int
     var_pix_ref: float
+    rec_full: np.ndarray | None = None
 
 
 def beamed_prior(cl: jax.Array, common_fwhm_arcmin: float, lmax: int) -> jax.Array:
@@ -211,6 +219,27 @@ def _build_sim(
     return sky, total
 
 
+def _one_sim(bundle: dict, seed: int):
+    """One MC realization: build sim → clean → the three masked-Wiener legs.
+
+    Module-level (not a closure) so it is picklable under the spawn pool; the per-sim
+    invariant inputs travel in ``bundle`` (see :func:`mc_cutsky_bandpowers`), bound via
+    ``functools.partial`` so the bundle is pickled once per chunk, not per sim. The serial
+    path calls it identically, so results are bit-identical to the worker count.
+    """
+    sky, total = _build_sim(seed, **bundle["sim_kw"])
+    cleaner = bundle["cleaner"]
+    beams = bundle["beam_fwhm_arcmin"]
+    lmax, nside = bundle["lmax"], bundle["nside"]
+    result = cleaner(total, beams, lmax=lmax, nside=nside)
+    priors = (bundle["inv_noise"], bundle["cl_ee_prior"], bundle["cl_bb_prior"])
+    bp_kw = bundle["bp_kw"]
+    rec_full = cutsky_bb_bandpower(result.cleaned_qu(), *priors, **bp_kw)
+    rec_b = cutsky_bb_bandpower(_cleaned_b_qu(result, sky.cmb_qu), *priors, **bp_kw)
+    rec_e = cutsky_bb_bandpower(_cleaned_e_qu(result, sky.cmb_qu), *priors, **bp_kw)
+    return np.asarray(rec_full), np.asarray(rec_b), np.asarray(rec_e)
+
+
 def mc_cutsky_bandpowers(
     *,
     cleaner: Cleaner,
@@ -280,9 +309,14 @@ def mc_cutsky_bandpowers(
     knee_ell, alpha_knee
         Optional 1/f noise (``None`` → white).
     workers
-        Process-pool workers for the ensemble (``1`` → serial; >1 requires a picklable
-        cleaner — local closures from the factories are not picklable, so use serial or
-        a module-level cleaner).
+        Process-pool workers for the ensemble (``1`` → serial). ``>1`` runs the per-sim
+        loop over a spawn pool and requires a **picklable** ``cleaner``:
+        :func:`augr.cleaning.nilc_cleaner` qualifies (it returns a ``functools.partial`` of
+        the module-level ``nilc_clean``); ``cmilc_cleaner`` does not yet, so use serial with
+        cMILC. Results are bit-identical to the worker count (per-sim CRN seeds). BLAS is
+        pinned to 1 thread in workers, so ducc threads follow ``DUCC0_NUM_THREADS`` /
+        ``OMP_NUM_THREADS`` — keep ``workers × ducc-threads ≈ cpu_count`` to avoid
+        oversubscription (see ``reference_ducc_omp_threading``).
     spectra
         ``CMBSpectra`` provider (default: a fresh ``CMBSpectra()``).
     bandpasses
@@ -335,22 +369,24 @@ def mc_cutsky_bandpowers(
         tol=tol,
     )
 
-    def _one(seed: int):
-        sky, total = _build_sim(seed, **sim_kw)
-        result = cleaner(total, beam_fwhm_arcmin, lmax=lmax, nside=nside)
-        rec_full = cutsky_bb_bandpower(
-            result.cleaned_qu(), inv_noise, cl_ee_prior, cl_bb_prior, **bp_kw
-        )
-        rec_b = cutsky_bb_bandpower(
-            _cleaned_b_qu(result, sky.cmb_qu), inv_noise, cl_ee_prior, cl_bb_prior, **bp_kw
-        )
-        rec_e = cutsky_bb_bandpower(
-            _cleaned_e_qu(result, sky.cmb_qu), inv_noise, cl_ee_prior, cl_bb_prior, **bp_kw
-        )
-        return np.asarray(rec_full), np.asarray(rec_b), np.asarray(rec_e)
-
+    bundle = {
+        "sim_kw": sim_kw,
+        "cleaner": cleaner,
+        "beam_fwhm_arcmin": beam_fwhm_arcmin,
+        "lmax": lmax,
+        "nside": nside,
+        "inv_noise": inv_noise,
+        "cl_ee_prior": cl_ee_prior,
+        "cl_bb_prior": cl_bb_prior,
+        "bp_kw": bp_kw,
+    }
     seeds = list(range(int(base_seed), int(base_seed) + int(n_sims)))
-    out = parallel_map(_one, seeds, workers=workers)
+    # workers > 1 needs a picklable `cleaner` (nilc_cleaner is picklable; cmilc_cleaner is
+    # not yet) — the bundle rides on the partial, pickled ~once per chunk.
+    chunksize = max(1, len(seeds) // (workers * 2)) if workers > 1 else 1
+    out = parallel_map(
+        functools.partial(_one_sim, bundle), seeds, workers=workers, chunksize=chunksize
+    )
     rec_full = jnp.asarray(np.stack([o[0] for o in out], axis=0))
     rec_b = jnp.asarray(np.stack([o[1] for o in out], axis=0))
     rec_e = jnp.asarray(np.stack([o[2] for o in out], axis=0))
@@ -369,6 +405,7 @@ def mc_cutsky_bandpowers(
         f_sky=mk.f_sky_of(mask),
         n_sims=int(n_sims),
         var_pix_ref=float(var_pix_ref),
+        rec_full=np.asarray(rec_full),
     )
 
 

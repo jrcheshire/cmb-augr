@@ -97,7 +97,7 @@ def test_cutsky_bb_bandpower_shape_finite() -> None:
     assert bool(jnp.all(jnp.isfinite(out)))
 
 
-def _run_mc(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2):
+def _run_mc(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2, workers=1):
     cl_ee, cl_bb = _priors(lmax)
     bm = _bin_matrix(2, ell_max, delta_ell, ell_per_bin_below)
     true_b = mk.bin_spectrum(
@@ -120,8 +120,17 @@ def _run_mc(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_b
         base_seed=0,
         fg_model=None,
         r_in=0.0,
-        workers=1,
+        workers=workers,
     )
+
+
+@pytest.mark.slow
+def test_mc_workers_parity() -> None:
+    """workers>1 (spawn pool, picklable nilc_cleaner) is bit-identical to serial (per-sim CRN)."""
+    serial = _run_mc(8, workers=1)
+    parallel = _run_mc(8, workers=2)
+    assert np.array_equal(serial.debiased_bandpowers, parallel.debiased_bandpowers)
+    assert np.array_equal(serial.rec_full, parallel.rec_full)
 
 
 @pytest.mark.slow
