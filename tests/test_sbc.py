@@ -115,5 +115,6 @@ def test_mc_coverage_smoke():
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     assert proc.returncode == 0, proc.stderr[-3000:]
     assert "MC-ensemble HL coverage" in proc.stdout
-    assert "cross-debias (headline)" in proc.stdout
+    assert "self-debias (HEADLINE" in proc.stdout  # headline = the calibration measure
+    assert "cross-debias (diagnostic" in proc.stdout
     assert "KS verdict" in proc.stdout

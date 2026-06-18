@@ -15,8 +15,14 @@ Design (disjoint train/test SBC):
   * TRAIN ensemble (base_seed) -> covariance, fiducial bandpower, residual template ->
     the Gaussian + HL likelihoods (the "analysis", frozen).
   * TEST ensemble (base_seed + SEED_STRIDE, disjoint) -> fresh "observed" realizations.
-  * **Cross-debias** the test raw recs with TRAIN's frozen transfer/leakage (headline; no
-    in-sample debias leak). Self-debias (test's own) is reported as a sensitivity check.
+  * **Self-debias** (each test sim debiased with the TEST ensemble's own transfer/leakage) is
+    the HEADLINE / calibration measure: each ensemble is centered at truth, so this isolates
+    the likelihood-shape calibration. **Cross-debias** (test raw recs through TRAIN's frozen
+    transfer/leakage) is a DIAGNOSTIC ONLY -- it is NOT a valid coverage construction: one
+    train calibration is reused across all test realizations, imprinting a shared offset
+    (random sign per draw; does not shrink with n_train) that under-covers regardless of the
+    likelihood. Reported to expose the finite-sim transfer/leakage effect, not to read
+    calibration off.
   * For each test realization: marginal r posterior (floating A_lens/A_res on a grid) ->
     PIT = F_post(r_true=r_in). Coverage = how often the interval covers the truth.
 
@@ -154,9 +160,12 @@ def main() -> None:
     if mc_test.rec_full is None:
         raise RuntimeError("mc_test.rec_full is None; needs the CutskyMC.rec_full forward field")
 
-    # Cross-debias (headline): test raw recs through TRAIN's frozen transfer/leakage.
+    # Self-debias = HEADLINE / calibration measure (each ensemble centered at truth).
+    data_self = np.asarray(mc_test.debiased_bandpowers)
+    # Cross-debias = DIAGNOSTIC ONLY (test raw recs through TRAIN's frozen transfer/leakage):
+    # a shared offset is reused across all test sims -> under-covers regardless of likelihood;
+    # exposes the finite-sim transfer/leakage effect, not a calibration measure.
     data_cross = np.asarray(mk.debias_bandpower(mc_test.rec_full, mc_train.transfer, mc_train.leakage))
-    data_self = np.asarray(mc_test.debiased_bandpowers)  # self-debias (sensitivity check)
 
     # --- likelihoods from TRAIN ---
     signal_model, _inst = build_cutsky_signal_model(
@@ -202,7 +211,8 @@ def main() -> None:
           f"r_in={args.r_in}  cleaner=NILC")
     print(f"  n_train={args.n_train}  n_test={n_test}  floated={sorted(floated) or 'none'}  "
           f"marginal sigma(r)={sigma_r:.3e}")
-    for tag, res in (("cross-debias (headline)", res_cross), ("self-debias (sensitivity)", res_self)):
+    for tag, res in (("self-debias (HEADLINE / calibration)", res_self),
+                     ("cross-debias (diagnostic only -- expected to under-cover)", res_cross)):
         print(f"\n  --- {tag} ---")
         sbc.print_coverage_table(sbc.coverage_table(res, upper_level=args.upper_level))
         if res.edge_hits["gauss"] or res.edge_hits["hl"]:
@@ -210,12 +220,16 @@ def main() -> None:
                   f"(widen --n-sigma-grid if non-negligible)")
     print(f"\n  KS verdict: recommend={ks['recommend']!r}  "
           f"(gauss_rejected_bump={ks['gauss_rejected_bump']}, hl_better_bump={ks['hl_better_bump']})")
-    print("\n  read-off: Gaussian under-covers & HL ~nominal => HL vindicated; both ~nominal => "
-          "Knox calibrated (re-scope the widening); both under-cover => mc_calibrated.")
+    print("\n  read-off (self-debias): both Gaussian & HL ~nominal => calibrated, HL adds nothing; "
+          "Gaussian under-covers & HL ~nominal => HL helps; both under-cover => mc_calibrated.")
 
     if args.plot:
-        sbc.make_coverage_plot(args.plot, res_cross)
-        print(f"\n  wrote {args.plot} (cross-debias)")
+        marg = f"marginalized over {', '.join(sorted(floated))}" if floated else "nuisances fixed"
+        title = (f"sigma(r) calibration -- cut-sky MC self-debias, fg={args.fg_model} ({marg})   "
+                 f"nside={args.nside}, f_sky={fsky_real:.2f}, r_in={args.r_in}, "
+                 f"n_train={args.n_train}, n_test={n_test}")
+        sbc.make_coverage_plot(args.plot, res_self, title=title)
+        print(f"\n  wrote {args.plot} (self-debias headline)")
 
 
 if __name__ == "__main__":
