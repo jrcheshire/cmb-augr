@@ -229,15 +229,17 @@ def print_coverage_table(rows, *, header=("Gaussian", "HL"), keys=("gauss", "hl"
         print(f"  {label:>26} | {g_c:>8.3f} +/-{g_e:.3f} | {h_c:>8.3f} +/-{h_e:.3f}")
 
 
-def make_coverage_plot(path, result: CoverageResult):
-    """Two-panel coverage-curve + PIT-histogram figure."""
+def make_coverage_plot(path, result: CoverageResult, *, title: str | None = None):
+    """Two-panel coverage-curve + PIT-histogram figure (optional suptitle)."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     pit = result.pit
-    fig, (ax_cov, ax_pit) = plt.subplots(1, 2, figsize=(11, 4.2))
+    fig, (ax_cov, ax_pit) = plt.subplots(1, 2, figsize=(11, 4.4))
+    if title:
+        fig.suptitle(title, fontsize=11)
     nominal = np.linspace(0.02, 0.98, 49)
     styles = (("gauss", "C3", "Gaussian / Knox"), ("hl", "C0", "Hamimeche-Lewis"))
     for tag, color, label in styles:
@@ -264,5 +266,5 @@ def make_coverage_plot(path, result: CoverageResult):
         xlim=(0, 1),
     )
     ax_pit.legend(loc="upper center", fontsize=9)
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.96] if title else None)
     fig.savefig(path, dpi=130)

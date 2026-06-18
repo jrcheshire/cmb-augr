@@ -184,7 +184,10 @@ def main() -> None:
               f"(widen --n-sigma-grid if non-negligible)")
 
     if args.plot:
-        sbc.make_coverage_plot(args.plot, result)
+        marg = f"marginalized over {', '.join(sorted(floated))}" if floated else "nuisances fixed"
+        title = (f"σ(r) error-bar calibration — analytic χ² oracle ({marg})   "
+                 f"f_sky={args.f_sky}, r={args.r_true}, ℓ≤{args.ell_max}, n_trials={args.n_trials}")
+        sbc.make_coverage_plot(args.plot, result, title=title)
         print(f"\n  wrote {args.plot}")
 
 
