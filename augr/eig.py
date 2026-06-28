@@ -70,7 +70,7 @@ from jax.scipy.special import logsumexp
 from augr.cleaning import Cleaner
 from augr.cost import CostModel, aperture_from_fwhm, budget_penalty
 from augr.fisher import _fisher_from_full
-from augr.optimize import OptimizationContext
+from augr.optimize import OptimizationContext, design_to_channels
 from augr.optimize_mapbased import w_inv_from_noise_design
 from augr.spectrum_stages import CutskyMCContext, mc_cutsky_cov_traced
 
@@ -90,7 +90,9 @@ def posterior_fisher_from_external_cov(cov, ctx: OptimizationContext):
     return F + jnp.diag(ctx.prior_diag)
 
 
-def marginal_eig_r_from_external_cov(cov, ctx: OptimizationContext, *, sigma_prior_r: float = 1.0):
+def marginal_eig_r_from_external_cov(
+    cov, ctx: OptimizationContext, *, sigma_prior_r: float = 1.0
+):
     """r-marginal Gaussian EIG ``log(sigma_prior_r / sigma_post(r))`` -- the primary objective.
 
     Differentiable in ``cov``; consistent by construction with
@@ -103,7 +105,9 @@ def marginal_eig_r_from_external_cov(cov, ctx: OptimizationContext, *, sigma_pri
     return jnp.log(sigma_prior_r) - jnp.log(sigma_r)
 
 
-def gaussian_eig_from_external_cov(cov, ctx: OptimizationContext, *, prior_fisher_logdet=None):
+def gaussian_eig_from_external_cov(
+    cov, ctx: OptimizationContext, *, prior_fisher_logdet=None
+):
     """D-optimal Gaussian EIG ``0.5 * logdet(F_post)`` -- the secondary/general objective.
 
     Joint information on the full parameter vector. With ``prior_fisher_logdet`` supplied
@@ -220,8 +224,12 @@ class HLEIGContext:
         )[0]
         names = list(signal_model.parameter_names)
         fid_vec = flatten_params({"r": r_fid, "A_lens": 1.0, "A_res": 1.0}, names)
-        layout = SpectrumLayout.from_freq_pairs(signal_model.freq_pairs, signal_model.n_bins)
-        base, t_r, t_l, t_res = (jnp.asarray(x) for x in sbc.linear_basis(signal_model, names))
+        layout = SpectrumLayout.from_freq_pairs(
+            signal_model.freq_pairs, signal_model.n_bins
+        )
+        base, t_r, t_l, t_res = (
+            jnp.asarray(x) for x in sbc.linear_basis(signal_model, names)
+        )
 
         nuis = sbc.NuisanceGrid.build(
             floated=floated,
@@ -273,7 +281,9 @@ class HLEIGResult:
     stderr_hl: float
     eig_gauss: float
     stderr_gauss: float
-    edge_frac: float  # mean posterior mass in the outermost grid points (grid-width check)
+    edge_frac: (
+        float  # mean posterior mass in the outermost grid points (grid-width check)
+    )
 
 
 def _grid_eig(marg_col, logprior_r, log_w):
@@ -470,7 +480,9 @@ def design_objective(
     while staying on the affordable side of the budget surface.
     """
     w_inv = w_inv_from_noise_design(n_det, net, eta_total, mission_years, mc_ctx.f_sky)
-    traced = mc_cutsky_cov_traced(w_inv, mc_ctx, cleaner, beam_fwhm=beam_fwhm, beam_p=beam_p)
+    traced = mc_cutsky_cov_traced(
+        w_inv, mc_ctx, cleaner, beam_fwhm=beam_fwhm, beam_p=beam_p
+    )
     util = _utility(
         traced.covariance,
         opt_ctx,
@@ -481,5 +493,85 @@ def design_objective(
         eig_key=eig_key,
         n_outer=n_outer,
     )
-    cost = design_cost(n_det, beam_fwhm, mission_years, cost_model=cost_model, freqs_ghz=freqs_ghz)
+    cost = design_cost(
+        n_det, beam_fwhm, mission_years, cost_model=cost_model, freqs_ghz=freqs_ghz
+    )
     return -util + budget_penalty(cost, budget, penalty_weight)
+
+
+def physical_design_objective(
+    design,
+    *,
+    freqs_per_group,
+    fp_diameter_m,
+    mc_ctx: CutskyMCContext,
+    opt_ctx: OptimizationContext,
+    cleaner: Cleaner,
+    cost_model: CostModel,
+    budget: float,
+    eta_total=0.5,
+    beam_p=None,
+    illumination_factor: float = 1.22,
+    packing_efficiency: float = 0.80,
+    net_override=None,
+    penalty_weight: float = 1.0,
+    objective: str = "marginal_eig_r",
+    sigma_prior_r: float = 1.0,
+    hl_eig_ctx: HLEIGContext | None = None,
+    eig_key=None,
+    n_outer: int = 256,
+):
+    """Cost-constrained EIG objective from the physical horn-packing design knobs.
+
+    ``design`` is the dict produced by
+    :meth:`augr.design_packing.PackingDesignSpec.design_pytree`:
+    ``{aperture_m, f_number, area_fractions, mission_years}``. Derives per-channel
+    ``(n_det, net, beam)`` via :func:`augr.optimize.design_to_channels` (focal-plane
+    packing, NET from photon noise, beam from the single physical aperture) and forwards
+    to :func:`design_objective` -- the same cut-sky MC forward + EIG utility + budget
+    penalty.
+
+    Returns ``-utility + budget_penalty`` (a minimization scalar). For the Gaussian
+    objectives, ``jax.grad`` w.r.t. the standardized ``z`` flows
+    ``z -> design_pytree -> design_to_channels -> design_objective``;
+    ``objective="hl_eig"`` is value-only (see the module docstring).
+    """
+    n_det, net, beam = design_to_channels(
+        design["aperture_m"],
+        design["f_number"],
+        fp_diameter_m,
+        design["area_fractions"],
+        freqs_per_group,
+        net_override=net_override,
+        illumination_factor=illumination_factor,
+        packing_efficiency=packing_efficiency,
+    )
+    freqs_flat = tuple(float(f) for grp in freqs_per_group for f in grp)
+    n_chan = len(freqs_flat)
+    if beam_p is None:
+        beam_p = jnp.ones(n_chan)
+    eta_arr = (
+        jnp.full((n_chan,), eta_total)
+        if jnp.ndim(eta_total) == 0
+        else jnp.asarray(eta_total)
+    )
+    return design_objective(
+        n_det,
+        net,
+        eta_arr,
+        design["mission_years"],
+        beam,
+        beam_p,
+        mc_ctx=mc_ctx,
+        opt_ctx=opt_ctx,
+        cleaner=cleaner,
+        cost_model=cost_model,
+        budget=budget,
+        freqs_ghz=freqs_flat,
+        penalty_weight=penalty_weight,
+        objective=objective,
+        sigma_prior_r=sigma_prior_r,
+        hl_eig_ctx=hl_eig_ctx,
+        eig_key=eig_key,
+        n_outer=n_outer,
+    )
