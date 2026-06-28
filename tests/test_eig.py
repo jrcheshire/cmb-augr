@@ -22,14 +22,24 @@ import jax
 import jax.numpy as jnp
 
 from augr import masking as mk
+from augr.active_subspace import (
+    DesignSpec,
+    active_subspace,
+    collect_gradients,
+    sample_designs,
+    subspace_alignment,
+)
 from augr.cleaning import nilc_cleaner
 from augr.config import cleaned_map_instrument
 from augr.cost import CostModel, aperture_from_fwhm, budget_penalty
 from augr.delensing import load_lensing_spectra
+from augr.design_opt import build_design_objectives
 from augr.eig import (
+    HLEIGContext,
     design_cost,
     design_objective,
     gaussian_eig_from_external_cov,
+    hl_eig_from_external_cov,
     marginal_eig_r_from_external_cov,
     posterior_fisher_from_external_cov,
 )
@@ -38,7 +48,7 @@ from augr.optimize import make_optimization_context, sigma_r_from_external_cov
 from augr.optimize_mapbased import w_inv_from_noise_design
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
-from augr.spectrum_stages import make_cutsky_mc_context
+from augr.spectrum_stages import make_cutsky_mc_context, mc_cutsky_cov_traced
 
 FREQS = (90.0, 150.0, 220.0)
 BEAMS = (40.0, 30.0, 20.0)
@@ -294,3 +304,137 @@ def test_design_objective_grad_and_eig_sigma_r_equivalence():
     b = np.concatenate([np.asarray(x).ravel() for x in g_sig])
     cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
     assert cos > 0.999
+
+
+# --- slow: HL-EIG (Stage 2) end-to-end through the cut-sky forward (gate 4d) ----------
+
+
+def _hl_eig_ctx(lmax):
+    """An HLEIGContext matching the tiny cut-sky config's binning (residual template, A_res)."""
+    ell = np.arange(2, lmax + 1, dtype=float)
+    return HLEIGContext.build(
+        template_ells=ell,
+        template_cl=(ell / 5.0) ** -2.4,
+        f_sky=0.6,
+        r_fid=0.0,
+        floated=frozenset({"A_res"}),
+        sigma_prior_r=0.05,
+        n_grid=400,
+        n_nuis_grid=41,
+        ell_max=lmax,
+        delta_ell=8,
+        ell_per_bin_below=2,
+    )
+
+
+@pytest.mark.slow
+def test_hl_eig_through_cutsky_forward():
+    """4d: HL-EIG runs end-to-end on the MC covariance; finite, positive, and not wider than
+    the Gaussian EIG beyond MC error (HL widens sigma(r) -> HL-EIG <= Gaussian-EIG)."""
+    mc_ctx, _opt_ctx, cleaner = _setup(12)
+    hl_ctx = _hl_eig_ctx(24)
+    w_inv = w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, 0.6
+    )
+    traced = mc_cutsky_cov_traced(
+        w_inv, mc_ctx, cleaner, beam_fwhm=jnp.asarray(BEAMS), beam_p=jnp.ones(len(BEAMS))
+    )
+    res = hl_eig_from_external_cov(
+        traced.covariance,
+        traced.mean_bandpower,
+        hl_ctx,
+        key=jax.random.PRNGKey(0),
+        n_outer=512,
+        return_diagnostics=True,
+    )
+    assert np.isfinite(res.eig_hl) and res.eig_hl > 0.0
+    assert res.edge_frac < 1e-2
+    # HL is the wider (more conservative) posterior, so its EIG does not exceed the Gaussian's
+    # beyond the MC band.
+    assert res.eig_hl <= res.eig_gauss + 4.0 * (res.stderr_hl + res.stderr_gauss)
+
+
+# --- slow: the intertwining headline -- Gaussian-EIG active subspace predicts HL-EIG (5d) ---
+
+
+def _design_spec_and_loss(mc_ctx, opt_ctx, cleaner, cost_model, budget, objective):
+    """DesignSpec over the 13-knob design + a z-space loss(z, ctx) for ``objective``."""
+    fid = {
+        "n_det": jnp.asarray(N_DET),
+        "net": jnp.asarray(NET),
+        "beam_fwhm": jnp.asarray(BEAMS),
+        "beam_p": jnp.ones(len(BEAMS)),
+        "mission_years": jnp.asarray(float(MISSION_YEARS)),
+    }
+    labels = tuple(f"k{i}" for i in range(3 * 4 + 1))
+    spec = DesignSpec.from_pytree(fid, labels, mode="log")
+
+    def loss(z, ctx):
+        d = spec.design_pytree(z)
+        return design_objective(
+            d["n_det"],
+            d["net"],
+            jnp.asarray(ETA),
+            d["mission_years"],
+            d["beam_fwhm"],
+            d["beam_p"],
+            mc_ctx=ctx,
+            opt_ctx=opt_ctx,
+            cleaner=cleaner,
+            cost_model=cost_model,
+            budget=budget,
+            freqs_ghz=FREQS,
+            objective=objective,
+        )
+
+    return spec, loss
+
+
+@pytest.mark.slow
+def test_active_subspace_surrogate_validity():
+    """5d: the cheap Gaussian-EIG active subspace is a valid surrogate for HL-EIG.
+
+    (i) the marginal-EIG-r and sigma(r) design subspaces share direction 1 (the monotone-
+    reparam consistency), and (ii) the non-Gaussian HL-EIG varies more along Gaussian-EIG
+    direction 1 than along an orthogonal direction -- so building the subspace from the cheap
+    gradient and scanning HL-EIG along it is justified.
+    """
+    mc_ctx, opt_ctx, cleaner = _setup(12)
+    cost_model = CostModel()
+    big_budget = 1.0e12
+    z = sample_designs(8, 13, sigma=0.12, method="lhs", seed=0)
+
+    spec, loss_eig = _design_spec_and_loss(
+        mc_ctx, opt_ctx, cleaner, cost_model, big_budget, "marginal_eig_r"
+    )
+    _spec, loss_sig = _design_spec_and_loss(
+        mc_ctx, opt_ctx, cleaner, cost_model, big_budget, "sigma_r"
+    )
+    _vfe, vg_eig = build_design_objectives(loss_eig)
+    _vfs, vg_sig = build_design_objectives(loss_sig)
+
+    sub_eig = active_subspace(collect_gradients(vg_eig, z, lambda _i: mc_ctx, n_crn=1).grads)
+    sub_sig = active_subspace(collect_gradients(vg_sig, z, lambda _i: mc_ctx, n_crn=1).grads)
+    # (i) the two objectives' leading design directions coincide (monotone reparam).
+    assert subspace_alignment(sub_eig.eigenvectors[:, 0], sub_sig.eigenvectors[:, 0]) > 0.98
+
+    # (ii) HL-EIG varies more along Gaussian-EIG direction 1 than along an orthogonal direction.
+    hl_ctx = _hl_eig_ctx(24)
+    w1 = sub_eig.eigenvectors[:, 0]
+    w_orth = sub_eig.eigenvectors[:, -1]  # least-active direction (orthonormal to w1)
+    key = jax.random.PRNGKey(1)
+
+    def hl_eig_at(zvec):
+        d = spec.design_pytree(jnp.asarray(zvec))
+        w_inv = w_inv_from_noise_design(
+            d["n_det"], d["net"], jnp.asarray(ETA), d["mission_years"], 0.6
+        )
+        tr = mc_cutsky_cov_traced(w_inv, mc_ctx, cleaner, beam_fwhm=d["beam_fwhm"], beam_p=d["beam_p"])
+        return float(
+            hl_eig_from_external_cov(tr.covariance, tr.mean_bandpower, hl_ctx, key=key, n_outer=512)
+        )
+
+    t = 0.18
+    range_w1 = abs(hl_eig_at(t * w1) - hl_eig_at(-t * w1))
+    range_orth = abs(hl_eig_at(t * w_orth) - hl_eig_at(-t * w_orth))
+    assert range_w1 > range_orth, (range_w1, range_orth)
