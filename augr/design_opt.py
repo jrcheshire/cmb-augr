@@ -47,12 +47,14 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
-import optax
+
+if TYPE_CHECKING:  # annotation only (string under `from __future__ import annotations`)
+    import optax
 
 
 @dataclass(frozen=True)
@@ -84,7 +86,9 @@ class DesignDescentResult:
 
 def build_design_objectives(
     loss_fn: Callable[[Any, Any], jnp.ndarray],
-) -> tuple[Callable[[Any, Any], jnp.ndarray], Callable[[Any, Any], tuple[jnp.ndarray, Any]]]:
+) -> tuple[
+    Callable[[Any, Any], jnp.ndarray], Callable[[Any, Any], tuple[jnp.ndarray, Any]]
+]:
     """``eqx.filter_jit`` the objective into ``(value_fn, value_and_grad_fn)``.
 
     Both are jitted over ``(params, ctx)`` so swapping in a fresh CRN ensemble of
@@ -132,6 +136,10 @@ def stochastic_design_descent(
         A :class:`DesignDescentResult`. Report ``params_best`` (best-on-val), not
         ``params_final``.
     """
+    # Lazy: only the Adam descent needs optax, not build_design_objectives / the
+    # active-subspace driver -- so the slim aarch64 'gpu' env need not ship optax.
+    import optax
+
     params = init_params
     state = optimizer.init(params)
     train_curve: list[float] = []
@@ -157,7 +165,11 @@ def stochastic_design_descent(
         updates, state = optimizer.update(grad, state, params)
         params = optax.apply_updates(params, updates)
 
-    per_eval_s = float(np.median(eval_times[1:])) if len(eval_times) > 1 else float(eval_times[0])
+    per_eval_s = (
+        float(np.median(eval_times[1:]))
+        if len(eval_times) > 1
+        else float(eval_times[0])
+    )
     return DesignDescentResult(
         params_final=params,
         params_best=best_params,
