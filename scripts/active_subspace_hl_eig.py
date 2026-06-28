@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 
 import jax
@@ -64,7 +65,11 @@ from augr.optimize import design_to_channels, make_optimization_context
 from augr.optimize_mapbased import w_inv_from_noise_design
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
-from augr.spectrum_stages import make_cutsky_mc_context, mc_cutsky_cov_traced
+from augr.spectrum_stages import (
+    load_sky_cache,
+    make_cutsky_mc_context,
+    mc_cutsky_cov_traced,
+)
 
 # Dichroic-feedhorn band layout: 3 singles {20, 35, 615} + 3 dichroic pairs (horn set by the
 # low band of each pair). The low-frequency bands are kept single (the 20/35 ratio is too wide
@@ -167,14 +172,27 @@ def _fiducial_channels(spec):
     )
 
 
-def _build_mc_ctx(static, spec, *, base_seed, n_sims, nside, lmax, fg_model):
-    """A cut-sky MC ensemble at a CRN seed block (fiducial design's sky/noise reference)."""
+def _build_mc_ctx(
+    static, spec, *, base_seed, n_sims, nside, lmax, fg_model, sky_cache=None
+):
+    """A cut-sky MC ensemble at a CRN seed block (fiducial design's sky/noise reference).
+
+    With ``sky_cache`` (a :class:`augr.spectrum_stages.SkyCache`), the foreground sky
+    ensemble is taken from the cache and PySM is never invoked -- the pysm3-less GPU path.
+    """
     n_det_fid, net_fid, beam_fid = _fiducial_channels(spec)
     w_inv_fid = np.asarray(
         w_inv_from_noise_design(
             n_det_fid, net_fid, spec.eta_total, spec.years_fid, F_SKY
         )
     )
+    hs = nk = vpr = None
+    if sky_cache is not None:
+        hs, nk, vpr = (
+            sky_cache.harmonic_skies,
+            sky_cache.noise_keys,
+            sky_cache.var_pix_ref,
+        )
     return make_cutsky_mc_context(
         cleaner=static["cleaner"],
         freqs_ghz=spec.freqs_flat,
@@ -192,6 +210,9 @@ def _build_mc_ctx(static, spec, *, base_seed, n_sims, nside, lmax, fg_model):
         base_seed=base_seed,
         fg_model=fg_model,
         r_in=0.0,
+        harmonic_skies=hs,
+        noise_keys=nk,
+        var_pix_ref=vpr,
     )
 
 
@@ -272,6 +293,13 @@ def main():
         help="budget = factor x fiducial cost",
     )
     p.add_argument("--backend", choices=["ducc", "jht"], default="ducc")
+    p.add_argument(
+        "--sky-cache-dir",
+        type=str,
+        default=None,
+        help="dir of precomputed FG sky caches (sky_<idx>.npz from scripts/build_sky_cache.py); "
+        "skips PySM -- the pysm3-less GPU path. Must match --nside/--lmax/--n-sims/--fg-model.",
+    )
     p.add_argument("--out", type=str, default="/tmp/active_subspace_hl_eig")
     args = p.parse_args()
 
@@ -302,6 +330,14 @@ def main():
     value_fn, vg_fn = build_design_objectives(loss)
 
     def make_ctx(idx):
+        cache = None
+        if args.sky_cache_dir is not None:
+            cache = load_sky_cache(os.path.join(args.sky_cache_dir, f"sky_{idx}.npz"))
+            if cache.nside != args.nside or cache.lmax != args.lmax:
+                raise ValueError(
+                    f"sky cache sky_{idx} nside/lmax {cache.nside}/{cache.lmax} != "
+                    f"args {args.nside}/{args.lmax}"
+                )
         return _build_mc_ctx(
             static,
             spec,
@@ -310,6 +346,7 @@ def main():
             nside=args.nside,
             lmax=args.lmax,
             fg_model=fg_model,
+            sky_cache=cache,
         )
 
     # --- 1. build the active subspace from the cheap Gaussian-EIG gradient ---
