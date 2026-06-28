@@ -305,7 +305,13 @@ def main():
 
     fg_model = None if args.fg_model.lower() == "none" else args.fg_model
     sht.set_sht_backend(args.backend)
+    # Print the JAX device up front: with --backend jht, a CPU device here means JAX fell
+    # back off the GPU (jax[cuda12] failed to init), and the run will crawl -- jht on CPU is
+    # ~100x slower than on the GPU (and far slower than ducc, which the gpu env omits).
     print(f"SHT backend: {sht.get_sht_backend()}   fg_model: {fg_model}")
+    print(f"JAX backend: {jax.default_backend()}   devices: {jax.devices()}")
+    if args.backend == "jht" and jax.default_backend() == "cpu":
+        print("  WARNING: --backend jht but JAX is on CPU -- the GPU was not initialized.")
     t0 = time.time()
 
     static = _static_pieces(args.nside, args.lmax)
