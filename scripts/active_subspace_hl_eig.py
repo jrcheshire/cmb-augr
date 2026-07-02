@@ -310,11 +310,34 @@ def _scan_point(zv, spec, static, value_fn, eval_ctx, hl_ctx, n_outer):
 _WORKER: dict = {}
 
 
+def _set_fft_mode(mode):
+    """Apply the jht azimuth-FFT mode (process-global; set before the first compile).
+
+    ``looped`` (jaxht>=0.2.0) routes the polar-cap FFTs through one common-length chirp-z
+    ``lax.scan``, keeping the compiled graph O(1) in ring-kernel count at a ~1.1x runtime
+    tax on the cap rings. Load-bearing regardless of ``--backend``: the masked-Wiener
+    stage calls ``jht.wiener`` / ``jht.bandpower`` directly, and under jht's own
+    ``unrolled`` default the SHT-heavy forward is uncompilable at nside>=64 (2.45 GB
+    executable on H200; ~42 min / 12 GB on Grace CPU).
+    """
+    import jht
+
+    jht.set_azimuth_fft_mode(mode)
+
+
 def _worker_pieces(cfg):
-    key = (cfg["nside"], cfg["lmax"], cfg["budget"], cfg["backend"], cfg["fg_model"])
+    key = (
+        cfg["nside"],
+        cfg["lmax"],
+        cfg["budget"],
+        cfg["backend"],
+        cfg["fg_model"],
+        cfg["fft_mode"],
+    )
     w = _WORKER.get(key)
     if w is None:
         sht.set_sht_backend(cfg["backend"])
+        _set_fft_mode(cfg["fft_mode"])
         spec = _spec()
         static = _static_pieces(cfg["nside"], cfg["lmax"])
         value_fn, vg_fn = build_design_objectives(
@@ -387,6 +410,7 @@ def _fanout_cfg(args, fg_model, budget):
         n_crn=args.n_crn,
         sky_cache_dir=args.sky_cache_dir,
         backend=args.backend,
+        fft_mode=args.fft_mode,
         eval_index=args.eval_index,
         sigma_prior_r=args.sigma_prior_r,
         n_outer=args.n_outer,
@@ -430,6 +454,14 @@ def main():
     )
     p.add_argument("--backend", choices=["ducc", "jht"], default="ducc")
     p.add_argument(
+        "--fft-mode",
+        choices=["looped", "unrolled"],
+        default="looped",
+        help="jht azimuth-FFT strategy (jaxht>=0.2.0). looped keeps compile O(1) in "
+        "ring kernels -- required at nside>=64; unrolled (jht's own default) is "
+        "marginally faster per transform but compile scales as nside x #SHTs.",
+    )
+    p.add_argument(
         "--sky-cache-dir",
         type=str,
         default=None,
@@ -454,10 +486,13 @@ def main():
 
     fg_model = None if args.fg_model.lower() == "none" else args.fg_model
     sht.set_sht_backend(args.backend)
+    _set_fft_mode(args.fft_mode)
     # Print the JAX device up front: with --backend jht, a CPU device here means JAX fell
     # back off the GPU (jax[cuda12] failed to init), and the run will crawl -- jht on CPU is
     # ~100x slower than on the GPU (and far slower than ducc, which the gpu env omits).
-    print(f"SHT backend: {sht.get_sht_backend()}   fg_model: {fg_model}")
+    print(
+        f"SHT backend: {sht.get_sht_backend()}   fft_mode: {args.fft_mode}   fg_model: {fg_model}"
+    )
     print(f"JAX backend: {jax.default_backend()}   devices: {jax.devices()}")
     if args.backend == "jht" and jax.default_backend() == "cpu":
         print("  WARNING: --backend jht but JAX is on CPU -- the GPU was not initialized.")
