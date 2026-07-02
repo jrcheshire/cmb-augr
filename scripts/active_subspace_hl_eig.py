@@ -42,6 +42,7 @@ import numpy as np
 from augr import masking as mk
 from augr import sht
 from augr.active_subspace import (
+    GradientSample,
     active_subspace,
     activity_scores,
     bootstrap_eiguncertainty,
@@ -63,6 +64,7 @@ from augr.eig import (
 from augr.foregrounds import NullForegroundModel
 from augr.optimize import design_to_channels, make_optimization_context
 from augr.optimize_mapbased import w_inv_from_noise_design
+from augr.parallel import parallel_map
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
 from augr.spectrum_stages import (
@@ -95,9 +97,7 @@ YEARS_FID = 4.0
 FP_DIAMETER_M = 0.3  # m (fixed cold focal-plane diameter)
 ETA_TOTAL = 0.5
 F_SKY = 0.6
-SEED_STRIDE = (
-    100_000  # disjoint CRN seed blocks (cf. mapbased_grad_characterization.py)
-)
+SEED_STRIDE = 100_000  # disjoint CRN seed blocks (cf. mapbased_grad_characterization.py)
 
 
 def _spec() -> PackingDesignSpec:
@@ -172,9 +172,7 @@ def _fiducial_channels(spec):
     )
 
 
-def _build_mc_ctx(
-    static, spec, *, base_seed, n_sims, nside, lmax, fg_model, sky_cache=None
-):
+def _build_mc_ctx(static, spec, *, base_seed, n_sims, nside, lmax, fg_model, sky_cache=None):
     """A cut-sky MC ensemble at a CRN seed block (fiducial design's sky/noise reference).
 
     With ``sky_cache`` (a :class:`augr.spectrum_stages.SkyCache`), the foreground sky
@@ -182,9 +180,7 @@ def _build_mc_ctx(
     """
     n_det_fid, net_fid, beam_fid = _fiducial_channels(spec)
     w_inv_fid = np.asarray(
-        w_inv_from_noise_design(
-            n_det_fid, net_fid, spec.eta_total, spec.years_fid, F_SKY
-        )
+        w_inv_from_noise_design(n_det_fid, net_fid, spec.eta_total, spec.years_fid, F_SKY)
     )
     hs = nk = vpr = None
     if sky_cache is not None:
@@ -237,7 +233,7 @@ def _make_loss(spec, static, cost_model, budget):
     return loss
 
 
-def _hl_template(args):
+def _hl_template(lmax):
     """Residual-template ``(ells, C_ell)`` for the A_res HL parameter.
 
     Toy power-law placeholder. The science headline should pass the real post-cleaning FG
@@ -245,17 +241,161 @@ def _hl_template(args):
     (``cl_residual_fg``; cf. :func:`augr.nilc_forecast.nilc_spectra` /
     ``spectrum_stages._cleaned_b_qu``). Deferred here: the cut-sky FG-only projection + the
     per-ell vs binned reconciliation in ``HLEIGContext`` deserve their own tested pass, and
-    the template shape does not affect Phase 0 timing.
+    the template shape does not affect timing.
     """
-    ells = np.arange(2, args.lmax + 1, dtype=float)
+    ells = np.arange(2, lmax + 1, dtype=float)
     return ells, (ells / 5.0) ** -2.4
+
+
+def _build_hl_ctx(lmax, sigma_prior_r):
+    """The design-independent HL-EIG context built from the residual template."""
+    ells, cl = _hl_template(lmax)
+    return HLEIGContext.build(
+        template_ells=ells,
+        template_cl=cl,
+        f_sky=F_SKY,
+        r_fid=0.0,
+        floated=frozenset({"A_res"}),
+        sigma_prior_r=sigma_prior_r,
+        n_grid=400,
+        n_nuis_grid=41,
+        ell_max=lmax,
+        delta_ell=8,
+        ell_per_bin_below=2,
+    )
+
+
+def _scan_point(zv, spec, static, value_fn, eval_ctx, hl_ctx, n_outer):
+    """(Gaussian-EIG, HL-EIG, cost) at one design point ``zv`` -- shared by serial + parallel."""
+    gauss = -float(value_fn(zv, eval_ctx))  # EIG = -loss (budget slack)
+    d = spec.design_pytree(zv)
+    n_det, net, beam = design_to_channels(
+        d["aperture_m"],
+        d["f_number"],
+        spec.fp_diameter_m,
+        d["area_fractions"],
+        spec.freqs_per_group,
+    )
+    w_inv = w_inv_from_noise_design(n_det, net, spec.eta_total, d["mission_years"], F_SKY)
+    tr = mc_cutsky_cov_traced(w_inv, eval_ctx, static["cleaner"], beam_fwhm=beam)
+    hl = float(
+        hl_eig_from_external_cov(
+            tr.covariance,
+            tr.mean_bandpower,
+            hl_ctx,
+            key=jax.random.PRNGKey(0),
+            n_outer=n_outer,
+        )
+    )
+    cost = float(
+        design_cost(
+            n_det,
+            beam,
+            d["mission_years"],
+            cost_model=CostModel(),
+            freqs_ghz=spec.freqs_flat,
+        )
+    )
+    return gauss, hl, cost
+
+
+# --- parallel design fan-out (augr.parallel process pool; for SKX / many-core CPU) --------
+# The gradient collect (over designs) and the HL scan (over scan points) are both
+# embarrassingly parallel. With --workers > 1, augr.parallel pins BLAS/ducc to 1 thread per
+# worker, so parallelism comes from the pool, not ducc threading -- the right tradeoff for
+# many independent design evaluations on a many-core node, and it sidesteps the
+# pin_blas-mutates-the-parent-env OMP conflict (the main process only does the cheap
+# eigendecomp). Worker functions are module-level (picklable for spawn); ``_WORKER`` caches
+# the per-process heavy pieces, built once per worker and reused across its tasks.
+_WORKER: dict = {}
+
+
+def _worker_pieces(cfg):
+    key = (cfg["nside"], cfg["lmax"], cfg["budget"], cfg["backend"], cfg["fg_model"])
+    w = _WORKER.get(key)
+    if w is None:
+        sht.set_sht_backend(cfg["backend"])
+        spec = _spec()
+        static = _static_pieces(cfg["nside"], cfg["lmax"])
+        value_fn, vg_fn = build_design_objectives(
+            _make_loss(spec, static, CostModel(), cfg["budget"])
+        )
+        w = {"spec": spec, "static": static, "value_fn": value_fn, "vg_fn": vg_fn}
+        _WORKER[key] = w
+    return w
+
+
+def _ctx_for(cfg, w, idx):
+    sky_cache = None
+    if cfg["sky_cache_dir"]:
+        sky_cache = load_sky_cache(os.path.join(cfg["sky_cache_dir"], f"sky_{idx}.npz"))
+    return _build_mc_ctx(
+        w["static"],
+        w["spec"],
+        base_seed=SEED_STRIDE * (idx + 1),
+        n_sims=cfg["n_sims"],
+        nside=cfg["nside"],
+        lmax=cfg["lmax"],
+        fg_model=cfg["fg_model"],
+        sky_cache=sky_cache,
+    )
+
+
+def _grad_worker(payload):
+    """CRN-averaged Gaussian-EIG (i, value, grad, spread) for one design -- for parallel_map."""
+    i, z_row, cfg = payload
+    w = _worker_pieces(cfg)
+    z_row = jnp.asarray(z_row)
+    vs, gs = [], []
+    for j in range(cfg["n_crn"]):
+        idx = i * cfg["n_crn"] + j  # matches collect_gradients' crn_seed0=0 scheme
+        v, g = w["vg_fn"](z_row, _ctx_for(cfg, w, idx))
+        vs.append(float(v))
+        gs.append(np.asarray(g, dtype=float))
+    g_stack = np.stack(gs, axis=0)
+    return i, float(np.mean(vs)), g_stack.mean(axis=0), g_stack.std(axis=0)
+
+
+def _scan_worker(payload):
+    """(k, Gaussian-EIG, HL-EIG, cost) at one scan point -- for parallel_map."""
+    k, t, w1, cfg = payload
+    w = _worker_pieces(cfg)
+    if "eval" not in w:  # build the held-out ensemble + HL context once per worker
+        w["eval"] = _ctx_for(cfg, w, cfg["eval_index"])
+        w["hl_ctx"] = _build_hl_ctx(cfg["lmax"], cfg["sigma_prior_r"])
+    zv = jnp.asarray(np.asarray(t) * np.asarray(w1))
+    gauss, hl, cost = _scan_point(
+        zv,
+        w["spec"],
+        w["static"],
+        w["value_fn"],
+        w["eval"],
+        w["hl_ctx"],
+        cfg["n_outer"],
+    )
+    return k, gauss, hl, cost
+
+
+def _fanout_cfg(args, fg_model, budget):
+    """Picklable config dict carried to the pool workers."""
+    return dict(
+        nside=args.nside,
+        lmax=args.lmax,
+        n_sims=args.n_sims,
+        fg_model=fg_model,
+        budget=budget,
+        n_crn=args.n_crn,
+        sky_cache_dir=args.sky_cache_dir,
+        backend=args.backend,
+        eval_index=args.eval_index,
+        sigma_prior_r=args.sigma_prior_r,
+        n_outer=args.n_outer,
+    )
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument(
-        "--n-sims", type=int, default=8, help="MC sims per ensemble (>= bins + 2)"
-    )
+    p.add_argument("--n-sims", type=int, default=8, help="MC sims per ensemble (>= bins + 2)")
     p.add_argument("--nside", type=int, default=16)
     p.add_argument("--lmax", type=int, default=24)
     p.add_argument(
@@ -270,12 +410,8 @@ def main():
         default=24,
         help="M design samples for C (use M > D for full rank)",
     )
-    p.add_argument(
-        "--sigma", type=float, default=0.12, help="design sampling radius (dex)"
-    )
-    p.add_argument(
-        "--n-crn", type=int, default=1, help="CRN redraws averaged per design"
-    )
+    p.add_argument("--sigma", type=float, default=0.12, help="design sampling radius (dex)")
+    p.add_argument("--n-crn", type=int, default=1, help="CRN redraws averaged per design")
     p.add_argument("--n-active", type=int, default=2)
     p.add_argument("--scan-points", type=int, default=9)
     p.add_argument(
@@ -299,6 +435,19 @@ def main():
         default=None,
         help="dir of precomputed FG sky caches (sky_<idx>.npz from scripts/build_sky_cache.py); "
         "skips PySM -- the pysm3-less GPU path. Must match --nside/--lmax/--n-sims/--fg-model.",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="process-pool workers for the design-gradient collect + HL scan (SKX many-core "
+        "CPU). >1 pins ducc to 1 thread/worker (parallelism from the pool, not threading).",
+    )
+    p.add_argument(
+        "--eval-index",
+        type=int,
+        default=9999,
+        help="held-out scan ensemble index (cf. build_sky_cache)",
     )
     p.add_argument("--out", type=str, default="/tmp/active_subspace_hl_eig")
     args = p.parse_args()
@@ -360,10 +509,23 @@ def main():
         f"\nsampling {args.n_designs} designs (D={spec.n_dim}) + collecting gradients "
         f"(n_crn={args.n_crn}) ..."
     )
-    z = sample_designs(
-        args.n_designs, spec.n_dim, sigma=args.sigma, method="lhs", seed=0
-    )
-    gs = collect_gradients(vg_fn, z, make_ctx, n_crn=args.n_crn)
+    z = sample_designs(args.n_designs, spec.n_dim, sigma=args.sigma, method="lhs", seed=0)
+    if args.workers > 1:
+        cfg = _fanout_cfg(args, fg_model, budget)
+        res = parallel_map(
+            _grad_worker,
+            [(i, np.asarray(z[i]), cfg) for i in range(args.n_designs)],
+            workers=args.workers,
+        )
+        res.sort(key=lambda r: r[0])
+        gs = GradientSample(
+            z=z,
+            values=np.array([r[1] for r in res]),
+            grads=np.stack([r[2] for r in res], axis=0),
+            crn_spread=np.stack([r[3] for r in res], axis=0),
+        )
+    else:
+        gs = collect_gradients(vg_fn, z, make_ctx, n_crn=args.n_crn)
     sub = active_subspace(gs.grads)
     boot = bootstrap_eiguncertainty(gs.grads, n_boot=300, n_active=args.n_active)
     print(f"  [{time.time() - t0:.0f}s] energy spectrum: {np.round(sub.energy, 3)}")
@@ -379,72 +541,40 @@ def main():
         print(f"    {spec.knob_labels[k]:>16}: {scores[k]:.3f}")
 
     # --- 2. evaluate HL-EIG (value-only) along the leading active direction ---
-    tmpl_ells, tmpl_cl = _hl_template(args)
-    hl_ctx = HLEIGContext.build(
-        template_ells=tmpl_ells,
-        template_cl=tmpl_cl,
-        f_sky=F_SKY,
-        r_fid=0.0,
-        floated=frozenset({"A_res"}),
-        sigma_prior_r=args.sigma_prior_r,
-        n_grid=400,
-        n_nuis_grid=41,
-        ell_max=args.lmax,
-        delta_ell=8,
-        ell_per_bin_below=2,
-    )
-    eval_ctx = make_ctx(9999)  # fixed held-out ensemble (never a construction ensemble)
     w1 = sub.eigenvectors[:, 0]
     ts = np.linspace(-args.scan_half_width, args.scan_half_width, args.scan_points)
-    key = jax.random.PRNGKey(0)
-
-    def hl_eig_at(zvec):
-        d = spec.design_pytree(zvec)
-        n_det, net, beam = design_to_channels(
-            d["aperture_m"],
-            d["f_number"],
-            spec.fp_diameter_m,
-            d["area_fractions"],
-            spec.freqs_per_group,
-        )
-        w_inv = w_inv_from_noise_design(
-            n_det, net, spec.eta_total, d["mission_years"], F_SKY
-        )
-        tr = mc_cutsky_cov_traced(w_inv, eval_ctx, static["cleaner"], beam_fwhm=beam)
-        return float(
-            hl_eig_from_external_cov(
-                tr.covariance, tr.mean_bandpower, hl_ctx, key=key, n_outer=args.n_outer
-            )
-        )
-
     print(
         f"\nscanning {args.scan_points} points along active direction 1 "
         f"(Gaussian-EIG vs HL-EIG) ..."
     )
-    gauss_eig, hl_eig, cost_scan = [], [], []
-    for t in ts:
-        zv = jnp.asarray(t * w1)
-        gauss_eig.append(-float(value_fn(zv, eval_ctx)))  # EIG = -loss (budget slack)
-        hl_eig.append(hl_eig_at(zv))
-        d = spec.design_pytree(zv)
-        n_det, _, beam = design_to_channels(
-            d["aperture_m"],
-            d["f_number"],
-            spec.fp_diameter_m,
-            d["area_fractions"],
-            spec.freqs_per_group,
+    if args.workers > 1:
+        cfg = _fanout_cfg(args, fg_model, budget)
+        res = parallel_map(
+            _scan_worker,
+            [(k, float(t), np.asarray(w1), cfg) for k, t in enumerate(ts)],
+            workers=args.workers,
         )
-        cost_scan.append(
-            float(
-                design_cost(
-                    n_det,
-                    beam,
-                    d["mission_years"],
-                    cost_model=cost_model,
-                    freqs_ghz=spec.freqs_flat,
-                )
+        res.sort(key=lambda r: r[0])
+        gauss_eig = [r[1] for r in res]
+        hl_eig = [r[2] for r in res]
+        cost_scan = [r[3] for r in res]
+    else:
+        hl_ctx = _build_hl_ctx(args.lmax, args.sigma_prior_r)
+        eval_ctx = make_ctx(args.eval_index)  # fixed held-out ensemble (never a construction one)
+        gauss_eig, hl_eig, cost_scan = [], [], []
+        for t in ts:
+            g, h, c = _scan_point(
+                jnp.asarray(t * w1),
+                spec,
+                static,
+                value_fn,
+                eval_ctx,
+                hl_ctx,
+                args.n_outer,
             )
-        )
+            gauss_eig.append(g)
+            hl_eig.append(h)
+            cost_scan.append(c)
     print(f"  [{time.time() - t0:.0f}s] done.")
 
     out = {
@@ -455,9 +585,7 @@ def main():
         "n_active_0.95": sub.n_active(0.95),
         "activity_scores": scores.tolist(),
         "direction_1": w1.tolist(),
-        "bootstrap": {
-            k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in boot.items()
-        },
+        "bootstrap": {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in boot.items()},
         "scan_t": ts.tolist(),
         "scan_gauss_eig": gauss_eig,
         "scan_hl_eig": hl_eig,
