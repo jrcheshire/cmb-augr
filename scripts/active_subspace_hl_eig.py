@@ -325,6 +325,20 @@ def _set_fft_mode(mode):
     jht.set_azimuth_fft_mode(mode)
 
 
+def _set_compile_cache(path):
+    """Point jax's persistent compilation cache at ``path`` (before the first compile).
+
+    Compile of the traced forward is ~hours at nside=128, so one warm job pays it for every
+    later process/job with the same shapes -- including all pool workers of a production
+    run. Historically useless here because the unrolled executable (2.45 GB) exceeded the
+    2 GB serialization cap; under the looped FFT mode it should fit. A RESOURCE_EXHAUSTED
+    cache-write warning in the log means the executable is STILL over the cap.
+    """
+    if path:
+        os.makedirs(path, exist_ok=True)
+        jax.config.update("jax_compilation_cache_dir", path)
+
+
 def _worker_pieces(cfg):
     key = (
         cfg["nside"],
@@ -338,6 +352,7 @@ def _worker_pieces(cfg):
     if w is None:
         sht.set_sht_backend(cfg["backend"])
         _set_fft_mode(cfg["fft_mode"])
+        _set_compile_cache(cfg["compile_cache"])
         spec = _spec()
         static = _static_pieces(cfg["nside"], cfg["lmax"])
         value_fn, vg_fn = build_design_objectives(
@@ -423,6 +438,7 @@ def _fanout_cfg(args, fg_model, budget):
         sky_cache_dir=args.sky_cache_dir,
         backend=args.backend,
         fft_mode=args.fft_mode,
+        compile_cache=args.compile_cache,
         eval_index=args.eval_index,
         sigma_prior_r=args.sigma_prior_r,
         n_outer=args.n_outer,
@@ -474,6 +490,15 @@ def main():
         "marginally faster per transform but compile scales as nside x #SHTs.",
     )
     p.add_argument(
+        "--compile-cache",
+        type=str,
+        default=None,
+        help="jax persistent compilation-cache dir (shared filesystem, e.g. $SCRATCH). "
+        "One job's ~hours compile at nside=128 pays for every later process/job with "
+        "the same shapes. A RESOURCE_EXHAUSTED cache-write warning means the "
+        "executable still exceeds the 2 GB serialization cap.",
+    )
+    p.add_argument(
         "--sky-cache-dir",
         type=str,
         default=None,
@@ -499,6 +524,7 @@ def main():
     fg_model = None if args.fg_model.lower() == "none" else args.fg_model
     sht.set_sht_backend(args.backend)
     _set_fft_mode(args.fft_mode)
+    _set_compile_cache(args.compile_cache)
     # Print the JAX device up front: with --backend jht, a CPU device here means JAX fell
     # back off the GPU (jax[cuda12] failed to init), and the run will crawl -- jht on CPU is
     # ~100x slower than on the GPU (and far slower than ducc, which the gpu env omits).
@@ -572,7 +598,20 @@ def main():
             crn_spread=np.stack([r[3] for r in res], axis=0),
         )
     else:
-        gs = collect_gradients(vg_fn, z, make_ctx, n_crn=args.n_crn)
+        n_call = [0]
+
+        def timed_vg(zv, ctx):
+            tc = time.time()
+            out = jax.block_until_ready(vg_fn(zv, ctx))
+            n_call[0] += 1
+            print(
+                f"    [serial] grad eval {n_call[0]}: {time.time() - tc:.0f}s"
+                + (" (includes jit compile)" if n_call[0] == 1 else ""),
+                flush=True,
+            )
+            return out
+
+        gs = collect_gradients(timed_vg, z, make_ctx, n_crn=args.n_crn)
     sub = active_subspace(gs.grads)
     boot = bootstrap_eiguncertainty(gs.grads, n_boot=300, n_active=args.n_active)
     print(f"  [{time.time() - t0:.0f}s] energy spectrum: {np.round(sub.energy, 3)}")
@@ -609,7 +648,8 @@ def main():
         hl_ctx = _build_hl_ctx(args.lmax, args.sigma_prior_r)
         eval_ctx = make_ctx(args.eval_index)  # fixed held-out ensemble (never a construction one)
         gauss_eig, hl_eig, cost_scan = [], [], []
-        for t in ts:
+        for k, t in enumerate(ts):
+            tc = time.time()
             g, h, c = _scan_point(
                 jnp.asarray(t * w1),
                 spec,
@@ -619,6 +659,7 @@ def main():
                 hl_ctx,
                 args.n_outer,
             )
+            print(f"    [serial] scan point {k}: {time.time() - tc:.0f}s", flush=True)
             gauss_eig.append(g)
             hl_eig.append(h)
             cost_scan.append(c)
