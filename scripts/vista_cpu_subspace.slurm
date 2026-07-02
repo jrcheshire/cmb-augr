@@ -19,11 +19,11 @@
 # oversubscribe 144 workers x N threads).
 #
 #SBATCH -J augr_subspace
-#SBATCH -p <vista-grace-cpu-queue>   # <-- Vista Grace-Grace partition (confirm the name)
+#SBATCH -p gg                         # Vista Grace-Grace CPU queue (confirm: sinfo -o '%P')
 #SBATCH -N 1
 #SBATCH -n 1                          # single task; parallelism is the in-process pool
 #SBATCH -t 04:00:00
-#SBATCH -A <JPL-ALLOCATION>           # <-- set your allocation
+#SBATCH -A <JPL-ALLOCATION>           # <-- set your allocation (or override: sbatch -A ...)
 #SBATCH -o subspace_%j.out
 #SBATCH -e subspace_%j.err
 
@@ -34,11 +34,15 @@ unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS 2>/dev/null || true
 
 cd "$WORK/cmb-augr"
 
-# nside=128 / lmax=256 is clean through the recomb bump (ducc has no 1.5*nside cap). M=96
+# lmax=192 is jht's HEALPix band-limit ceiling at nside=128 (lmax <= 1.5*nside, enforced by
+# jht.wiener even under --backend ducc) and is still clean through the recomb bump. M=96
 # designs (>> D=8) gives a robust C and saturates ~96 cores (1 design/worker). pysm3 runs on
-# the Grace cores, so --fg-model d1s1 generates inline -- the sky cache is OPTIONAL here.
+# the Grace cores, so --fg-model d1s1 generates inline -- the sky cache is OPTIONAL here --
+# but the TEMPLATES must be pre-cached from the LOGIN node (compute nodes have no internet):
+#   pixi run -e cpu python -c "import pysm3, pysm3.units as u; \
+#       pysm3.Sky(nside=128, preset_strings=['d1','s1']).get_emission(100*u.GHz)"
 pixi run -e cpu python scripts/active_subspace_hl_eig.py \
-    --backend ducc --fft-mode looped --nside 128 --lmax 256 \
+    --backend ducc --fft-mode looped --nside 128 --lmax 192 \
     --n-sims 100 --n-designs 96 --n-crn 1 \
     --workers 96 \
     --scan-points 11 --n-outer 1024 \
