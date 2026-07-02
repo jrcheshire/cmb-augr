@@ -308,6 +308,7 @@ def _scan_point(zv, spec, static, value_fn, eval_ctx, hl_ctx, n_outer):
 # eigendecomp). Worker functions are module-level (picklable for spawn); ``_WORKER`` caches
 # the per-process heavy pieces, built once per worker and reused across its tasks.
 _WORKER: dict = {}
+_N_GRAD_CALLS = [0]  # per-process (each spawn worker holds its own module state)
 
 
 def _set_fft_mode(mode):
@@ -390,9 +391,10 @@ def _grad_worker(payload):
         t0 = time.time()
         v, g = w["vg_fn"](z_row, _ctx_for(cfg, w, idx))
         g = np.asarray(g, dtype=float)  # blocks until computed, so the timing is honest
+        _N_GRAD_CALLS[0] += 1
+        note = " (includes jit compile)" if _N_GRAD_CALLS[0] == 1 else ""
         print(
-            f"    [pid {os.getpid()}] grad design {i} crn {j}: {time.time() - t0:.0f}s"
-            " (a worker's first call includes jit compile)",
+            f"    [pid {os.getpid()}] grad design {i} crn {j}: {time.time() - t0:.0f}s{note}",
             flush=True,
         )
         vs.append(float(v))
