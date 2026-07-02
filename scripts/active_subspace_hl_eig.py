@@ -372,9 +372,16 @@ def _grad_worker(payload):
     vs, gs = [], []
     for j in range(cfg["n_crn"]):
         idx = i * cfg["n_crn"] + j  # matches collect_gradients' crn_seed0=0 scheme
+        t0 = time.time()
         v, g = w["vg_fn"](z_row, _ctx_for(cfg, w, idx))
+        g = np.asarray(g, dtype=float)  # blocks until computed, so the timing is honest
+        print(
+            f"    [pid {os.getpid()}] grad design {i} crn {j}: {time.time() - t0:.0f}s"
+            " (a worker's first call includes jit compile)",
+            flush=True,
+        )
         vs.append(float(v))
-        gs.append(np.asarray(g, dtype=float))
+        gs.append(g)
     g_stack = np.stack(gs, axis=0)
     return i, float(np.mean(vs)), g_stack.mean(axis=0), g_stack.std(axis=0)
 
@@ -387,6 +394,7 @@ def _scan_worker(payload):
         w["eval"] = _ctx_for(cfg, w, cfg["eval_index"])
         w["hl_ctx"] = _build_hl_ctx(cfg["lmax"], cfg["sigma_prior_r"])
     zv = jnp.asarray(np.asarray(t) * np.asarray(w1))
+    t0 = time.time()
     gauss, hl, cost = _scan_point(
         zv,
         w["spec"],
@@ -395,6 +403,10 @@ def _scan_worker(payload):
         w["eval"],
         w["hl_ctx"],
         cfg["n_outer"],
+    )
+    print(
+        f"    [pid {os.getpid()}] scan point {k}: {time.time() - t0:.0f}s",
+        flush=True,
     )
     return k, gauss, hl, cost
 
