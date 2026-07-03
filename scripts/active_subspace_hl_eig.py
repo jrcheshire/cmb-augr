@@ -46,7 +46,6 @@ from augr.active_subspace import (
     active_subspace,
     activity_scores,
     bootstrap_eiguncertainty,
-    collect_gradients,
     sample_designs,
 )
 from augr.cleaning import nilc_cleaner
@@ -340,8 +339,69 @@ def _set_compile_cache(path):
         jax.config.update("jax_compilation_cache_dir", path)
 
 
-def _worker_pieces(cfg):
-    key = (
+# --- incremental part files (resume / multi-node) ------------------------------------------
+# Every design gradient and scan point is written to its own .npz under --parts-dir the
+# moment it finishes (atomic tmp+rename; one file per task, so concurrent writers never
+# collide, incl. on Lustre). A task whose part already exists and matches the config is
+# loaded instead of recomputed, so a killed or timed-out job resumes from what it has, and
+# disjoint --design-range jobs on separate nodes fill one shared parts dir. Stage results
+# are assembled FROM DISK, never from in-memory returns, so "computed here" and "computed
+# elsewhere" are indistinguishable.
+
+
+def _part_path(parts_dir, kind, idx):
+    return os.path.join(parts_dir, f"{kind}_{idx:04d}.npz")
+
+
+def _write_part(path, **arrays):
+    tmp = f"{path}.{os.getpid()}.tmp.npz"
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
+
+
+def _load_part(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with np.load(path) as z:
+            return {k: z[k] for k in z.files}
+    except Exception:  # truncated/corrupt write from a killed job -> recompute
+        return None
+
+
+def _grad_part_valid(part, z_row, cfg):
+    return (
+        part is not None
+        and part["z"].shape == np.shape(z_row)
+        and np.allclose(part["z"], z_row, rtol=1e-12, atol=0.0)
+        and int(part["nside"]) == cfg["nside"]
+        and int(part["lmax"]) == cfg["lmax"]
+        and int(part["n_sims"]) == cfg["n_sims"]
+        and int(part["n_crn"]) == cfg["n_crn"]
+        and str(part["fg_model"]) == str(cfg["fg_model"])
+        and np.isclose(float(part["budget"]), cfg["budget"])
+    )
+
+
+def _scan_part_valid(part, t, w1, cfg):
+    return (
+        part is not None
+        and np.isclose(float(part["t"]), t)
+        and part["w1"].shape == np.shape(w1)
+        and np.allclose(part["w1"], w1, rtol=1e-12, atol=0.0)
+        and int(part["nside"]) == cfg["nside"]
+        and int(part["lmax"]) == cfg["lmax"]
+        and int(part["n_sims"]) == cfg["n_sims"]
+        and int(part["eval_index"]) == cfg["eval_index"]
+        and int(part["n_outer"]) == cfg["n_outer"]
+        and np.isclose(float(part["sigma_prior_r"]), cfg["sigma_prior_r"])
+        and str(part["fg_model"]) == str(cfg["fg_model"])
+        and np.isclose(float(part["budget"]), cfg["budget"])
+    )
+
+
+def _pieces_key(cfg):
+    return (
         cfg["nside"],
         cfg["lmax"],
         cfg["budget"],
@@ -349,6 +409,10 @@ def _worker_pieces(cfg):
         cfg["fg_model"],
         cfg["fft_mode"],
     )
+
+
+def _worker_pieces(cfg):
+    key = _pieces_key(cfg)
     w = _WORKER.get(key)
     if w is None:
         sht.set_sht_backend(cfg["backend"])
@@ -368,6 +432,11 @@ def _ctx_for(cfg, w, idx):
     sky_cache = None
     if cfg["sky_cache_dir"]:
         sky_cache = load_sky_cache(os.path.join(cfg["sky_cache_dir"], f"sky_{idx}.npz"))
+        if sky_cache.nside != cfg["nside"] or sky_cache.lmax != cfg["lmax"]:
+            raise ValueError(
+                f"sky cache sky_{idx} nside/lmax {sky_cache.nside}/{sky_cache.lmax} != "
+                f"cfg {cfg['nside']}/{cfg['lmax']}"
+            )
     return _build_mc_ctx(
         w["static"],
         w["spec"],
@@ -381,15 +450,19 @@ def _ctx_for(cfg, w, idx):
 
 
 def _grad_worker(payload):
-    """CRN-averaged Gaussian-EIG (i, value, grad, spread) for one design -- for parallel_map."""
+    """One design's CRN-averaged Gaussian-EIG gradient -> grad_<i>.npz (skipped if cached)."""
     i, z_row, cfg = payload
+    path = _part_path(cfg["parts_dir"], "grad", i)
+    if _grad_part_valid(_load_part(path), z_row, cfg):
+        print(f"    [pid {os.getpid()}] grad design {i}: cached", flush=True)
+        return i
     w = _worker_pieces(cfg)
-    z_row = jnp.asarray(z_row)
+    z_arr = jnp.asarray(z_row)
     vs, gs = [], []
     for j in range(cfg["n_crn"]):
         idx = i * cfg["n_crn"] + j  # matches collect_gradients' crn_seed0=0 scheme
         t0 = time.time()
-        v, g = w["vg_fn"](z_row, _ctx_for(cfg, w, idx))
+        v, g = w["vg_fn"](z_arr, _ctx_for(cfg, w, idx))
         g = np.asarray(g, dtype=float)  # blocks until computed, so the timing is honest
         _N_GRAD_CALLS[0] += 1
         note = " (includes jit compile)" if _N_GRAD_CALLS[0] == 1 else ""
@@ -400,12 +473,29 @@ def _grad_worker(payload):
         vs.append(float(v))
         gs.append(g)
     g_stack = np.stack(gs, axis=0)
-    return i, float(np.mean(vs)), g_stack.mean(axis=0), g_stack.std(axis=0)
+    _write_part(
+        path,
+        z=np.asarray(z_row),
+        value=np.mean(vs),
+        grad=g_stack.mean(axis=0),
+        crn_spread=g_stack.std(axis=0),
+        nside=cfg["nside"],
+        lmax=cfg["lmax"],
+        n_sims=cfg["n_sims"],
+        n_crn=cfg["n_crn"],
+        fg_model=str(cfg["fg_model"]),
+        budget=cfg["budget"],
+    )
+    return i
 
 
 def _scan_worker(payload):
-    """(k, Gaussian-EIG, HL-EIG, cost) at one scan point -- for parallel_map."""
+    """One HL-EIG scan point along direction 1 -> scan_<k>.npz (skipped if cached)."""
     k, t, w1, cfg = payload
+    path = _part_path(cfg["parts_dir"], "scan", k)
+    if _scan_part_valid(_load_part(path), t, w1, cfg):
+        print(f"    [pid {os.getpid()}] scan point {k}: cached", flush=True)
+        return k
     w = _worker_pieces(cfg)
     if "eval" not in w:  # build the held-out ensemble + HL context once per worker
         w["eval"] = _ctx_for(cfg, w, cfg["eval_index"])
@@ -425,7 +515,23 @@ def _scan_worker(payload):
         f"    [pid {os.getpid()}] scan point {k}: {time.time() - t0:.0f}s",
         flush=True,
     )
-    return k, gauss, hl, cost
+    _write_part(
+        path,
+        t=t,
+        w1=np.asarray(w1),
+        gauss_eig=gauss,
+        hl_eig=hl,
+        cost=cost,
+        nside=cfg["nside"],
+        lmax=cfg["lmax"],
+        n_sims=cfg["n_sims"],
+        eval_index=cfg["eval_index"],
+        n_outer=cfg["n_outer"],
+        sigma_prior_r=cfg["sigma_prior_r"],
+        fg_model=str(cfg["fg_model"]),
+        budget=cfg["budget"],
+    )
+    return k
 
 
 def _fanout_cfg(args, fg_model, budget):
@@ -441,6 +547,7 @@ def _fanout_cfg(args, fg_model, budget):
         backend=args.backend,
         fft_mode=args.fft_mode,
         compile_cache=args.compile_cache,
+        parts_dir=args.parts_dir,
         eval_index=args.eval_index,
         sigma_prior_r=args.sigma_prior_r,
         n_outer=args.n_outer,
@@ -520,8 +627,30 @@ def main():
         default=9999,
         help="held-out scan ensemble index (cf. build_sky_cache)",
     )
+    p.add_argument(
+        "--parts-dir",
+        type=str,
+        default=None,
+        help="dir for incremental per-task results (grad_<i>.npz / scan_<k>.npz; default "
+        "<out>_parts). Finished tasks are skipped on restart, so a killed or timed-out "
+        "job resumes where it died, and disjoint --design-range jobs fill one shared dir.",
+    )
+    p.add_argument(
+        "--design-range",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("I0", "I1"),
+        help="compute only designs I0 <= i < I1 this run (splits the gradient stage across "
+        "jobs/nodes; indices refer to the full --n-designs LHS, which is seed-fixed). "
+        "While any design is missing from --parts-dir the run exits 0 after its range, "
+        "before the eigendecomp; the run that completes the set continues to the scan.",
+    )
     p.add_argument("--out", type=str, default="/tmp/active_subspace_hl_eig")
     args = p.parse_args()
+    if args.parts_dir is None:
+        args.parts_dir = args.out + "_parts"
+    os.makedirs(args.parts_dir, exist_ok=True)
 
     fg_model = None if args.fg_model.lower() == "none" else args.fg_model
     sht.set_sht_backend(args.backend)
@@ -559,25 +688,16 @@ def main():
     loss = _make_loss(spec, static, cost_model, budget)
     value_fn, vg_fn = build_design_objectives(loss)
 
-    def make_ctx(idx):
-        cache = None
-        if args.sky_cache_dir is not None:
-            cache = load_sky_cache(os.path.join(args.sky_cache_dir, f"sky_{idx}.npz"))
-            if cache.nside != args.nside or cache.lmax != args.lmax:
-                raise ValueError(
-                    f"sky cache sky_{idx} nside/lmax {cache.nside}/{cache.lmax} != "
-                    f"args {args.nside}/{args.lmax}"
-                )
-        return _build_mc_ctx(
-            static,
-            spec,
-            base_seed=SEED_STRIDE * (idx + 1),
-            n_sims=args.n_sims,
-            nside=args.nside,
-            lmax=args.lmax,
-            fg_model=fg_model,
-            sky_cache=cache,
-        )
+    cfg = _fanout_cfg(args, fg_model, budget)
+    if args.workers <= 1:
+        # Serial mode runs the same worker fns in-process (parallel_map(workers<=1) never
+        # spawns); hand them the already-built pieces so nothing is rebuilt or recompiled.
+        _WORKER[_pieces_key(cfg)] = {
+            "spec": spec,
+            "static": static,
+            "value_fn": value_fn,
+            "vg_fn": vg_fn,
+        }
 
     # --- 1. build the active subspace from the cheap Gaussian-EIG gradient ---
     print(
@@ -585,35 +705,34 @@ def main():
         f"(n_crn={args.n_crn}) ..."
     )
     z = sample_designs(args.n_designs, spec.n_dim, sigma=args.sigma, method="lhs", seed=0)
-    if args.workers > 1:
-        cfg = _fanout_cfg(args, fg_model, budget)
-        res = parallel_map(
-            _grad_worker,
-            [(i, np.asarray(z[i]), cfg) for i in range(args.n_designs)],
-            workers=args.workers,
+    i0, i1 = args.design_range or (0, args.n_designs)
+    parallel_map(
+        _grad_worker,
+        [(i, np.asarray(z[i]), cfg) for i in range(i0, i1)],
+        workers=args.workers,
+    )
+    parts = {
+        i: p
+        for i in range(args.n_designs)
+        if _grad_part_valid(
+            p := _load_part(_part_path(args.parts_dir, "grad", i)), np.asarray(z[i]), cfg
         )
-        res.sort(key=lambda r: r[0])
-        gs = GradientSample(
-            z=z,
-            values=np.array([r[1] for r in res]),
-            grads=np.stack([r[2] for r in res], axis=0),
-            crn_spread=np.stack([r[3] for r in res], axis=0),
+    }
+    if len(parts) < args.n_designs:
+        missing = sorted(set(range(args.n_designs)) - set(parts))
+        print(
+            f"  [{time.time() - t0:.0f}s] gradient stage partial: {len(parts)}/"
+            f"{args.n_designs} parts in {args.parts_dir} (missing e.g. {missing[:8]}). "
+            "Run the remaining --design-range(s), then any rerun continues past the "
+            "eigendecomp."
         )
-    else:
-        n_call = [0]
-
-        def timed_vg(zv, ctx):
-            tc = time.time()
-            out = jax.block_until_ready(vg_fn(zv, ctx))
-            n_call[0] += 1
-            print(
-                f"    [serial] grad eval {n_call[0]}: {time.time() - tc:.0f}s"
-                + (" (includes jit compile)" if n_call[0] == 1 else ""),
-                flush=True,
-            )
-            return out
-
-        gs = collect_gradients(timed_vg, z, make_ctx, n_crn=args.n_crn)
+        return
+    gs = GradientSample(
+        z=z,
+        values=np.array([float(parts[i]["value"]) for i in range(args.n_designs)]),
+        grads=np.stack([parts[i]["grad"] for i in range(args.n_designs)], axis=0),
+        crn_spread=np.stack([parts[i]["crn_spread"] for i in range(args.n_designs)], axis=0),
+    )
     sub = active_subspace(gs.grads)
     boot = bootstrap_eiguncertainty(gs.grads, n_boot=300, n_active=args.n_active)
     print(f"  [{time.time() - t0:.0f}s] energy spectrum: {np.round(sub.energy, 3)}")
@@ -635,36 +754,27 @@ def main():
         f"\nscanning {args.scan_points} points along active direction 1 "
         f"(Gaussian-EIG vs HL-EIG) ..."
     )
-    if args.workers > 1:
-        cfg = _fanout_cfg(args, fg_model, budget)
-        res = parallel_map(
-            _scan_worker,
-            [(k, float(t), np.asarray(w1), cfg) for k, t in enumerate(ts)],
-            workers=args.workers,
+    parallel_map(
+        _scan_worker,
+        [(k, float(t), np.asarray(w1), cfg) for k, t in enumerate(ts)],
+        workers=args.workers,
+    )
+    sparts = {
+        k: p
+        for k, t in enumerate(ts)
+        if _scan_part_valid(
+            p := _load_part(_part_path(args.parts_dir, "scan", k)), float(t), w1, cfg
         )
-        res.sort(key=lambda r: r[0])
-        gauss_eig = [r[1] for r in res]
-        hl_eig = [r[2] for r in res]
-        cost_scan = [r[3] for r in res]
-    else:
-        hl_ctx = _build_hl_ctx(args.lmax, args.sigma_prior_r)
-        eval_ctx = make_ctx(args.eval_index)  # fixed held-out ensemble (never a construction one)
-        gauss_eig, hl_eig, cost_scan = [], [], []
-        for k, t in enumerate(ts):
-            tc = time.time()
-            g, h, c = _scan_point(
-                jnp.asarray(t * w1),
-                spec,
-                static,
-                value_fn,
-                eval_ctx,
-                hl_ctx,
-                args.n_outer,
-            )
-            print(f"    [serial] scan point {k}: {time.time() - tc:.0f}s", flush=True)
-            gauss_eig.append(g)
-            hl_eig.append(h)
-            cost_scan.append(c)
+    }
+    if len(sparts) < args.scan_points:
+        print(
+            f"  [{time.time() - t0:.0f}s] scan stage partial: {len(sparts)}/"
+            f"{args.scan_points} parts in {args.parts_dir}; rerun to continue."
+        )
+        return
+    gauss_eig = [float(sparts[k]["gauss_eig"]) for k in range(args.scan_points)]
+    hl_eig = [float(sparts[k]["hl_eig"]) for k in range(args.scan_points)]
+    cost_scan = [float(sparts[k]["cost"]) for k in range(args.scan_points)]
     print(f"  [{time.time() - t0:.0f}s] done.")
 
     out = {
