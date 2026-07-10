@@ -52,6 +52,28 @@ def test_aic_dimension_counts_super_unity_eigenvalues() -> None:
     assert int(aic_dimension(lam_desc)) == 2
 
 
+def test_aic_dimension_ignores_sub_unity_eigenvalues() -> None:
+    """λ < 1 = nuisance over-modeled in that direction (e.g. a regularization floor
+    against a rank-deficient noiseless total): no foreground content — must not be
+    penalized into the subspace via −ln λ (pre-clamp this saturated m = n and W
+    degenerated to the identity)."""
+    lam_desc = jnp.asarray([50.0, 20.0, 1.0, 1e-8, 1e-12])
+    assert int(aic_dimension(lam_desc)) == 2
+
+
+def test_estimator_rank_deficient_total_does_not_saturate() -> None:
+    """k FG modes + rank-1 nuisance + floor, total rank < n: m stays k, W != I."""
+    rng = np.random.default_rng(5)
+    n, k = 4, 2
+    ones = np.ones((n, 1))
+    cov_n = 10.0 * (ones @ ones.T) + 1e-5 * np.eye(n)  # rank-1 CMB + tiny floor
+    fdirs = rng.normal(size=(n, k))
+    cov_t = 10.0 * (ones @ ones.T) + fdirs @ np.diag([200.0, 80.0]) @ fdirs.T  # rank 3 of 4
+    w, m = gnilc_fg_estimator(jnp.asarray(cov_t), jnp.asarray(cov_n), m_bias=0)
+    assert int(m) == k
+    assert not np.allclose(np.asarray(w), np.eye(n), atol=1e-3)
+
+
 def test_matsqrt_pair_roundtrip() -> None:
     rng = np.random.default_rng(7)
     a = rng.normal(size=(4, 4))

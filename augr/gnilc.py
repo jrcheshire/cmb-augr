@@ -144,8 +144,15 @@ def _aic_m(lam_desc: jax.Array) -> jax.Array:
     frozen downstream by ``stop_gradient`` on the selector mask anyway. ``lam_desc`` is the
     descending eigenvalues, shape ``(..., n)``; returns the integer ``m``, shape ``(...,)``
     (a leading batch is supported for per-pixel localization).
+
+    Eigenvalues are clamped at 1 before the penalty: the Eq 3.5 model is
+    ``R = R_n + R_fg`` (PSD excess), so ``λ ≥ 1`` by construction and ``λ < 1`` can only
+    mean the nuisance covariance over-models that direction (e.g. a regularization floor
+    against a rank-deficient noiseless total) — such directions carry no foreground and
+    must be AIC-neutral, not penalized into the subspace via the diverging ``−ln λ``
+    (which otherwise saturates ``m = n`` and degrades ``W`` to the identity).
     """
-    lam = jnp.maximum(lam_desc, 1e-12)
+    lam = jnp.maximum(lam_desc, 1.0)
     n = lam.shape[-1]
     g = lam - jnp.log(lam) - 1.0  # (..., n)
     suffix = jnp.flip(jnp.cumsum(jnp.flip(g, axis=-1), axis=-1), axis=-1)  # Σ_{k≥m}, m=0..n-1
