@@ -51,6 +51,14 @@ oracle (true FG through the NILC weights) to O(1) across ℓ. This matches Caron
 documented ``m_bias=[0,1,1,1]`` (+1 mode at the FG-relevant needlet scales), so the
 user-facing defaults here are **``m_bias=1``**.
 
+Geometry-agnostic core
+----------------------
+Steps 2–4 consume only channel-space covariance matrices — no maps, needlets, or SHTs —
+so the core is public: :func:`gnilc_fg_estimator` (``(cov_total, cov_nuis) → (W, m)``),
+:func:`aic_dimension`, :func:`matsqrt_pair`. Pipelines on other geometries (e.g. flat-sky
+patches) supply their own per-domain covariances and handle everything downstream of
+``W`` themselves; only the full-sky wrappers below need the ``[compsep]`` extra.
+
 Scope: **global** per-needlet-band weights by default (with ``m_bias=1`` the template is
 faithful without per-pixel domains); opt-in **per-pixel localization** via
 ``localization_fwhm_arcmin`` lets the AIC dimension and weights adapt to the local sky —
@@ -83,6 +91,16 @@ from .nilc import (
     needlet_beta,
 )
 from .sht import _ell_of_alm, _m_zero_mask, check_band_limit
+
+__all__ = [
+    "GNILCResult",
+    "aic_dimension",
+    "alm2cl",
+    "build_gnilc",
+    "gnilc_fg_estimator",
+    "gnilc_residual_template",
+    "matsqrt_pair",
+]
 
 # ---------------------------------------------------------------------------
 # small numerical helpers
@@ -169,6 +187,13 @@ def _gnilc_fg_estimator(
     proj = (u_desc * p[..., None, :]) @ u_desc.swapaxes(-1, -2)  # Σ_{k<m} u_k u_kᵀ
     w = cn_half @ proj @ cn_ihalf
     return w, m
+
+
+# Public names for the geometry-agnostic core (see module docstring): consumes only
+# channel-space covariances, so it is reusable outside the full-sky wrappers below.
+gnilc_fg_estimator = _gnilc_fg_estimator
+aic_dimension = _aic_m
+matsqrt_pair = _matsqrt_pair
 
 
 def _localized_cov(beta_active, localization_fwhm_arcmin, *, lmax, nside, n_iter):
