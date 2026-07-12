@@ -55,7 +55,12 @@ import numpy as np
 
 from . import masking as mk
 from .cleaning import Cleaner
-from .compsep_sims import HarmonicSky, assemble_band_maps, beam_harmonic_sky, harmonic_sky
+from .compsep_sims import (
+    HarmonicSky,
+    assemble_band_maps,
+    beam_harmonic_sky,
+    harmonic_sky,
+)
 from .covariance import mc_bandpower_covariance
 from .instrument import beam_bl
 from .parallel import parallel_map
@@ -464,9 +469,15 @@ class CutskyMCContext(eqx.Module):
     not supplied to :func:`mc_cutsky_cov_traced`).
     """
 
-    harmonic_skies: HarmonicSky  # batched HarmonicSky (unbeamed; leaves carry a sim axis)
-    noise_keys: jax.Array  # (n_sims, 2) stacked PRNGKeys (CRN; fixed across the gradient)
-    beam_fwhm_arcmin: tuple = eqx.field(static=True)  # concrete reference per-band beams
+    harmonic_skies: (
+        HarmonicSky  # batched HarmonicSky (unbeamed; leaves carry a sim axis)
+    )
+    noise_keys: (
+        jax.Array
+    )  # (n_sims, 2) stacked PRNGKeys (CRN; fixed across the gradient)
+    beam_fwhm_arcmin: tuple = eqx.field(
+        static=True
+    )  # concrete reference per-band beams
     # concrete reference shape exponents (None = Gaussian)
     beam_shape_p: tuple | None = eqx.field(static=True)
     inv_noise: jax.Array
@@ -526,6 +537,8 @@ def make_cutsky_mc_context(
     r_in: float = 0.0,
     hit_map: jax.Array | None = None,
     var_pix_ref: float | None = None,
+    harmonic_skies: HarmonicSky | None = None,
+    noise_keys: jax.Array | None = None,
     knee_ell: jax.Array | None = None,
     alpha_knee: float = 1.0,
     max_iter: int = 200,
@@ -548,11 +561,22 @@ def make_cutsky_mc_context(
     Parameters mirror :func:`mc_cutsky_bandpowers`; ``w_inv`` here is the *fiducial*
     per-band noise power used to set ``var_pix_ref`` (the traced forward varies
     ``w_inv`` around it). ``var_pix_ref`` may be supplied to skip the setup clean.
+
+    ``harmonic_skies`` / ``noise_keys`` (optional): a precomputed sky ensemble, e.g.
+    from :func:`load_sky_cache` on a pysm3-less env (the aarch64 GPU). When supplied,
+    the PySM foreground generation is skipped entirely (``noise_keys`` and
+    ``var_pix_ref`` must accompany it; ``n_sims`` is taken from the cached ensemble).
+    The remaining pieces (inv_noise, priors, binning) are rebuilt locally -- they need
+    no pysm3. Generate the cache once with :func:`save_sky_cache` on a pysm3-capable
+    machine; this decouples the slow FG sim from the GPU forward and pins the FG
+    realizations.
     """
     spectra = CMBSpectra() if spectra is None else spectra
     freqs_ghz = tuple(float(f) for f in freqs_ghz)
     beam_fwhm_arcmin = tuple(float(b) for b in beam_fwhm_arcmin)
-    beam_shape_p = None if beam_shape_p is None else tuple(float(p) for p in beam_shape_p)
+    beam_shape_p = (
+        None if beam_shape_p is None else tuple(float(p) for p in beam_shape_p)
+    )
     npix = 12 * int(nside) ** 2
     hit_map = jnp.ones(npix) if hit_map is None else jnp.asarray(hit_map)
     common_fwhm = float(min(beam_fwhm_arcmin))
@@ -572,19 +596,41 @@ def make_cutsky_mc_context(
             bandpasses=bandpasses,
         )
 
-    seeds = list(range(int(base_seed), int(base_seed) + int(n_sims)))
-    # Stack the per-sim ensemble into ONE batched (unbeamed) HarmonicSky (the alm
-    # leaves get a leading sim axis; the static fields are shared) + stacked keys, so
-    # the traced forward can lax.map over the sim axis instead of Python-unrolling the
-    # cleaner n_sims times (O(1) compile, scan-accumulated memory -> higher n_sims).
-    _hsky_tuple = tuple(_hsky(s) for s in seeds)
-    harmonic_skies = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *_hsky_tuple)
-    noise_keys = jnp.stack([jax.random.PRNGKey(int(s)) for s in seeds], axis=0)
+    if harmonic_skies is None:
+        seeds = list(range(int(base_seed), int(base_seed) + int(n_sims)))
+        # Stack the per-sim ensemble into ONE batched (unbeamed) HarmonicSky (the alm
+        # leaves get a leading sim axis; the static fields are shared) + stacked keys, so
+        # the traced forward can lax.map over the sim axis instead of Python-unrolling the
+        # cleaner n_sims times (O(1) compile, scan-accumulated memory -> higher n_sims).
+        _hsky_tuple = tuple(_hsky(s) for s in seeds)
+        harmonic_skies = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *_hsky_tuple)
+        noise_keys = jnp.stack([jax.random.PRNGKey(int(s)) for s in seeds], axis=0)
+    else:
+        # Precomputed FG sky ensemble -- e.g. loaded from a sky cache (save_sky_cache /
+        # load_sky_cache) on a pysm3-less env (the aarch64 GPU). No PySM is touched here.
+        # noise_keys + var_pix_ref must accompany it (the setup clean below would otherwise
+        # need a freshly generated sky); n_sims is taken from the cached ensemble.
+        if noise_keys is None:
+            raise ValueError(
+                "noise_keys must be supplied when harmonic_skies is precomputed."
+            )
+        if var_pix_ref is None:
+            raise ValueError(
+                "var_pix_ref must be supplied when harmonic_skies is precomputed "
+                "(the setup clean needs a generated sky otherwise)."
+            )
+        n_sims = int(harmonic_skies.cmb_b_alm.shape[0])
+        if int(noise_keys.shape[0]) != n_sims:
+            raise ValueError(
+                f"noise_keys has {int(noise_keys.shape[0])} sims but harmonic_skies has {n_sims}."
+            )
 
     # var_pix_ref: frozen filter knob from one setup clean at the fiducial w_inv +
     # reference beams (matches mc_cutsky_bandpowers; uses the base_seed + n_sims sim).
     if var_pix_ref is None:
-        sky0 = beam_harmonic_sky(_hsky(base_seed + n_sims), beam_fwhm_arcmin, beam_shape_p)
+        sky0 = beam_harmonic_sky(
+            _hsky(base_seed + n_sims), beam_fwhm_arcmin, beam_shape_p
+        )
         total0 = assemble_band_maps(
             sky0,
             jnp.asarray(w_inv),
@@ -622,6 +668,98 @@ def make_cutsky_mc_context(
         n_sims=int(n_sims),
         var_pix_ref=float(var_pix_ref),
         f_sky=mk.f_sky_of(mask),
+    )
+
+
+@dataclass(frozen=True)
+class SkyCache:
+    """A serialized foreground-sky ensemble for a pysm3-less env (the aarch64 GPU).
+
+    Holds the PySM-dependent pieces of a :class:`CutskyMCContext` -- the per-sim
+    ``HarmonicSky`` ensemble (CMB + foreground alm), the noise CRN keys, and the
+    filter-normalization ``var_pix_ref`` -- plus the config metadata used to validate
+    that the GPU-side build matches the generation. Produced by :func:`save_sky_cache`
+    on a pysm3-capable machine; consumed via ``make_cutsky_mc_context(
+    harmonic_skies=cache.harmonic_skies, noise_keys=cache.noise_keys,
+    var_pix_ref=cache.var_pix_ref, ...)``.
+    """
+
+    harmonic_skies: HarmonicSky
+    noise_keys: jax.Array
+    var_pix_ref: float
+    freqs_ghz: tuple[float, ...]
+    beam_fwhm_arcmin: tuple[float, ...]
+    nside: int
+    lmax: int
+    n_sims: int
+    f_sky: float
+    fg_model: str
+    base_seed: int
+
+
+def save_sky_cache(path, ctx: CutskyMCContext, *, fg_model, base_seed: int = 0) -> None:
+    """Serialize the PySM-dependent sky ensemble of a built ``ctx`` to ``path`` (.npz).
+
+    The only pysm3-requiring pieces of :func:`make_cutsky_mc_context` are the foreground
+    ``HarmonicSky`` ensemble and the setup-clean ``var_pix_ref``. Build the context once
+    on a pysm3-capable machine, save it here, scp the file, then rebuild on a pysm3-less
+    env via :func:`load_sky_cache` + ``make_cutsky_mc_context(harmonic_skies=...,
+    noise_keys=..., var_pix_ref=...)``. ``fg_model`` / ``base_seed`` are recorded as
+    metadata (not otherwise recoverable from ``ctx``). The full per-sim ensemble is
+    stored (so stochastic small-scale models like d10/d12 are captured, not just one
+    deterministic d1s1 template).
+    """
+    hs = ctx.harmonic_skies
+    blob = dict(
+        cmb_b_alm=np.asarray(hs.cmb_b_alm),
+        noise_keys=np.asarray(ctx.noise_keys),
+        var_pix_ref=np.asarray(float(ctx.var_pix_ref)),
+        freqs_ghz=np.asarray(hs.freqs_ghz, dtype=float),
+        beam_fwhm_arcmin=np.asarray(ctx.beam_fwhm_arcmin, dtype=float),
+        nside=np.asarray(int(ctx.nside)),
+        lmax=np.asarray(int(ctx.lmax)),
+        r_in=np.asarray(float(hs.r_in)),
+        n_sims=np.asarray(int(ctx.n_sims)),
+        f_sky=np.asarray(float(ctx.f_sky)),
+        base_seed=np.asarray(int(base_seed)),
+        fg_model=np.asarray(str(fg_model)),
+        has_fg=np.asarray(hs.fg_eb_alm is not None),
+        has_cmb_e=np.asarray(hs.cmb_e_alm is not None),
+    )
+    if hs.fg_eb_alm is not None:
+        blob["fg_eb_alm"] = np.asarray(hs.fg_eb_alm)
+    if hs.cmb_e_alm is not None:
+        blob["cmb_e_alm"] = np.asarray(hs.cmb_e_alm)
+    np.savez(path, **blob)
+
+
+def load_sky_cache(path) -> SkyCache:
+    """Load a :class:`SkyCache` written by :func:`save_sky_cache` (no pysm3 required)."""
+    z = np.load(path, allow_pickle=False)
+    fg = jnp.asarray(z["fg_eb_alm"]) if bool(z["has_fg"]) else None
+    cmb_e = jnp.asarray(z["cmb_e_alm"]) if bool(z["has_cmb_e"]) else None
+    freqs = tuple(float(f) for f in z["freqs_ghz"])
+    hs = HarmonicSky(
+        freqs_ghz=freqs,
+        nside=int(z["nside"]),
+        lmax=int(z["lmax"]),
+        r_in=float(z["r_in"]),
+        cmb_b_alm=jnp.asarray(z["cmb_b_alm"]),
+        fg_eb_alm=fg,
+        cmb_e_alm=cmb_e,
+    )
+    return SkyCache(
+        harmonic_skies=hs,
+        noise_keys=jnp.asarray(z["noise_keys"]),
+        var_pix_ref=float(z["var_pix_ref"]),
+        freqs_ghz=freqs,
+        beam_fwhm_arcmin=tuple(float(b) for b in z["beam_fwhm_arcmin"]),
+        nside=int(z["nside"]),
+        lmax=int(z["lmax"]),
+        n_sims=int(z["n_sims"]),
+        f_sky=float(z["f_sky"]),
+        fg_model=str(z["fg_model"]),
+        base_seed=int(z["base_seed"]),
     )
 
 
@@ -693,7 +831,11 @@ def mc_cutsky_cov_traced(
         )
         result = cleaner(total, bf, bp, lmax=ctx.lmax, nside=ctx.nside)
         rec_full = cutsky_bb_bandpower(
-            result.cleaned_qu(), ctx.inv_noise, ctx.cl_ee_prior, ctx.cl_bb_prior, **bp_kw
+            result.cleaned_qu(),
+            ctx.inv_noise,
+            ctx.cl_ee_prior,
+            ctx.cl_bb_prior,
+            **bp_kw,
         )
         rec_b = cutsky_bb_bandpower(
             _cleaned_b_qu(result, band_sky.cmb_qu),

@@ -44,7 +44,7 @@ camb = ["camb"]
 broom = ["cmbroom", "pyyaml"]
 compsep = ["ducc0", "pysm3"]
 sampling = ["blackjax", "optax"]
-masking = ["jaxht>=0.1.4"]
+masking = ["jaxht>=0.2.0"]
 notebooks = ["jupyterlab", "ipykernel", "matplotlib"]
 
 [tool.setuptools.packages.find]
@@ -104,18 +104,17 @@ jaxlib = ">=0.4"
 equinox = ">=0.11"
 blackjax = "*"
 optax = "*"
-jaxht = ">=0.1.4"
+jaxht = ">=0.2.0"
 pywigxjpf = "*"
 cmbroom = "*"
 pyyaml = "*"
 cmb-augr = { path = ".", editable = true }
 
 # GPU environment for ARM CUDA clusters (TACC Vista `gh` / GH200, H200). A minimal
-# feature -- NOT the full default env -- so the niche compiled conda/sdist deps
-# (camb, namaster, ducc0, pysm3, cmbroom, pywigxjpf) that lack reliable linux-aarch64
-# binaries stay OFF aarch64. jax comes from PyPI here too, so GPU is just the
-# `cuda12` extra (aarch64 wheels exist); the jht SHT backend runs the transforms on
-# the H200, and the map-based CMB-only forecasts need no ducc0/pysm3. Use it with
+# feature -- NOT the full default env -- because the GPU path uses the jht JAX-native SHT
+# and the map-based CMB-only forecasts need no ducc0/pysm3. (The genuinely aarch64-hard
+# deps -- camb, namaster, cmbroom, pywigxjpf -- stay off all aarch64 features.) jax comes
+# from PyPI so GPU is just the `cuda12` extra (aarch64 wheels exist). Use it with
 # `pixi run -e gpu python scripts/mapbased_grad_characterization.py --mode ladder ...`.
 [tool.pixi.feature.gpu]
 platforms = ["linux-aarch64"]
@@ -132,13 +131,44 @@ healpy = ">=1.16"
 
 [tool.pixi.feature.gpu.pypi-dependencies]
 jax = { version = ">=0.4", extras = ["cuda12"] }
-jaxht = ">=0.1.4"
+jaxht = ">=0.2.0"
 equinox = ">=0.11"
+cmb-augr = { path = ".", editable = true }
+
+# CPU environment for the GPU-less Grace-Grace Vista nodes (aarch64, ~144 cores/node).
+# Unlike `gpu`, this carries ducc0 + pysm3: conda-forge DOES ship linux-aarch64 builds for
+# them (verified -- ducc0 0.41.0 / pysm3 / healpy import on Grace via `pixi exec`), so PySM
+# FG generation runs inline and the needlet-cleaner SHTs go through the opaque ducc
+# custom_call (`--backend ducc`). The masked-Wiener stage stays jht regardless of backend
+# (masking.py calls jht.wiener / jht.bandpower directly), so compiling at nside>=64 relies
+# on jaxht>=0.2.0's looped azimuth-FFT mode (the driver sets it; --fft-mode) -- unrolled
+# per-ring kernels made the graph multi-GB (~42 min compile / 12 GB measured on Grace).
+# The aarch64-hard deps (camb, namaster, cmbroom, pywigxjpf) are not needed by the map-based
+# forecast / active-subspace driver, so they stay off. Use it with
+# `pixi run -e cpu python scripts/active_subspace_hl_eig.py --backend ducc --workers N ...`.
+[tool.pixi.feature.cpu]
+platforms = ["linux-aarch64"]
+
+[tool.pixi.feature.cpu.dependencies]
+python = ">=3.12"
+numpy = ">=1.24"
+scipy = ">=1.10"
+matplotlib = ">=3.7"
+healpy = ">=1.16"
+ducc0 = "*"
+pysm3 = "*"
+
+[tool.pixi.feature.cpu.pypi-dependencies]
+jax = ">=0.4"
+jaxlib = ">=0.4"
+equinox = ">=0.11"
+jaxht = ">=0.2.0"
 cmb-augr = { path = ".", editable = true }
 
 [tool.pixi.environments]
 default = { features = ["host"] }
 gpu = { features = ["gpu"], no-default-feature = true }
+cpu = { features = ["cpu"], no-default-feature = true }
 
 [tool.pixi.tasks]
 test = { cmd = "pytest tests/ -m 'not slow' -n auto --maxprocesses=8 --timeout=180 --timeout-method=thread --max-worker-restart=0 -ra", env = { AUGR_DELENS_WORKERS = "1", AUGR_SHT_NTHREADS = "1", OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1" } }

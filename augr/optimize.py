@@ -45,6 +45,7 @@ from augr.telescope import (
     beam_fwhm_arcmin,
     count_pixels_continuous,
     horn_diameter,
+    photon_noise_net_jax,
 )
 
 # Backward-compat alias: the optimize and FisherForecast paths share the
@@ -78,6 +79,7 @@ class OptimizationContext:
         eta:          Initial total efficiency per channel, shape (n_chan,).
         freqs:        Channel frequencies [GHz], tuple of floats.
     """
+
     signal_model: SignalModel
     J_blocks: jnp.ndarray
     J: jnp.ndarray
@@ -124,8 +126,7 @@ def make_optimization_context(
     fixed_params = fixed_params or []
 
     # Build signal model (defines data vector structure, Jacobian)
-    sig = SignalModel(instrument, foreground_model, cmb_spectra,
-                      **signal_kwargs)
+    sig = SignalModel(instrument, foreground_model, cmb_spectra, **signal_kwargs)
 
     # Parameter bookkeeping
     all_names = sig.parameter_names
@@ -138,7 +139,7 @@ def make_optimization_context(
     # Pre-compute Jacobian (depends on foreground params + frequencies, not
     # on instrument noise/beam/n_det)
     J_full = sig.jacobian(params)  # (n_data, n_all_params)
-    J = J_full[:, free_idx]        # (n_data, n_free)
+    J = J_full[:, free_idx]  # (n_data, n_free)
 
     n_spec = len(sig.freq_pairs)
     n_bins = sig.n_bins
@@ -226,18 +227,27 @@ def sigma_r_from_channels(
     alpha_arr = jnp.broadcast_to(jnp.asarray(alpha_knee), (n_chan,))
 
     # Compute noise N_ell per channel: (n_chan, n_ells)
-    noise_nls = jnp.stack([
-        noise_nl_continuous(
-            net[i], n_det[i], beam_fwhm[i], eta_total[i],
-            ells, mission_years, f_sky,
-            knee_arr[i], alpha_arr[i],
-        )
-        for i in range(n_chan)
-    ])
+    noise_nls = jnp.stack(
+        [
+            noise_nl_continuous(
+                net[i],
+                n_det[i],
+                beam_fwhm[i],
+                eta_total[i],
+                ells,
+                mission_years,
+                f_sky,
+                knee_arr[i],
+                alpha_arr[i],
+            )
+            for i in range(n_chan)
+        ]
+    )
 
     # Covariance blocks: (n_bins, n_spec, n_spec)
     cov_blocks = bandpower_covariance_blocks_from_noise(
-        ctx.signal_model, noise_nls, f_sky, ctx.fiducial_params)
+        ctx.signal_model, noise_nls, f_sky, ctx.fiducial_params
+    )
 
     # Fisher matrix: J^T Sigma^{-1} J via the unified primitive.
     F = _fisher_from_blocks(ctx.J_blocks, cov_blocks)
@@ -300,6 +310,70 @@ def sigma_r_from_external_cov(
     return jnp.sqrt(F_inv[ctx.r_idx, ctx.r_idx])
 
 
+def design_to_channels(
+    aperture_m,
+    f_number,
+    fp_diameter_m,
+    area_fractions,
+    freqs_per_group: tuple[tuple[float, ...], ...],
+    *,
+    net_override=None,
+    illumination_factor: float = 1.22,
+    packing_efficiency: float = 0.80,
+):
+    """Differentiable telescope design -> per-channel ``(n_det, net, beam)``.
+
+    The focal-plane packing physics shared by the analytic (:func:`sigma_r_from_design`)
+    and map-based (:func:`augr.eig.physical_design_objective`) forecasts:
+
+    - horn diameter set by the lowest band in each pixel group (Griffin 2002,
+      ``d = 2 F lambda``);
+    - hex cell area + continuous pixel count over the group's allocated focal-plane area
+      ``area_fractions[g] * pi (fp_diameter / 2)^2``;
+    - dichroic groups share a horn, so ``n_det = 2 * n_pixels`` (dual-pol) at *each* band
+      in the group;
+    - NET per channel from photon noise (:func:`augr.telescope.photon_noise_net_jax`)
+      unless ``net_override`` is supplied;
+    - beam per channel from the single physical aperture (:func:`beam_fwhm_arcmin`).
+
+    Args:
+        aperture_m:      Primary mirror diameter [m].
+        f_number:        Focal ratio f/D.
+        fp_diameter_m:   Usable focal plane diameter [m] (sets the fixed total area).
+        area_fractions:  Focal-plane area allocation per group, shape ``(n_groups,)``.
+        freqs_per_group: Per-group frequency tuples (1 or 2 bands each), e.g.
+                         ``((20.,), (35.,), (80., 115.), ...)``.
+        net_override:    If given, per-channel NETs to use instead of photon noise,
+                         shape ``(n_chan,)`` in flattened-group order.
+        illumination_factor: FWHM = factor x lambda/D (1.22 for Airy).
+        packing_efficiency:  Fraction of ideal hex packing achieved.
+
+    Returns:
+        ``(n_det, net, beam)``, each ``(n_chan,)`` in flattened ``freqs_per_group`` order.
+        Differentiable in ``aperture_m``, ``f_number``, ``area_fractions`` (and
+        ``net_override`` if given).
+    """
+    a_fp = jnp.pi * (fp_diameter_m / 2.0) ** 2
+    n_det_list, beam_list, net_list = [], [], []
+    chan_idx = 0
+    for g, freqs in enumerate(freqs_per_group):
+        nu_low = min(freqs)  # static (Python float)
+        d_horn = horn_diameter(nu_low, f_number)
+        a_cell = (jnp.sqrt(3.0) / 2.0) * d_horn**2  # hex_cell_area, JAX
+        a_alloc = area_fractions[g] * a_fp
+        n_pixels = count_pixels_continuous(a_alloc, a_cell, packing_efficiency)
+        n_det_group = 2.0 * n_pixels  # dual-pol; dichroic bands share the horn
+        for nu in freqs:
+            n_det_list.append(n_det_group)
+            beam_list.append(beam_fwhm_arcmin(nu, aperture_m, illumination_factor))
+            if net_override is not None:
+                net_list.append(net_override[chan_idx])
+            else:
+                net_list.append(photon_noise_net_jax(nu))
+            chan_idx += 1
+    return jnp.stack(n_det_list), jnp.stack(net_list), jnp.stack(beam_list)
+
+
 def sigma_r_from_design(
     aperture_m: jnp.ndarray,
     f_number: jnp.ndarray,
@@ -348,39 +422,29 @@ def sigma_r_from_design(
         ``fisher._fisher_from_blocks`` -- the same primitive as
         ``FisherForecast.sigma``. The two paths agree to fp64 precision.
     """
-    a_fp = jnp.pi * (fp_diameter_m / 2.0) ** 2
+    n_det_arr, net_arr, beam_arr = design_to_channels(
+        aperture_m,
+        f_number,
+        fp_diameter_m,
+        area_fractions,
+        freqs_per_group,
+        net_override=net_override,
+        illumination_factor=illumination_factor,
+        packing_efficiency=packing_efficiency,
+    )
 
-    # Derive per-channel params from design
-    n_det_list = []
-    beam_list = []
-    net_list = []
-
-    chan_idx = 0
-    for g, freqs in enumerate(freqs_per_group):
-        nu_low = min(freqs)  # static (Python float)
-        d_horn = horn_diameter(nu_low, f_number)
-        a_cell = (jnp.sqrt(3.0) / 2.0) * d_horn ** 2  # hex_cell_area, JAX
-        a_alloc = area_fractions[g] * a_fp
-        n_pixels = count_pixels_continuous(a_alloc, a_cell, packing_efficiency)
-        n_det_group = 2.0 * n_pixels
-
-        for nu in freqs:
-            beam = beam_fwhm_arcmin(nu, aperture_m, illumination_factor)
-            n_det_list.append(n_det_group)
-            beam_list.append(beam)
-            if net_override is not None:
-                net_list.append(net_override[chan_idx])
-            else:
-                from augr.telescope import photon_noise_net_jax
-                net_list.append(photon_noise_net_jax(nu))
-            chan_idx += 1
-
-    n_det_arr = jnp.stack(n_det_list)
-    beam_arr = jnp.stack(beam_list)
-    net_arr = jnp.stack(net_list)
-
-    eta_arr = jnp.full(n_det_arr.shape, eta_total) if jnp.ndim(eta_total) == 0 else eta_total
+    eta_arr = (
+        jnp.full(n_det_arr.shape, eta_total) if jnp.ndim(eta_total) == 0 else eta_total
+    )
 
     return sigma_r_from_channels(
-        n_det_arr, net_arr, beam_arr, eta_arr,
-        ctx, mission_years, f_sky, knee_ell, alpha_knee)
+        n_det_arr,
+        net_arr,
+        beam_arr,
+        eta_arr,
+        ctx,
+        mission_years,
+        f_sky,
+        knee_ell,
+        alpha_knee,
+    )
