@@ -6,10 +6,12 @@ import pytest
 
 from augr.foregrounds import (
     ELL_REF,
+    CompositeForegroundModel,
     ForegroundModel,
     GaussianForegroundModel,
     MomentExpansionModel,
     NullForegroundModel,
+    ResidualTemplateForegroundModel,
     _dust_moment_factor,
     _sync_moment_factor,
 )
@@ -469,3 +471,118 @@ def test_null_model_returns_zero_cl():
         cl = model.cl_bb(nu_i, nu_j, ells, empty_params)
         assert cl.shape == ells.shape
         assert jnp.all(cl == 0.0)
+
+
+# -----------------------------------------------------------------------
+# ResidualTemplateForegroundModel
+# -----------------------------------------------------------------------
+
+_RES_AMP = 1e-4
+
+
+@pytest.fixture
+def residual_model():
+    ells = np.arange(2, 400, dtype=float)
+    cl = np.full_like(ells, _RES_AMP)
+    return ResidualTemplateForegroundModel(cl, ells)
+
+
+def test_residual_model_satisfies_protocol(residual_model):
+    assert isinstance(residual_model, ForegroundModel)
+
+
+def test_residual_model_parameter_names(residual_model):
+    assert residual_model.parameter_names == ["A_res"]
+
+
+def test_residual_model_auto_spectrum_scales_with_a_res(residual_model):
+    """On an auto-spectrum (nu_i == nu_j) cl_bb = A_res * T_res."""
+    ells = jnp.arange(20, 200, dtype=jnp.float64)
+    cl = residual_model.cl_bb(150.0, 150.0, ells, jnp.array([2.0]))
+    assert jnp.allclose(cl, 2.0 * _RES_AMP)
+
+
+def test_residual_model_cross_spectrum_is_zero(residual_model):
+    """On a cross-spectrum (nu_i != nu_j) cl_bb is identically zero."""
+    ells = jnp.arange(20, 200, dtype=jnp.float64)
+    cl = residual_model.cl_bb(90.0, 150.0, ells, jnp.array([1.0]))
+    assert cl.shape == ells.shape
+    assert jnp.all(cl == 0.0)
+
+
+def test_residual_model_extrapolates_nearest_neighbour():
+    """Below the template's ell range, extrapolate to fp[0] (not zero).
+
+    BROOM bandpowers start at the first bin center (~ell=4 for delta_ell=5);
+    zero-extrapolation at the reionization bump would silently null the
+    A_res constraint where sigma(r) is most sensitive for a space mission.
+    """
+    ells_in = np.arange(50, 200, dtype=float)
+    amp = 7e-4
+    model = ResidualTemplateForegroundModel(np.full_like(ells_in, amp), ells_in)
+    low = jnp.arange(2, 50, dtype=jnp.float64)
+    cl = model.cl_bb(150.0, 150.0, low, jnp.array([1.0]))
+    assert jnp.allclose(cl, amp), "should extrapolate flat, not to zero"
+
+
+def test_residual_model_requires_matching_lengths():
+    with pytest.raises(ValueError, match="shape"):
+        ResidualTemplateForegroundModel(np.ones(10), np.arange(20))
+
+
+def test_residual_model_rejects_too_short():
+    with pytest.raises(ValueError, match="length"):
+        ResidualTemplateForegroundModel(np.array([]), np.array([]))
+
+
+def test_residual_model_rejects_non_1d():
+    with pytest.raises(ValueError, match="1-D"):
+        ResidualTemplateForegroundModel(np.ones((3, 3)), np.ones((3, 3)))
+
+
+# -----------------------------------------------------------------------
+# CompositeForegroundModel
+# -----------------------------------------------------------------------
+
+def test_composite_satisfies_protocol(residual_model):
+    comp = CompositeForegroundModel([GaussianForegroundModel(), residual_model])
+    assert isinstance(comp, ForegroundModel)
+
+
+def test_composite_concatenates_parameter_names(residual_model):
+    """Parameter order is the concatenation of the components', in order."""
+    gauss = GaussianForegroundModel()
+    comp = CompositeForegroundModel([gauss, residual_model])
+    assert comp.parameter_names == [*gauss.parameter_names, "A_res"]
+
+
+def test_composite_sums_component_spectra(residual_model):
+    """cl_bb is the sum of the components on a shared parameter vector."""
+    gauss = GaussianForegroundModel()
+    comp = CompositeForegroundModel([gauss, residual_model])
+    ells = jnp.arange(20, 200, dtype=jnp.float64)
+    gp = jnp.asarray(np.array([4.7, 1.6, -0.58, 19.6, 1.5, -3.1, -0.6, 0.0, 0.0]))
+    a_res = jnp.array([3.0])
+    full = jnp.concatenate([gp, a_res])
+    got = comp.cl_bb(150.0, 150.0, ells, full)
+    want = (gauss.cl_bb(150.0, 150.0, ells, gp)
+            + residual_model.cl_bb(150.0, 150.0, ells, a_res))
+    assert jnp.allclose(got, want)
+
+
+def test_composite_with_null_reduces_to_single(residual_model):
+    """Null + Residual == Residual alone (Null contributes nothing)."""
+    comp = CompositeForegroundModel([NullForegroundModel(), residual_model])
+    assert comp.parameter_names == ["A_res"]
+    ells = jnp.arange(20, 200, dtype=jnp.float64)
+    p = jnp.array([1.7])
+    assert jnp.allclose(
+        comp.cl_bb(150.0, 150.0, ells, p),
+        residual_model.cl_bb(150.0, 150.0, ells, p),
+    )
+
+
+def test_composite_rejects_duplicate_parameter_names():
+    with pytest.raises(ValueError, match="collide"):
+        CompositeForegroundModel(
+            [GaussianForegroundModel(), GaussianForegroundModel()])

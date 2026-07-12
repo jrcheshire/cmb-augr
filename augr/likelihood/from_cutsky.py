@@ -38,7 +38,7 @@ import numpy as np
 
 from augr.config import cleaned_map_instrument
 from augr.fisher import FisherForecast
-from augr.foregrounds import NullForegroundModel
+from augr.foregrounds import ResidualTemplateForegroundModel
 from augr.likelihood.gaussian import GaussianLikelihood
 from augr.likelihood.hl import HLLikelihood
 from augr.likelihood.mc_calibrated import MCCalibratedLikelihood, bandpower_ks
@@ -83,14 +83,15 @@ def build_cutsky_signal_model(
     inst = cleaned_map_instrument(f_sky=f_sky)
     kw = dict(
         instrument=inst,
-        foreground_model=NullForegroundModel(),
+        foreground_model=ResidualTemplateForegroundModel(
+            jnp.asarray(template_cl),
+            jnp.asarray(template_ells, dtype=float),
+        ),
         cmb_spectra=CMBSpectra(),
         ell_min=ell_min,
         ell_max=ell_max,
         delta_ell=delta_ell,
         ell_per_bin_below=ell_per_bin_below,
-        residual_template_cl=jnp.asarray(template_cl),
-        residual_template_ells=jnp.asarray(template_ells, dtype=float),
     )
     if delensed_bb is not None:
         kw["delensed_bb"] = jnp.asarray(delensed_bb)

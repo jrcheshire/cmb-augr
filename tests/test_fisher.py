@@ -5,7 +5,11 @@ import numpy as np
 import pytest
 
 from augr.fisher import FisherForecast
-from augr.foregrounds import GaussianForegroundModel
+from augr.foregrounds import (
+    CompositeForegroundModel,
+    GaussianForegroundModel,
+    ResidualTemplateForegroundModel,
+)
 from augr.instrument import Channel, Instrument, ScalarEfficiency, noise_nl
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
@@ -330,10 +334,11 @@ def signal_model_with_template(instrument):
     """SignalModel carrying a flat residual template."""
     ells = np.arange(2, 400, dtype=float)
     cl = np.full_like(ells, 1e-4)
+    fg = CompositeForegroundModel(
+        [GaussianForegroundModel(), ResidualTemplateForegroundModel(cl, ells)])
     return SignalModel(
-        instrument, GaussianForegroundModel(), CMBSpectra(),
+        instrument, fg, CMBSpectra(),
         ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
-        residual_template_cl=cl, residual_template_ells=ells,
     )
 
 

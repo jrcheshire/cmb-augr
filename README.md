@@ -91,13 +91,12 @@ augr/
                    feedhorn geometry; supports dichroic pixel groups
   foregrounds.py   GaussianForegroundModel (9 params, BK15-style),
                    MomentExpansionModel (17 params, Chluba+ 2017),
-                   and NullForegroundModel for post-component-separation
-                   forecasts
+                   NullForegroundModel + ResidualTemplateForegroundModel
+                   (A_res) for post-component-separation forecasts, and
+                   CompositeForegroundModel (sum of models)
   spectra.py       CMB BB power spectra from CAMB templates (tensor + lensing)
   signal.py        SignalModel: assembles the binned cross-frequency data
-                   vector and computes the Jacobian via jax.jacfwd; supports
-                   an optional residual-template amplitude (A_res) for the
-                   post-component-separation mode
+                   vector and computes the Jacobian via jax.jacfwd
   covariance.py    Bandpower covariance matrix (Knox formula)
   fisher.py        Fisher information matrix, marginalized and conditional
                    constraints; Cholesky solver with eigendecomposition fallback
@@ -122,12 +121,41 @@ augr/
                    propagation à la Wallis et al. 2017
   crosslinks_southpole.py   South Pole / BICEP-Array companion to crosslinks.py
 
+  --- in-house map-based component separation (see the "Component
+      separation and post-separation forecasts" section) ---
+  pipeline.py      ForecastConfig + run_forecast: sky -> cleaner -> spectra
+                   -> Fisher, the single entry point; SpectrumSource
+                   (FULLSKY_SCALAR / CUTSKY_MC) and ResidualTemplateSource
+                   (ORACLE / GNILC) switches
+  cleaning.py      Cleaner / CleanerResult protocols + nilc_cleaner /
+                   cmilc_cleaner factories (interchangeable at the
+                   ForecastConfig(cleaner=...) slot)
+  nilc.py          Blind needlet ILC (empirical, differentiable)
+  cmilc.py         Constrained moment ILC: deprojects specified
+                   foreground-moment SEDs (not blind)
+  gnilc.py         GNILC foreground-residual estimator and the data-driven
+                   A_res residual template
+  compsep_sims.py  Multi-frequency sky + band-map assembly (beams, hit-map
+                   anisotropic noise, 1/f)
+  noise_sims.py    White and correlated-1/f noise-map draws
+  masking.py       Cut-sky masked-Wiener B-mode estimator (E->B leakage)
+  spectrum_stages.py  Monte-Carlo cut-sky bandpower covariance ensemble
+  nilc_forecast.py Post-NILC spectra (noise / residual FG / CMB) via the
+                   cleaner weights -> external_noise_bb
+  forecast.py      forecast_from_spectra: the post-separation forecast half
+                   (baseline / flat-A_res / Gaussian-A_res + delta_r bias)
+  bandpass.py      Bandpass type + color corrections for the sky and cMILC SEDs
+  sht.py           Pluggable SHT backend (device-aware: jht on GPU, ducc on CPU)
+
 scripts/
   validate_pico.py             Validation against PICO published sigma(r) targets
   validate_carones.py          Validation against Carones 2025 post-CompSep
                                residual-template forecast (LiteBIRD-PTEP)
   validate_bk.py               BK sigma(r) time evolution; analog of
                                Buza 2019 thesis Fig. 7.9
+  cutsky_headline.py           In-house map-based pipeline headline:
+                               scalar-1/f_sky Knox vs cut-sky masked-Wiener
+                               MC sigma(r) via pipeline.run_forecast
   broom_residual_template.py   End-to-end BROOM driver: NILC + GNILC +
                                residual-template MC for an external
                                component-separation forecast
@@ -213,7 +241,11 @@ band_90 = BandSpec(nu_ghz=90.0, extra_loading=atm_at_90)
 
 **Moment expansion (Chluba+ 2017):** Extends the Gaussian model with second-order terms capturing spatial variation of spectral parameters (variance of beta_d, T_d, beta_s, c_s, and their cross-moments). 17 free parameters. Reduces exactly to the Gaussian model when all moment amplitudes are zero.
 
-**Null model:** No-op (zero `cl_bb`) for forecasts on maps that have already been cleaned by an external component-separation pipeline. Pair with `SignalModel(..., residual_template_cl=...)` to fit `r` against a cleaned-map noise spectrum plus a template-amplitude nuisance `A_res`; see the **Post-component-separation forecasts** section below.
+**Null model:** No-op (zero `cl_bb`) for forecasts on maps that have already been cleaned by an external component-separation pipeline — the residual is left unmodelled, so its effect on `r` shows up as a bias `Δr`.
+
+**Residual-template model:** `ResidualTemplateForegroundModel(template_cl, template_ells)` carries the post-component-separation residual foreground as a one-parameter foreground: `C_ℓ^res(ν_i, ν_j) = A_res · T_res(ℓ)` on auto-spectra, zero on cross-spectra. Floating `A_res` marginalizes the residual instead of leaving it as a bias. Comparing this against the **Null model** (residual unmodelled) is exactly the Carones 2025 debias-OFF `Δr` vs `A_res`-marginalized `σ(r)` comparison. This replaces the deprecated `SignalModel(..., residual_template_cl=...)` keyword, which still works (with a `DeprecationWarning`) by building this model internally.
+
+**Composite model:** `CompositeForegroundModel([model_a, model_b, ...])` sums several foreground models over one concatenated parameter vector — e.g. a `ResidualTemplateForegroundModel` on top of a parametric `GaussianForegroundModel`.
 
 Custom models satisfy a structural `Protocol`: any class with `parameter_names` and `cl_bb(nu_i, nu_j, ells, params)` works.
 
@@ -349,19 +381,67 @@ kill_orphan_workers()
 
 For nested-pool callers (outer pool calling into `iterate_delensing` per worker), `process_pool` automatically sets `AUGR_DELENS_WORKERS = max(1, cpu_count // n_workers)` for the children so total CPU use ≈ `cpu_count`. Override with `process_pool(n, delens_workers=K)`.
 
-## Post-component-separation forecasts
+## Component separation and post-separation forecasts
 
-When the foregrounds have been removed by an external component-separation pipeline (e.g. NILC + GNILC via [BROOM](https://github.com/alecarones/broom)), `augr` can consume the cleaned map and residual-template spectra directly, replacing the analytic multifrequency model with measured inputs:
+`augr` has an in-house, differentiable, map-based component-separation pipeline — the home-grown successor to consuming an external cleaning run. It simulates a multi-frequency sky, cleans it, estimates the post-separation B-mode spectra, and runs the Fisher forecast end-to-end. The single entry point is `pipeline.run_forecast(config)`, driven by a `ForecastConfig`; no bespoke Fisher / `SignalModel` wiring.
+
+### Worked example
+
+```python
+from augr.cleaning import nilc_cleaner
+from augr.pipeline import ForecastConfig, run_forecast
+
+cfg = ForecastConfig(
+    freqs_ghz=(30.0, 44.0, 95.0, 150.0, 280.0),
+    beam_fwhm_arcmin=(72.0, 52.0, 28.0, 20.0, 12.0),
+    w_inv=(2.0e-4, 1.2e-4, 5.0e-5, 5.0e-5, 1.5e-4),  # uK^2 sr per band
+    cleaner=nilc_cleaner(),   # blind needlet ILC; swap for cmilc_cleaner(freqs, ...)
+    nside=128, lmax=256,
+    fg_model="d1s1",          # PySM sky string; None = no foregrounds (fast smoke run)
+    f_sky=0.6, seed=0,
+)
+result = run_forecast(cfg)
+print(result.sigma_r_baseline)  # residual left unmodelled -> its effect is result.delta_r
+print(result.sigma_r_gauss)     # A_res marginalized with the Gaussian prior
+```
+
+`run_forecast` returns a `ForecastResult` with `sigma_r_baseline` / `sigma_r_flat` / `sigma_r_gauss` (residual unmodelled / flat `A_res` prior / Gaussian `A_res` prior), the debias-OFF linear bias `delta_r`, and diagnostics. `ForecastConfig.from_instrument(inst, cleaner, nside=..., lmax=...)` builds the same config from an `Instrument` (single source of truth for freqs / beams / white-noise depth / bandpasses).
+
+### Cleaners (the "xILC" family)
+
+All satisfy the `cleaning.Cleaner` protocol and are interchangeable at the `ForecastConfig(cleaner=...)` slot:
+
+- `nilc_cleaner(...)` — blind needlet ILC (`nilc.py`).
+- `cmilc_cleaner(freqs, moments=...)` — constrained moment ILC that deprojects the specified foreground-moment SEDs (`cmilc.py`); not blind, so it takes the band-center `freqs`.
+- GNILC data-driven residual template via `ResidualTemplateSource.GNILC` (`gnilc.gnilc_residual_template`) — what a real pipeline computes for the `A_res` template, versus `ResidualTemplateSource.ORACLE` which projects the true foreground map (a forecasting diagnostic).
+
+Pass `clean_e=True` for the spin-2 Q/U cleaner required by the cut-sky path.
+
+### Realistic instrument effects
+
+- **Anisotropic noise (hit maps):** `ForecastConfig(hit_map=...)` scales per-pixel noise by exposure; build an L2-scan envelope with `hit_maps.l2_hit_map(nside, alpha, beta)`. Uniform when `None`.
+- **1/f noise:** the map assembler (`compsep_sims.assemble_band_maps`, via `noise_sims.correlated_noise_maps`) draws correlated 1/f noise `N_ℓ = w_inv · (1 + (ℓ_knee/ℓ)^α)`.
+- **Bandpasses:** `ForecastConfig.from_instrument` carries per-band `Bandpass` objects so the sky and the cMILC deprojection SEDs are color-corrected from one source; monochromatic (`None`) is byte-identical to the band-center path.
+
+### Cut-sky Monte-Carlo covariance
+
+For a masked analysis where E→B leakage variance matters, set `spectrum_source=SpectrumSource.CUTSKY_MC` with a `mask=` and a spin-2 cleaner (`clean_e=True`). The pipeline runs the cleaner over an MC ensemble (`n_sims_mc`) through the masked-Wiener cut-sky estimator (`masking.py`), so the bandpower covariance — leakage variance included — comes from the sims (`spectrum_stages.mc_cutsky_bandpowers`) instead of the scalar-`1/f_sky` Knox approximation. `scripts/cutsky_headline.py` runs both arms (`FULLSKY_SCALAR` vs `CUTSKY_MC`) and reports the σ(r) ratio.
+
+### Consuming the post-separation spectra directly
+
+The forecast half is also usable on its own — feed it a cleaned-map noise spectrum and a residual template from any pipeline (in-house or external):
 
 - `config.cleaned_map_instrument(f_sky)` — single-channel placeholder Instrument; only `f_sky` enters the Knox mode count.
-- `foregrounds.NullForegroundModel` — drop-in for the multifrequency model; satisfies the same Protocol with empty `parameter_names`.
-- `signal.SignalModel(..., residual_template_cl=..., residual_template_ells=...)` — appends an `A_res` nuisance amplitude with shape from the supplied residual template.
-- `fisher.FisherForecast(..., external_noise_bb=...)` — opt-in flag for routing through a beam-deconvolved noise spectrum from the component-separation pipeline; raises if `cleaned_map_instrument` is used without this kwarg.
+- `foregrounds.NullForegroundModel` — the residual left unmodelled (its bias becomes `delta_r`); `foregrounds.ResidualTemplateForegroundModel(template_cl, template_ells)` — the residual marginalized via `A_res`. Comparing the two is the Carones 2025 debias-OFF vs marginalized result.
+- `fisher.FisherForecast(..., external_noise_bb=...)` — routes through a beam-deconvolved noise spectrum from the component-separation pipeline; raises if `cleaned_map_instrument` is used without it.
+- `forecast.forecast_from_spectra(...)` wraps all of the above (both `A_res` variants + the `delta_r` bias) given the spectra.
 
-Production scripts:
+### External component separation (BROOM consumer)
+
+`augr` can also consume an external NILC + GNILC run from [BROOM](https://github.com/alecarones/broom):
 
 - `scripts/broom_residual_template.py` — BROOM driver: NILC + GNILC + per-sim `anafast` across an MC loop; writes the post-NILC noise spectrum and the Carones 2025 (arXiv:2510.20785) Eq. 3.7 debiased residual template.
-- `scripts/validate_carones.py` — augr consumer: loads the BROOM outputs, runs Fisher variants (no template / flat `A_res` prior / Gaussian `A_res` prior), prints σ(r) plus a 2×2 (r, A_res) Fisher condition-number diagnostic.
+- `scripts/validate_carones.py` — augr consumer: loads the BROOM outputs, runs the Fisher variants, prints σ(r) plus a 2×2 (r, A_res) Fisher condition-number diagnostic.
 
 ## TODO
 

@@ -96,6 +96,151 @@ class NullForegroundModel:
 
 
 # -----------------------------------------------------------------------
+# Residual-template model (post-component-separation use)
+# -----------------------------------------------------------------------
+
+class ResidualTemplateForegroundModel:
+    """Post-component-separation residual foreground as a one-parameter template.
+
+    After a component-separation pipeline (NILC / GNILC / cMILC) removes
+    the foregrounds from the multi-frequency maps, a residual foreground
+    BB power ``T_res(ℓ)`` is left in the single cleaned map. This model
+    carries that residual as a foreground with a single amplitude
+    parameter ``A_res`` scaling a fixed, precomputed template::
+
+        C_ℓ^{res}(ν_i, ν_j) = A_res · T_res(ℓ)   for ν_i == ν_j (auto only)
+                            = 0                    for ν_i != ν_j
+
+    It satisfies the ForegroundModel Protocol, so it drops into
+    ``SignalModel`` / ``FisherForecast`` exactly like
+    :class:`GaussianForegroundModel` — the residual template then flows
+    through the ordinary foreground path in both the data vector and the
+    ``M = S + N`` Knox covariance, with no special-casing. This is the
+    modern replacement for the deprecated
+    ``SignalModel(residual_template_cl=...)`` keyword.
+
+    Compare against :class:`NullForegroundModel` (no residual modelled) to
+    reproduce the Carones 2025 (arXiv:2510.20785) debias-OFF ``Δr`` vs
+    ``A_res``-marginalized ``σ(r)`` result: the ``NullForegroundModel`` run
+    leaves the residual unmodelled (its bias becomes ``Δr``), while this
+    model floats ``A_res`` to marginalize it.
+
+    The template is restricted to auto-spectra (``ν_i == ν_j``) because the
+    post-separation residual lives in the single cleaned map. In the usual
+    single-cleaned-channel workflow there is only one (auto) spectrum, so
+    this restriction is a no-op; it matters only if the model is attached
+    to a multi-channel instrument, where the residual is added to each
+    equal-frequency auto-block and left off genuine cross-frequency blocks.
+
+    Args:
+        template_cl:   Residual BB template ``C_ℓ`` [μK², CMB thermodynamic], 1-D.
+        template_ells: Multipoles for ``template_cl``, same shape, ascending.
+
+    Off the provided ℓ range the template is extended by nearest-neighbour
+    (``jnp.interp``'s default ``fp[0]`` / ``fp[-1]``) rather than zero: the
+    reionization bump (ℓ ≲ 10) typically sits below the first bandpower
+    centre, and zero-extrapolation there would silently null the ``A_res``
+    constraint exactly where ``σ(r)`` is most sensitive for a space mission.
+    """
+
+    _PARAM_NAMES: ClassVar[list[str]] = ["A_res"]
+
+    def __init__(self, template_cl, template_ells):
+        cl = jnp.asarray(template_cl, dtype=jnp.float64)
+        ells = jnp.asarray(template_ells, dtype=jnp.float64)
+        if cl.ndim != 1 or ells.ndim != 1:
+            raise ValueError(
+                "template_cl and template_ells must be 1-D; got shapes "
+                f"{cl.shape} and {ells.shape}.")
+        if cl.shape != ells.shape:
+            raise ValueError(
+                f"template_cl shape {cl.shape} must match template_ells "
+                f"shape {ells.shape}.")
+        if cl.shape[0] < 2:
+            raise ValueError(
+                "template_cl and template_ells must have length >= 2 for "
+                f"interpolation; got length {cl.shape[0]}.")
+        self._template_cl = cl
+        self._template_ells = ells
+
+    @property
+    def parameter_names(self) -> list[str]:
+        return list(self._PARAM_NAMES)
+
+    def cl_bb(self,
+              nu_i: float,
+              nu_j: float,
+              ells: jnp.ndarray,
+              params: jnp.ndarray) -> jnp.ndarray:
+        # nu_i, nu_j are static Python floats (channel frequencies), not
+        # traced, so this is a trace-time branch: the residual enters
+        # auto-spectra (equal-frequency) blocks only.
+        if nu_i != nu_j:
+            return jnp.zeros_like(ells, dtype=jnp.float64)
+        template = jnp.interp(ells, self._template_ells, self._template_cl)
+        return params[0] * template
+
+
+# -----------------------------------------------------------------------
+# Composite model (sum of several foreground models)
+# -----------------------------------------------------------------------
+
+class CompositeForegroundModel:
+    """Sum of several foreground models sharing one flat parameter vector.
+
+    Concatenates the component models' parameters in order and returns the
+    summed BB spectrum. Two uses:
+
+    * Place a :class:`ResidualTemplateForegroundModel` on top of a
+      parametric model (e.g. a residual left after cleaning a sky that
+      still has a parametric foreground component).
+    * Back-compat target for the deprecated
+      ``SignalModel(residual_template_cl=...)`` keyword, which builds
+      ``CompositeForegroundModel([fg_model, ResidualTemplateForegroundModel(...)])``
+      so the appended ``A_res`` keeps its historical trailing position.
+
+    The combined ``parameter_names`` is the concatenation of the
+    components' ``parameter_names`` in the given order; duplicate names
+    across components raise (they would alias the same slot).
+
+    Args:
+        models: Ordered sequence of ForegroundModel-compatible objects.
+    """
+
+    def __init__(self, models):
+        self._models = list(models)
+        names: list[str] = []
+        sizes: list[int] = []
+        for m in self._models:
+            mn = list(m.parameter_names)
+            names.extend(mn)
+            sizes.append(len(mn))
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            raise ValueError(
+                "CompositeForegroundModel component parameter names "
+                f"collide: {dupes}.")
+        self._names = names
+        self._sizes = sizes
+
+    @property
+    def parameter_names(self) -> list[str]:
+        return list(self._names)
+
+    def cl_bb(self,
+              nu_i: float,
+              nu_j: float,
+              ells: jnp.ndarray,
+              params: jnp.ndarray) -> jnp.ndarray:
+        total = jnp.zeros_like(ells, dtype=jnp.float64)
+        start = 0
+        for m, n in zip(self._models, self._sizes, strict=True):
+            total = total + m.cl_bb(nu_i, nu_j, ells, params[start:start + n])
+            start += n
+        return total
+
+
+# -----------------------------------------------------------------------
 # Gaussian parametric model (BK18-style)
 # -----------------------------------------------------------------------
 
