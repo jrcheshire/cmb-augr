@@ -4,7 +4,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from augr.foregrounds import GaussianForegroundModel, NullForegroundModel
+from augr.foregrounds import (
+    CompositeForegroundModel,
+    GaussianForegroundModel,
+    NullForegroundModel,
+    ResidualTemplateForegroundModel,
+)
 from augr.instrument import Channel, Instrument, ScalarEfficiency
 from augr.signal import (
     SignalModel,
@@ -328,13 +333,18 @@ def residual_template():
 @pytest.fixture(scope="module")
 def signal_model_with_template(simple_instrument, fg_model, cmb_spectra,
                                residual_template):
-    """SignalModel with a residual-template amplitude A_res appended."""
+    """SignalModel with a residual template carried by the foreground model.
+
+    The residual now lives in a ResidualTemplateForegroundModel; composing
+    it with the Gaussian FG model keeps A_res as the trailing parameter.
+    """
     ells, cl = residual_template
+    fg = CompositeForegroundModel(
+        [fg_model, ResidualTemplateForegroundModel(cl, ells)])
     return SignalModel(
-        simple_instrument, fg_model, cmb_spectra,
+        simple_instrument, fg, cmb_spectra,
         ell_min=20, ell_max=200, delta_ell=35,
         ell_per_bin_below=30, window="tophat",
-        residual_template_cl=cl, residual_template_ells=ells,
     )
 
 
@@ -353,12 +363,19 @@ def test_a_res_appended_to_parameter_names(signal_model_with_template,
     assert names == expected
 
 
-def test_fg_params_from_excludes_a_res(signal_model_with_template, fg_model):
-    """fg_params_from returns exactly the fg block, not A_res at the tail."""
+def test_fg_params_from_includes_a_res(signal_model_with_template, fg_model):
+    """fg_params_from returns the whole fg block, now including A_res.
+
+    A_res is a genuine foreground parameter (the residual-template
+    amplitude carried by the composite FG model), so it is the trailing
+    entry of the block passed to foreground_model.cl_bb.
+    """
     names = signal_model_with_template.parameter_names
     params = _fiducial_with_a_res(names, 1.0)
     fg = signal_model_with_template.fg_params_from(params)
-    assert fg.shape == (len(fg_model.parameter_names),)
+    # 9 Gaussian params + 1 A_res.
+    assert fg.shape == (len(fg_model.parameter_names) + 1,)
+    assert float(fg[-1]) == 1.0  # trailing entry is A_res
 
 
 def test_a_res_zero_matches_no_template(signal_model, signal_model_with_template):
@@ -411,8 +428,49 @@ def test_jacobian_a_res_column(signal_model_with_template):
             assert jnp.allclose(block, 0.0, atol=1e-14)
 
 
-def test_residual_template_requires_ells(simple_instrument, fg_model, cmb_spectra):
-    """Passing residual_template_cl without ells should error loudly."""
+def test_deprecated_residual_template_kwarg_warns(
+        simple_instrument, fg_model, cmb_spectra, residual_template):
+    """The residual_template_cl keyword is deprecated -> DeprecationWarning."""
+    ells, cl = residual_template
+    with pytest.warns(DeprecationWarning, match="residual template now lives"):
+        SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+            residual_template_cl=cl, residual_template_ells=ells,
+        )
+
+
+def test_deprecated_residual_template_kwarg_matches_model(
+        simple_instrument, fg_model, cmb_spectra, residual_template):
+    """The deprecated kwarg is bit-identical to the FG-model path.
+
+    SignalModel(residual_template_cl=...) routes through
+    CompositeForegroundModel([fg_model, ResidualTemplateForegroundModel(...)]),
+    so the parameter vector and data vector must match the explicit model.
+    """
+    ells, cl = residual_template
+    with pytest.warns(DeprecationWarning):
+        sm_kwarg = SignalModel(
+            simple_instrument, fg_model, cmb_spectra,
+            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+            residual_template_cl=cl, residual_template_ells=ells,
+        )
+    fg = CompositeForegroundModel(
+        [fg_model, ResidualTemplateForegroundModel(cl, ells)])
+    sm_model = SignalModel(
+        simple_instrument, fg, cmb_spectra,
+        ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
+    )
+    assert sm_kwarg.parameter_names == sm_model.parameter_names
+    params = _fiducial_with_a_res(sm_kwarg.parameter_names, 1.3)
+    assert jnp.allclose(
+        sm_kwarg.data_vector(params), sm_model.data_vector(params),
+        rtol=1e-12, atol=1e-14)
+
+
+def test_deprecated_residual_template_requires_ells(
+        simple_instrument, fg_model, cmb_spectra):
+    """cl without ells still errors loudly through the deprecation shim."""
     cl = np.full(100, 1e-4)
     with pytest.raises(ValueError, match="residual_template_ells"):
         SignalModel(
@@ -420,57 +478,6 @@ def test_residual_template_requires_ells(simple_instrument, fg_model, cmb_spectr
             ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
             residual_template_cl=cl,
         )
-
-
-def test_residual_template_rejects_empty(simple_instrument, fg_model, cmb_spectra):
-    """An empty residual_template_cl / ells should fail loudly at init,
-    not silently register a zero-jacobian A_res column that explodes
-    inside the Fisher solve."""
-    with pytest.raises(ValueError, match="length"):
-        SignalModel(
-            simple_instrument, fg_model, cmb_spectra,
-            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
-            residual_template_cl=np.array([]),
-            residual_template_ells=np.array([]),
-        )
-
-
-def test_residual_template_rejects_mismatched_shapes(
-        simple_instrument, fg_model, cmb_spectra):
-    """Mismatched ells/cl lengths fail at init with a clear message."""
-    with pytest.raises(ValueError, match="shape"):
-        SignalModel(
-            simple_instrument, fg_model, cmb_spectra,
-            ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
-            residual_template_cl=np.ones(10),
-            residual_template_ells=np.arange(20),
-        )
-
-
-def test_residual_template_extrapolates_nearest_neighbour(
-        simple_instrument, fg_model, cmb_spectra):
-    """Template provided with ell_min > SignalModel.ell_min must extrapolate
-    to fp[0] (not zero) at low ells.
-
-    BROOM bandpowers start at the first bin center (~ell=4 for delta_ell=5).
-    Zero-extrapolation at the reionization bump would silently null the
-    A_res constraint where sigma(r) is most sensitive for a space mission.
-    """
-    # Template provided only at ell >= 50 with a distinctive amplitude
-    ells_in = np.arange(50, 200, dtype=float)
-    amp = 7e-4
-    cl_in = np.full_like(ells_in, amp)
-
-    sm = SignalModel(
-        simple_instrument, fg_model, cmb_spectra,
-        ell_min=2, ell_max=180, delta_ell=5, ell_per_bin_below=30,
-        residual_template_cl=cl_in, residual_template_ells=ells_in,
-    )
-    # Internal interpolated template on SignalModel's ell grid
-    tmpl = np.asarray(sm._residual_template_cl)
-    # Below the input range: nearest-neighbour = fp[0] = amp
-    assert np.all(tmpl == pytest.approx(amp, rel=1e-12)), \
-        "Template should extrapolate flat (nearest-neighbour), not zero"
 
 
 def test_delensed_bb_range_must_cover_signal_model(

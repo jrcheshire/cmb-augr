@@ -26,7 +26,7 @@ import numpy as np
 
 from .config import DEFAULT_PRIORS_POST_COMPSEP, cleaned_map_instrument
 from .fisher import FisherForecast
-from .foregrounds import NullForegroundModel
+from .foregrounds import NullForegroundModel, ResidualTemplateForegroundModel
 from .signal import SignalModel
 from .spectra import CMBSpectra
 
@@ -151,18 +151,25 @@ def forecast_from_spectra(
     cmb = CMBSpectra()
 
     def _signal(with_template):
+        # Baseline: no residual modelled (NullForegroundModel) -> the
+        # unmodelled residual becomes the Δr bias. A_res variant: the
+        # residual is a ResidualTemplateForegroundModel foreground, so
+        # A_res is a marginalizable parameter. Compare the two for the
+        # Carones debias-OFF Δr vs A_res-marginalized σ(r) result.
+        if with_template:
+            fg_model = ResidualTemplateForegroundModel(
+                jnp.asarray(tcl), jnp.asarray(template_ells, dtype=float))
+        else:
+            fg_model = NullForegroundModel()
         kw = dict(
             instrument=inst,
-            foreground_model=NullForegroundModel(),
+            foreground_model=fg_model,
             cmb_spectra=cmb,
             ell_min=ell_min,
             ell_max=ell_max,
             delta_ell=delta_ell,
             ell_per_bin_below=ell_per_bin_below,
         )
-        if with_template:
-            kw["residual_template_cl"] = jnp.asarray(tcl)
-            kw["residual_template_ells"] = jnp.asarray(template_ells, dtype=float)
         if delensed_bb is not None:
             kw["delensed_bb"] = jnp.asarray(delensed_bb)
             kw["delensed_bb_ells"] = jnp.asarray(delensed_bb_ells, dtype=float)
