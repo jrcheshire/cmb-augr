@@ -50,8 +50,8 @@ from augr.instrument import (
 
 # flatten_params only reads keys that appear in SignalModel.parameter_names,
 # so A_res here is a harmless convenience for the post-CompSep workflow --
-# it is consumed only when a residual template is attached, and silently
-# ignored otherwise. Delensed mode similarly ignores A_lens.
+# it is consumed only when a ResidualTemplateForegroundModel is in use, and
+# silently ignored otherwise. Delensed mode similarly ignores A_lens.
 FIDUCIAL_BK15: dict[str, float] = {
     "r":           0.0,    # tensor-to-scalar ratio (target: r = 0)
     "A_lens":      1.0,    # lensing amplitude (1 = no delensing)
@@ -84,16 +84,16 @@ DEFAULT_FIXED: list[str] = ["T_dust"]
 # Post-component-separation priors
 # ---------------------------------------------------------------------------
 #
-# Used together with NullForegroundModel + SignalModel(residual_template_cl=...)
-# for forecasts that consume the output of an external component-separation
-# pipeline (NILC/GNILC via BROOM, etc.). Keep separate from DEFAULT_PRIORS
-# because A_res is only a meaningful parameter when a residual template is
-# attached -- otherwise it's silently ignored and just adds noise to the
-# prior dict for vanilla forecasts.
+# Used with a ResidualTemplateForegroundModel for forecasts that consume the
+# output of an external component-separation pipeline (NILC/GNILC via BROOM,
+# etc.). Keep separate from DEFAULT_PRIORS because A_res is only a meaningful
+# parameter when a residual template is in use -- otherwise it's silently
+# ignored and just adds noise to the prior dict for vanilla forecasts.
 #
 # Compose with the multifrequency priors when running a post-CompSep forecast
-# that still uses an FG model (e.g. residual contamination on top of a
-# multi-frequency cleaning step):
+# that still uses a parametric FG model (residual contamination on top of a
+# multi-frequency cleaning step, via
+# CompositeForegroundModel([GaussianForegroundModel(), ResidualTemplateForegroundModel(...)])):
 #
 #     priors = {**DEFAULT_PRIORS, **DEFAULT_PRIORS_POST_COMPSEP}
 

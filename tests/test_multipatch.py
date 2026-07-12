@@ -17,7 +17,12 @@ from augr.config import (
 )
 from augr.crosslinks import yearavg_depth_1d
 from augr.fisher import FisherForecast
-from augr.foregrounds import GaussianForegroundModel, MomentExpansionModel
+from augr.foregrounds import (
+    CompositeForegroundModel,
+    GaussianForegroundModel,
+    MomentExpansionModel,
+    ResidualTemplateForegroundModel,
+)
 from augr.multipatch import (
     MultiPatchFisher,
     _is_per_patch,
@@ -577,14 +582,15 @@ class TestMultiPatchDelensedAndResidualModes(unittest.TestCase):
         n_ells = ell_max + 1
         template = jnp.full(n_ells, 1e-6)
         template_ells = jnp.arange(n_ells, dtype=float)
-        signal_kwargs = {
-            "ell_max": ell_max, "delta_ell": 35,
-            "residual_template_cl": template,
-            "residual_template_ells": template_ells,
-        }
+        signal_kwargs = {"ell_max": ell_max, "delta_ell": 35}
+        # A_res lives in the foreground model now: compose the residual
+        # template on top of the parametric Gaussian model.
+        fg = CompositeForegroundModel(
+            [GaussianForegroundModel(),
+             ResidualTemplateForegroundModel(template, template_ells)])
         fid = {**FIDUCIAL_BK15, "A_lens": 0.27}
         mpf = MultiPatchFisher(
-            self.inst, self.fg, self.cmb, sky, fid,
+            self.inst, fg, self.cmb, sky, fid,
             priors=DEFAULT_PRIORS,
             fixed_params=[*list(DEFAULT_FIXED), "Delta_dust"],
             signal_kwargs=signal_kwargs,

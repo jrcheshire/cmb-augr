@@ -23,11 +23,17 @@ and the parameter vector becomes:
 
 from __future__ import annotations
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from augr.foregrounds import ForegroundModel
+from augr.foregrounds import (
+    CompositeForegroundModel,
+    ForegroundModel,
+    ResidualTemplateForegroundModel,
+)
 from augr.instrument import Instrument
 from augr.spectra import CMBSpectra
 
@@ -409,8 +415,36 @@ class SignalModel:
                  bandpower_window_ells: (
                      np.ndarray | jnp.ndarray | None) = None):
         self._instrument = instrument
-        self._fg_model = foreground_model
         self._cmb = cmb_spectra
+
+        # Back-compat: the residual template used to be a SignalModel
+        # keyword; it now lives in the foreground models. Route the
+        # deprecated keyword through ResidualTemplateForegroundModel so the
+        # rest of __init__ sees a single foreground model and A_res is just
+        # another (trailing) foreground parameter.
+        if residual_template_cl is not None:
+            warnings.warn(
+                "SignalModel(residual_template_cl=..., "
+                "residual_template_ells=...) is deprecated; pass a "
+                "ResidualTemplateForegroundModel as foreground_model instead "
+                "(or CompositeForegroundModel([fg_model, "
+                "ResidualTemplateForegroundModel(...)]) to keep another "
+                "foreground model). The residual template now lives in the "
+                "foreground models.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if residual_template_ells is None:
+                raise ValueError(
+                    "residual_template_cl requires residual_template_ells.")
+            residual_model = ResidualTemplateForegroundModel(
+                residual_template_cl, residual_template_ells)
+            if foreground_model.parameter_names:
+                foreground_model = CompositeForegroundModel(
+                    [foreground_model, residual_model])
+            else:
+                foreground_model = residual_model
+        self._fg_model = foreground_model
 
         # Delensed mode: precomputed residual lensing BB replaces A_lens
         self._delensed = delensed_bb is not None
@@ -428,15 +462,10 @@ class SignalModel:
         else:
             base_names = ["r", "A_lens", *list(foreground_model.parameter_names)]
 
-        # Residual-template mode: optional additive post-CompSep residual
-        # with amplitude A_res appended to the parameter vector.
-        self._residual_template = residual_template_cl is not None
-        if self._residual_template:
-            self._a_res_idx = len(base_names)
-            self._param_names = [*base_names, "A_res"]
-        else:
-            self._a_res_idx = None
-            self._param_names = base_names
+        # A_res (when a residual template is used) is now an ordinary
+        # trailing foreground parameter carried by the foreground model, so
+        # it is already included in base_names above — no special handling.
+        self._param_names = base_names
 
         # Frequency pairs: unique (i ≤ j), stored as (channel_index, channel_index)
         n_chan = len(instrument.channels)
@@ -485,35 +514,6 @@ class SignalModel:
             self._delensed_bb = jnp.interp(self._ells, ells_in, cl_in)
         else:
             self._delensed_bb = None
-
-        # Pre-interpolate residual template onto our ell grid (not JAX-traced).
-        # The template represents the MC-averaged post-CompSep foreground
-        # residual C_ell^BB; A_res scales it as a nuisance amplitude.
-        # Outside the provided ell range we use nearest-neighbour
-        # (jnp.interp default: fp[0] / fp[-1]) rather than zero. The
-        # reionization bump (ell <~ 10) typically sits below the first
-        # BROOM bandpower center, and zero-extrapolation there silently
-        # nulls the A_res constraint exactly where sigma(r) is most
-        # sensitive for a space mission.
-        if self._residual_template:
-            if residual_template_ells is None:
-                raise ValueError(
-                    "residual_template_cl requires residual_template_ells.")
-            cl_in = jnp.asarray(residual_template_cl, dtype=float)
-            ells_in = jnp.asarray(residual_template_ells, dtype=float)
-            if cl_in.shape[0] < 2 or ells_in.shape[0] < 2:
-                raise ValueError(
-                    "residual_template_cl and residual_template_ells must "
-                    "have length >= 2 for interpolation; got "
-                    f"lengths {ells_in.shape[0]} and {cl_in.shape[0]}.")
-            if cl_in.shape != ells_in.shape:
-                raise ValueError(
-                    f"residual_template_cl shape {cl_in.shape} must match "
-                    f"residual_template_ells shape {ells_in.shape}.")
-            self._residual_template_cl = jnp.interp(
-                self._ells, ells_in, cl_in)
-        else:
-            self._residual_template_cl = None
 
         # Binning. Three paths converge into a single internal 3-D
         # tensor ``_bin_matrix_3d`` of shape (n_pairs, n_bins, n_ells)
@@ -715,9 +715,10 @@ class SignalModel:
 
         Args:
             params: Flat JAX array of length n_params.
-                    Order: [r, (A_lens), <foreground params>, (A_res)].
-                    A_lens is present only in non-delensed mode; A_res is
-                    present only when a residual template is attached.
+                    Order: [r, (A_lens), <foreground params>].
+                    A_lens is present only in non-delensed mode. A_res, when
+                    a ResidualTemplateForegroundModel is used, is the final
+                    foreground parameter.
 
         Returns:
             Flat JAX array of length n_data = n_spectra × n_bins.
@@ -734,14 +735,6 @@ class SignalModel:
 
         fg_params = params[self._fg_start:self._fg_end]
 
-        # Precompute the residual-template contribution (auto-spectra only).
-        # Post-component-separation the residual lives in the single
-        # cleaned map, so it only enters the i==j auto-BB blocks.
-        if self._residual_template:
-            cl_residual = params[self._a_res_idx] * self._residual_template_cl
-        else:
-            cl_residual = None
-
         # Build bandpowers for each frequency pair. In per-spectrum BPWF
         # mode the bin matrix differs per pair; in shared / synthetic
         # modes ``_bin_matrix_3d`` is a broadcast view of the 2-D matrix
@@ -752,8 +745,6 @@ class SignalModel:
             nu_j = self._freqs[j_ch]
             cl_fg = self._fg_model.cl_bb(nu_i, nu_j, self._ells, fg_params)
             cl_total = cl_cmb + cl_fg
-            if cl_residual is not None and i_ch == j_ch:
-                cl_total = cl_total + cl_residual
             if self._is_per_spectrum_bpwf:
                 bp = self._bin_matrix_3d[s] @ cl_total    # (n_bins,)
             else:
@@ -792,24 +783,13 @@ class SignalModel:
             A_lens = params[1]
             return self._cmb.cl_bb(self._ells, r, A_lens)
 
-    def residual_bb_unbinned(self, params: jnp.ndarray) -> jnp.ndarray:
-        """A_res-scaled residual-template BB on the ell grid.
-
-        Post-component-separation, the residual lives in the single
-        cleaned map, so this contribution only enters the auto-spectrum
-        (i == j) blocks of M = S + N -- callers must apply it to the
-        diagonal only. Returns zeros when no residual template is
-        attached, so it is always safe to add.
-        """
-        if self._residual_template:
-            return params[self._a_res_idx] * self._residual_template_cl
-        return jnp.zeros_like(self._ells)
-
     def fg_params_from(self, params: jnp.ndarray) -> jnp.ndarray:
-        """Extract foreground parameters from the full parameter vector.
+        """Extract the foreground-parameter block from the full vector.
 
-        Slices exactly the foreground-parameter block, so trailing
-        parameters (e.g. A_res) are not accidentally included.
+        Slices exactly the block consumed by ``foreground_model.cl_bb``.
+        When a ResidualTemplateForegroundModel (or a composite containing
+        one) is used, ``A_res`` is the trailing foreground parameter and is
+        therefore included here.
         """
         return params[self._fg_start:self._fg_end]
 

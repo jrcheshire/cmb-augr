@@ -44,10 +44,11 @@ def _build_M_signal_unbinned(signal_model: SignalModel,
                               fiducial_params: jnp.ndarray) -> jnp.ndarray:
     """Unbinned signal-only M_signal(ℓ), shape (n_chan, n_chan, n_ells).
 
-    M_signal[i, j, ℓ] = C_ℓ^CMB + C_ℓ^{FG, ij} + δ_{ij} C_ℓ^{res}.
-    The residual template A_res·T_res(ℓ) enters only on i==j auto-blocks,
-    matching the post-CompSep convention that the residual lives in the
-    single cleaned map.
+    M_signal[i, j, ℓ] = C_ℓ^CMB + C_ℓ^{FG, ij}. A post-CompSep residual
+    template enters through the foreground model as a
+    ResidualTemplateForegroundModel (A_res·T_res on auto-blocks only), so
+    it is folded into C_ℓ^{FG} here with no special-casing — matching the
+    residual added to the data vector in SignalModel.data_vector.
     """
     n_chan = len(signal_model.frequencies)
     ells = signal_model.ells
@@ -55,7 +56,6 @@ def _build_M_signal_unbinned(signal_model: SignalModel,
     fg_model = signal_model.foreground_model
 
     cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
-    cl_res = signal_model.residual_bb_unbinned(fiducial_params)
     fg_params = signal_model.fg_params_from(fiducial_params)
 
     M = jnp.zeros((n_chan, n_chan, ells.shape[0]))
@@ -63,8 +63,6 @@ def _build_M_signal_unbinned(signal_model: SignalModel,
         for j in range(i, n_chan):
             cl_fg = fg_model.cl_bb(freqs[i], freqs[j], ells, fg_params)
             cl_total = cl_cmb + cl_fg
-            if i == j:
-                cl_total = cl_total + cl_res
             M = M.at[i, j, :].set(cl_total)
             if i != j:
                 M = M.at[j, i, :].set(cl_total)

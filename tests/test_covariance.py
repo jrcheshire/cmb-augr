@@ -15,7 +15,11 @@ from augr.covariance import (
     knox_sigma_from_measured_spectrum,
     mc_bandpower_covariance,
 )
-from augr.foregrounds import GaussianForegroundModel
+from augr.foregrounds import (
+    CompositeForegroundModel,
+    GaussianForegroundModel,
+    ResidualTemplateForegroundModel,
+)
 from augr.instrument import Channel, Instrument, ScalarEfficiency
 from augr.signal import SignalModel, flatten_params
 from augr.spectra import CMBSpectra
@@ -188,12 +192,13 @@ def signal_model_with_template(two_chan_instrument):
     """Signal model with a flat residual template, 2-channel / same binning."""
     ells = np.arange(2, 400, dtype=float)
     cl = np.full_like(ells, _RES_T_AMPLITUDE)
+    fg = CompositeForegroundModel(
+        [GaussianForegroundModel(), ResidualTemplateForegroundModel(cl, ells)])
     return SignalModel(
         two_chan_instrument,
-        GaussianForegroundModel(),
+        fg,
         CMBSpectra(),
         ell_min=20, ell_max=200, delta_ell=35, ell_per_bin_below=30,
-        residual_template_cl=cl, residual_template_ells=ells,
     )
 
 
