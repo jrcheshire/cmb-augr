@@ -125,6 +125,22 @@ Knowing how the modules chain together matters more than any one file:
    uses Gauss-Legendre quadrature (~2 min / 5 iter); full-sky uses
    `wigner.py` Schulten-Gordon recursion (~10 min / 5 iter).
 
+   **Differentiable flat-sky delensing (issue #45, Stage 1).** The
+   flat-sky path is `lax.scan` + `jnp` throughout, so it is a single
+   `jax.jit` / `jax.grad` trace in the noise spectra. The pure core is
+   `_delens_core(...)` (returns `(cl_bb_res, n0_mv, A_lens_eff,
+   a_lens_history)` all as jnp); `iterate_delensing` is a thin wrapper
+   that adds the host-side `DelensedSpectra` packaging (casts
+   `A_lens_eff` to `float`, prints per-iteration `A_lens_eff` when
+   `verbose`) — public API byte-identical. `delens_residual_bb(spectra,
+   nl_tt, nl_ee, nl_bb, ...)` is the differentiable entry point the
+   design forward consumes: close over `spectra` and the integer knobs
+   (compile-time constants) and it is grad-traceable in the noise. jit
+   gives ~2.2× over eager (FLOP-bound scan); one jitted grad solve is
+   ~20 s at l_max_qe=1000 / ~90 s at l_max_qe=1500 on CPU. `fullsky=True`
+   still runs but hits the numpy Wigner island (not jit/grad-able —
+   Stage 3).
+
    **N₀ validation status (2026-05-07).** Validated against `plancklens`
    at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:
    - **TT flat-sky**: machine-precision against the constant-Cℓ closed

@@ -1368,6 +1368,112 @@ class DelensedSpectra:
     A_lens_eff: float
 
 
+def _delens_core(spectra: LensingSpectra,
+                 nl_tt: jnp.ndarray,
+                 nl_ee: jnp.ndarray,
+                 nl_bb: jnp.ndarray,
+                 ls: jnp.ndarray,
+                 Ls: jnp.ndarray,
+                 *,
+                 n_iter: int,
+                 l_min_qe: int,
+                 l_max_qe: int,
+                 n_phi: int,
+                 fullsky: bool) -> tuple[jnp.ndarray, jnp.ndarray,
+                                         jnp.ndarray, jnp.ndarray]:
+    """Pure iterative-delensing core -- no host-side casts or I/O.
+
+    Runs the Smith+ 2012 self-consistent QE-delensing iteration and returns
+    jnp arrays only.  In the flat-sky path (fullsky=False) every operation is
+    lax.scan + jnp, so the whole computation is a single jax.jit / jax.grad
+    trace in the noise spectra (nl_tt, nl_ee, nl_bb).  The public
+    iterate_delensing wraps this and adds the host-side DelensedSpectra
+    packaging plus optional verbose printing.  fullsky=True still runs
+    (eagerly) but hits the numpy Wigner island and is neither jit- nor
+    grad-able (Stage 3 territory).
+
+    spectra is treated as a compile-time constant (the fiducial CMB spectra
+    don't vary across designs); close over it when jitting.
+
+    Returns:
+        (cl_bb_res, n0_mv, A_lens_eff, a_lens_history) -- all jnp.  cl_bb_res
+        is at ls; n0_mv at Ls; A_lens_eff is a scalar; a_lens_history has
+        shape (n_iter,).
+    """
+    cl_bb_lens_at_ls = _interp_at(spectra.cl_bb_len, ls)
+
+    # The iteration updates the BB spectrum used in the EB/TB filter
+    # denominators.  Start with the full lensed BB.
+    cl_bb_current = spectra.cl_bb_len
+    cl_bb_res = jnp.zeros_like(ls)
+    n0 = jnp.zeros_like(Ls)
+    a_lens_hist = []
+
+    for _iteration in range(n_iter):
+        # Total BB in the filters is cl_bb_current + nl_bb, but the estimator
+        # functions add spectra.cl_bb_len + nl_bb; pass an effective noise
+        # that makes the total come out right:
+        # nl_bb_eff = cl_bb_current + nl_bb - spectra.cl_bb_len
+        nl_bb_eff = cl_bb_current - spectra.cl_bb_len + nl_bb
+
+        # MV N_0 with the current BB in the EB/TB filters.
+        n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb_eff,
+                           l_min_qe, l_max_qe, n_phi, fullsky=fullsky)
+
+        # Residual BB (exact Smith+ Eq. 12 with the W_EE Wiener filter).
+        cl_bb_res = residual_cl_bb(ls, Ls, spectra, n0,
+                                   l_min_qe, l_max_qe, n_phi,
+                                   fullsky=fullsky, nl_ee=nl_ee)
+
+        # Interpolate the residual onto the full ell grid for the next
+        # iteration's filters.  Outside the QE ls range we fall back to the
+        # full lensed BB -- i.e. "no delensing applied where we didn't
+        # reconstruct."  Flat-constant extrapolation (the prior behaviour at
+        # ell > ls[-1]) silently under-counted BB in the EB filter
+        # denominator past ls[-1], producing an artificially small N_0 and
+        # an over-optimistic residual at ell in ls.
+        cl_bb_res_interp = jnp.interp(spectra.ells, ls, cl_bb_res,
+                                       left=0.0, right=0.0)
+        in_range = (spectra.ells >= ls[0]) & (spectra.ells <= ls[-1])
+        cl_bb_current = jnp.where(in_range, cl_bb_res_interp,
+                                  spectra.cl_bb_len)
+
+        a_lens_hist.append(jnp.sum(cl_bb_res) / jnp.sum(cl_bb_lens_at_ls))
+
+    # Final effective A_lens (kept as a jnp scalar; the public wrapper casts).
+    A_lens_eff = jnp.sum(cl_bb_res) / jnp.sum(cl_bb_lens_at_ls)
+    return cl_bb_res, n0, A_lens_eff, jnp.stack(a_lens_hist)
+
+
+def delens_residual_bb(spectra: LensingSpectra,
+                       nl_tt: jnp.ndarray,
+                       nl_ee: jnp.ndarray,
+                       nl_bb: jnp.ndarray,
+                       ls: jnp.ndarray | None = None,
+                       L_max: int = 3000,
+                       l_min_qe: int = 2,
+                       l_max_qe: int = 3000,
+                       n_phi: int = 128,
+                       n_iter: int = 5) -> jnp.ndarray:
+    """Differentiable residual lensing BB from iterative flat-sky QE delensing.
+
+    Flat-sky, pure-jnp entry point for the residual C_l^{BB} the design
+    forward needs: jax.jit / jax.grad-traceable in the noise spectra
+    (nl_tt, nl_ee, nl_bb) (close over spectra and the integer knobs, which
+    are compile-time constants).  Equivalent to
+    iterate_delensing(..., fullsky=False).cl_bb_res without the host-side
+    dataclass packaging.  Returns C_l^{BB,res} at ls.
+    """
+    if ls is None:
+        ls = jnp.arange(2, 301, dtype=float)
+    Ls = jnp.arange(2, L_max + 1, dtype=float)
+    cl_bb_res, _n0, _a, _hist = _delens_core(
+        spectra, nl_tt, nl_ee, nl_bb, ls, Ls,
+        n_iter=n_iter, l_min_qe=l_min_qe, l_max_qe=l_max_qe,
+        n_phi=n_phi, fullsky=False)
+    return cl_bb_res
+
+
 def iterate_delensing(spectra: LensingSpectra,
                       nl_tt: jnp.ndarray,
                       nl_ee: jnp.ndarray,
@@ -1426,50 +1532,15 @@ def iterate_delensing(spectra: LensingSpectra,
 
     Ls = jnp.arange(2, L_max + 1, dtype=float)
 
-    # The iteration updates the BB spectrum used in the EB and TB filter
-    # denominators. Start with full lensed BB.
-    cl_bb_current = spectra.cl_bb_len.copy()
-    cl_bb_res = n0 = None  # set on first iteration
+    cl_bb_res, n0, A_lens_eff, a_lens_hist = _delens_core(
+        spectra, nl_tt, nl_ee, nl_bb, ls, Ls,
+        n_iter=n_iter, l_min_qe=l_min_qe, l_max_qe=l_max_qe,
+        n_phi=n_phi, fullsky=fullsky)
 
-    for iteration in range(n_iter):
-        # Build a modified spectra-like object with updated BB for filters
-        # We do this by modifying nl_bb_eff: the total BB in filters is
-        # cl_bb_current + nl_bb, but the estimator functions take
-        # spectra.cl_bb_len + nl_bb as total. So we pass an effective noise
-        # that makes the total come out right:
-        # nl_bb_eff = cl_bb_current + nl_bb - spectra.cl_bb_len
-        nl_bb_eff = cl_bb_current - spectra.cl_bb_len + nl_bb
-
-        # Compute MV N_0
-        n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb_eff,
-                           l_min_qe, l_max_qe, n_phi, fullsky=fullsky)
-
-        # Compute residual BB (exact Smith+ Eq. 12 with W_EE Wiener filter)
-        cl_bb_res = residual_cl_bb(ls, Ls, spectra, n0,
-                                   l_min_qe, l_max_qe, n_phi,
-                                   fullsky=fullsky, nl_ee=nl_ee)
-
-        # Interpolate residual onto the full ell grid for the next
-        # iteration's filters.  Outside the QE ls range we fall back to
-        # the full lensed BB -- i.e. "no delensing applied where we
-        # didn't reconstruct."  Flat-constant extrapolation (the prior
-        # behaviour at ell > ls[-1]) silently under-counted BB in the EB
-        # filter denominator past ls[-1], producing an artificially
-        # small N_0 and an over-optimistic residual at ell in ls.
-        cl_bb_res_interp = jnp.interp(spectra.ells, ls, cl_bb_res,
-                                       left=0.0, right=0.0)
-        in_range = (spectra.ells >= ls[0]) & (spectra.ells <= ls[-1])
-        cl_bb_current = jnp.where(in_range, cl_bb_res_interp,
-                                  spectra.cl_bb_len)
-
-        if verbose:
-            cl_bb_lens_at_ls = _interp_at(spectra.cl_bb_len, ls)
-            a_lens = float(jnp.sum(cl_bb_res) / jnp.sum(cl_bb_lens_at_ls))
-            print(f"  Iteration {iteration + 1}: A_lens_eff = {a_lens:.4f}")
-
-    # Final effective A_lens
-    cl_bb_lens_at_ls = _interp_at(spectra.cl_bb_len, ls)
-    A_lens_eff = float(jnp.sum(cl_bb_res) / jnp.sum(cl_bb_lens_at_ls))
+    if verbose:
+        for i in range(n_iter):
+            print(f"  Iteration {i + 1}: "
+                  f"A_lens_eff = {float(a_lens_hist[i]):.4f}")
 
     return DelensedSpectra(
         ls=ls,
@@ -1477,5 +1548,5 @@ def iterate_delensing(spectra: LensingSpectra,
         n0_mv=n0,
         Ls=Ls,
         n_iter=n_iter,
-        A_lens_eff=A_lens_eff,
+        A_lens_eff=float(A_lens_eff),
     )

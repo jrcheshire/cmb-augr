@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -18,6 +19,7 @@ from augr.delensing import (
     compute_n0_tb,
     compute_n0_te,
     compute_n0_tt,
+    delens_residual_bb,
     iterate_delensing,
     lensing_kernel,
     load_lensing_spectra,
@@ -281,6 +283,61 @@ class TestIterativeDelensing:
         )
         assert result.cl_bb_res.shape == ls.shape
         assert result.n0_mv.shape == result.Ls.shape
+
+
+# Light delensing config (mirrors test_result_shape) so the differentiable
+# tests below stay in the fast gate.
+_DIFF_KW = dict(ls=jnp.arange(2, 201, dtype=float),
+                L_max=500, l_max_qe=500, n_phi=32, n_iter=2)
+
+
+class TestDifferentiableDelensing:
+    """delens_residual_bb (flat-sky) is jit- and grad-clean (issue #45)."""
+
+    def test_matches_iterate(self, spectra, noise):
+        """delens_residual_bb equals iterate_delensing.cl_bb_res bit-for-bit."""
+        cl = delens_residual_bb(
+            spectra, noise["tt"], noise["ee"], noise["bb"], **_DIFF_KW)
+        res = iterate_delensing(
+            spectra, noise["tt"], noise["ee"], noise["bb"], **_DIFF_KW)
+        np.testing.assert_array_equal(np.asarray(cl),
+                                      np.asarray(res.cl_bb_res))
+
+    def test_jit_matches_eager(self, spectra, noise):
+        """jit (spectra + knobs closed over) reproduces the eager result."""
+        eager = delens_residual_bb(
+            spectra, noise["tt"], noise["ee"], noise["bb"], **_DIFF_KW)
+        jit_fn = jax.jit(
+            lambda a, b, c: delens_residual_bb(spectra, a, b, c, **_DIFF_KW))
+        jitted = jit_fn(noise["tt"], noise["ee"], noise["bb"])
+        # The whole flat-sky trace is lax.scan + jnp, so jit reorders only
+        # fusion, not math; 1e-12 is far below any physical tolerance.
+        np.testing.assert_allclose(np.asarray(jitted), np.asarray(eager),
+                                   rtol=1e-12, atol=0.0)
+
+    def test_grad_finite_and_fd_consistent(self, spectra, noise):
+        """jax.grad wrt each noise spectrum is finite and matches central FD.
+
+        FD is taken along the scale-consistent direction v = nl_bb
+        (multiplicative perturbation), which stays in the smooth
+        positive-noise interior instead of pushing low-ell noise negative.
+        """
+        def scalar_of(a, b, c):
+            return jnp.sum(
+                delens_residual_bb(spectra, a, b, c, **_DIFF_KW))
+
+        nl_tt, nl_ee, nl_bb = noise["tt"], noise["ee"], noise["bb"]
+        g_tt, g_ee, g_bb = jax.grad(scalar_of, argnums=(0, 1, 2))(
+            nl_tt, nl_ee, nl_bb)
+        for g in (g_tt, g_ee, g_bb):
+            assert jnp.all(jnp.isfinite(g))
+
+        h = 1e-4
+        f_plus = scalar_of(nl_tt, nl_ee, nl_bb * (1 + h))
+        f_minus = scalar_of(nl_tt, nl_ee, nl_bb * (1 - h))
+        fd = float((f_plus - f_minus) / (2 * h))
+        ad = float(jnp.dot(g_bb, nl_bb))
+        np.testing.assert_allclose(fd, ad, rtol=1e-4)
 
 
 # -----------------------------------------------------------------------
