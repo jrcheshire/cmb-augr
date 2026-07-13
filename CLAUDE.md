@@ -29,11 +29,21 @@ Knowing how the modules chain together matters more than any one file:
    `to_instrument(design)` derives a frozen `Instrument` (list of
    `Channel`s: frequency, NET, beam, n_det, efficiency).
    `combined_noise_nl(inst, ells, "BB")` yields the MV-combined noise
-   spectrum. The default photon-noise calculation models only CMB +
-   telescope graybody emission (L2 baseline); per-band extra loading
-   (galactic foregrounds at high ν, atmosphere for ground/balloon
-   repurposings) attaches via the `extra_loading` callable on each
-   `BandSpec` and is threaded through `to_instrument` automatically.
+   spectrum. The `photon_noise_net` core models CMB + telescope graybody
+   emission; per-band extra loading (galactic foregrounds at high ν,
+   atmosphere for ground/balloon repurposings) attaches via the
+   `extra_loading` callable on each `BandSpec` and is threaded through
+   `to_instrument` automatically. **`augr.loading` supplies a
+   physics-derived Galactic dust+synchrotron loading term** (occupation
+   `n = I_ν c²/(2hν³)`; dust = τ_353-scaled GNILC MBB, sync = Commander
+   power law), calibrated to the GAL070 science region in
+   `config.GALACTIC_LOADING` (`scripts/calibrate_galactic_loading.py`).
+   It is **default-ON** for the physical study designs (`probe_design`,
+   `flagship_design`, and the packing forward `eig.physical_design_objective`
+   — pass `galactic_loading=False` to disable), and **OFF** for the
+   `_idealized` / `pico_like` presets so `validate_pico` still reproduces
+   PICO. Negligible NET penalty at ν ≲ 300 GHz, ~3% at 615 GHz, dominant
+   above ~700 GHz (dust overtakes the CMB Wien tail).
    Presets in `config.py`: `simple_probe`, `pico_like`,
    `litebird_like` (22 sub-array Channels per the LiteBIRD PTEP
    channel-specification table — each physical sub-array at a shared
