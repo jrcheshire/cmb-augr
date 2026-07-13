@@ -81,6 +81,46 @@ DEFAULT_FIXED: list[str] = ["T_dust"]
 
 
 # ---------------------------------------------------------------------------
+# Galactic optical-loading normalizations (photon-noise NET)
+# ---------------------------------------------------------------------------
+#
+# Absolute TOTAL-INTENSITY (Stokes-I) Galactic brightness feeding the
+# per-band ``extra_loading`` term in ``augr.telescope.photon_noise_net``.
+# Distinct from (and ~10-20x larger than) the polarized ``A_dust`` / ``A_sync``
+# amplitudes above, which set the C_ell foreground model.
+#
+# Region-mean over the Planck HFI GAL070 mask (f_sky = 0.7005, matching the
+# probe-study fiducial), from peer-reviewed Planck component-separation
+# products (the loading uses component-separated dust, not the CIB-contaminated
+# raw 353 GHz map):
+#   - dust: Planck GNILC dust model (Opacity / Temperature / Spectral-Index),
+#     the product PySM d10/d11/d12 are built on. NU_REF = 353 GHz.
+#   - sync: Planck 2015 Commander synchrotron amplitude I_ML [uK_RJ],
+#     NU_REF = 408 MHz, extrapolated with the FIDUCIAL_BK15 RJ index beta_sync.
+# Regenerate with scripts/calibrate_galactic_loading.py.
+GALACTIC_LOADING: dict[str, float] = {
+    "tau_353":         3.6314e-06,  # GNILC Opacity, GAL070 mean
+    "beta_d":          1.6199,      # GNILC Spectral-Index, GAL070 mean
+    "T_d":             19.436,      # GNILC Temperature [K], GAL070 mean
+    "T_sync_ref_K":    15.334,      # Commander I_ML [K_RJ], GAL070 mean @ 408 MHz
+    "beta_s":         -3.1,         # RJ index (= FIDUCIAL_BK15 beta_sync)
+    "sync_nu_ref_ghz": 0.408,       # Commander NU_REF = 408 MHz
+}
+
+
+def galactic_extra_loading():
+    """Build the default Galactic dust+sync ``extra_loading`` callable.
+
+    Convenience wrapper over ``augr.loading.make_galactic_extra_loading`` with
+    the calibrated ``GALACTIC_LOADING`` region-means. Returns a jnp-traceable
+    ``n_extra(nu_hz) -> occupation`` to attach to ``BandSpec.extra_loading``.
+    """
+    from augr.loading import make_galactic_extra_loading
+
+    return make_galactic_extra_loading(**GALACTIC_LOADING)
+
+
+# ---------------------------------------------------------------------------
 # Post-component-separation priors
 # ---------------------------------------------------------------------------
 #

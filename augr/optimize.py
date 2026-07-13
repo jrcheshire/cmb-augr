@@ -320,6 +320,7 @@ def design_to_channels(
     net_override=None,
     illumination_factor: float = 1.22,
     packing_efficiency: float = 0.80,
+    extra_loading=None,
 ):
     """Differentiable telescope design -> per-channel ``(n_det, net, beam)``.
 
@@ -347,6 +348,11 @@ def design_to_channels(
                          shape ``(n_chan,)`` in flattened-group order.
         illumination_factor: FWHM = factor x lambda/D (1.22 for Airy).
         packing_efficiency:  Fraction of ideal hex packing achieved.
+        extra_loading:   Optional jnp-traceable ``n_extra(nu_hz) -> occupation``
+                         (e.g. ``config.galactic_extra_loading()``) added to
+                         every band's photon-noise NET. Ignored when
+                         ``net_override`` is supplied. Default ``None``
+                         reproduces the no-Galactic-loading baseline.
 
     Returns:
         ``(n_det, net, beam)``, each ``(n_chan,)`` in flattened ``freqs_per_group`` order.
@@ -369,7 +375,7 @@ def design_to_channels(
             if net_override is not None:
                 net_list.append(net_override[chan_idx])
             else:
-                net_list.append(photon_noise_net_jax(nu))
+                net_list.append(photon_noise_net_jax(nu, extra_loading=extra_loading))
             chan_idx += 1
     return jnp.stack(n_det_list), jnp.stack(net_list), jnp.stack(beam_list)
 
@@ -389,6 +395,7 @@ def sigma_r_from_design(
     eta_total: jnp.ndarray | float = 0.50,
     knee_ell: jnp.ndarray | float = 0.0,
     alpha_knee: jnp.ndarray | float = 1.0,
+    extra_loading=None,
 ) -> jnp.ndarray:
     """Differentiable sigma(r) from telescope design parameters.
 
@@ -413,6 +420,11 @@ def sigma_r_from_design(
         eta_total:       Total efficiency (scalar or per-channel).
         knee_ell:        1/f knee multipole.
         alpha_knee:      1/f spectral index.
+        extra_loading:   Optional jnp-traceable ``n_extra(nu_hz) -> occupation``
+                         (e.g. ``config.galactic_extra_loading()``) added to
+                         every band's photon-noise NET. Default ``None``
+                         reproduces the no-Galactic-loading baseline. Ignored
+                         when ``net_override`` is supplied.
 
     Returns:
         Scalar sigma(r).
@@ -431,6 +443,7 @@ def sigma_r_from_design(
         net_override=net_override,
         illumination_factor=illumination_factor,
         packing_efficiency=packing_efficiency,
+        extra_loading=extra_loading,
     )
 
     eta_arr = (

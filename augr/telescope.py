@@ -494,7 +494,19 @@ def to_instrument(design: TelescopeDesign) -> Instrument:
 # Convenience factories
 # ---------------------------------------------------------------------------
 
-def probe_design(aperture_m: float = 1.5) -> TelescopeDesign:
+def _galactic_extra_loading():
+    """Lazy handle to the default Galactic dust+sync ``extra_loading`` callable.
+
+    Imported lazily to keep ``telescope`` free of a module-level ``config``
+    dependency (``config`` imports ``telescope`` lazily in turn).
+    """
+    from augr.config import galactic_extra_loading
+
+    return galactic_extra_loading()
+
+
+def probe_design(aperture_m: float = 1.5,
+                 galactic_loading: bool = True) -> TelescopeDesign:
     """Probe-class (~$1B) space mission design.
 
     f/2 optics, 0.4 m focal plane.
@@ -507,18 +519,27 @@ def probe_design(aperture_m: float = 1.5) -> TelescopeDesign:
             beam FWHM (∝ λ/D); horn size, detector count and photon-
             noise NET are independent of aperture under the rest of
             the model.
+        galactic_loading: If True (default), add the physics-derived
+            Galactic dust+synchrotron optical loading to every band's
+            photon-noise NET (``config.GALACTIC_LOADING``). Negligible at
+            low ν; a few-% NET penalty in the submm. Set False for the
+            no-Galactic-loading L2 baseline.
     """
+    extra = _galactic_extra_loading() if galactic_loading else None
     pixel_groups = (
         PixelGroup(
-            bands=(BandSpec(30.0), BandSpec(40.0)),
+            bands=(BandSpec(30.0, extra_loading=extra),
+                   BandSpec(40.0, extra_loading=extra)),
             area_fraction=1.0 / 3.0,
         ),
         PixelGroup(
-            bands=(BandSpec(85.0), BandSpec(150.0)),
+            bands=(BandSpec(85.0, extra_loading=extra),
+                   BandSpec(150.0, extra_loading=extra)),
             area_fraction=1.0 / 3.0,
         ),
         PixelGroup(
-            bands=(BandSpec(220.0), BandSpec(340.0)),
+            bands=(BandSpec(220.0, extra_loading=extra),
+                   BandSpec(340.0, extra_loading=extra)),
             area_fraction=1.0 / 3.0,
         ),
     )
@@ -531,28 +552,39 @@ def probe_design(aperture_m: float = 1.5) -> TelescopeDesign:
     )
 
 
-def flagship_design() -> TelescopeDesign:
+def flagship_design(galactic_loading: bool = True) -> TelescopeDesign:
     """Flagship-class (~$2B) space mission design.
 
     3.0 m aperture, f/2 optics, 0.6 m focal plane.
     8 bands in 4 dichroic pairs: (30, 40), (85, 150), (220, 280),
     (340, 500) GHz. Equal area allocation, 5-year L2 mission, f_sky = 0.7.
+
+    Args:
+        galactic_loading: If True (default), add the physics-derived
+            Galactic dust+synchrotron optical loading to every band's NET
+            (``config.GALACTIC_LOADING``). Set False for the no-Galactic-
+            loading L2 baseline.
     """
+    extra = _galactic_extra_loading() if galactic_loading else None
     pixel_groups = (
         PixelGroup(
-            bands=(BandSpec(30.0), BandSpec(40.0)),
+            bands=(BandSpec(30.0, extra_loading=extra),
+                   BandSpec(40.0, extra_loading=extra)),
             area_fraction=0.25,
         ),
         PixelGroup(
-            bands=(BandSpec(85.0), BandSpec(150.0)),
+            bands=(BandSpec(85.0, extra_loading=extra),
+                   BandSpec(150.0, extra_loading=extra)),
             area_fraction=0.25,
         ),
         PixelGroup(
-            bands=(BandSpec(220.0), BandSpec(280.0)),
+            bands=(BandSpec(220.0, extra_loading=extra),
+                   BandSpec(280.0, extra_loading=extra)),
             area_fraction=0.25,
         ),
         PixelGroup(
-            bands=(BandSpec(340.0), BandSpec(500.0)),
+            bands=(BandSpec(340.0, extra_loading=extra),
+                   BandSpec(500.0, extra_loading=extra)),
             area_fraction=0.25,
         ),
     )

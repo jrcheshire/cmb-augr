@@ -65,6 +65,31 @@ def cmb_to_rj(nu_ghz: float) -> float:
     return 1.0 / rj_to_cmb(nu_ghz)
 
 
+def occupation_from_intensity(nu_hz: float, I_nu: float) -> float:
+    """Photon occupation number from total specific intensity.
+
+    n(ν) = I_ν · c² / (2 h ν³)
+
+    where I_ν is the total (both-polarization) specific intensity
+    [W m⁻² sr⁻¹ Hz⁻¹] filling a single spatial mode (throughput AΩ = λ²).
+    This is the exact inverse of the blackbody relation B_ν(T) = 2hν³/c² · n_BE,
+    so passing a Planck B_ν recovers the Bose-Einstein occupation
+    1/(exp(hν/kT) − 1) used for the CMB and telescope terms in
+    ``telescope.photon_noise_net``. Use it to convert a Galactic-foreground
+    (or atmospheric) sky brightness into the occupation the ``extra_loading``
+    hook expects.
+
+    Args:
+        nu_hz: Frequency [Hz] (note: Hz, not GHz — pairs with SI I_ν and
+            matches the band grid handed to ``extra_loading``).
+        I_nu:  Total specific intensity [W m⁻² sr⁻¹ Hz⁻¹].
+
+    Returns:
+        Dimensionless photon occupation number (per polarization, per mode).
+    """
+    return I_nu * C_LIGHT**2 / (2.0 * H_PLANCK * nu_hz**3)
+
+
 # ---------------------------------------------------------------------------
 # Foreground spectral energy distributions (SEDs)
 # Normalized to 1 at their respective reference frequencies.

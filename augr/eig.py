@@ -520,6 +520,7 @@ def physical_design_objective(
     hl_eig_ctx: HLEIGContext | None = None,
     eig_key=None,
     n_outer: int = 256,
+    galactic_loading: bool = True,
 ):
     """Cost-constrained EIG objective from the physical horn-packing design knobs.
 
@@ -535,7 +536,17 @@ def physical_design_objective(
     objectives, ``jax.grad`` w.r.t. the standardized ``z`` flows
     ``z -> design_pytree -> design_to_channels -> design_objective``;
     ``objective="hl_eig"`` is value-only (see the module docstring).
+
+    ``galactic_loading`` (default True) adds the physics-derived Galactic
+    dust+synchrotron optical loading (``config.GALACTIC_LOADING``) to every
+    band's photon-noise NET, so the submm groups (e.g. 615 GHz) reflect dust
+    loading. Ignored when ``net_override`` is supplied.
     """
+    extra_loading = None
+    if galactic_loading and net_override is None:
+        from augr.config import galactic_extra_loading
+
+        extra_loading = galactic_extra_loading()
     n_det, net, beam = design_to_channels(
         design["aperture_m"],
         design["f_number"],
@@ -545,6 +556,7 @@ def physical_design_objective(
         net_override=net_override,
         illumination_factor=illumination_factor,
         packing_efficiency=packing_efficiency,
+        extra_loading=extra_loading,
     )
     freqs_flat = tuple(float(f) for grp in freqs_per_group for f in grp)
     n_chan = len(freqs_flat)
