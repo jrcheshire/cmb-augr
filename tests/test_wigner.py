@@ -147,3 +147,63 @@ def test_wigner3j_vectorized_matches_sympy(L, j1_max, m1, m2):
                     f"L={L}, j1={j1}, l2={l2}, m1={m1}, m2={m2}, m3={m3}: "
                     f"augr={actual:.6e}, sympy={expected:.6e}"
                 )
+
+
+# -----------------------------------------------------------------------
+# JAX port (augr.wigner_jax) -- validated against the sympy-locked numpy
+# version (issue #45 Stage 3). jax == numpy suffices since numpy == sympy
+# is locked above.
+# -----------------------------------------------------------------------
+
+import functools  # noqa: E402
+
+import jax  # noqa: E402
+
+from augr.wigner_jax import (  # noqa: E402
+    wigner3j_000_vectorized_jax,
+    wigner3j_vectorized_jax,
+)
+
+
+@pytest.mark.parametrize(
+    "L,j1_max,m1,m2",
+    [
+        (1, 3, 0, -1),
+        (1, 3, -2, 0),
+        (5, 8, -2, 0),
+        (5, 8, 2, -2),
+        (10, 12, 2, 0),
+        (20, 25, -2, 0),
+        (50, 60, -2, 0),
+        (100, 120, -2, 0),
+    ],
+)
+def test_wigner3j_vectorized_jax_matches_numpy(L, j1_max, m1, m2):
+    j1 = np.arange(0, j1_max + 1, dtype=float)
+    l2max = int(j1.max()) + L
+    _, w_np = wigner3j_vectorized(L, j1, m1=m1, m2=m2, l2_max_global=l2max)
+    _, w_j = wigner3j_vectorized_jax(L, j1, m1=m1, m2=m2, l2_max_global=l2max)
+    w_j = np.asarray(w_j)
+    # fp64: max abs diff is machine-eps; meaningful entries match to <1e-8.
+    np.testing.assert_allclose(w_j, w_np, rtol=1e-8, atol=1e-11)
+
+
+@pytest.mark.parametrize("L,j1_max", [(2, 14), (5, 20), (37, 60), (100, 120)])
+def test_wigner3j_000_vectorized_jax_matches_numpy(L, j1_max):
+    j1 = np.arange(0, j1_max + 1, dtype=float)
+    l2max = int(j1.max()) + L
+    _, w_np = wigner3j_000_vectorized(L, j1, l2_max=l2max)
+    _, w_j = wigner3j_000_vectorized_jax(L, j1, l2_max=l2max)
+    np.testing.assert_allclose(np.asarray(w_j), w_np, rtol=1e-8, atol=1e-11)
+
+
+def test_wigner_jax_jit_compiles():
+    """Both paths compile under jax.jit (L and l2 bounds static)."""
+    j1 = np.arange(2, 60, dtype=float)
+    f2 = jax.jit(functools.partial(
+        wigner3j_vectorized_jax, 37, m1=-2, m2=0, l2_max_global=100))
+    _, w2 = wigner3j_vectorized(37, j1, m1=-2, m2=0, l2_max_global=100)
+    np.testing.assert_allclose(np.asarray(f2(j1)[1]), w2, rtol=1e-8, atol=1e-11)
+    f0 = jax.jit(functools.partial(wigner3j_000_vectorized_jax, 37, l2_max=100))
+    _, w0 = wigner3j_000_vectorized(37, j1, l2_max=100)
+    np.testing.assert_allclose(np.asarray(f0(j1)[1]), w0, rtol=1e-8, atol=1e-11)
