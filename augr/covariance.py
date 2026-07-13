@@ -41,7 +41,9 @@ def _nu_b(bin_edges: list[tuple[int, int]], f_sky: float) -> jnp.ndarray:
 
 
 def _build_M_signal_unbinned(signal_model: SignalModel,
-                              fiducial_params: jnp.ndarray) -> jnp.ndarray:
+                              fiducial_params: jnp.ndarray,
+                              delensed_bb_override: jnp.ndarray | None = None
+                              ) -> jnp.ndarray:
     """Unbinned signal-only M_signal(ℓ), shape (n_chan, n_chan, n_ells).
 
     M_signal[i, j, ℓ] = C_ℓ^CMB + C_ℓ^{FG, ij}. A post-CompSep residual
@@ -55,7 +57,8 @@ def _build_M_signal_unbinned(signal_model: SignalModel,
     freqs = signal_model.frequencies
     fg_model = signal_model.foreground_model
 
-    cl_cmb = signal_model.cmb_bb_unbinned(fiducial_params)
+    cl_cmb = signal_model.cmb_bb_unbinned(
+        fiducial_params, delensed_bb_override=delensed_bb_override)
     fg_params = signal_model.fg_params_from(fiducial_params)
 
     M = jnp.zeros((n_chan, n_chan, ells.shape[0]))
@@ -70,15 +73,22 @@ def _build_M_signal_unbinned(signal_model: SignalModel,
 
 
 def _build_M_signal(signal_model: SignalModel,
-                    fiducial_params: jnp.ndarray) -> jnp.ndarray:
+                    fiducial_params: jnp.ndarray,
+                    delensed_bb_override: jnp.ndarray | None = None
+                    ) -> jnp.ndarray:
     """Binned signal-only block M_signal, shape (n_chan, n_chan, n_bins).
 
     Convenience wrapper around ``_build_M_signal_unbinned`` that applies
     the bin matrix W along the last axis. Used by the per-bin
     block-diagonal fast path; the BPWF-aware full-covariance path uses
     ``_build_M_signal_unbinned`` directly to keep the per-ℓ spectrum.
+
+    ``delensed_bb_override`` is passed through unchanged (default None =
+    byte-identical).
     """
-    M_ell = _build_M_signal_unbinned(signal_model, fiducial_params)
+    M_ell = _build_M_signal_unbinned(
+        signal_model, fiducial_params,
+        delensed_bb_override=delensed_bb_override)
     W = signal_model.bin_matrix           # (n_bins, n_ells)
     # Contract on the last axis: M[i, j, b] = Σ_ℓ W[b, ℓ] M_ell[i, j, ℓ].
     return jnp.einsum('be,ije->ijb', W, M_ell)
@@ -319,6 +329,7 @@ def bandpower_covariance_blocks_from_noise(
     noise_nls: jnp.ndarray,
     f_sky: float,
     fiducial_params: jnp.ndarray,
+    delensed_bb_override: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """Per-bin Knox covariance from pre-computed noise arrays.
 
@@ -355,7 +366,8 @@ def bandpower_covariance_blocks_from_noise(
             "Σ_ℓ W_b(ℓ) W_{b'}(ℓ) (2ℓ+1) and the per-bin block-diagonal "
             "Knox approximation breaks. Use "
             "bandpower_covariance_full_from_noise instead.")
-    M = _build_M_signal(signal_model, fiducial_params)
+    M = _build_M_signal(signal_model, fiducial_params,
+                        delensed_bb_override=delensed_bb_override)
     W = signal_model.bin_matrix
     n_chan = noise_nls.shape[0]
     for i in range(n_chan):

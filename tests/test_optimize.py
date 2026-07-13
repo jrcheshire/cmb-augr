@@ -10,6 +10,7 @@ from augr.covariance import (
     bandpower_covariance_blocks,
     bandpower_covariance_blocks_from_noise,
 )
+from augr.delensing import load_lensing_spectra
 from augr.fisher import FisherForecast
 from augr.foregrounds import GaussianForegroundModel, NullForegroundModel
 from augr.instrument import (
@@ -19,6 +20,8 @@ from augr.instrument import (
     white_noise_power_continuous,
 )
 from augr.optimize import (
+    _combined_white_nl_bb,
+    _delens_from_combined_bb,
     make_optimization_context,
     sigma_r_from_channels,
     sigma_r_from_design,
@@ -403,3 +406,137 @@ class TestExternalCovSigmaR:
         out = jitted(cov)
         assert jnp.isfinite(out)
         assert float(out) > 0
+
+
+# -----------------------------------------------------------------------
+# Self-consistent delensing in the design forward (issue #45 Stage 2)
+# -----------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def lensing():
+    return load_lensing_spectra()
+
+
+# Small forecast + delensing config (fast gate).
+_S2_SIG_KW = dict(ell_min=2, ell_max=300, delta_ell=30, ell_per_bin_below=10)
+_S2_DELENS_KW = dict(delens_l_max_qe=300, delens_n_iter=2)
+
+
+class TestDelensedDesignForward:
+    """Design-dependent delensing wired into the analytic forward (#45 Stage 2)."""
+
+    def _common(self, instrument):
+        return dict(
+            instrument=instrument,
+            foreground_model=GaussianForegroundModel(),
+            cmb_spectra=CMBSpectra(),
+            fiducial_params=dict(FIDUCIAL_BK15),
+            fixed_params=["T_dust", "Delta_dust"],
+        )
+
+    def _eval(self, ctx, instrument, n_det=None):
+        return sigma_r_from_channels(
+            ctx.n_det if n_det is None else n_det,
+            ctx.net, ctx.beam, ctx.eta, ctx,
+            mission_years=instrument.mission_duration_years,
+            f_sky=instrument.f_sky,
+        )
+
+    def test_off_is_default_and_fields_none(self, instrument):
+        """delens=None (default) leaves the delensing context empty."""
+        ctx = make_optimization_context(**self._common(instrument), **_S2_SIG_KW)
+        assert ctx.delens_mode is None
+        assert ctx.delens_cl_bb_res0 is None
+        assert ctx.delens_jac is None
+
+    def test_bad_mode_raises(self, instrument, lensing):
+        with pytest.raises(ValueError, match="delens must be"):
+            make_optimization_context(
+                **self._common(instrument), delens="nope",
+                lensing_spectra=lensing, **_S2_SIG_KW)
+
+    def test_recompute_reproduces_frozen_and_tightens(self, instrument, lensing):
+        """recompute at the reference design == frozen-delensed forecast, and
+        delensing tightens sigma(r) vs the A_lens=1 forecast."""
+        ctx_rec = make_optimization_context(
+            **self._common(instrument), delens="recompute",
+            lensing_spectra=lensing, **_S2_DELENS_KW, **_S2_SIG_KW)
+        # A_lens drops from the parameter vector in delensed mode.
+        assert "A_lens" not in ctx_rec.signal_model.parameter_names
+
+        ctx_frozen = make_optimization_context(
+            **self._common(instrument),
+            delensed_bb=ctx_rec.delens_cl_bb_res0,
+            delensed_bb_ells=ctx_rec.delens_ls, **_S2_SIG_KW)
+        s_rec = float(self._eval(ctx_rec, instrument))
+        s_frozen = float(self._eval(ctx_frozen, instrument))
+        # Exact: the reference recompute reproduces the frozen residual.
+        np.testing.assert_allclose(s_rec, s_frozen, rtol=1e-9)
+
+        ctx_alens = make_optimization_context(
+            **self._common(instrument), **_S2_SIG_KW)
+        assert s_rec < float(self._eval(ctx_alens, instrument))
+
+    def test_recompute_grad_finite_and_sign(self, instrument, lensing):
+        """grad wrt n_det is finite and negative (more detectors -> lower sigma)."""
+        ctx = make_optimization_context(
+            **self._common(instrument), delens="recompute",
+            lensing_spectra=lensing, **_S2_DELENS_KW, **_S2_SIG_KW)
+        g = jax.grad(lambda nd: self._eval(ctx, instrument, n_det=nd))(ctx.n_det)
+        assert jnp.all(jnp.isfinite(g))
+        assert jnp.all(g < 0)
+
+    def test_delens_chain_grad_matches_fd(self, instrument, lensing):
+        """Rigorous gradient check on the design -> delensing chain, isolated
+        from the ill-conditioned Fisher inversion.
+
+        The scalar is sum(cl_bb_res) as a function of n_det, routed through the
+        exact same combined-white-noise -> QE-residual chain the forward uses.
+        Central FD along the design direction (multiplicative n_det step)
+        converges to autodiff as h shrinks (the sum(cl_bb_res) map is smooth;
+        only the downstream sigma(r) inv() carries the known FD-noise floor).
+        """
+        ctx = make_optimization_context(
+            **self._common(instrument), delens="recompute",
+            lensing_spectra=lensing, **_S2_DELENS_KW, **_S2_SIG_KW)
+        my = instrument.mission_duration_years
+        fsky = instrument.f_sky
+
+        def f(n_det):
+            nl_bb = _combined_white_nl_bb(
+                n_det, ctx.net, ctx.beam, ctx.eta, ctx.delens_ells, my, fsky)
+            return jnp.sum(_delens_from_combined_bb(
+                lensing, nl_bb, ctx.delens_ls,
+                ctx.delens_l_max_qe, ctx.delens_n_iter))
+
+        g = jax.grad(f)(ctx.n_det)
+        assert jnp.all(jnp.isfinite(g))
+        ad = float(jnp.dot(g, ctx.n_det))         # directional along n_det
+        # sum(cl_bb_res) at l_max_qe=300 is strongly curved and carries a
+        # ~1e-7 fp64 floor from the lax.scan reductions, so central FD is only
+        # reliable at a small step (h ~ 1e-5); larger h is curvature/noise
+        # dominated. At h = 1e-5 FD reproduces autodiff to < 1e-3.
+        h = 1e-5
+        fd = float((f(ctx.n_det * (1 + h)) - f(ctx.n_det * (1 - h))) / (2 * h))
+        np.testing.assert_allclose(fd, ad, rtol=1e-3)
+
+    @pytest.mark.slow
+    def test_linearized_matches_recompute_at_reference(self, instrument, lensing):
+        """linearized == recompute at the reference (nl_bb - nl_bb0 = 0), and
+        its gradient is finite. Uses a small ell range so the jacrev precompute
+        (O(n_ls) delensing solves) stays cheap."""
+        sig_kw = dict(ell_min=2, ell_max=60, delta_ell=10, ell_per_bin_below=10)
+        dkw = dict(delens_l_max_qe=200, delens_n_iter=2,
+                   delens_ls=jnp.arange(2, 61, dtype=float))
+        ctx_rec = make_optimization_context(
+            **self._common(instrument), delens="recompute",
+            lensing_spectra=lensing, **dkw, **sig_kw)
+        ctx_lin = make_optimization_context(
+            **self._common(instrument), delens="linearized",
+            lensing_spectra=lensing, **dkw, **sig_kw)
+        s_rec = float(self._eval(ctx_rec, instrument))
+        s_lin = float(self._eval(ctx_lin, instrument))
+        np.testing.assert_allclose(s_lin, s_rec, rtol=1e-9)
+        g = jax.grad(
+            lambda nd: self._eval(ctx_lin, instrument, n_det=nd))(ctx_lin.n_det)
+        assert jnp.all(jnp.isfinite(g))

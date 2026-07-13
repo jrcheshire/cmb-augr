@@ -237,6 +237,29 @@ Knowing how the modules chain together matters more than any one file:
    `sigma_r_from_design(...)` (Tier 2, physical geometry) are both
    `jax.grad`-compatible.
 
+   **Self-consistent delensing in the forward (issue #45 Stage 2).**
+   `make_optimization_context(..., delens=..., lensing_spectra=...)`
+   couples QE delensing into the differentiable forward so σ(r) credits
+   the delensing a design can actually achieve (instead of the frozen
+   A_lens=1 / fixed-`delensed_bb` behaviour). The design enters delensing
+   only through the inverse-variance-combined **white** pol noise
+   (`_combined_white_nl_bb`; 1/f ignored — the QE reconstruction is
+   dominated by the ℓ~500-2000 lensing peak), and since the residual is
+   additive in r the Jacobian stays structural — only the covariance
+   signal `S` picks up the design-dependent residual, via a
+   `delensed_bb_override` threaded `sigma_r_from_channels →
+   bandpower_covariance_blocks_from_noise → cmb_bb_unbinned`. Two modes:
+   `delens='recompute'` re-runs `delens_residual_bb` every eval (exact;
+   ~tens of s/solve on CPU — cheap relative to the ~2 h map-based forward,
+   dominant for the ms analytic forward); `delens='linearized'`
+   precomputes the residual Jacobian `d(cl_bb_res)/d(nl_bb)` once
+   (`jax.jacrev`, O(n_ls) solves — expensive build) and applies it
+   linearly per eval (near-free, first-order). Default `delens=None` is
+   byte-identical. The context is built in delensed mode at a reference
+   solve, so recompute at the reference design reproduces the frozen
+   residual exactly. **Full-sky delensing (`fullsky=True`) is still numpy
+   (Stage 3); the forward uses the flat-sky path.**
+
 7. **`multipatch.py` + `sky_patches.py`.** `MultiPatchFisher` runs
    independent per-patch Fishers with shared spectral indices and
    per-patch amplitudes, then combines. Costs scale linearly in
