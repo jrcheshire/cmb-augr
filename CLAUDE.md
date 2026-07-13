@@ -125,6 +125,38 @@ Knowing how the modules chain together matters more than any one file:
    uses Gauss-Legendre quadrature (~2 min / 5 iter); full-sky uses
    `wigner.py` Schulten-Gordon recursion (~10 min / 5 iter).
 
+   **Differentiable flat-sky delensing (issue #45, Stage 1).** The
+   flat-sky path is `lax.scan` + `jnp` throughout, so it is a single
+   `jax.jit` / `jax.grad` trace in the noise spectra. The pure core is
+   `_delens_core(...)` (returns `(cl_bb_res, n0_mv, A_lens_eff,
+   a_lens_history)` all as jnp); `iterate_delensing` is a thin wrapper
+   that adds the host-side `DelensedSpectra` packaging (casts
+   `A_lens_eff` to `float`, prints per-iteration `A_lens_eff` when
+   `verbose`) — public API byte-identical. `delens_residual_bb(spectra,
+   nl_tt, nl_ee, nl_bb, ...)` is the differentiable entry point the
+   design forward consumes: close over `spectra` and the integer knobs
+   (compile-time constants) and it is grad-traceable in the noise. jit
+   gives ~2.2× over eager (FLOP-bound scan); one jitted grad solve is
+   ~20 s at l_max_qe=1000 / ~90 s at l_max_qe=1500 on CPU.
+
+   **Differentiable full-sky delensing (issue #45, Stage 3).**
+   `fullsky=True` also has a pure-jnp, `jax.grad`-traceable path: pass
+   `backend='jax'` to `iterate_delensing` (or `compute_n0_mv` /
+   `residual_cl_bb`). `augr/wigner_jax.py` ports both Wigner-3j paths
+   (spin-0 Racah via `jax.scipy.special.gammaln`; spin-2 Schulten-Gordon
+   as a `lax.scan` backward sweep — `spin2_body` / `spin0_body` are the
+   traced-L cores), and `augr/delensing_fullsky_jax.py` reimplements all
+   five N_0 estimators + the lensing kernel with those, driving the per-L
+   sweep via `lax.map` over the static `_fullsky_L_samples` grid (uniform
+   shapes via a global `l2_max = l_max + max(L_sample)`; no ProcessPool).
+   Validated bit-for-bit against the sympy-locked numpy Wigner (rel
+   ~1e-11) and the numpy full-sky drivers (rel ~1e-13, TE ~1e-11); the
+   whole `iterate_delensing(fullsky=True, backend='jax')` reproduces the
+   numpy full-sky solve to ~1e-15 and is grad-finite. `backend='numpy'`
+   (default) keeps the ProcessPool Wigner path as the reference. The
+   design forward still uses flat-sky for speed; the differentiable
+   full-sky path is the accuracy cross-check.
+
    **N₀ validation status (2026-05-07).** Validated against `plancklens`
    at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:
    - **TT flat-sky**: machine-precision against the constant-Cℓ closed
@@ -220,6 +252,29 @@ Knowing how the modules chain together matters more than any one file:
    `sigma_r_from_channels(n_det, net, beam, eta, ctx)` (Tier 1) and
    `sigma_r_from_design(...)` (Tier 2, physical geometry) are both
    `jax.grad`-compatible.
+
+   **Self-consistent delensing in the forward (issue #45 Stage 2).**
+   `make_optimization_context(..., delens=..., lensing_spectra=...)`
+   couples QE delensing into the differentiable forward so σ(r) credits
+   the delensing a design can actually achieve (instead of the frozen
+   A_lens=1 / fixed-`delensed_bb` behaviour). The design enters delensing
+   only through the inverse-variance-combined **white** pol noise
+   (`_combined_white_nl_bb`; 1/f ignored — the QE reconstruction is
+   dominated by the ℓ~500-2000 lensing peak), and since the residual is
+   additive in r the Jacobian stays structural — only the covariance
+   signal `S` picks up the design-dependent residual, via a
+   `delensed_bb_override` threaded `sigma_r_from_channels →
+   bandpower_covariance_blocks_from_noise → cmb_bb_unbinned`. Two modes:
+   `delens='recompute'` re-runs `delens_residual_bb` every eval (exact;
+   ~tens of s/solve on CPU — cheap relative to the ~2 h map-based forward,
+   dominant for the ms analytic forward); `delens='linearized'`
+   precomputes the residual Jacobian `d(cl_bb_res)/d(nl_bb)` once
+   (`jax.jacrev`, O(n_ls) solves — expensive build) and applies it
+   linearly per eval (near-free, first-order). Default `delens=None` is
+   byte-identical. The context is built in delensed mode at a reference
+   solve, so recompute at the reference design reproduces the frozen
+   residual exactly. **Full-sky delensing (`fullsky=True`) is still numpy
+   (Stage 3); the forward uses the flat-sky path.**
 
 7. **`multipatch.py` + `sky_patches.py`.** `MultiPatchFisher` runs
    independent per-patch Fishers with shared spectral indices and

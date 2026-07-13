@@ -35,9 +35,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import jax
 import jax.numpy as jnp
 
 from augr.covariance import bandpower_covariance_blocks_from_noise
+from augr.delensing import LensingSpectra, delens_residual_bb
 from augr.fisher import _fisher_from_blocks, _fisher_from_full
 from augr.instrument import Instrument, noise_nl_continuous
 from augr.signal import SignalModel, flatten_params
@@ -53,6 +55,49 @@ from augr.telescope import (
 # downstream code imports it; new code should use _fisher_from_blocks
 # directly.
 _fisher_from_blocks_solve = _fisher_from_blocks
+
+
+def _combined_white_nl_bb(n_det: jnp.ndarray,
+                          net: jnp.ndarray,
+                          beam: jnp.ndarray,
+                          eta: jnp.ndarray,
+                          ells: jnp.ndarray,
+                          mission_years: float,
+                          f_sky: float) -> jnp.ndarray:
+    """Inverse-variance-combined *white* polarization noise N_l^BB.
+
+    White (no 1/f) by design: the QE lensing reconstruction is dominated by
+    the E/B lensing peak (l ~ 500-2000) where 1/f is negligible, and using
+    white noise keeps the context-build reference solve consistent with the
+    per-design eval regardless of the covariance-side ``knee_ell``. Same
+    channel parameters that feed the covariance noise, so it tracks the
+    design differentiably.
+    """
+    n_chan = n_det.shape[0]
+    inv = jnp.zeros_like(ells, dtype=float)
+    for i in range(n_chan):
+        nl_i = noise_nl_continuous(net[i], n_det[i], beam[i], eta[i], ells,
+                                   mission_years, f_sky, 0.0, 1.0)
+        inv = inv + 1.0 / nl_i
+    return 1.0 / inv
+
+
+def _delens_from_combined_bb(spectra: LensingSpectra,
+                             nl_bb: jnp.ndarray,
+                             ls: jnp.ndarray,
+                             l_max_qe: int,
+                             n_iter: int) -> jnp.ndarray:
+    """Residual lensing BB from the single combined polarization noise.
+
+    In the design forward the inverse-variance-combined noise obeys the
+    pol/temperature relation ``nl_ee = nl_bb`` and ``nl_tt = nl_bb / 2``, so
+    the iterative-QE residual is a function of ``nl_bb`` alone. ``nl_bb`` is
+    indexed on ``spectra.ells`` (the LensingSpectra grid).  Differentiable
+    (flat-sky ``delens_residual_bb``), so this composes into ``jax.grad``.
+    """
+    return delens_residual_bb(
+        spectra, nl_bb / 2.0, nl_bb, nl_bb,
+        ls=ls, L_max=l_max_qe, l_max_qe=l_max_qe, n_iter=n_iter)
 
 
 @dataclass(frozen=True)
@@ -93,6 +138,19 @@ class OptimizationContext:
     eta: jnp.ndarray
     freqs: tuple[float, ...]
 
+    # Self-consistent delensing coupling (issue #45 Stage 2). All None when
+    # delens is off -> the forward is byte-identical to the frozen-A_lens /
+    # frozen-delensed_bb path. See make_optimization_context(delens=...).
+    delens_mode: str | None = None            # None | 'recompute' | 'linearized'
+    lensing_spectra: LensingSpectra | None = None
+    delens_ls: jnp.ndarray | None = None      # ell grid of cl_bb_res
+    delens_ells: jnp.ndarray | None = None    # noise grid for delensing (spectra.ells)
+    delens_l_max_qe: int = 1000
+    delens_n_iter: int = 5
+    delens_cl_bb_res0: jnp.ndarray | None = None  # reference residual (on delens_ls)
+    delens_nl_bb0: jnp.ndarray | None = None      # reference combined nl_bb (on delens_ells)
+    delens_jac: jnp.ndarray | None = None         # d(cl_bb_res)/d(nl_bb), linearized mode
+
 
 def make_optimization_context(
     instrument: Instrument,
@@ -101,6 +159,12 @@ def make_optimization_context(
     fiducial_params: dict[str, float],
     priors: dict[str, float] | None = None,
     fixed_params: list[str] | None = None,
+    *,
+    delens: str | None = None,
+    lensing_spectra: LensingSpectra | None = None,
+    delens_l_max_qe: int = 1000,
+    delens_n_iter: int = 5,
+    delens_ls: jnp.ndarray | None = None,
     **signal_kwargs,
 ) -> OptimizationContext:
     """One-time setup for differentiable sigma(r) optimization.
@@ -116,6 +180,20 @@ def make_optimization_context(
         fiducial_params: Dict of fiducial parameter values.
         priors:          Dict mapping param name -> prior sigma.
         fixed_params:    List of params to hold fixed.
+        delens:          None (off), 'recompute', or 'linearized' -- enable
+                         self-consistent design-dependent delensing in the
+                         forward (issue #45 Stage 2). Requires
+                         ``lensing_spectra``. 'recompute' re-runs the QE
+                         residual every eval (exact; ~tens of seconds per
+                         solve). 'linearized' precomputes the residual
+                         Jacobian d(cl_bb_res)/d(nl_bb) once (O(n_ls) solves --
+                         expensive build) and applies it linearly per eval
+                         (near-free; first-order accurate). Owns delensed_bb.
+        lensing_spectra: LensingSpectra for the QE delensing (delens only).
+        delens_l_max_qe: Max QE multipole for the delensing (delens only).
+        delens_n_iter:   Delensing iterations (delens only).
+        delens_ls:       ell grid for the residual (delens only; default
+                         2..300, must span the SignalModel [ell_min, ell_max]).
         **signal_kwargs: Passed to SignalModel (ell_min, ell_max, delta_ell,
                          ell_per_bin_below, delensed_bb, etc.)
 
@@ -124,6 +202,58 @@ def make_optimization_context(
     """
     priors = priors or {}
     fixed_params = fixed_params or []
+
+    # Channel parameters as JAX arrays (also the reference point for delensing).
+    channels = instrument.channels
+    n_det = jnp.array([float(ch.n_detectors) for ch in channels])
+    net = jnp.array([ch.net_per_detector for ch in channels])
+    beam = jnp.array([ch.beam_fwhm_arcmin for ch in channels])
+    eta = jnp.array([ch.efficiency.total for ch in channels])
+    freqs = tuple(ch.nu_ghz for ch in channels)
+
+    # Self-consistent delensing (issue #45 Stage 2). When enabled, the design
+    # forward recomputes (or linearizes) the residual lensing BB from the
+    # design-dependent combined noise. Here we build the reference solve at the
+    # supplied instrument: it both (a) puts the SignalModel in delensed mode
+    # (A_lens drops out; the residual is additive in r so the Jacobian stays
+    # structural) and (b) serves as the linearization point. The reference
+    # uses the same white-noise combine as the per-eval path, so recompute at
+    # the reference design reproduces this frozen residual exactly (when the
+    # per-eval mission_years / f_sky match the instrument's).
+    if delens not in (None, "recompute", "linearized"):
+        raise ValueError(
+            f"delens must be None, 'recompute', or 'linearized'; got {delens!r}")
+    delens_ls_arr = delens_nl_bb0 = delens_cl_bb_res0 = delens_jac = None
+    delens_ells_arr = None
+    if delens is not None:
+        if lensing_spectra is None:
+            raise ValueError(
+                "delens requires lensing_spectra=load_lensing_spectra(...).")
+        if "delensed_bb" in signal_kwargs:
+            raise ValueError(
+                "delens=... owns delensed_bb; do not also pass it in "
+                "signal_kwargs.")
+        delens_ells_arr = lensing_spectra.ells
+        delens_ls_arr = (jnp.arange(2, 301, dtype=float)
+                         if delens_ls is None else delens_ls)
+        delens_nl_bb0 = _combined_white_nl_bb(
+            n_det, net, beam, eta, delens_ells_arr,
+            instrument.mission_duration_years, instrument.f_sky)
+        delens_cl_bb_res0 = _delens_from_combined_bb(
+            lensing_spectra, delens_nl_bb0, delens_ls_arr,
+            delens_l_max_qe, delens_n_iter)
+        if delens == "linearized":
+            # J = d(cl_bb_res)/d(nl_bb) at the reference (reverse-mode: output
+            # dim n_ls << input dim n_ells). This precompute costs O(n_ls)
+            # delensing solves -- expensive; amortized over many cheap evals.
+            delens_jac = jax.jacrev(
+                lambda nlbb: _delens_from_combined_bb(
+                    lensing_spectra, nlbb, delens_ls_arr,
+                    delens_l_max_qe, delens_n_iter))(delens_nl_bb0)
+        # Put the SignalModel in delensed mode at the reference residual.
+        signal_kwargs = dict(signal_kwargs)
+        signal_kwargs["delensed_bb"] = delens_cl_bb_res0
+        signal_kwargs["delensed_bb_ells"] = delens_ls_arr
 
     # Build signal model (defines data vector structure, Jacobian)
     sig = SignalModel(instrument, foreground_model, cmb_spectra, **signal_kwargs)
@@ -155,14 +285,6 @@ def make_optimization_context(
     # Index of r in free params
     r_idx = free_names.index("r")
 
-    # Extract channel parameters as JAX arrays
-    channels = instrument.channels
-    n_det = jnp.array([float(ch.n_detectors) for ch in channels])
-    net = jnp.array([ch.net_per_detector for ch in channels])
-    beam = jnp.array([ch.beam_fwhm_arcmin for ch in channels])
-    eta = jnp.array([ch.efficiency.total for ch in channels])
-    freqs = tuple(ch.nu_ghz for ch in channels)
-
     return OptimizationContext(
         signal_model=sig,
         J_blocks=J_blocks,
@@ -176,6 +298,15 @@ def make_optimization_context(
         beam=beam,
         eta=eta,
         freqs=freqs,
+        delens_mode=delens,
+        lensing_spectra=lensing_spectra,
+        delens_ls=delens_ls_arr,
+        delens_ells=delens_ells_arr,
+        delens_l_max_qe=delens_l_max_qe,
+        delens_n_iter=delens_n_iter,
+        delens_cl_bb_res0=delens_cl_bb_res0,
+        delens_nl_bb0=delens_nl_bb0,
+        delens_jac=delens_jac,
     )
 
 
@@ -244,9 +375,33 @@ def sigma_r_from_channels(
         ]
     )
 
+    # Self-consistent delensing: recompute (or linearize) the residual lensing
+    # BB from this design's combined noise and feed it into the covariance
+    # signal as a delensed_bb override. None when delens is off (byte-identical).
+    delensed_override = None
+    if ctx.delens_mode is not None:
+        # Combined *white* pol noise on the full delensing ell grid (1/f
+        # ignored for the QE reconstruction; nl_ee = nl_bb, nl_tt = nl_bb/2
+        # are handled inside _delens_from_combined_bb). Same white combine as
+        # the context-build reference, so recompute at the reference design
+        # reproduces the frozen residual.
+        nl_bb_del = _combined_white_nl_bb(
+            n_det, net, beam_fwhm, eta_total, ctx.delens_ells,
+            mission_years, f_sky)
+        if ctx.delens_mode == "recompute":
+            cl_res = _delens_from_combined_bb(
+                ctx.lensing_spectra, nl_bb_del, ctx.delens_ls,
+                ctx.delens_l_max_qe, ctx.delens_n_iter)
+        else:  # 'linearized': cl_bb_res0 + J (nl_bb - nl_bb0)
+            cl_res = ctx.delens_cl_bb_res0 + ctx.delens_jac @ (
+                nl_bb_del - ctx.delens_nl_bb0)
+        # Interpolate onto the signal ell grid used by cmb_bb_unbinned.
+        delensed_override = jnp.interp(ells, ctx.delens_ls, cl_res)
+
     # Covariance blocks: (n_bins, n_spec, n_spec)
     cov_blocks = bandpower_covariance_blocks_from_noise(
-        ctx.signal_model, noise_nls, f_sky, ctx.fiducial_params
+        ctx.signal_model, noise_nls, f_sky, ctx.fiducial_params,
+        delensed_bb_override=delensed_override,
     )
 
     # Fisher matrix: J^T Sigma^{-1} J via the unified primitive.

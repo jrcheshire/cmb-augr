@@ -771,17 +771,34 @@ class SignalModel:
     # Unbinned spectrum (used by covariance.py)
     # ------------------------------------------------------------------
 
-    def cmb_bb_unbinned(self, params: jnp.ndarray) -> jnp.ndarray:
+    def cmb_bb_unbinned(self, params: jnp.ndarray,
+                        delensed_bb_override: jnp.ndarray | None = None
+                        ) -> jnp.ndarray:
         """CMB BB spectrum on the ell grid, from parameters.
 
         Handles both standard (r, A_lens) and delensed (r only) modes.
+
+        In delensed mode, ``delensed_bb_override`` (on ``self._ells``, same
+        grid as the construction-time ``delensed_bb``) replaces the frozen
+        residual lensing spectrum.  This lets the differentiable design
+        forward substitute a design-dependent residual (self-consistent
+        delensing) without rebuilding the SignalModel -- the residual is
+        additive in r, so it changes only the fiducial CMB BB (hence the
+        covariance), never the Jacobian.  Ignored/None reproduces the frozen
+        spectrum exactly.
         """
         r = params[0]
         if self._delensed:
-            return r * self._cmb.cl_tensor_r1(self._ells) + self._delensed_bb
-        else:
-            A_lens = params[1]
-            return self._cmb.cl_bb(self._ells, r, A_lens)
+            delensed = (self._delensed_bb if delensed_bb_override is None
+                        else delensed_bb_override)
+            return r * self._cmb.cl_tensor_r1(self._ells) + delensed
+        if delensed_bb_override is not None:
+            raise ValueError(
+                "delensed_bb_override was supplied but this SignalModel is "
+                "not in delensed mode (it carries an A_lens parameter). "
+                "Build the model with delensed_bb=... to use the override.")
+        A_lens = params[1]
+        return self._cmb.cl_bb(self._ells, r, A_lens)
 
     def fg_params_from(self, params: jnp.ndarray) -> jnp.ndarray:
         """Extract the foreground-parameter block from the full vector.
