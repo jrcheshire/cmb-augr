@@ -11,7 +11,7 @@ Fisher-matrix forecasting for CMB B-mode polarization experiments, targeting the
 Given an instrument specification (frequency bands, detector counts, noise levels, beam sizes, integration time), `augr` computes the marginalized Fisher constraint on *r* after accounting for:
 
 - **Foreground contamination** from polarized dust and synchrotron, modeled as either a simple Gaussian (BK15-style, 9 parameters) or a moment expansion (17 parameters) that captures SED spatial variation and frequency decorrelation. A no-op model is also provided for forecasts on maps that have already been component-separated by an external pipeline.
-- **Gravitational lensing** B-modes, either parameterized by A_lens or self-consistently delensed via iterative quadratic-estimator lensing reconstruction (flat-sky or full-sky Wigner 3j)
+- **Gravitational lensing** B-modes, either parameterized by A_lens or self-consistently delensed via iterative quadratic-estimator lensing reconstruction (flat-sky or full-sky Wigner 3j) — differentiable end-to-end, so σ(r) can credit the design-dependent delensing an instrument achieves
 - **Priors** on foreground spectral indices from Planck/WMAP
 - **Bandpower covariance** via the Knox formula across all frequency cross-spectra
 - **Multi-patch likelihoods** with shared spectral indices and per-patch amplitudes, for sky regions of differing foreground complexity
@@ -102,13 +102,22 @@ augr/
                    constraints; Cholesky solver with eigendecomposition fallback
   delensing.py     Iterative QE lensing reconstruction: all 5 estimators
                    (TT, TE, EE, EB, TB) with MV combination, residual BB
-                   via lensing kernel, flat-sky and full-sky (Wigner 3j) modes
+                   via lensing kernel, flat-sky and full-sky (Wigner 3j)
+                   modes. Fully jax.jit / jax.grad-traceable in the noise
+                   spectra (flat-sky natively; full-sky via backend="jax")
   wigner.py        Wigner 3j symbols: closed-form (0,0,0) via log-gamma,
                    Schulten-Gordon backward recursion for spin-2, vectorized
                    over l1 for fixed L
+  wigner_jax.py    JAX-native Wigner 3j (Racah closed form + Schulten-Gordon
+                   recursion as a lax.scan sweep); L may be traced
+  delensing_fullsky_jax.py  Pure-jnp full-sky N_0 estimators + lensing
+                   kernel (lax.map over L, no ProcessPool) -- the
+                   differentiable backend="jax" full-sky path
   optimize.py      Differentiable sigma(r) for gradient-based instrument
                    optimization: channel-level (Tier 1) and telescope
-                   design-level (Tier 2) via jax.grad
+                   design-level (Tier 2) via jax.grad; optional
+                   self-consistent delensing folded into the forward
+                   (make_optimization_context(delens="recompute"|"linearized"))
   units.py         Physical constants, RJ/CMB unit conversions, dust and
                    synchrotron SEDs and their log-derivatives
   multipatch.py    Multi-patch Fisher with shared spectral indices and
@@ -299,6 +308,8 @@ nl_ee, nl_tt = nl_bb, combined_noise_nl(inst, spec.ells, "TT")
 result = iterate_delensing(spec, nl_tt, nl_ee, nl_bb, fullsky=True, n_iter=5)
 # result.A_lens_eff ~ 0.29 for probe-class, result.cl_bb_res for Fisher input
 ```
+
+**Differentiable end-to-end.** Both paths are `jax.jit` / `jax.grad`-traceable in the noise spectra. The flat-sky path is native (`augr.delensing.delens_residual_bb` is the differentiable entry point returning `cl_bb_res`); the full-sky path becomes differentiable with `backend="jax"`, which routes through the JAX-native Wigner 3j in `wigner_jax.py` and the pure-jnp drivers in `delensing_fullsky_jax.py` (validated bit-for-bit against the numpy/ProcessPool reference to ~1e-15). This lets σ(r) credit the delensing a given instrument can *achieve*: `make_optimization_context(..., delens="recompute", lensing_spectra=...)` recomputes the residual lensing BB from each design's noise inside the differentiable forward, so `jax.grad(sigma_r_from_design)` accounts for the design-dependence of delensing efficiency (a cheap first-order `delens="linearized"` surrogate is also provided).
 
 ## Scan strategy
 

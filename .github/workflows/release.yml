@@ -1,0 +1,60 @@
+name: publish
+
+# Build and publish to PyPI on a version tag (v*). Uses PyPI Trusted
+# Publishing (OIDC) -- no API token stored in the repo. This requires a
+# one-time PyPI-side config: on https://pypi.org/manage/project/cmb-augr/
+# add a "trusted publisher" with
+#   Owner: jrcheshire   Repository: cmb-augr
+#   Workflow: release.yml   Environment: pypi
+# Until that is configured, the `publish` job's upload step will fail
+# (the `build` job still succeeds and uploads the artifacts).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:  # allow a manual build (dry run; publish still tag-gated)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          twine check dist/*
+      - name: Release-blocker -- author metadata must read "James Cheshire"
+        run: |
+          meta=$(python -c "import glob,zipfile,sys; \
+            w=glob.glob('dist/*.whl')[0]; z=zipfile.ZipFile(w); \
+            print(next(z.read(n).decode() for n in z.namelist() if n.endswith('METADATA')))")
+          echo "$meta" | grep -E '^(Name|Version|Author-email):'
+          echo "$meta" | grep -Eq '^Author-email:.*James Cheshire.*<cheshire@caltech\.edu>' \
+            || { echo "::error::METADATA author is not 'James Cheshire <cheshire@caltech.edu>'"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Only publish for an actual tag push, not the manual dry-run dispatch.
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/cmb-augr
+    permissions:
+      id-token: write   # OIDC token for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
