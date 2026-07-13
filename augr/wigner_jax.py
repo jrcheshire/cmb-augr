@@ -41,21 +41,15 @@ def _parity_sign(x: jnp.ndarray) -> jnp.ndarray:
 # (l1 l2 L; 0 0 0) -- closed-form via log-gamma
 # -----------------------------------------------------------------------
 
-def wigner3j_000_vectorized_jax(L: int, l1_arr,
-                                l2_min: int = 0,
-                                l2_max: int | None = None
-                                ) -> tuple[np.ndarray, jnp.ndarray]:
-    """JAX port of ``wigner.wigner3j_000_vectorized``.
+def spin0_body(L_f, l1, l2_min: int, l2_max: int) -> jnp.ndarray:
+    """(l1 l2 L; 0 0 0) closed-form table for a single L; ``L`` may be traced.
 
-    Returns (l2_grid, w3j) with w3j[i, j] = (l1_arr[i], l2_grid[j], L; 0 0 0),
-    zero where the triangle fails or l1+l2+L is odd.
+    ``L_f`` scalar value (concrete or tracer); ``l1`` jnp array; ``l2_min,
+    l2_max`` static ints. ``lax.map``-friendly core of
+    :func:`wigner3j_000_vectorized_jax`. Returns w of shape
+    ``(len(l1), l2_max - l2_min + 1)``.
     """
-    l1 = jnp.asarray(l1_arr, dtype=float)
-    if l2_max is None:
-        l2_max = int(np.max(np.asarray(l1_arr))) + int(L)
     l2_grid = jnp.arange(l2_min, l2_max + 1, dtype=float)   # (n_l2,)
-    L_f = float(L)
-
     l1c = l1[:, None]                 # (n_l1, 1)
     l2c = l2_grid[None, :]            # (1, n_l2)
     ssum = l1c + l2c + L_f            # (n_l1, n_l2)
@@ -77,7 +71,24 @@ def wigner3j_000_vectorized_jax(L: int, l1_arr,
              + 0.5 * (gammaln(2.0 * a + 1.0) + gammaln(2.0 * b + 1.0)
                       + gammaln(2.0 * c + 1.0) - gammaln(2.0 * s_safe + 2.0)))
     sign = _parity_sign(s_safe)
-    w = jnp.where(valid, sign * jnp.exp(log_w), 0.0)
+    return jnp.where(valid, sign * jnp.exp(log_w), 0.0)
+
+
+def wigner3j_000_vectorized_jax(L: int, l1_arr,
+                                l2_min: int = 0,
+                                l2_max: int | None = None
+                                ) -> tuple[np.ndarray, jnp.ndarray]:
+    """JAX port of ``wigner.wigner3j_000_vectorized`` (concrete ``L``).
+
+    Returns (l2_grid, w3j) with w3j[i, j] = (l1_arr[i], l2_grid[j], L; 0 0 0),
+    zero where the triangle fails or l1+l2+L is odd. The ``lax.map``-friendly
+    traced-``L`` core is :func:`spin0_body`.
+    """
+    l1 = jnp.asarray(l1_arr, dtype=float)
+    if l2_max is None:
+        l2_max = int(np.max(np.asarray(l1_arr))) + int(L)
+    l2_grid = jnp.arange(l2_min, l2_max + 1, dtype=float)
+    w = spin0_body(float(L), l1, l2_min, l2_max)
     return l2_grid.astype(int), w
 
 
@@ -110,37 +121,25 @@ def _sg_b_jax(j, j1, j2, m1, m2, m3):
 # Vectorized spin-2 recursion: all l1 simultaneously for fixed L
 # -----------------------------------------------------------------------
 
-def wigner3j_vectorized_jax(L: int, l1_array,
-                            m1: int = 2, m2: int = -2,
-                            l2_min_global: int = 0,
-                            l2_max_global: int | None = None
-                            ) -> tuple[np.ndarray, jnp.ndarray]:
-    """JAX port of ``wigner.wigner3j_vectorized`` (backward SG sweep as scan).
+def spin2_body(L_f, l1, m1: int, m2: int, m3: int,
+               l2_min: int, l2_max: int) -> jnp.ndarray:
+    """Spin-2 Schulten-Gordon table for a single L, ``L`` may be traced.
 
-    Computes (l1, L, l2; m1, m2, m3) for all l1 and valid l2. Same seeds,
-    coefficient signs, normalization, and sign fix as the numpy version.
+    ``L_f`` is a scalar value (concrete or a JAX tracer); ``l1`` is a jnp
+    array; ``m1, m2, m3, l2_min, l2_max`` are static Python ints (they set
+    array shapes and carry no control flow on ``L_f``). This is the
+    ``lax.map``-friendly core; the public ``wigner3j_vectorized_jax`` wraps
+    it with the concrete-``L`` grid bookkeeping and edge cases. Returns
+    w_full of shape ``(len(l1), l2_max - l2_min + 1)``.
     """
-    m3 = -(m1 + m2)
-    l1 = jnp.asarray(l1_array, dtype=float)
     n_l1 = l1.shape[0]
-    L_f = float(L)
-
-    l2_min = max(l2_min_global, abs(m3))
-    l2_max = (int(np.max(np.asarray(l1_array))) + int(L)
-              if l2_max_global is None else l2_max_global)
     n_l2 = l2_max - l2_min + 1
-
-    if n_l2 <= 0 or abs(m2) > L:
-        return (np.arange(l2_min, l2_max + 1, dtype=int),
-                jnp.zeros((n_l1, max(n_l2, 0))))
-
     l2_grid = jnp.arange(l2_min, l2_max + 1, dtype=float)   # (n_l2,)
     rows = jnp.arange(n_l1)
 
-    l2_lo = jnp.maximum(jnp.abs(l1 - L_f), abs(m3))
     l2_hi = l1 + L_f
     m1_ok = jnp.abs(m1) <= l1
-    mask = ((l2_grid[None, :] >= l2_lo[:, None])
+    mask = ((l2_grid[None, :] >= jnp.maximum(jnp.abs(l1 - L_f), abs(m3))[:, None])
             & (l2_grid[None, :] <= l2_hi[:, None])
             & m1_ok[:, None])                              # (n_l1, n_l2)
 
@@ -162,7 +161,7 @@ def wigner3j_vectorized_jax(L: int, l1_array,
 
     # --- Backward scan over idx = n_l2-3 .. 0. Carry = (w_{idx+1}, w_{idx+2}).
     if n_l2 >= 3:
-        idxs = jnp.arange(n_l2 - 3, -1, -1)                # descending
+        idxs = jnp.arange(n_l2 - 3, -1, -1)                # descending (static)
         j_step = l2_grid[idxs + 1]                         # j at each step
         l2_at = l2_grid[idxs]
         mask_cols = mask[:, idxs].T                        # (n_steps, n_l1)
@@ -199,6 +198,34 @@ def wigner3j_vectorized_jax(L: int, l1_array,
     target_sign = _parity_sign(l1 - L_f - m3)
     current_val = w_full[rows, jmax_idx]
     needs_flip = (current_val * target_sign) < 0
-    w_full = jnp.where(needs_flip[:, None], -w_full, w_full)
+    return jnp.where(needs_flip[:, None], -w_full, w_full)
 
+
+def wigner3j_vectorized_jax(L: int, l1_array,
+                            m1: int = 2, m2: int = -2,
+                            l2_min_global: int = 0,
+                            l2_max_global: int | None = None
+                            ) -> tuple[np.ndarray, jnp.ndarray]:
+    """JAX port of ``wigner.wigner3j_vectorized`` (backward SG sweep as scan).
+
+    Computes (l1, L, l2; m1, m2, m3) for all l1 and valid l2. Same seeds,
+    coefficient signs, normalization, and sign fix as the numpy version.
+    ``L`` is a concrete int here; the ``lax.map``-friendly traced-``L`` core
+    is :func:`spin2_body`.
+    """
+    m3 = -(m1 + m2)
+    l1 = jnp.asarray(l1_array, dtype=float)
+    n_l1 = l1.shape[0]
+
+    l2_min = max(l2_min_global, abs(m3))
+    l2_max = (int(np.max(np.asarray(l1_array))) + int(L)
+              if l2_max_global is None else l2_max_global)
+    n_l2 = l2_max - l2_min + 1
+
+    if n_l2 <= 0 or abs(m2) > L:
+        return (np.arange(l2_min, l2_max + 1, dtype=int),
+                jnp.zeros((n_l1, max(n_l2, 0))))
+
+    w_full = spin2_body(float(L), l1, m1, m2, m3, l2_min, l2_max)
+    l2_grid = jnp.arange(l2_min, l2_max + 1, dtype=float)
     return l2_grid.astype(int), w_full

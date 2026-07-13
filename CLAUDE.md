@@ -137,9 +137,25 @@ Knowing how the modules chain together matters more than any one file:
    design forward consumes: close over `spectra` and the integer knobs
    (compile-time constants) and it is grad-traceable in the noise. jit
    gives ~2.2× over eager (FLOP-bound scan); one jitted grad solve is
-   ~20 s at l_max_qe=1000 / ~90 s at l_max_qe=1500 on CPU. `fullsky=True`
-   still runs but hits the numpy Wigner island (not jit/grad-able —
-   Stage 3).
+   ~20 s at l_max_qe=1000 / ~90 s at l_max_qe=1500 on CPU.
+
+   **Differentiable full-sky delensing (issue #45, Stage 3).**
+   `fullsky=True` also has a pure-jnp, `jax.grad`-traceable path: pass
+   `backend='jax'` to `iterate_delensing` (or `compute_n0_mv` /
+   `residual_cl_bb`). `augr/wigner_jax.py` ports both Wigner-3j paths
+   (spin-0 Racah via `jax.scipy.special.gammaln`; spin-2 Schulten-Gordon
+   as a `lax.scan` backward sweep — `spin2_body` / `spin0_body` are the
+   traced-L cores), and `augr/delensing_fullsky_jax.py` reimplements all
+   five N_0 estimators + the lensing kernel with those, driving the per-L
+   sweep via `lax.map` over the static `_fullsky_L_samples` grid (uniform
+   shapes via a global `l2_max = l_max + max(L_sample)`; no ProcessPool).
+   Validated bit-for-bit against the sympy-locked numpy Wigner (rel
+   ~1e-11) and the numpy full-sky drivers (rel ~1e-13, TE ~1e-11); the
+   whole `iterate_delensing(fullsky=True, backend='jax')` reproduces the
+   numpy full-sky solve to ~1e-15 and is grad-finite. `backend='numpy'`
+   (default) keeps the ProcessPool Wigner path as the reference. The
+   design forward still uses flat-sky for speed; the differentiable
+   full-sky path is the accuracy cross-check.
 
    **N₀ validation status (2026-05-07).** Validated against `plancklens`
    at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:

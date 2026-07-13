@@ -544,7 +544,8 @@ def compute_n0_mv(Ls: jnp.ndarray,
                   n_phi: int = 128,
                   fullsky: bool = False,
                   *,
-                  max_workers: int | None = None) -> jnp.ndarray:
+                  max_workers: int | None = None,
+                  backend: str = "numpy") -> jnp.ndarray:
     """Minimum-variance combination of all five QE estimators.
 
     1/N_0^{MV}(L) = Σ_α 1/N_0^α(L)    (HO02 Eq. 22)
@@ -566,6 +567,14 @@ def compute_n0_mv(Ls: jnp.ndarray,
     for this call (use ``AUGR_DELENS_WORKERS=1`` env var for the same
     effect process-wide).
     """
+    if fullsky and backend == "jax":
+        # Differentiable jnp full-sky MV (issue #45 Stage 3). No ProcessPool.
+        from augr.delensing_fullsky_jax import compute_n0_mv_fullsky_jax
+        return compute_n0_mv_fullsky_jax(
+            Ls, spectra, nl_tt, nl_ee, nl_bb, l_min, l_max)
+    if backend not in ("numpy", "jax"):
+        raise ValueError(f"backend must be 'numpy' or 'jax'; got {backend!r}")
+
     global _force_serial
     if max_workers == 1:
         prev_force = _force_serial
@@ -1288,7 +1297,8 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
                    n_phi: int = 128,
                    fullsky: bool = False,
                    *,
-                   nl_ee: jnp.ndarray | None = None) -> jnp.ndarray:
+                   nl_ee: jnp.ndarray | None = None,
+                   backend: str = "numpy") -> jnp.ndarray:
     """Residual lensing BB after QE delensing (Smith et al. 2012, Eq. 12).
 
     The full Smith+ 2012 formula is
@@ -1319,6 +1329,14 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
     Returns:
         C_l^{BB,res} at each l in ls.
     """
+    if fullsky and backend == "jax":
+        # Differentiable jnp full-sky residual (issue #45 Stage 3).
+        from augr.delensing_fullsky_jax import residual_cl_bb_fullsky_jax
+        return residual_cl_bb_fullsky_jax(
+            ls, Ls, spectra, n0_mv, l_min, l_max, nl_ee=nl_ee)
+    if backend not in ("numpy", "jax"):
+        raise ValueError(f"backend must be 'numpy' or 'jax'; got {backend!r}")
+
     cl_pp_at_L = _interp_at(spectra.cl_pp, Ls)
     w_pp = cl_pp_at_L / (cl_pp_at_L + n0_mv)
     cl_pp_res = cl_pp_at_L * (1.0 - w_pp)           # = C_φφ N_0 / (C_φφ + N_0)
@@ -1379,8 +1397,9 @@ def _delens_core(spectra: LensingSpectra,
                  l_min_qe: int,
                  l_max_qe: int,
                  n_phi: int,
-                 fullsky: bool) -> tuple[jnp.ndarray, jnp.ndarray,
-                                         jnp.ndarray, jnp.ndarray]:
+                 fullsky: bool,
+                 backend: str = "numpy") -> tuple[jnp.ndarray, jnp.ndarray,
+                                                  jnp.ndarray, jnp.ndarray]:
     """Pure iterative-delensing core -- no host-side casts or I/O.
 
     Runs the Smith+ 2012 self-consistent QE-delensing iteration and returns
@@ -1418,12 +1437,14 @@ def _delens_core(spectra: LensingSpectra,
 
         # MV N_0 with the current BB in the EB/TB filters.
         n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb_eff,
-                           l_min_qe, l_max_qe, n_phi, fullsky=fullsky)
+                           l_min_qe, l_max_qe, n_phi, fullsky=fullsky,
+                           backend=backend)
 
         # Residual BB (exact Smith+ Eq. 12 with the W_EE Wiener filter).
         cl_bb_res = residual_cl_bb(ls, Ls, spectra, n0,
                                    l_min_qe, l_max_qe, n_phi,
-                                   fullsky=fullsky, nl_ee=nl_ee)
+                                   fullsky=fullsky, nl_ee=nl_ee,
+                                   backend=backend)
 
         # Interpolate the residual onto the full ell grid for the next
         # iteration's filters.  Outside the QE ls range we fall back to the
@@ -1485,7 +1506,8 @@ def iterate_delensing(spectra: LensingSpectra,
                       n_phi: int = 128,
                       n_iter: int = 5,
                       verbose: bool = False,
-                      fullsky: bool = False) -> DelensedSpectra:
+                      fullsky: bool = False,
+                      backend: str = "numpy") -> DelensedSpectra:
     """Iterative QE delensing: compute residual lensing BB self-consistently.
 
     The key insight (Smith et al. 2012 §3.1): lensed B-mode power acts as
@@ -1523,6 +1545,13 @@ def iterate_delensing(spectra: LensingSpectra,
         n_iter:     Number of iterations (3-5 typically sufficient).
         verbose:    Print A_lens_eff at each iteration.
         fullsky:    Use full-sky Wigner 3j coupling.
+        backend:    'numpy' (default) or 'jax'. Only consulted when
+                    fullsky=True: 'numpy' uses the ProcessPool Wigner
+                    drivers; 'jax' uses the differentiable pure-jnp
+                    full-sky drivers (augr.delensing_fullsky_jax), so the
+                    whole full-sky solve is jax.jit / jax.grad-traceable
+                    in the noise spectra (issue #45 Stage 3). The flat-sky
+                    path is already jnp regardless of backend.
 
     Returns:
         DelensedSpectra with residual BB, final N_0, and effective A_lens.
@@ -1535,7 +1564,7 @@ def iterate_delensing(spectra: LensingSpectra,
     cl_bb_res, n0, A_lens_eff, a_lens_hist = _delens_core(
         spectra, nl_tt, nl_ee, nl_bb, ls, Ls,
         n_iter=n_iter, l_min_qe=l_min_qe, l_max_qe=l_max_qe,
-        n_phi=n_phi, fullsky=fullsky)
+        n_phi=n_phi, fullsky=fullsky, backend=backend)
 
     if verbose:
         for i in range(n_iter):
