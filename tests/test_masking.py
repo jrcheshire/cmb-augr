@@ -322,6 +322,18 @@ def test_namaster_mean_bandpower_crosscheck():
     E→B mixing and ``purify_b=False`` (plain MASTER) is the right, robust choice
     — purification on a sharp binary mask is both unnecessary here and
     numerically fragile. Skips if pymaster is not installed.
+
+    .. warning::
+       **CIRCULAR AS WRITTEN — do not trust this as a masked-Wiener gate.**
+       ``transfer_function(rec[None, :], true_b)`` returns ``rec / true_b``, so
+       ``debiased`` below equals ``true_b`` *identically* for a single sim. What is
+       actually asserted is "NaMaster's decoupled BB matches the analytic input BB
+       to 30% in the median above ℓ=40" — a NaMaster-vs-truth check with the
+       masked-Wiener estimator algebraically cancelled out of it. A real gate needs
+       a transfer frozen on an *independent* B-only ensemble, as
+       :func:`test_fidelity_recovers_input_bb` does. Left in place (it is a valid,
+       if weak, NaMaster sanity check) rather than silently "fixed"; the
+       non-circular pattern lives in ``tests/test_pseudo_cl.py``.
     """
     pymaster = pytest.importorskip("pymaster")
     _ls, ell, _bl, _cl_ee, _cl_bb_len, cl_ee_p, cl_bb_p, spec, bm, centers = _validation_setup()
