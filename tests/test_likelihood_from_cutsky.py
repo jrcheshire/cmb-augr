@@ -205,6 +205,25 @@ def test_bandpower_ks_recommends_gaussian_for_normal_ensemble():
 
 @pytest.mark.slow
 def test_hl_forecast_from_cutsky_mc_gates():
+    """End-to-end gate on the orchestrator: parity, HL widening, and convergence.
+
+    KNOWN RESIDUAL — do not "fix" this by adding samples if it regresses. HL is only
+    defined where ``C_model`` is positive-definite, and ``_safe_g``'s eigenvalue floor
+    makes the log-prob saturate at a finite ≈ −6.2e10 out there rather than −inf, which
+    NUTS cannot integrate across. Bounding the amplitudes (``_DEFAULT_POSITIVE``) moves
+    that boundary out of the sampled region and takes this config from **1/6 to 5/6
+    seeds** converging. The remaining ~1/6 escapes along the *r* direction, whose
+    boundary sits only **1.1 sigma below the mode** (``C_model`` first goes non-positive
+    at r = -0.0142 for r_fid = 0.01, sigma ~ 0.022) and which is left unbounded on
+    purpose (see the note on ``_DEFAULT_POSITIVE``). ``seed=0`` is the long-standing
+    pinned seed and passes with margin (R-hat(r) 1.0045, ESS 200, 0 divergences).
+
+    Raising ``num_samples`` does NOT widen the R-hat margin here (measured: seed 0 gives
+    R-hat 1.0045 at 2ch/500s and 1.0054 at 4ch/1000s, for 4x the runtime), so the small
+    config is deliberate. ``sigma_r_hl_profile`` is the sampling-free number and is
+    stable to 4 digits across every seed and config tested — prefer it if this ever
+    goes flaky.
+    """
     pytest.importorskip("blackjax")
     pytest.importorskip("optax")
     from augr.likelihood import hl_forecast_from_cutsky_mc

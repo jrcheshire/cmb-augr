@@ -551,6 +551,73 @@ Motivating use case: linking augr's Fisher forecast to bk-jax's
 real-data bandpower outputs (`~/bicepkeck/bk-jax/`), so the same
 forecast machinery runs on BK24 / BK28 bandpowers.
 
+`augr.pseudo_cl` (below) is the in-house *producer* of such a window:
+`MasterBB.window` / `.window_ells` are already in this convention and on
+the integer ℓ grid, so `SignalModel`'s per-row `np.interp` is the
+identity and nothing is lost. `forecast_from_spectra` accepts
+`bandpower_window=` / `bandpower_window_ells=` and threads them through.
+
+
+## MASTER pseudo-Cℓ on an apodized mask (`augr/pseudo_cl.py`)
+
+Cut-sky BB bandpowers for an *already cleaned* map, with the mask's mode
+coupling deconvolved via NaMaster. The complement to `augr/masking.py`:
+that module is a differentiable, prior-regularized Wiener filter on a
+**sharp** mask; this one is the standard MASTER deconvolution — prior-free,
+**apodized**, and **not differentiable** (NaMaster is C). Nothing here can
+sit inside a `jax.grad` of σ(r); it is consumed as a frozen BPWF plus an MC
+covariance (`covariance.mc_bandpower_covariance` →
+`FisherForecast(external_covariance=...)`).
+
+Surface: `apodize_mask`, `mask_moments` → `MaskMoments` (`w1/w2/w4`,
+`.f_sky_eff = w2²/w4`), `master_bin_edges`, and `MasterBB.build(...)` with
+`field` / `field_from_b_alm` / `decouple` / `bb` / `window` / `save_window`.
+Build fields once and cross them when several spectra come off the same maps
+(the ilc consumer needs 4 fields but 7 spectra).
+
+**Documented convention exception.** `MasterBB` owns an opaque
+`NmtWorkspace` (a C handle), so unlike everything else in augr it is **not**
+a frozen dataclass, not hashable, and not picklable. Do not hand one to a
+process-pool worker — each worker calls `build()` itself, which costs ~19 ms
+at nside 128 / lmax 256. That cheapness is also why there is no disk cache.
+`purify_b` is part of the object's identity, not a per-call argument,
+because the coupling matrix differs between the purified and unpurified
+cases.
+
+**Three NaMaster gotchas, all baked into `build()`:**
+1. `NmtField(lmax=...)` must be explicit — it otherwise defaults to
+   `3·nside−1` and mismatches the `NmtBin` lmax.
+2. **`purify_b=True` raises unless `lmax_mask=lmax` is also passed** (the
+   mask alm is built at `3·nside−1`, 73920 vs 33153 coefficients at
+   lmax 256). `build()` promotes `lmax_mask=None` → `lmax` when purifying.
+   For a strict purified-vs-plain comparison pass `lmax_mask=lmax` to
+   *both*, so the arms differ only in `purify_b`.
+3. `NmtBin.from_edges` infers its own lmax from the last edge and
+   `from_fields` then rejects the mismatch — use the explicit
+   `NmtBin(bpws=, ells=, weights=, lmax=)` form.
+
+**Mode counting.** An apodized mask loses modes as `w2²/w4`, not `⟨w⟩`;
+`masking.f_sky_of` returns the bare mean, which is correct only because
+*its* masks are binary (`w^i = w`). Use `MaskMoments.f_sky_eff` for a Knox
+`f_sky` on a tapered mask — `covariance.knox_sigma_from_measured_spectrum`
+delegates exactly this to the caller and nothing in augr computes it
+otherwise.
+
+**Pure-B is opt-in and off by default.** A B-only input (e.g. a NILC output
+where E was discarded upstream) has no E to leak, so purification buys
+nothing and is numerically fragile on a near-binary mask. Turn it on only
+for input that genuinely carries E.
+
+Gate: `tests/test_pseudo_cl.py` recovers a known analytic input BB from
+B-only sims, with truth = `W @ C_ℓ^{BB,theory}` — never a quantity derived
+from the recovery. Measured margins are recorded in the test docstrings
+(band-mean ratio 0.998–0.999, max per-bin deviation ≲1%). Mutation-verified:
+dropping the deconvolution drives the ratio to 0.687. Note it does **not**
+catch a missing apodization (a sharp mask recovers the mean just as well) —
+the taper is for variance and `purify_b` stability, not mean bias.
+⚠️ `tests/test_masking.py::test_namaster_mean_bandpower_crosscheck` is
+**circular** and is not a gate; see the warning in its docstring.
+
 
 ## Post-component-separation forecasts (BROOM consumer mode)
 

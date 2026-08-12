@@ -50,15 +50,34 @@ from augr.likelihood.nuts import (
     run_nuts_chains,
 )
 from augr.likelihood.posterior import Posterior, make_log_posterior
-from augr.likelihood.prior import GaussianPrior, PositivityTransform
+from augr.likelihood.prior import (
+    DEFAULT_POSITIVE_PARAMS,
+    GaussianPrior,
+    PositivityTransform,
+)
 from augr.likelihood.protocols import SignalSpectrumModel
 from augr.signal import SignalModel, flatten_params
 from augr.spectra import CMBSpectra
 
-# Single cleaned BB map: r + A_lens + A_res, no foreground-index banana, so the
-# amplitudes can be sampled unbounded (the model is linear in r / A_lens / A_res
-# with no sqrt — no NaN region) for a clean Gaussian-NUTS == Gaussian-Fisher parity.
-_DEFAULT_POSITIVE: frozenset[str] = frozenset()
+# Single cleaned BB map: r + A_lens + A_res, no foreground-index banana. This was
+# once `frozenset()` (everything unbounded) on the argument that "the model is linear
+# in r / A_lens / A_res with no sqrt — no NaN region". That is true of the *model* and
+# of the *Gaussian* likelihood, but NOT of HL: HL eigendecomposes and takes a matrix
+# square root of the model covariance, so it is only defined where C_model ≻ 0.
+# `_safe_g`'s eigenvalue floor keeps it real out there, which means the log-prob does
+# not go to −inf (which NUTS would reject cleanly) but SATURATES at a finite ≈ −6.2e10
+# — a cliff with an astronomical gradient, the pathological case for a symplectic
+# integrator. Unbounded amplitudes walk straight into it: measured 72–219 divergent
+# transitions, whose recorded positions produced sigma(r) = 3.06 and 33.4 against a
+# true ~0.022. Bounding the amplitudes moves that boundary out of the sampled region
+# (measured: converged_hl 1/6 → 5/6 seeds, divergences → 0 on the passing seeds).
+#
+# r deliberately stays UNBOUNDED: it is the parity-relevant parameter, and bounding it
+# both breaks the apples-to-apples comparison with the symmetric Fisher sigma(r) and
+# shifts the profile sigma by 23% (2.20e-2 → 2.72e-2). Gaussian-NUTS == Gaussian-Fisher
+# parity survives bounding the amplitudes (measured 0.92–1.07 across seeds, vs the
+# 12% bar), so the original rationale's cost does not actually materialise.
+_DEFAULT_POSITIVE: frozenset[str] = DEFAULT_POSITIVE_PARAMS
 
 
 def build_cutsky_signal_model(

@@ -40,8 +40,17 @@ Conventions
 * **Maps are in the galactic frame** (PySM native; matches
   ``hit_maps.l2_hit_map(coord="G")``), so a ``|b|``-cut mask thresholds pixel
   latitude directly with no rotation. RING ordering, HEALPix-internal Q/U.
-* **Sharp masks, no apodization** (the design choice; the Wiener prior, not an
-  apodization taper, controls the ambiguous modes).
+* **Sharp masks, no apodization — for *this* estimator.** The Wiener prior, not an
+  apodization taper, controls the E/B-ambiguous modes here, so a taper would only
+  throw away sky. This does **not** generalize: :mod:`augr.pseudo_cl`'s MASTER
+  pseudo-Cℓ estimator has no prior, so the taper is the only thing suppressing the
+  ambiguous boundary modes, and ``purify_b`` there requires a smooth window
+  outright. Measured cost of a 2° ``C2`` taper on Planck GAL070 at nside 128:
+  effective ``w2²/w4`` goes 0.7005 → 0.6895, i.e. 1.6%.
+* **Mode counting.** :func:`f_sky_of` returns the bare ``⟨w⟩``, which is correct
+  *because* the masks here are binary (``w^i = w``, so ``w2²/w4 = ⟨w⟩``). An
+  apodized mask needs ``w2²/w4`` instead — see
+  :class:`augr.pseudo_cl.MaskMoments`.
 """
 
 from __future__ import annotations

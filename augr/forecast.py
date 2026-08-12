@@ -78,6 +78,8 @@ def forecast_from_spectra(
     delensed_bb=None,
     delensed_bb_ells=None,
     external_covariance=None,
+    bandpower_window=None,
+    bandpower_window_ells=None,
 ) -> ForecastResult:
     """σ(r) variants + Δr from beam-free cleaned-map noise + residual-template spectra.
 
@@ -117,11 +119,26 @@ def forecast_from_spectra(
         Optional self-consistent residual lensing ``C_ℓ^{BB}`` replacing the
         ``A_lens`` multiplier; must be supplied together and span
         ``[ell_min, ell_max]``.
+    bandpower_window, bandpower_window_ells
+        Optional measured bandpower window ``(n_bins, n_ells)`` and its ℓ grid, e.g.
+        the MASTER BB→BB window from :attr:`augr.pseudo_cl.MasterBB.window` /
+        ``window_ells``, or a release BPWF via
+        :func:`augr.bandpower_windows.load_bandpower_window`. When supplied,
+        ``delta_ell`` / ``ell_per_bin_below`` are ignored and the binning comes
+        entirely from the window; must be given together and span
+        ``[ell_min, ell_max]``. Because BPWFs generally overlap between bins, this
+        also switches the covariance onto the overlap-aware full-matrix path — so
+        pair it with ``external_covariance`` (or with beam-deconvolved ``nl_post``,
+        which ``FisherForecast`` then requires).
     """
     if a_res_prior is None:
         a_res_prior = DEFAULT_PRIORS_POST_COMPSEP["A_res"]
     if (delensed_bb is None) != (delensed_bb_ells is None):
         raise ValueError("delensed_bb and delensed_bb_ells must be supplied together.")
+    if (bandpower_window is None) != (bandpower_window_ells is None):
+        raise ValueError(
+            "bandpower_window and bandpower_window_ells must be supplied together."
+        )
     use_external_cov = external_covariance is not None
     if not use_external_cov and nl_post is None:
         raise ValueError(
@@ -173,6 +190,9 @@ def forecast_from_spectra(
         if delensed_bb is not None:
             kw["delensed_bb"] = jnp.asarray(delensed_bb)
             kw["delensed_bb_ells"] = jnp.asarray(delensed_bb_ells, dtype=float)
+        if bandpower_window is not None:
+            kw["bandpower_window"] = jnp.asarray(bandpower_window)
+            kw["bandpower_window_ells"] = jnp.asarray(bandpower_window_ells, dtype=float)
         return SignalModel(**kw)
 
     baseline = _signal(with_template=False)
