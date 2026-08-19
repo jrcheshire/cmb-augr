@@ -16,14 +16,27 @@ run), ducc on CPU (where it is ~100x faster):
   hand-written ``jax.custom_vjp``. Correct and fast on CPU up to the HEALPix grid
   limit (``lmax ≈ 3·nside − 1``); but the ``pure_callback`` is a host hop, so it
   does NOT run on a GPU — under ``jax.jit`` it round-trips device→host→device.
-  Also needed when ``lmax > 1.5·nside`` (jht raises there).
+  Also the accurate choice when ``lmax > 1.5·nside``, where jht's quadrature
+  weights leave the validated band (see below).
 * **jht** (``pip install jaxht``, GPU/TPU default) — native-JAX spin-0/2 SHTs (pure
   JAX, no C++), so every transform runs on CUDA with no code change and is
   differentiated by JAX directly (no ``custom_vjp``). Validated bit-for-bit against
   the ducc backend to fp64 on synthesis / adjoint, spin-0 and spin-2, through high
-  band limit (``lmax ≈ 4000`` at ``nside = 4096``). Its support is ``lmax ≲
-  1.5·nside`` (it raises above that); within that range it is the trustworthy GPU /
-  end-to-end-differentiable map backend.
+  band limit (``lmax ≈ 4000`` at ``nside = 4096``). Its validated band is ``lmax ≲
+  1.5·nside``; within that range it is the trustworthy GPU / end-to-end-
+  differentiable map backend.
+
+  That ceiling is a **soft accuracy tier, not a hard limit — jht warns above it, it
+  does not raise** (verified: nside=16 / lmax=40 returns finite output plus a
+  ``UserWarning``). It comes from jht solving for its own ring quadrature weights
+  rather than shipping HEALPix's: it fits ``Lw = 2·nside`` even Legendre degrees,
+  which is exactly the number of distinct weights available (rings pair N/S except
+  the equator), while the analysis products ``λ_l0 λ_l'0`` run to degree ``2·lmax``.
+  Full exactness therefore needs ``lmax ≤ nside``; between there and the ceiling the
+  round-trip error grows ~1e-13 → ~5e-7, still inside jht's 1e-4 contract. Raising
+  ``n_iter`` recovers precision above the ceiling. Pushing ``Lw`` to the
+  fully-determined ``4·nside − 2`` is Vandermonde-ill-conditioned and was rejected
+  upstream, so extending the band would take a better-conditioned weight solve.
 
 ``s2fft`` (the other JAX-native candidate) has a structural spin-2 HEALPix
 *inverse* defect as of v1.4.0, so it is not used; jht is the JAX-native backend.
