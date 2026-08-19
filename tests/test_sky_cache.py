@@ -28,7 +28,8 @@ BEAMS = (40.0, 30.0, 20.0)
 
 
 def _build_ctx(
-    *, harmonic_skies=None, noise_keys=None, var_pix_ref=1.0, n_sims=3, base_seed=0
+    *, harmonic_skies=None, noise_keys=None, var_pix_ref=1.0, n_sims=3, base_seed=0,
+    split_lensing=False,
 ):
     """A tiny CMB-only cut-sky MC context (no pysm3; var_pix_ref supplied -> no setup clean)."""
     ls = load_lensing_spectra()
@@ -69,6 +70,7 @@ def _build_ctx(
         var_pix_ref=var_pix_ref,
         harmonic_skies=harmonic_skies,
         noise_keys=noise_keys,
+        split_lensing=split_lensing,
     )
 
 
@@ -149,3 +151,46 @@ def test_cache_bypass_validation():
         _build_ctx(harmonic_skies=hs, noise_keys=ctx.noise_keys, var_pix_ref=None)
     with pytest.raises(ValueError, match="noise_keys has"):
         _build_ctx(harmonic_skies=hs, noise_keys=ctx.noise_keys[:2], var_pix_ref=1.0)
+
+
+def test_sky_cache_carries_the_lensing_split(tmp_path):
+    """A split ensemble survives the round trip, and rebuilds into a delens-capable ctx.
+
+    The production EIG runs load their skies from this cache on pysm3-less nodes, so
+    a cache that dropped ``cmb_b_lens_alm`` would strand them at A_lens = 1 -- the
+    exact bias the delensing seam exists to remove.
+    """
+    ctx = _build_ctx(n_sims=3, base_seed=11, split_lensing=True)
+    p = str(tmp_path / "split.npz")
+    save_sky_cache(p, ctx, fg_model="none", base_seed=11)
+    cache = load_sky_cache(p)
+
+    assert cache.harmonic_skies.cmb_b_lens_alm is not None
+    np.testing.assert_array_equal(
+        np.asarray(cache.harmonic_skies.cmb_b_lens_alm),
+        np.asarray(ctx.harmonic_skies.cmb_b_lens_alm),
+    )
+    rebuilt = _build_ctx(
+        harmonic_skies=cache.harmonic_skies,
+        noise_keys=cache.noise_keys,
+        var_pix_ref=cache.var_pix_ref,
+        split_lensing=True,
+    )
+    assert rebuilt.cl_bb_lens_ref is not None
+
+
+def test_unsplit_cache_refuses_a_delensing_context(tmp_path):
+    """Asking for split_lensing against a cache without it raises, rather than
+    silently rebuilding an ensemble that cannot delens."""
+    ctx = _build_ctx(n_sims=3, base_seed=12)
+    p = str(tmp_path / "plain.npz")
+    save_sky_cache(p, ctx, fg_model="none", base_seed=12)
+    cache = load_sky_cache(p)
+    assert cache.harmonic_skies.cmb_b_lens_alm is None
+    with pytest.raises(ValueError, match="split_lensing=True"):
+        _build_ctx(
+            harmonic_skies=cache.harmonic_skies,
+            noise_keys=cache.noise_keys,
+            var_pix_ref=cache.var_pix_ref,
+            split_lensing=True,
+        )

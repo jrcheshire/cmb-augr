@@ -177,6 +177,15 @@ class HarmonicSky(eqx.Module):
         carry realistic E-modes for cut-sky E→B leakage — e.g. the masked-Wiener
         forecast. The full-sky B-only forecasts leave it ``None`` (E and B do not
         mix full-sky, so CMB E is irrelevant there).
+    cmb_b_lens_alm
+        The **lensing** part of ``cmb_b_alm``, shape ``(n_alm,)``, or ``None``
+        (default) when the realization was not split. Set it (via
+        ``harmonic_sky(split_lensing=True)``) to make the sim's lensing B a
+        *design-dependent* quantity: :func:`beam_harmonic_sky`'s ``lens_scale``
+        rescales this component in-trace, which is how a delensing design knob
+        reaches the Monte-Carlo covariance (see
+        :func:`augr.spectrum_stages.mc_cutsky_cov_traced` ``cl_bb_res=``). The
+        tensor part is the implied difference ``cmb_b_alm - cmb_b_lens_alm``.
     """
 
     freqs_ghz: tuple[float, ...] = eqx.field(static=True)
@@ -186,6 +195,7 @@ class HarmonicSky(eqx.Module):
     cmb_b_alm: jax.Array
     fg_eb_alm: jax.Array | None
     cmb_e_alm: jax.Array | None = None
+    cmb_b_lens_alm: jax.Array | None = None
 
     @property
     def n_band(self) -> int:
@@ -206,6 +216,45 @@ def cmb_b_alm(spectra: CMBSpectra, r_in: float, lmax: int, *, seed: int = 0) -> 
     np.random.seed(int(seed) & 0xFFFFFFFF)  # noqa: NPY002 - healpy.synalm uses the global RNG
     b_alm = hp.synalm(cl_bb, lmax=lmax, new=True)
     return jnp.asarray(b_alm)
+
+
+def cmb_b_alm_split(
+    spectra: CMBSpectra, r_in: float, lmax: int, *, seed: int = 0
+) -> tuple[jax.Array, jax.Array]:
+    """Draw the CMB B alm as ``(lensing, tensor)`` components [healpy packing].
+
+    The delensing-aware companion to :func:`cmb_b_alm`. Lensing B and tensor B are
+    physically independent Gaussian fields whose spectra add, so drawing them
+    separately and summing is statistically identical to the single
+    ``synalm(C^BB(r_in))`` draw — but it keeps the lensing part *addressable*, which
+    is what lets a delensing design knob rescale it in-trace
+    (:func:`beam_harmonic_sky` ``lens_scale=``) instead of baking full lensing into
+    the realization.
+
+    The lensing draw reuses ``seed`` on ``C_ℓ^{BB}(r=0)``, so at ``r_in = 0`` this
+    reproduces :func:`cmb_b_alm`'s realization **exactly**; the tensor draw is
+    seeded independently (``seed + 2``, clear of the ``seed + 1`` E draw). At
+    ``r_in > 0`` the summed realization therefore differs from :func:`cmb_b_alm`'s
+    at the same seed while having the same statistics.
+
+    Returns ``(b_lens_alm, b_tensor_alm)``; their sum is the total CMB B alm.
+    """
+    import healpy as hp
+
+    ells = np.arange(lmax + 1)
+    cl_lens = np.asarray(spectra.cl_lensing(jnp.asarray(ells, dtype=float)))
+    cl_tens = float(r_in) * np.asarray(
+        spectra.cl_tensor_r1(jnp.asarray(ells, dtype=float))
+    )
+    # Guard tiny negative interpolation undershoot (as in cmb_b_alm).
+    cl_lens = np.clip(cl_lens, 0.0, None)
+    cl_tens = np.clip(cl_tens, 0.0, None)
+
+    np.random.seed(int(seed) & 0xFFFFFFFF)  # noqa: NPY002 - healpy.synalm uses the global RNG
+    b_lens = hp.synalm(cl_lens, lmax=lmax, new=True)
+    np.random.seed(int(seed + 2) & 0xFFFFFFFF)  # noqa: NPY002 - as above
+    b_tens = hp.synalm(cl_tens, lmax=lmax, new=True)
+    return jnp.asarray(b_lens), jnp.asarray(b_tens)
 
 
 def cmb_e_alm(cl_ee: jax.Array, lmax: int, *, seed: int = 0) -> jax.Array:
@@ -473,6 +522,7 @@ def harmonic_sky(
     fg_seed: int | None = None,
     cl_ee: jax.Array | None = None,
     bandpasses: Sequence[Bandpass | None] | None = None,
+    split_lensing: bool = False,
 ) -> HarmonicSky:
     """Build the aperture-independent harmonic sky (CMB B alm + per-band FG E/B alm).
 
@@ -492,12 +542,24 @@ def harmonic_sky(
 
     ``bandpasses`` (optional, per-band ``Bandpass``) bandpass-integrates the
     foreground emission; ``None`` (default) is the monochromatic band-center path.
+
+    ``split_lensing`` (default False) draws the CMB B alm as separate lensing +
+    tensor components (:func:`cmb_b_alm_split`) and keeps the lensing part on the
+    returned sky as ``cmb_b_lens_alm``, so a delensing design knob can rescale it
+    in-trace. At ``r_in = 0`` the total realization is unchanged; at ``r_in > 0`` it
+    is a different (statistically identical) realization — see
+    :func:`cmb_b_alm_split`.
     """
     check_band_limit(lmax, nside)
     if fg_seed is None:
         fg_seed = cmb_seed
 
-    b_alm = cmb_b_alm(spectra, r_in, lmax, seed=cmb_seed)
+    if split_lensing:
+        b_lens_alm, b_tens_alm = cmb_b_alm_split(spectra, r_in, lmax, seed=cmb_seed)
+        b_alm = b_lens_alm + b_tens_alm
+    else:
+        b_lens_alm = None
+        b_alm = cmb_b_alm(spectra, r_in, lmax, seed=cmb_seed)
     e_alm = None if cl_ee is None else cmb_e_alm(cl_ee, lmax, seed=cmb_seed + 1)
     fg_eb = (
         None
@@ -515,6 +577,7 @@ def harmonic_sky(
         cmb_b_alm=b_alm,
         fg_eb_alm=fg_eb,
         cmb_e_alm=e_alm,
+        cmb_b_lens_alm=b_lens_alm,
     )
 
 
@@ -524,6 +587,7 @@ def beam_harmonic_sky(
     beam_shape_p=None,
     *,
     beam_fwhm_ref: tuple[float, ...] | None = None,
+    lens_scale: jax.Array | None = None,
 ) -> BandSky:
     """Beam an aperture-independent :class:`HarmonicSky` at one aperture → :class:`BandSky`.
 
@@ -537,14 +601,35 @@ def beam_harmonic_sky(
     map math — :func:`assemble_band_maps` uses only ``cmb_qu`` / ``fg_qu``), a concrete
     ``beam_fwhm_ref`` must then be supplied for that field; it defaults to
     ``beam_fwhm_arcmin`` for the concrete (sweep) call.
+
+    ``lens_scale`` (optional, ``ℓ = 0..lmax``, may be **traced**) is the delensing
+    design knob: the sky's lensing B component is multiplied by it before beaming, so
+    passing ``sqrt(C_ℓ^{BB,res} / C_ℓ^{BB,lens})`` turns the realization's full
+    lensing B into the design's *residual* lensing B. Requires a sky built with
+    ``harmonic_sky(split_lensing=True)`` — without the split there is no lensing
+    component to address, and silently scaling the total B would scale the tensor
+    signal too (i.e. rescale ``r``). ``None`` (default) leaves the realization alone.
     """
     if len(beam_fwhm_arcmin) != hsky.n_band:
         raise ValueError(
             f"beam_fwhm_arcmin has {len(beam_fwhm_arcmin)} entries but the harmonic "
             f"sky has {hsky.n_band} bands."
         )
+    b_alm = hsky.cmb_b_alm
+    if lens_scale is not None:
+        if hsky.cmb_b_lens_alm is None:
+            raise ValueError(
+                "lens_scale= needs a lensing/tensor-split realization; build the sky "
+                "with harmonic_sky(split_lensing=True). Scaling the total B alm "
+                "instead would rescale the tensor signal (r) along with the lensing."
+            )
+        # b = b_tensor + s * b_lensing, with b_tensor = b_total - b_lensing.
+        scaled_lens = almxfl(
+            jnp.asarray(hsky.cmb_b_lens_alm), jnp.asarray(lens_scale), hsky.lmax
+        )
+        b_alm = b_alm - hsky.cmb_b_lens_alm + scaled_lens
     cmb_qu = cmb_band_qu(
-        hsky.cmb_b_alm,
+        b_alm,
         beam_fwhm_arcmin,
         hsky.lmax,
         hsky.nside,

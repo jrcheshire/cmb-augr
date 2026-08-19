@@ -70,7 +70,7 @@ from jax.scipy.special import logsumexp
 from augr.cleaning import Cleaner
 from augr.cost import CostModel, aperture_from_fwhm, budget_penalty
 from augr.fisher import _fisher_from_full
-from augr.optimize import OptimizationContext, design_to_channels
+from augr.optimize import DelensCoupling, OptimizationContext, design_to_channels
 from augr.optimize_mapbased import w_inv_from_noise_design
 from augr.spectrum_stages import CutskyMCContext, mc_cutsky_cov_traced
 
@@ -461,6 +461,7 @@ def design_objective(
     hl_eig_ctx: HLEIGContext | None = None,
     eig_key=None,
     n_outer: int = 256,
+    delens: DelensCoupling | None = None,
 ):
     """Cost-constrained Bayesian-design objective to MINIMIZE.
 
@@ -492,13 +493,40 @@ def design_objective(
     assumption it encodes is that the analysis mask *is* the survey footprint -- if a
     study ever analyses less sky than it observes, this term needs revisiting.
 
+    ``delens`` (optional :class:`augr.optimize.DelensCoupling`) makes the **lensing
+    B-mode floor design-dependent**: the design's own noise sets how well the
+    iterative QE reconstructs lensing, and the resulting residual ``C_ell^BB``
+    rescales the lensing B in the Monte-Carlo sims. Without it the forward runs at
+    ``A_lens = 1``, which credits aperture with none of its delensing benefit and
+    tilts an aperture trade against aperture by construction. It requires ``mc_ctx``
+    built with ``split_lensing=True``, and ``opt_ctx``'s signal model should be built
+    on ``delens.cl_bb_res0`` so the model half of the coupling matches the sims at the
+    reference design (the same frozen-Jacobian convention
+    :func:`augr.optimize.sigma_r_from_channels` uses analytically).
+
     Returns ``-utility + budget_penalty`` (a minimization scalar): descent maximizes EIG
     while staying on the affordable side of the budget surface.
     """
     f_sky_noise = mc_ctx.f_sky if mask is None else jnp.mean(jnp.asarray(mask))
     w_inv = w_inv_from_noise_design(n_det, net, eta_total, mission_years, f_sky_noise)
+    cl_bb_res = cl_bb_res_ells = None
+    if delens is not None:
+        # The QE reconstruction is driven by the design's raw per-channel noise, not
+        # by the post-compsep map, so it reads the design knobs directly. f_sky is the
+        # same sky the mask defines -- delensing over more sky is not free.
+        cl_bb_res = delens.residual(
+            n_det, net, beam_fwhm, eta_total, mission_years, f_sky_noise
+        )
+        cl_bb_res_ells = delens.ls
     traced = mc_cutsky_cov_traced(
-        w_inv, mc_ctx, cleaner, beam_fwhm=beam_fwhm, beam_p=beam_p, mask=mask
+        w_inv,
+        mc_ctx,
+        cleaner,
+        beam_fwhm=beam_fwhm,
+        beam_p=beam_p,
+        mask=mask,
+        cl_bb_res=cl_bb_res,
+        cl_bb_res_ells=cl_bb_res_ells,
     )
     util = _utility(
         traced.covariance,
@@ -538,6 +566,7 @@ def physical_design_objective(
     eig_key=None,
     n_outer: int = 256,
     galactic_loading: bool = True,
+    delens: DelensCoupling | None = None,
 ):
     """Cost-constrained EIG objective from the physical horn-packing design knobs.
 
@@ -558,6 +587,10 @@ def physical_design_objective(
     dust+synchrotron optical loading (``config.GALACTIC_LOADING``) to every
     band's photon-noise NET, so the submm groups (e.g. 615 GHz) reflect dust
     loading. Ignored when ``net_override`` is supplied.
+
+    ``delens`` (optional) is forwarded to :func:`design_objective` -- see there. It
+    matters most on this entry point: ``design`` carries the aperture, and delensing
+    is one of the two channels through which aperture buys sigma(r).
     """
     extra_loading = None
     if galactic_loading and net_override is None:
@@ -603,4 +636,5 @@ def physical_design_objective(
         hl_eig_ctx=hl_eig_ctx,
         eig_key=eig_key,
         n_outer=n_outer,
+        delens=delens,
     )
