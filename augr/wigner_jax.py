@@ -198,7 +198,17 @@ def spin2_body(L_f, l1, m1: int, m2: int, m3: int,
     target_sign = _parity_sign(l1 - L_f - m3)
     current_val = w_full[rows, jmax_idx]
     needs_flip = (current_val * target_sign) < 0
-    return jnp.where(needs_flip[:, None], -w_full, w_full)
+    w_full = jnp.where(needs_flip[:, None], -w_full, w_full)
+
+    # --- Guard |m2| <= L. The symbol vanishes identically when a magnetic
+    #     quantum number exceeds its own angular momentum, but the recursion
+    #     above only ever constrains m1 (row-wise, via ``m1_ok``) and m3 (via
+    #     the l2 lower bound) -- nothing tests m2 against L, so the seed and
+    #     normalization would hand back a unit-norm but meaningless table.
+    #     ``wigner3j_vectorized_jax`` short-circuits this case for concrete L;
+    #     the traced core must too, because ``lax.map`` callers reach it
+    #     directly. No-op for the m2=0 delensing callers.
+    return jnp.where(jnp.abs(m2) <= L_f, w_full, 0.0)
 
 
 def wigner3j_vectorized_jax(L: int, l1_array,

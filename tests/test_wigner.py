@@ -158,8 +158,10 @@ def test_wigner3j_vectorized_matches_sympy(L, j1_max, m1, m2):
 import functools  # noqa: E402
 
 import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
 
 from augr.wigner_jax import (  # noqa: E402
+    spin2_body,
     wigner3j_000_vectorized_jax,
     wigner3j_vectorized_jax,
 )
@@ -207,3 +209,72 @@ def test_wigner_jax_jit_compiles():
     f0 = jax.jit(functools.partial(wigner3j_000_vectorized_jax, 37, l2_max=100))
     _, w0 = wigner3j_000_vectorized(37, j1, l2_max=100)
     np.testing.assert_allclose(np.asarray(f0(j1)[1]), w0, rtol=1e-8, atol=1e-11)
+
+
+# -----------------------------------------------------------------------
+# spin2_body: the traced core's own contract. The tests above all go
+# through wigner3j_vectorized_jax, which guards the edge cases before
+# calling the core -- but lax.map callers (delensing_fullsky_jax, and the
+# MASTER coupling matrix) call spin2_body DIRECTLY, so the core has to
+# hold the same contract on its own.
+# -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("L", [0, 1])
+def test_spin2_body_zeroes_L_below_abs_m2(L):
+    """|m2| > L must give exactly zero, as the public wrapper already returns.
+
+    The recursion constrains m1 row-wise (``m1_ok``) and m3 through the l2 lower
+    bound, but nothing tests m2 against L. Without an explicit guard the seed and
+    the ``sum_j (2j+1) w^2 = 1`` normalization hand back a unit-norm table where
+    the symbol is identically zero -- measured |w|max = 0.447 at L=0 and 0.526 at
+    L=1 for (m1, m2) = (2, -2). ``wigner3j_vectorized_jax`` short-circuits this
+    for concrete L; the core must too.
+
+    This has never bitten because every pre-existing caller
+    (``delensing_fullsky_jax``) uses m2=0, where |m2| <= L is free. The MASTER
+    coupling matrix streams l2 from 0 at (m1, m2) = (2, -2) and hits it directly.
+    """
+    l1 = jnp.arange(0, 6, dtype=float)
+    w = np.asarray(spin2_body(float(L), l1, 2, -2, 0, 0, 8))
+    assert np.all(w == 0.0), f"L={L}: |w|max = {np.abs(w).max():.4f}, expected 0"
+
+
+@pytest.mark.parametrize("L", [0, 1, 2, 3, 7])
+def test_spin2_body_matches_numpy_at_spin2_m(L):
+    """Direct-core parity with the sympy-locked numpy version at (m1, m2) = (2, -2).
+
+    Covers both sides of the guard: L < 2 (must be zero) and L >= 2 (must match).
+    """
+    l1 = np.arange(0, 6, dtype=float)
+    _, w_np = wigner3j_vectorized(L, l1, m1=2, m2=-2, l2_min_global=0, l2_max_global=8)
+    w_j = np.asarray(spin2_body(float(L), jnp.asarray(l1), 2, -2, 0, 0, 8))
+    np.testing.assert_allclose(w_j, w_np, rtol=1e-8, atol=1e-11)
+
+
+def test_spin2_body_normalization_requires_full_l2_grid():
+    """The l2 grid must reach l1 + L for every row, or the sum rule silently lies.
+
+    ``spin2_body`` normalizes by ``sum_j (2j+1) w^2 = 1`` over whatever grid it is
+    handed, so a row whose support runs past ``l2_max`` is renormalized against a
+    partial sum. Rows that fit are untouched (bit-identical below); clipped rows
+    come back wrong by 73-162% of their own scale.
+
+    Consequence for callers that stream l2: allocate the l2 axis out to
+    ``2 * lmax`` and zero-pad the mask power spectrum above ``lmax_mask``, rather
+    than sizing the grid to ``lmax_mask``.
+    """
+    L, n = 12, 19
+    l1 = jnp.arange(0, 13, dtype=float)
+    full = np.asarray(spin2_body(float(L), l1, 2, -2, 0, 0, 24))[:, :n]
+    trunc = np.asarray(spin2_body(float(L), l1, 2, -2, 0, 0, 18))[:, :n]
+
+    # rows with support [|l1-L|, l1+L] inside the truncated grid: bit-identical
+    fits = slice(0, 7)  # l1 <= 6 -> l1 + L <= 18
+    np.testing.assert_array_equal(trunc[fits], full[fits])
+
+    # clipped rows: wrong by a large fraction of their own scale
+    for row in (8, 10, 12):
+        scale = np.abs(full[row]).max()
+        rel = np.abs(trunc[row] - full[row]).max() / scale
+        assert rel > 0.5, f"l1={row}: truncation changed the row by only {rel:.3f}"
