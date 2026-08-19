@@ -99,6 +99,53 @@ class NullForegroundModel:
 # Residual-template model (post-component-separation use)
 # -----------------------------------------------------------------------
 
+def _warn_if_bandpowers(cl, ells, *, gap: float = 1.5, ratio: float = 10.0
+                        ) -> None:
+    """Warn when a template looks like BANDPOWERS passed as an ℓ-grid function.
+
+    A template on a genuine ℓ grid varies smoothly between neighbouring
+    samples. One sampled at bandpower CENTRES can jump by orders of magnitude
+    between adjacent entries that are tens of multipoles apart, and linear
+    interpolation across such a step is badly wrong -- an order-of-magnitude
+    overshoot in the bin after a wide reionization bin, in the case that
+    prompted this guard.
+
+    The test is deliberately narrow: BOTH a gap wider than ``gap`` in ℓ AND a
+    jump larger than ``ratio`` across it, with both endpoints positive. A
+    smooth spectrum on a coarse grid does not trip it, and neither does a
+    noisy template on a unit grid.
+    """
+    import warnings
+
+    import numpy as np
+
+    ls = np.asarray(ells, dtype=float)
+    c = np.asarray(cl, dtype=float)
+    if ls.size < 2:
+        return
+    gaps = np.diff(ls)
+    lo, hi = c[:-1], c[1:]
+    both_pos = (lo > 0) & (hi > 0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        jump = np.where(both_pos, np.maximum(lo, hi) / np.minimum(lo, hi), 1.0)
+    bad = (gaps > gap) & (jump > ratio)
+    if not np.any(bad):
+        return
+    k = int(np.argmax(np.where(bad, jump, 0.0)))
+    warnings.warn(
+        f"template_cl looks like BANDPOWERS, not a function on an ell grid: "
+        f"it changes by {jump[k]:.3g}x between ell={ls[k]:g} and "
+        f"ell={ls[k + 1]:g}. This class INTERPOLATES between the samples it is "
+        f"given, so a step that large across a gap that wide will be modelled "
+        f"badly (an 11x overshoot was measured in exactly this situation). If "
+        f"these are bandpowers, use "
+        f"ResidualTemplateForegroundModel.from_bandpowers(cl_b, bin_lo, "
+        f"bin_hi, ells) instead.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 class ResidualTemplateForegroundModel:
     """Post-component-separation residual foreground as a one-parameter template.
 
@@ -132,6 +179,11 @@ class ResidualTemplateForegroundModel:
     to a multi-channel instrument, where the residual is added to each
     equal-frequency auto-block and left off genuine cross-frequency blocks.
 
+    **If your template is natively BINNED** (one value per bandpower bin, as a
+    component-separation MC produces), do NOT pass its bin centres here -- this
+    class interpolates between the samples it is given, which misreads a steep
+    spectrum across a wide bin edge. Use :meth:`from_bandpowers`.
+
     Args:
         template_cl:   Residual BB template ``C_ℓ`` [μK², CMB thermodynamic], 1-D.
         template_ells: Multipoles for ``template_cl``, same shape, ascending.
@@ -160,8 +212,30 @@ class ResidualTemplateForegroundModel:
             raise ValueError(
                 "template_cl and template_ells must have length >= 2 for "
                 f"interpolation; got length {cl.shape[0]}.")
+        _warn_if_bandpowers(cl, ells)
         self._template_cl = cl
         self._template_ells = ells
+
+    @classmethod
+    def from_bandpowers(cls, template_cl, bin_lo, bin_hi, ells):
+        """Build from a NATIVELY BINNED template, un-binned correctly.
+
+        Use this whenever the template arrived as one number per bandpower
+        bin — a component-separation MC residual, a post-cleaning noise
+        spectrum. Passing bin CENTRES to ``__init__`` instead makes the
+        consumer interpolate between them, which misreads a steep spectrum
+        badly across a wide bin edge; see
+        :func:`augr.bandpower_windows.unbin_bandpower_template`.
+
+        Args:
+            template_cl: Bandpower values, shape ``(n_bins,)``.
+            bin_lo:      First multipole of each bin, inclusive.
+            bin_hi:      Last multipole of each bin, inclusive.
+            ells:        Target ℓ grid, ascending.
+        """
+        from augr.bandpower_windows import unbin_bandpower_template
+        return cls(unbin_bandpower_template(template_cl, bin_lo, bin_hi, ells),
+                   ells)
 
     @property
     def parameter_names(self) -> list[str]:
