@@ -537,3 +537,73 @@ def test_f_sky_eff_is_differentiable_in_the_mask():
 
     g = float(jax.grad(f_sky)(25.0))
     assert np.isfinite(g) and g < 0.0, g
+
+
+def test_beam_matches_namaster_nmtfield_beam():
+    """B_l^2 on the column axis reproduces NmtField(beam=...) exactly.
+
+    Measured 1.1e-15 relative to the window peak.
+
+    Worth stating why this exists at all: the masked-Wiener estimator this
+    module replaces never handles the beam explicitly -- its MC transfer F_b
+    absorbs B_c^2 along with the filter suppression. MASTER is unbiased by
+    construction and so has no F_b, which means an omitted beam is absorbed
+    nowhere and biases the recovered spectrum low without any test noticing.
+    """
+    nmt = pytest.importorskip("pymaster")
+    nside, lmax = 16, 24
+    mask = _smooth_mask(nside)
+    edges = [(lo, lo + 5) for lo in range(2, lmax - 4, 6)]
+    b_ell = healpy.gauss_beam(np.radians(1.0), lmax=lmax)
+
+    mine = MasterBBJax.build(jnp.asarray(mask), bin_edges=edges, nside=nside,
+                             lmax=lmax, beam_bl=jnp.asarray(b_ell))
+
+    z = np.zeros(healpy.nside2npix(nside))
+    fld = nmt.NmtField(mask, [z, z], spin=2, lmax=lmax, beam=b_ell)
+    bpws = -np.ones(lmax + 1, dtype=int)
+    for i, (lo, hi) in enumerate(edges):
+        bpws[lo:hi + 1] = i
+    bins = nmt.NmtBin(bpws=bpws, ells=np.arange(lmax + 1),
+                      weights=np.ones(lmax + 1), lmax=lmax)
+    ref = np.asarray(nmt.NmtWorkspace.from_fields(fld, fld, bins)
+                     .get_bandpower_windows())[3, :, 3, :]
+    np.testing.assert_allclose(np.asarray(mine.window), ref, rtol=1e-10, atol=1e-14)
+
+
+def test_omitting_the_beam_biases_the_recovered_spectrum_low():
+    """A missing beam is a large, silent low bias on the BANDPOWERS.
+
+    Note where it does *not* show up: the bandpower window is nearly
+    beam-insensitive (max 2% even at a 10 deg beam), because B_l^2 appears in
+    both the numerator and the binned inverse and largely cancels. The beam
+    deconvolution lives in the decoupled bandpowers, where only the denominator
+    carries it -- so a window-level check would have missed this entirely.
+
+    Measured at nside=32/lmax=48 on a beamed B-only sky, recovered/truth in the
+    top bin: 0.995 with the beam, 0.356 without it at a 3 deg beam, and 0.058
+    without it at 5 deg.
+    """
+    nside, lmax = 32, 48
+    mask = _smooth_mask(nside, 25.0, 8.0)
+    edges = _edges(lmax)
+    b_ell = healpy.gauss_beam(np.radians(3.0), lmax=lmax)
+    cl = np.concatenate([[0.0, 0.0], 1.0 / np.arange(2, lmax + 1) ** 2.0])
+
+    np.random.seed(0)  # noqa: NPY002 - healpy.synalm uses the global RNG
+    alm = healpy.almxfl(healpy.synalm(cl, lmax=lmax, new=True), b_ell)
+    q, u = healpy.alm2map_spin([np.zeros_like(alm), alm], nside, 2, lmax)
+    qu = jnp.asarray(np.stack([q, u]))
+
+    kw = dict(bin_edges=edges, nside=nside, lmax=lmax)
+    with_beam = MasterBBJax.build(jnp.asarray(mask), beam_bl=jnp.asarray(b_ell), **kw)
+    without = MasterBBJax.build(jnp.asarray(mask), **kw)
+    truth = np.asarray(with_beam.window @ cl)
+
+    r_with = np.asarray(with_beam.bb(qu)) / truth
+    r_without = np.asarray(without.bb(qu)) / truth
+    assert abs(r_with[-1] - 1.0) < 0.2, r_with
+    assert r_without[-1] < 0.6, (
+        f"omitting the beam no longer biases the top bin (ratio {r_without[-1]:.3f})"
+        " -- this tripwire has gone stale"
+    )

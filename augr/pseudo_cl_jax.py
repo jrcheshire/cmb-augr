@@ -87,7 +87,8 @@ def mask_power_spectrum(mask, *, nside: int, lmax_mask: int,
     return alm2cl(alm[0], int(lmax_mask))
 
 
-def coupling_matrices(w_ell, *, lmax: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+def coupling_matrices(w_ell, *, lmax: int,
+                      beam_bl=None) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Parity-split spin-2 mode-coupling matrices ``(M+, M-)``.
 
     Both are ``(lmax + 1, lmax + 1)`` indexed ``[l1, l2]``. Rows and columns
@@ -98,7 +99,18 @@ def coupling_matrices(w_ell, *, lmax: int) -> tuple[jnp.ndarray, jnp.ndarray]:
     zero-padded (or truncated) onto the internal ``[0, 2*lmax]`` l3 grid.
 
     Linear in ``w_ell``, and the Wigner symbols carry no mask dependence, so the
-    whole mask gradient flows through this one argument.
+    whole mask gradient flows through that argument.
+
+    ``beam_bl`` is the transfer ``B_l`` of the map being analysed, on
+    ``[0, lmax]``. It enters as ``B_l2^2`` on the **column** axis, so the
+    resulting windows map a *beam-free* ``C_l`` to the bandpowers of the
+    *beamed* map -- verified against ``NmtField(beam=...)`` to 1.1e-15.
+
+    **Supply it.** The masked-Wiener path this replaces hides the beam inside its
+    MC transfer ``F_b`` (see :func:`augr.spectrum_stages.beamed_prior`), so it
+    never appears explicitly. MASTER has no ``F_b`` -- being unbiased by
+    construction is the whole point -- so an omitted beam is not absorbed
+    anywhere and silently biases the recovered spectrum low.
     """
     lmax = int(lmax)
     l3_max = 2 * lmax
@@ -127,7 +139,12 @@ def coupling_matrices(w_ell, *, lmax: int) -> tuple[jnp.ndarray, jnp.ndarray]:
     # MASTER convention wants. Sequential by construction -- one Wigner table
     # is live at a time, 0.6 MB at lmax=192.
     m_plus, m_minus = lax.map(body, jnp.arange(lmax + 1, dtype=float))
-    return m_plus.T, m_minus.T
+    m_plus, m_minus = m_plus.T, m_minus.T
+    if beam_bl is not None:
+        b2 = jnp.asarray(beam_bl)[: lmax + 1] ** 2
+        m_plus = m_plus * b2[None, :]
+        m_minus = m_minus * b2[None, :]
+    return m_plus, m_minus
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +289,14 @@ class MasterBBJax(eqx.Module):
 
     @classmethod
     def build(cls, mask, *, bin_edges, nside: int, lmax: int,
-              lmax_mask: int | None = None, n_iter: int = 3) -> MasterBBJax:
-        """Compute W_l, the coupling matrices and both windows for ``mask``."""
+              lmax_mask: int | None = None, n_iter: int = 3,
+              beam_bl=None) -> MasterBBJax:
+        """Compute W_l, the coupling matrices and both windows for ``mask``.
+
+        ``beam_bl`` is the transfer of the map that will be passed to
+        :meth:`bb`; see :func:`coupling_matrices` for why leaving it out is a
+        silent low bias rather than a harmless omission.
+        """
         nside, lmax = int(nside), int(lmax)
         lmax_mask = 3 * nside - 1 if lmax_mask is None else int(lmax_mask)
         edges = tuple((int(lo), int(hi)) for lo, hi in bin_edges)
@@ -282,7 +305,7 @@ class MasterBBJax(eqx.Module):
         mask = jnp.asarray(mask)
         w_ell = mask_power_spectrum(mask, nside=nside, lmax_mask=lmax_mask,
                                     n_iter=n_iter)
-        m_plus, m_minus = coupling_matrices(w_ell, lmax=lmax)
+        m_plus, m_minus = coupling_matrices(w_ell, lmax=lmax, beam_bl=beam_bl)
         b_w, b_s = bin_matrices(edges, lmax)
         ops = decouple_operators(m_plus, m_minus, b_w, b_s)
         window, window_ee = bandpower_windows_bb(ops)
