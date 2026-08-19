@@ -45,6 +45,77 @@ from pathlib import Path
 import numpy as np
 
 
+def unbin_bandpower_template(template_cl,
+                             bin_lo,
+                             bin_hi,
+                             ells) -> np.ndarray:
+    """Un-bin a natively binned spectrum onto an ℓ grid, piecewise-constant.
+
+    A spectrum measured as *bandpowers* — a residual-foreground template from
+    a component-separation MC, a post-cleaning noise spectrum, anything that
+    arrives as one number per bin — is not a function sampled at the bin
+    centres. Handing its ``(centre, value)`` pairs to a consumer that
+    interpolates (``ResidualTemplateForegroundModel``,
+    ``SignalModel(residual_template_cl=...)``, ``forecast_from_spectra``)
+    silently reinterprets it as one, and linear interpolation between centres
+    is a bad model of a steep spectrum.
+
+    The failure is worst exactly where CMB analyses put their widest bin. With
+    a wide reionization bin ``[2, 29]`` followed by ``Δℓ = 20`` bins, a dust-like
+    residual falls ~100× from bin 0 to bin 1; interpolating from centre 15.5 to
+    centre 39.5 across that cliff and re-binning through the BPWF overshoots
+    bin 1 by an order of magnitude, while the neighbours come out 15-20% low.
+    Observed in the wild at **11.4×** in bin 1, which understated ``σ(A_res)``
+    by 1.8-3.7× and ``σ(r)`` by 6-22%.
+
+    Piecewise-constant is the right un-binning for a bandpower: it is the
+    unique reconstruction that returns the original bandpowers when re-binned
+    through a top-hat, and it makes no claim about structure the binning
+    already threw away. Off the ends the first/last bin values extend, matching
+    the nearest-neighbour convention the interpolating consumers use.
+
+    Args:
+        template_cl: Bandpower values, shape ``(n_bins,)``.
+        bin_lo:      First multipole of each bin, inclusive, shape ``(n_bins,)``.
+        bin_hi:      Last multipole of each bin, inclusive, shape ``(n_bins,)``.
+        ells:        Target ℓ grid, ascending.
+
+    Returns:
+        ``template_cl`` on ``ells``, shape ``ells.shape``.
+
+    Example:
+        >>> cl_ell = unbin_bandpower_template(cl_b, lo, hi, np.arange(lmax + 1))
+        >>> model = ResidualTemplateForegroundModel(cl_ell, np.arange(lmax + 1))
+
+        or equivalently ``ResidualTemplateForegroundModel.from_bandpowers``.
+    """
+    cl = np.asarray(template_cl, dtype=float)
+    lo = np.asarray(bin_lo)
+    hi = np.asarray(bin_hi)
+    grid = np.asarray(ells, dtype=float)
+    if cl.ndim != 1:
+        raise ValueError(f"template_cl must be 1-D; got shape {cl.shape}.")
+    if lo.shape != cl.shape or hi.shape != cl.shape:
+        raise ValueError(
+            f"bin_lo {lo.shape} and bin_hi {hi.shape} must match "
+            f"template_cl {cl.shape}.")
+    if np.any(hi < lo):
+        raise ValueError("every bin_hi must be >= its bin_lo.")
+
+    # Bins are assumed ordered and non-overlapping; searchsorted then maps
+    # each ell to the bin containing it, and clips the ends onto the edge
+    # bins (nearest-neighbour extension, as documented above).
+    order = np.argsort(lo)
+    lo_s, hi_s, cl_s = lo[order], hi[order], cl[order]
+    idx = np.clip(np.searchsorted(lo_s, grid, side="right") - 1, 0, len(cl_s) - 1)
+    out = cl_s[idx]
+    # ells falling in a gap BETWEEN bins take the preceding bin's value, which
+    # searchsorted already gives; only the pre-first-bin case needs forcing.
+    out = np.where(grid < lo_s[0], cl_s[0], out)
+    out = np.where(grid > hi_s[-1], cl_s[-1], out)
+    return out
+
+
 def load_bandpower_window(path: str | Path
                           ) -> tuple[np.ndarray, np.ndarray]:
     """Load a measured BPWF from disk.
