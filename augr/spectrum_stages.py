@@ -64,6 +64,7 @@ from .compsep_sims import (
 from .covariance import mc_bandpower_covariance
 from .instrument import beam_bl
 from .parallel import parallel_map
+from .pseudo_cl_jax import MasterBBJax
 from .sht import synthesis_pol
 from .spectra import CMBSpectra
 
@@ -496,6 +497,17 @@ class CutskyMCContext(eqx.Module):
     n_sims: int = eqx.field(static=True)
     var_pix_ref: float = eqx.field(static=True)
     f_sky: float = eqx.field(static=True)
+    # --- MASTER estimator path (default: the masked-Wiener path, unchanged) ---
+    # ``mask`` is a TRACED leaf, unlike ``f_sky``: it is the sky-coverage design
+    # coordinate. The Wiener path never reads it (its mask is already folded into
+    # ``inv_noise``), so carrying it costs nothing there.
+    mask: jax.Array | None = None
+    estimator: str = eqx.field(static=True, default="wiener")
+    lmax_mask: int | None = eqx.field(static=True, default=None)
+    # Derived eagerly from bin_matrix (a traced leaf, so it cannot be read
+    # in-trace) and therefore static. Guarantees the MASTER bins are the Fisher
+    # bins rather than a parallel definition that can drift.
+    master_bin_edges: tuple | None = eqx.field(static=True, default=None)
 
 
 class CutskyMCTraced(eqx.Module):
@@ -546,6 +558,8 @@ def make_cutsky_mc_context(
     spectra: CMBSpectra | None = None,
     bandpasses=None,
     beam_shape_p=None,
+    estimator: str = "wiener",
+    lmax_mask: int | None = None,
 ) -> CutskyMCContext:
     """Eager precompute for the differentiable cut-sky MC.
 
@@ -668,6 +682,11 @@ def make_cutsky_mc_context(
         n_sims=int(n_sims),
         var_pix_ref=float(var_pix_ref),
         f_sky=mk.f_sky_of(mask),
+        mask=jnp.asarray(mask),
+        estimator=str(estimator),
+        lmax_mask=None if lmax_mask is None else int(lmax_mask),
+        master_bin_edges=(_edges_from_bin_matrix(bin_matrix, ell_min)
+                          if str(estimator) == "master" else None),
     )
 
 
@@ -763,6 +782,95 @@ def load_sky_cache(path) -> SkyCache:
     )
 
 
+def _edges_from_bin_matrix(bin_matrix, ell_min: int) -> tuple[tuple[int, int], ...]:
+    """Inclusive ``(lo, hi)`` edges implied by a SignalModel bin matrix.
+
+    Read off the nonzero support of each row rather than taken as a separate
+    argument, so the MASTER bins cannot drift from the Fisher bins they must
+    match. Raises on a non-contiguous row -- a gappy bin would silently mean
+    something different to the two estimators.
+    """
+    bm = np.asarray(bin_matrix)
+    edges = []
+    for i, row in enumerate(bm):
+        nz = np.nonzero(row)[0]
+        if nz.size == 0:
+            raise ValueError(f"bin {i} of bin_matrix has empty support.")
+        if nz.size != nz[-1] - nz[0] + 1:
+            raise ValueError(
+                f"bin {i} of bin_matrix is non-contiguous; MASTER bins must be "
+                "contiguous l ranges."
+            )
+        edges.append((int(nz[0]) + int(ell_min), int(nz[-1]) + int(ell_min)))
+    return tuple(edges)
+
+
+def _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask) -> CutskyMCTraced:
+    """MASTER branch of :func:`mc_cutsky_cov_traced`.
+
+    Structurally simpler than the masked-Wiener branch, in a way that is the
+    point rather than a detail:
+
+    * **One leg per sim, not three.** MASTER is unbiased by construction, so the
+      transfer ``F_b`` and the E->B leakage template have nothing to calibrate --
+      they are exactly 1 and 0. The B-only and E-only projections exist solely to
+      measure them, so they are not run.
+    * **The mask is used directly**, not folded into ``inv_noise``. MASTER is a
+      mode deconvolution, not an inverse-variance filter, so it takes no noise
+      weighting and no signal prior at all.
+    * **The beam is explicit.** With no ``F_b`` to absorb ``B_c^2`` it goes into
+      the coupling matrix, at the common resolution the cleaner delivers.
+
+    The estimator is built once, outside the per-sim loop: the coupling matrix
+    depends on the mask and beams, not on the realization.
+    """
+    m = ctx.mask if mask is None else jnp.asarray(mask)
+    if m is None:
+        raise ValueError(
+            "estimator='master' needs a mask on the context (or a mask= override); "
+            "got None. The Wiener path folds its mask into inv_noise, MASTER does not."
+        )
+    if ctx.master_bin_edges is None:
+        raise ValueError(
+            "estimator='master' needs master_bin_edges; build the context via "
+            "make_cutsky_mc_context(estimator='master') so they are derived from "
+            "bin_matrix."
+        )
+    ells = jnp.arange(int(ctx.lmax) + 1, dtype=float)
+    common_fwhm = jnp.min(jnp.asarray(bf))
+    master = MasterBBJax.build(
+        m,
+        bin_edges=ctx.master_bin_edges,
+        nside=ctx.nside,
+        lmax=ctx.lmax,
+        lmax_mask=ctx.lmax_mask,
+        beam_bl=beam_bl(ells, common_fwhm),
+    )
+
+    def _one(hsky, key):
+        band_sky = beam_harmonic_sky(hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin)
+        total = assemble_band_maps(
+            band_sky, w_inv, ctx.hit_map, noise_key=key,
+            knee_ell=ctx.knee_ell, alpha_knee=ctx.alpha_knee,
+        )
+        result = cleaner(total, bf, bp, lmax=ctx.lmax, nside=ctx.nside)
+        return master.bb(result.cleaned_qu())
+
+    rec = jax.lax.map(
+        lambda bk: _one(bk[0], bk[1]), (ctx.harmonic_skies, ctx.noise_keys)
+    )
+    n_bins = rec.shape[1]
+    return CutskyMCTraced(
+        covariance=mc_bandpower_covariance(rec, hartlap=True),
+        debiased_bandpowers=rec,
+        transfer=jnp.ones(n_bins),
+        leakage=jnp.zeros(n_bins),
+        mean_bandpower=jnp.mean(rec, axis=0),
+        f_sky=ctx.f_sky,
+        n_sims=ctx.n_sims,
+    )
+
+
 def mc_cutsky_cov_traced(
     w_inv: jax.Array,
     ctx: CutskyMCContext,
@@ -770,6 +878,7 @@ def mc_cutsky_cov_traced(
     *,
     beam_fwhm: jax.Array | None = None,
     beam_p: jax.Array | None = None,
+    mask: jax.Array | None = None,
 ) -> CutskyMCTraced:
     """Differentiable cut-sky MC bandpower covariance as a function of ``w_inv`` (and beams).
 
@@ -807,6 +916,14 @@ def mc_cutsky_cov_traced(
     # Supplying beam_fwhm / beam_p makes the beams traced (the beam-design gradient).
     bf = ctx.beam_fwhm_arcmin if beam_fwhm is None else beam_fwhm
     bp = ctx.beam_shape_p if beam_p is None else beam_p
+    if ctx.estimator == "master":
+        return _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask)
+    if mask is not None:
+        raise ValueError(
+            "mask= is only meaningful for estimator='master'. The masked-Wiener "
+            "path folds its mask into inv_noise at context-build time, so an "
+            "override here would be silently ignored."
+        )
     bp_kw = dict(
         bin_matrix=ctx.bin_matrix,
         ell_min=ctx.ell_min,
