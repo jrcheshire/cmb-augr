@@ -161,6 +161,7 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 
 from augr.wigner_jax import (  # noqa: E402
+    spin0_body,
     spin2_body,
     wigner3j_000_vectorized_jax,
     wigner3j_vectorized_jax,
@@ -278,3 +279,36 @@ def test_spin2_body_normalization_requires_full_l2_grid():
         scale = np.abs(full[row]).max()
         rel = np.abs(trunc[row] - full[row]).max() / scale
         assert rel > 0.5, f"l1={row}: truncation changed the row by only {rel:.3f}"
+
+
+@pytest.mark.parametrize("m1,m2,m3", [(2, -2, 0), (-2, 0, 2)])
+def test_spin2_body_gradient_is_finite(m1, m2, m3):
+    """Reverse mode through the recursion must not produce NaN.
+
+    ``_sg_a_jax``'s ``sqrt(maximum(arg, 0))`` was correct in value but
+    NaN-poisoned in reverse mode: d/dx sqrt(x) is infinite at x=0 and the
+    clamped branch contributes a zero, so the cotangent is inf * 0. It now uses
+    the double-where idiom, substituting the argument before the sqrt.
+
+    (The normalization has the same latent pattern but is unreachable -- see the
+    note at that line. Mutating it back fails no test; mutating _sg_a_jax fails
+    two, which is why only the reachable one was changed.)
+
+    Nothing in augr differentiates with respect to a multipole index, so this
+    guards a property rather than a caller. It is worth guarding anyway: a NaN
+    in the reverse pass of a module whose entire purpose is differentiability is
+    a footgun for the next caller, and the fix leaves the forward pass bitwise
+    unchanged.
+    """
+    l1 = jnp.arange(0, 6, dtype=float)
+    g = jax.grad(jax.jit(lambda j2: spin2_body(j2, l1, m1, m2, m3, 0, 8).sum()))
+    grads = np.array([float(g(float(j2))) for j2 in (0, 1, 3, 5)])
+    assert np.all(np.isfinite(grads)), f"non-finite gradients: {grads}"
+
+
+def test_spin0_body_gradient_is_finite():
+    """Companion to the spin-2 case; the closed form goes through gammaln."""
+    l1 = jnp.arange(0, 6, dtype=float)
+    g = jax.grad(jax.jit(lambda j2: spin0_body(j2, l1, 0, 8).sum()))
+    grads = np.array([float(g(float(j2))) for j2 in (0, 1, 3, 5)])
+    assert np.all(np.isfinite(grads)), f"non-finite gradients: {grads}"

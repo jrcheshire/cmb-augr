@@ -101,9 +101,14 @@ def _sg_a_jax(j, j1, j2, m3):
     arg = ((j ** 2 - (j1 - j2) ** 2)
            * ((j1 + j2 + 1.0) ** 2 - j ** 2)
            * (j ** 2 - m3 ** 2))
+    # Double-where. ``sqrt(maximum(arg, 0))`` is right in value but its reverse
+    # pass is NaN wherever arg <= 0: d/dx sqrt(x) is infinite at x=0 and the
+    # clamp contributes a zero, so the cotangent is inf * 0. Substitute the
+    # argument BEFORE the sqrt so the untaken branch never evaluates one.
+    ok = (arg > 0.0) & (j != 0.0)
+    safe_arg = jnp.where(ok, arg, 1.0)
     safe_j = jnp.where(j == 0.0, 1.0, j)
-    a = jnp.sqrt(jnp.maximum(arg, 0.0)) / safe_j
-    return jnp.where(j == 0.0, 0.0, a)
+    return jnp.where(ok, jnp.sqrt(safe_arg) / safe_j, 0.0)
 
 
 def _sg_b_jax(j, j1, j2, m1, m2, m3):
@@ -121,15 +126,15 @@ def _sg_b_jax(j, j1, j2, m1, m2, m3):
 # Vectorized spin-2 recursion: all l1 simultaneously for fixed L
 # -----------------------------------------------------------------------
 
-def spin2_body(L_f, l1, m1: int, m2: int, m3: int,
+def spin2_body(j2, l1, m1: int, m2: int, m3: int,
                l2_min: int, l2_max: int) -> jnp.ndarray:
-    """Spin-2 Schulten-Gordon table for a single L, ``L`` may be traced.
+    """Spin-2 Schulten-Gordon table for a single j2, ``j2`` may be traced.
 
-    ``L_f`` is a scalar value (concrete or a JAX tracer); ``l1`` is a jnp
+    ``j2`` is a scalar value (concrete or a JAX tracer); ``l1`` is a jnp
     array; ``m1, m2, m3, l2_min, l2_max`` are static Python ints (they set
-    array shapes and carry no control flow on ``L_f``). This is the
+    array shapes and carry no control flow on ``j2``). This is the
     ``lax.map``-friendly core; the public ``wigner3j_vectorized_jax`` wraps
-    it with the concrete-``L`` grid bookkeeping and edge cases. Returns
+    it with the concrete-``j2`` grid bookkeeping and edge cases. Returns
     w_full of shape ``(len(l1), l2_max - l2_min + 1)``.
     """
     n_l1 = l1.shape[0]
@@ -137,9 +142,9 @@ def spin2_body(L_f, l1, m1: int, m2: int, m3: int,
     l2_grid = jnp.arange(l2_min, l2_max + 1, dtype=float)   # (n_l2,)
     rows = jnp.arange(n_l1)
 
-    l2_hi = l1 + L_f
+    l2_hi = l1 + j2
     m1_ok = jnp.abs(m1) <= l1
-    mask = ((l2_grid[None, :] >= jnp.maximum(jnp.abs(l1 - L_f), abs(m3))[:, None])
+    mask = ((l2_grid[None, :] >= jnp.maximum(jnp.abs(l1 - j2), abs(m3))[:, None])
             & (l2_grid[None, :] <= l2_hi[:, None])
             & m1_ok[:, None])                              # (n_l1, n_l2)
 
@@ -148,8 +153,8 @@ def spin2_body(L_f, l1, m1: int, m2: int, m3: int,
     # --- Seeds. Order matters: scatter the first backward step (at
     #     jmax-1), then the j_max seed (=1), so that when jmax_idx == 0 the
     #     unit seed wins (matching the numpy jmax_idx > 0 guard). ---
-    a_jmax = _sg_a_jax(l2_hi, l1, L_f, m3)                  # j = l1 + L, per row
-    b_jmax = _sg_b_jax(l2_hi, l1, L_f, m1, m2, m3)
+    a_jmax = _sg_a_jax(l2_hi, l1, j2, m3)                  # j = l1 + j2, per row
+    b_jmax = _sg_b_jax(l2_hi, l1, j2, m1, m2, m3)
     safe_a_jmax = jnp.where(jnp.abs(a_jmax) > _TINY, a_jmax, 1.0)
     first = jnp.where((jnp.abs(a_jmax) > _TINY) & m1_ok,
                       -b_jmax / safe_a_jmax, 0.0)
@@ -170,9 +175,9 @@ def spin2_body(L_f, l1, m1: int, m2: int, m3: int,
         def body(carry, x):
             w1, w2 = carry                                 # w_{idx+1}, w_{idx+2}
             j, l2i, mcol, wscol = x
-            a_j = _sg_a_jax(j, l1, L_f, m3)
-            b_j = _sg_b_jax(j, l1, L_f, m1, m2, m3)
-            a_jp1 = _sg_a_jax(j + 1.0, l1, L_f, m3)
+            a_j = _sg_a_jax(j, l1, j2, m3)
+            b_j = _sg_b_jax(j, l1, j2, m1, m2, m3)
+            a_jp1 = _sg_a_jax(j + 1.0, l1, j2, m3)
             safe_a = jnp.where(jnp.abs(a_j) > _TINY, a_j, 1.0)
             rec = -(b_j * w1 + a_jp1 * w2) / safe_a
             rec = jnp.where(jnp.abs(a_j) > _TINY, rec, 0.0)
@@ -191,36 +196,44 @@ def spin2_body(L_f, l1, m1: int, m2: int, m3: int,
     # --- Normalize: sum_j (2j+1) w^2 = 1 per row. ---
     wt = 2.0 * l2_grid + 1.0
     norm_sq = jnp.sum(wt[None, :] * w_full ** 2, axis=1)
+    # NOTE: this single-where has the same latent NaN as _sg_a_jax had -- rows
+    # with |m1| > l1 are identically zero, so norm_sq == 0 and sqrt's reverse
+    # pass is infinite there. Deliberately left alone because it is unreachable:
+    # both inputs (j2, l1) are integer multipole indices, so nothing
+    # differentiable sits upstream of w_full and the cotangent never arrives.
+    # Verified -- mutating this line back fails no test, while mutating
+    # _sg_a_jax fails two. If a caller ever makes the table depend on a
+    # continuous parameter, apply the _sg_a_jax double-where here too.
     safe_norm = jnp.where(norm_sq > _TINY, jnp.sqrt(norm_sq), 1.0)
     w_full = w_full / safe_norm[:, None]
 
-    # --- Sign fix: w at j_max has sign (-1)^{l1-L-m3}. ---
-    target_sign = _parity_sign(l1 - L_f - m3)
+    # --- Sign fix: w at j_max has sign (-1)^{l1-j2-m3}. ---
+    target_sign = _parity_sign(l1 - j2 - m3)
     current_val = w_full[rows, jmax_idx]
     needs_flip = (current_val * target_sign) < 0
     w_full = jnp.where(needs_flip[:, None], -w_full, w_full)
 
-    # --- Guard |m2| <= L. The symbol vanishes identically when a magnetic
+    # --- Guard |m2| <= j2. The symbol vanishes identically when a magnetic
     #     quantum number exceeds its own angular momentum, but the recursion
     #     above only ever constrains m1 (row-wise, via ``m1_ok``) and m3 (via
-    #     the l2 lower bound) -- nothing tests m2 against L, so the seed and
+    #     the l2 lower bound) -- nothing tests m2 against j2, so the seed and
     #     normalization would hand back a unit-norm but meaningless table.
-    #     ``wigner3j_vectorized_jax`` short-circuits this case for concrete L;
+    #     ``wigner3j_vectorized_jax`` short-circuits this case for concrete j2;
     #     the traced core must too, because ``lax.map`` callers reach it
     #     directly. No-op for the m2=0 delensing callers.
-    return jnp.where(jnp.abs(m2) <= L_f, w_full, 0.0)
+    return jnp.where(jnp.abs(m2) <= j2, w_full, 0.0)
 
 
-def wigner3j_vectorized_jax(L: int, l1_array,
+def wigner3j_vectorized_jax(j2: int, l1_array,
                             m1: int = 2, m2: int = -2,
                             l2_min_global: int = 0,
                             l2_max_global: int | None = None
                             ) -> tuple[np.ndarray, jnp.ndarray]:
     """JAX port of ``wigner.wigner3j_vectorized`` (backward SG sweep as scan).
 
-    Computes (l1, L, l2; m1, m2, m3) for all l1 and valid l2. Same seeds,
+    Computes (l1, j2, l2; m1, m2, m3) for all l1 and valid l2. Same seeds,
     coefficient signs, normalization, and sign fix as the numpy version.
-    ``L`` is a concrete int here; the ``lax.map``-friendly traced-``L`` core
+    ``j2`` is a concrete int here; the ``lax.map``-friendly traced-``j2`` core
     is :func:`spin2_body`.
     """
     m3 = -(m1 + m2)
@@ -228,14 +241,14 @@ def wigner3j_vectorized_jax(L: int, l1_array,
     n_l1 = l1.shape[0]
 
     l2_min = max(l2_min_global, abs(m3))
-    l2_max = (int(np.max(np.asarray(l1_array))) + int(L)
+    l2_max = (int(np.max(np.asarray(l1_array))) + int(j2)
               if l2_max_global is None else l2_max_global)
     n_l2 = l2_max - l2_min + 1
 
-    if n_l2 <= 0 or abs(m2) > L:
+    if n_l2 <= 0 or abs(m2) > j2:
         return (np.arange(l2_min, l2_max + 1, dtype=int),
                 jnp.zeros((n_l1, max(n_l2, 0))))
 
-    w_full = spin2_body(float(L), l1, m1, m2, m3, l2_min, l2_max)
+    w_full = spin2_body(float(j2), l1, m1, m2, m3, l2_min, l2_max)
     l2_grid = jnp.arange(l2_min, l2_max + 1, dtype=float)
     return l2_grid.astype(int), w_full
