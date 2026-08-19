@@ -230,6 +230,19 @@ def almxfl(alm: jax.Array, fl: jax.Array, lmax: int) -> jax.Array:
     return alm * fl[ell]
 
 
+
+def alm2cl(alm: jax.Array, lmax: int) -> jax.Array:
+    """Angular power spectrum ``C_ℓ`` of a B-only alm, JAX-differentiable.
+
+    ``C_ℓ = [|a_{ℓ0}|² + 2 Σ_{m>0} |a_{ℓm}|²] / (2ℓ+1)`` in healpy triangular packing —
+    the differentiable analog of ``healpy.alm2cl`` for the GNILC residual spectra.
+    """
+    ell = jnp.asarray(_ell_of_alm(int(lmax)))
+    is_m0 = jnp.asarray(_m_zero_mask(int(lmax)))
+    power = jnp.where(is_m0, jnp.abs(alm) ** 2, 2.0 * jnp.abs(alm) ** 2)
+    cl = jnp.zeros(int(lmax) + 1, dtype=power.dtype).at[ell].add(power)
+    return cl / (2.0 * jnp.arange(int(lmax) + 1) + 1.0)
+
 # ---------------------------------------------------------------------------
 # band-limit ↔ nside coupling (HEALPix grid policy)
 # ---------------------------------------------------------------------------
