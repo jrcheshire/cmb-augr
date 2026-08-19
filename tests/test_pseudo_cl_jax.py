@@ -428,3 +428,112 @@ def test_recovers_input_bb_with_e_present_needs_both_windows():
         "the single-window truth is no longer distinguishable -- this test has "
         f"stopped guarding anything (mean/naive = {mean[:2] / naive[:2]})"
     )
+
+
+# ---------------------------------------------------------------------------
+# S3: the mask as a differentiable design coordinate
+# ---------------------------------------------------------------------------
+
+
+def _b_only_qu(nside, lmax, seed=0):
+    np.random.seed(seed)  # noqa: NPY002 - healpy.synalm uses the global RNG
+    cl = np.concatenate([[0.0, 0.0], 1.0 / np.arange(2, lmax + 1) ** 2.0])
+    alm_b = healpy.synalm(cl, lmax=lmax, new=True)
+    q, u = healpy.alm2map_spin([np.zeros_like(alm_b), alm_b], nside, 2, lmax)
+    return jnp.asarray(np.stack([q, u]))
+
+
+def _bandpower_sum_of_cut(b_cut, qu, nside, lmax, edges, width=8.0):
+    from augr.masking import smooth_gal_cut_mask
+
+    mask = smooth_gal_cut_mask(nside, b_cut, width)
+    mb = MasterBBJax.build(mask, bin_edges=edges, nside=nside, lmax=lmax)
+    return jnp.sum(mb.bb(qu))
+
+
+@pytest.mark.slow
+def test_grad_through_the_estimator_matches_finite_difference():
+    """jax.grad of a bandpower w.r.t. the mask cut, against central FD.
+
+    The gradient traverses everything: the sigmoid mask, the spin-0 SHT for W_l,
+    the lax.map Wigner contraction, both decoupling solves, and the spin-2 SHT of
+    the masked map. This is the claim the whole module exists to support.
+
+    Measured convergence at nside=32, b_cut=25 deg (|grad - FD| / |FD|):
+    1.5e-2 at h=1.25, 2.5e-3 at h=0.5, 6.2e-4 at h=0.25, 9.9e-5 at h=0.1 --
+    falling as h^2, which is the signature of a correct gradient against a
+    second-order difference rather than an accidental agreement.
+    """
+    nside, lmax = 32, 48
+    edges, qu = _edges(lmax), _b_only_qu(nside, lmax)
+    b0 = 25.0
+
+    grad = float(jax.grad(_bandpower_sum_of_cut)(b0, qu, nside, lmax, edges))
+    errs = []
+    for h in (0.5, 0.25, 0.1):
+        fd = (float(_bandpower_sum_of_cut(b0 + h, qu, nside, lmax, edges))
+              - float(_bandpower_sum_of_cut(b0 - h, qu, nside, lmax, edges))) / (2 * h)
+        errs.append(abs(grad - fd) / abs(fd))
+    assert errs[-1] < 0.05, f"grad {grad:.6e} vs FD, rel errors {errs}"
+    assert errs[0] > errs[-1], f"FD error should shrink with h: {errs}"
+
+
+@pytest.mark.slow
+def test_grad_through_the_level_set_coordinate():
+    """The same, along the nested-mask coordinate t rather than a latitude cut.
+
+    This is the coordinate the production run actually varies. Measured relative
+    agreement with central FD: 8.2e-5.
+    """
+    from augr.masking import admission_rank, gal_cut_mask, level_set_mask
+
+    nside, lmax = 32, 48
+    edges, qu = _edges(lmax), _b_only_qu(nside, lmax)
+    rank = admission_rank(
+        jnp.stack([gal_cut_mask(nside, c) for c in (10.0, 20.0, 30.0, 40.0)]))
+
+    def scalar(t):
+        mb = MasterBBJax.build(level_set_mask(rank, t, 0.4), bin_edges=edges,
+                               nside=nside, lmax=lmax)
+        return jnp.sum(mb.bb(qu))
+
+    g = float(jax.grad(scalar)(1.5))
+    fd = (float(scalar(1.55)) - float(scalar(1.45))) / 0.1
+    assert abs(g - fd) / abs(fd) < 0.05, f"grad {g:.6e} vs FD {fd:.6e}"
+
+
+def test_jit_matches_eager_value_and_grad():
+    """jit/eager parity, to the repo's usual tolerances.
+
+    Measured: value bit-identical, gradient relative difference 2.4e-15, compile
+    0.28 s. The traced graph is small by design -- the Wigner recursion runs in a
+    sequential lax.map rather than unrolled, which is what kept an earlier
+    SHT-heavy forward from producing a multi-GB graph.
+    """
+    nside, lmax = 16, 24
+    edges, qu = _edges(lmax), _b_only_qu(nside, lmax)
+    fn = lambda b: _bandpower_sum_of_cut(b, qu, nside, lmax, edges)  # noqa: E731
+
+    v_eager, g_eager = jax.value_and_grad(fn)(20.0)
+    v_jit, g_jit = jax.jit(jax.value_and_grad(fn))(20.0)
+    np.testing.assert_allclose(float(v_jit), float(v_eager), rtol=1e-6)
+    np.testing.assert_allclose(float(g_jit), float(g_eager), rtol=1e-4)
+
+
+def test_f_sky_eff_is_differentiable_in_the_mask():
+    """f_sky_eff = <w^2>^2/<w^4> carries a gradient, unlike masking.f_sky_of.
+
+    ``f_sky_of`` returns a Python float, so it terminates the trace -- fine for
+    the fixed-mask paths it was written for, useless as a design coordinate.
+    """
+    from augr.masking import smooth_gal_cut_mask
+
+    nside, lmax = 16, 24
+
+    def f_sky(b_cut):
+        mb = MasterBBJax.build(smooth_gal_cut_mask(nside, b_cut, 8.0),
+                               bin_edges=_edges(lmax), nside=nside, lmax=lmax)
+        return mb.f_sky_eff
+
+    g = float(jax.grad(f_sky)(25.0))
+    assert np.isfinite(g) and g < 0.0, g

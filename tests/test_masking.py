@@ -15,6 +15,8 @@ extra); the NaMaster cross-check additionally needs pymaster.
 
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
 import pytest
 
@@ -377,3 +379,95 @@ def test_namaster_mean_bandpower_crosscheck():
     ratio = debiased[sel] / nmt_b[sel]
     assert np.all(np.isfinite(ratio))
     assert np.abs(np.median(ratio) - 1.0) < 0.3, np.median(ratio)
+
+
+# ---------------------------------------------------------------------------
+# Differentiable mask families (the sky-coverage design axis)
+# ---------------------------------------------------------------------------
+
+
+def test_smooth_gal_cut_mask_is_differentiable_in_both_parameters():
+    """The whole point: gal_cut_mask/galactic_mask carry no gradient at all.
+
+    Both threshold with a numpy comparison, so ``d f_sky / d b_cut`` does not
+    exist for them. The sigmoid family is smooth in the cut latitude *and* in
+    the width, which is what lets sky coverage be a design coordinate.
+    """
+    import jax
+
+    nside = 32
+    d_bcut = float(jax.grad(
+        lambda b: jnp.mean(mk.smooth_gal_cut_mask(nside, b, 5.0)))(25.0))
+    d_width = float(jax.grad(
+        lambda w: jnp.mean(mk.smooth_gal_cut_mask(nside, 25.0, w)))(5.0))
+    assert np.isfinite(d_bcut) and np.isfinite(d_width)
+    # cutting to higher |b| can only remove sky
+    assert d_bcut < 0.0
+
+
+def test_smooth_gal_cut_mask_f_sky_is_monotone_and_bounded():
+    nside = 32
+    f = [float(jnp.mean(mk.smooth_gal_cut_mask(nside, b, 5.0)))
+         for b in (10.0, 20.0, 30.0, 40.0, 50.0)]
+    assert all(a > b for a, b in itertools.pairwise(f)), f
+    assert min(f) > 0.0 and max(f) < 1.0
+
+
+def test_smooth_mask_approaches_the_sharp_cut_as_width_shrinks():
+    """The family really is a smoothing of gal_cut_mask -- but pixelization floors it.
+
+    Measured |f_sky - sharp| at nside=32, cut 25 deg: 9.1e-3 / 4.7e-3 / 4.5e-3 /
+    1.1e-5 at width = 5 / 1 / 0.5 / 0.05 deg. Note the **plateau** near 4.5e-3
+    between widths 1 and 0.5: once the taper is narrower than the HEALPix ring
+    spacing it stops being resolved, and only below that does it collapse onto
+    the sharp cut. That floor is pixelization, not an implementation defect, and
+    it is the other half of why width_deg should stay at or above a pixel scale.
+    """
+    nside = 32
+    sharp = np.asarray(mk.gal_cut_mask(nside, 25.0)).mean()
+    wide = np.abs(np.asarray(mk.smooth_gal_cut_mask(nside, 25.0, 5.0)).mean() - sharp)
+    narrow = np.abs(np.asarray(mk.smooth_gal_cut_mask(nside, 25.0, 0.05)).mean() - sharp)
+    assert wide < 2e-2, wide
+    assert narrow < 1e-4, narrow
+    assert narrow < wide
+
+
+def test_admission_rank_and_level_sets_reproduce_a_nested_family():
+    """At integer t with a narrow width, the level set IS the family member."""
+    nside = 32
+    cuts = [10.0, 20.0, 30.0, 40.0]
+    stack = jnp.stack([mk.gal_cut_mask(nside, c) for c in cuts])
+    rank = mk.admission_rank(stack)
+    assert set(np.asarray(rank).astype(int).tolist()) == {0, 1, 2, 3, 4}
+
+    # rank >= k <=> admitted by the k most permissive cuts
+    for k, cut in enumerate(sorted(cuts), start=1):
+        recovered = np.asarray(mk.level_set_mask(rank, k - 0.5, width=1e-3))
+        np.testing.assert_allclose(recovered, np.asarray(mk.gal_cut_mask(nside, cut)),
+                                   atol=1e-6)
+
+
+def test_level_set_mask_f_sky_is_monotone_in_t():
+    """No folds along the design coordinate for an optimizer to catch on."""
+    nside = 32
+    rank = mk.admission_rank(
+        jnp.stack([mk.gal_cut_mask(nside, c) for c in (10.0, 20.0, 30.0, 40.0)]))
+    f = [float(jnp.mean(mk.level_set_mask(rank, t))) for t in np.arange(-0.5, 4.0, 0.5)]
+    assert all(a >= b for a, b in itertools.pairwise(f)), f
+
+
+def test_admission_rank_rejects_a_non_nested_family():
+    """A non-nested stack still sums to a plausible-looking field -- so it raises.
+
+    This is the silent-wrong-answer case: without the check the rank field is a
+    well-formed array and level_set_mask returns a well-formed mask, but the
+    level sets are no longer the input masks and interpolating between them
+    means nothing.
+    """
+    nside = 32
+    overlapping = jnp.stack([mk.gal_cut_mask(nside, 20.0),
+                             1.0 - mk.gal_cut_mask(nside, 40.0)])
+    with pytest.raises(ValueError, match="not nested"):
+        mk.admission_rank(overlapping)
+    # ...and is computable when the caller takes responsibility
+    assert mk.admission_rank(overlapping, check=False).shape == (hp.nside2npix(nside),)
