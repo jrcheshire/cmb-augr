@@ -437,3 +437,44 @@ def test_master_mask_override_is_differentiable():
         errs.append(abs(g - fd) / abs(fd))
     assert errs[-1] < 0.05, f"grad {g:.6e}, FD rel errors {errs}"
     assert errs[0] > errs[-1], f"FD error should shrink with h: {errs}"
+
+
+@pytest.mark.slow
+def test_master_and_wiener_agree_on_sigma_r():
+    """The two estimators must land close, and this is what guards the E-leak trap.
+
+    They are different estimators with different failure modes -- MASTER is
+    prior-free and unbiased by construction; the masked-Wiener filter carries a
+    signal prior frozen at r=0 and is documented as biased-by-construction, a
+    bias-for-variance trade -- so they will not agree exactly. Measured at
+    nside=16/lmax=24 with 24 sims on shared CRN: 1.95e-3 vs 1.65e-3, a ratio of
+    1.18, with MASTER the looser of the two. That is the expected direction: the
+    prior buys variance by suppressing ambiguous low-l modes.
+
+    A factor-2 gate is deliberately loose on that comparison and deliberately
+    tight on the failure it exists to catch. Feeding MASTER the full cleaned Q/U
+    instead of the cleaned B alm leaks real lensing E (~100x the B power) into
+    pseudo-BB; the 2x2 decoupling removes it in the mean but not in variance, and
+    sigma(r) jumps to 8.7e-2 -- a ratio of ~13, which this test fails loudly.
+    """
+    ctx_m, cleaner = _master_setup(24)
+    ctx_w, _ = _traced_setup(24)
+    from augr.config import cleaned_map_instrument as _inst
+    from augr.optimize import make_optimization_context, sigma_r_from_external_cov
+
+    opt_ctx = make_optimization_context(
+        _inst(f_sky=0.6), NullForegroundModel(), CMBSpectra(),
+        {"r": 0.0, "A_lens": 1.0}, priors={}, fixed_params=[],
+        ell_min=2, ell_max=24, delta_ell=8, ell_per_bin_below=2)
+
+    def sigma(ctx):
+        out = mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner)
+        return float(sigma_r_from_external_cov(out.covariance, opt_ctx))
+
+    s_master, s_wiener = sigma(ctx_m), sigma(ctx_w)
+    ratio = s_master / s_wiener
+    assert 0.5 < ratio < 2.0, (
+        f"MASTER {s_master:.3e} vs Wiener {s_wiener:.3e} (ratio {ratio:.2f}). "
+        "A ratio near 13 means MASTER is being fed the E+B cleaned map instead "
+        "of the cleaned B alm."
+    )

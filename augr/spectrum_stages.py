@@ -821,6 +821,18 @@ def _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask) -> CutskyMCTraced:
     * **The beam is explicit.** With no ``F_b`` to absorb ``B_c^2`` it goes into
       the coupling matrix, at the common resolution the cleaner delivers.
 
+    It consumes the cleaned **B alm**, not ``cleaned_qu()``. That is not a
+    micro-optimization: the full cleaned Q/U carries the cleaned *E* as well, and
+    lensing EE is ~100x BB, so masking leaks a large real E power into pseudo-BB.
+    The 2x2 decoupling removes that in the mean but not in variance. Measured at
+    nside=16/lmax=24 with 40 sims, feeding cleaned_qu() inflates the lowest-bin
+    fractional scatter from 0.21 to 0.94 and sigma(r) from 6.4e-3 to 8.7e-2 --
+    against 5.6e-3 for the masked-Wiener reference. Taking the B alm restores
+    the pure-B-by-construction property the cleaner already provides (E is
+    discarded at ``common_resolution_b_alm``), and is what the NaMaster workflow
+    does via ``MasterBB.field_from_b_alm``. No BB information is lost: the
+    cleaned E carries none.
+
     The estimator is built once, outside the per-sim loop: the coupling matrix
     depends on the mask and beams, not on the realization.
     """
@@ -854,7 +866,7 @@ def _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask) -> CutskyMCTraced:
             knee_ell=ctx.knee_ell, alpha_knee=ctx.alpha_knee,
         )
         result = cleaner(total, bf, bp, lmax=ctx.lmax, nside=ctx.nside)
-        return master.bb(result.cleaned_qu())
+        return master.bb_from_b_alm(result.cleaned_b_alm)
 
     rec = jax.lax.map(
         lambda bk: _one(bk[0], bk[1]), (ctx.harmonic_skies, ctx.noise_keys)
