@@ -502,7 +502,7 @@ class CutskyMCContext(eqx.Module):
     # coordinate. The Wiener path never reads it (its mask is already folded into
     # ``inv_noise``), so carrying it costs nothing there.
     mask: jax.Array | None = None
-    estimator: str = eqx.field(static=True, default="wiener")
+    estimator: str = eqx.field(static=True, default="master")
     lmax_mask: int | None = eqx.field(static=True, default=None)
     # Derived eagerly from bin_matrix (a traced leaf, so it cannot be read
     # in-trace) and therefore static. Guarantees the MASTER bins are the Fisher
@@ -558,7 +558,7 @@ def make_cutsky_mc_context(
     spectra: CMBSpectra | None = None,
     bandpasses=None,
     beam_shape_p=None,
-    estimator: str = "wiener",
+    estimator: str = "master",
     lmax_mask: int | None = None,
 ) -> CutskyMCContext:
     """Eager precompute for the differentiable cut-sky MC.

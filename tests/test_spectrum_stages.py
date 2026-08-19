@@ -213,6 +213,7 @@ def _traced_setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per
         base_seed=0,
         fg_model=None,
         r_in=0.0,
+        estimator="wiener",
     )
     return ctx, cleaner
 
