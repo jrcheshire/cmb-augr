@@ -447,6 +447,7 @@ def design_objective(
     mission_years,
     beam_fwhm,
     beam_p,
+    mask=None,
     *,
     mc_ctx: CutskyMCContext,
     opt_ctx: OptimizationContext,
@@ -470,18 +471,34 @@ def design_objective(
     (:func:`augr.cost.budget_penalty`).
 
     For the Gaussian objectives (``marginal_eig_r`` / ``d_optimal`` / ``sigma_r``) this is
-    ``jax.grad``-able via ``jax.grad(design_objective, argnums=(0, 1, 2, 3, 4, 5))`` -> the
-    joint noise+beam design gradient (``mc_ctx`` / ``opt_ctx`` / ``cleaner`` / ``cost_model``
-    static). ``objective="hl_eig"`` is **value-only** (requires ``hl_eig_ctx`` + ``eig_key``;
-    the HL covariance inverse is computed on host, so the trace breaks under ``jax.grad``) --
-    the design subspace is built from the cheap Gaussian gradient and only evaluates HL-EIG.
+    ``jax.grad``-able via ``jax.grad(design_objective, argnums=(0, 1, 2, 3, 4, 5, 6))`` ->
+    the joint noise + beam + **sky-coverage** design gradient (``mc_ctx`` / ``opt_ctx`` /
+    ``cleaner`` / ``cost_model`` static). ``objective="hl_eig"`` is **value-only**
+    (requires ``hl_eig_ctx`` + ``eig_key``; the HL covariance inverse is computed on host,
+    so the trace breaks under ``jax.grad``) -- the design subspace is built from the cheap
+    Gaussian gradient and only evaluates HL-EIG.
+
+    ``mask`` is the sky-coverage coordinate: a per-pixel weight map, traced, from a
+    differentiable family such as :func:`augr.masking.smooth_gal_cut_mask` or
+    :func:`augr.masking.level_set_mask`. It requires ``mc_ctx`` built with
+    ``estimator="master"``; the masked-Wiener path bakes its mask into ``inv_noise`` at
+    context-build time and cannot vary it. Leave it ``None`` (default) to hold sky
+    coverage fixed at the context's mask, which reproduces the previous behaviour exactly.
+
+    **The mask feeds the noise as well as the mode count**, via
+    ``w_inv_from_noise_design(..., f_sky=<mask>)``. This is physics, not plumbing: the
+    same detector-seconds spread over more sky give a shallower map, and without that
+    coupling the gradient sees only the mode-count gain and runs away to full sky. The
+    assumption it encodes is that the analysis mask *is* the survey footprint -- if a
+    study ever analyses less sky than it observes, this term needs revisiting.
 
     Returns ``-utility + budget_penalty`` (a minimization scalar): descent maximizes EIG
     while staying on the affordable side of the budget surface.
     """
-    w_inv = w_inv_from_noise_design(n_det, net, eta_total, mission_years, mc_ctx.f_sky)
+    f_sky_noise = mc_ctx.f_sky if mask is None else jnp.mean(jnp.asarray(mask))
+    w_inv = w_inv_from_noise_design(n_det, net, eta_total, mission_years, f_sky_noise)
     traced = mc_cutsky_cov_traced(
-        w_inv, mc_ctx, cleaner, beam_fwhm=beam_fwhm, beam_p=beam_p
+        w_inv, mc_ctx, cleaner, beam_fwhm=beam_fwhm, beam_p=beam_p, mask=mask
     )
     util = _utility(
         traced.covariance,

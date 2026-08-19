@@ -28,6 +28,7 @@ from augr.instrument import beam_bl
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
 from augr.spectrum_stages import (
+    _edges_from_bin_matrix,
     beamed_prior,
     cutsky_bb_bandpower,
     make_cutsky_mc_context,
@@ -212,6 +213,7 @@ def _traced_setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per
         base_seed=0,
         fg_model=None,
         r_in=0.0,
+        estimator="wiener",
     )
     return ctx, cleaner
 
@@ -307,3 +309,173 @@ def test_traced_cov_jit_matches_eager() -> None:
     cov_eager = cov_of(w0, bf, bp)
     cov_jit = jax.jit(cov_of)(w0, bf, bp)
     np.testing.assert_allclose(np.asarray(cov_jit), np.asarray(cov_eager), rtol=1e-6, atol=1e-30)
+
+
+# --- MASTER estimator path ---------------------------------------------------
+
+
+def _master_setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8):
+    """As _traced_setup, but estimator='master' and a SMOOTH mask.
+
+    MASTER needs a tapered mask -- a hard step puts ~1.6e-3 of its power above
+    the band limit versus 1.7e-8 for a resolved taper -- so the sigmoid family is
+    the right companion here, not galactic_mask.
+    """
+    cl_ee, cl_bb = _priors(lmax)
+    bm = _bin_matrix(2, ell_max, delta_ell, 2)
+    true_b = mk.bin_spectrum(
+        jnp.clip(CMBSpectra().cl_bb(jnp.arange(lmax + 1, dtype=float), 0.0), 0.0, None), bm, 2
+    )
+    cleaner = nilc_cleaner(clean_e=True)
+    ctx = make_cutsky_mc_context(
+        cleaner=cleaner, freqs_ghz=FREQS, beam_fwhm_arcmin=BEAMS, w_inv=W_INV,
+        nside=nside, lmax=lmax, mask=mk.smooth_gal_cut_mask(nside, 25.0, 8.0),
+        cl_ee=cl_ee, cl_bb_prior_unbeamed=cl_bb, bin_matrix=bm, ell_min=2,
+        true_bb_binned=true_b, n_sims=n_sims, base_seed=0, fg_model=None, r_in=0.0,
+        estimator="master",
+    )
+    return ctx, cleaner
+
+
+def test_edges_from_bin_matrix_matches_the_signal_model_binning():
+    """Edges are read off bin_matrix, so MASTER bins cannot drift from Fisher bins."""
+    bm = _bin_matrix(2, 24, 8, 2)
+    assert _edges_from_bin_matrix(bm, 2) == ((2, 9), (10, 17), (18, 24))
+
+
+def test_edges_from_bin_matrix_rejects_a_gappy_bin():
+    """A non-contiguous bin would mean different things to the two estimators."""
+    bm = np.zeros((2, 23))
+    bm[0, [0, 1, 5]] = 1.0   # gap
+    bm[1, 6:] = 1.0
+    with pytest.raises(ValueError, match="non-contiguous"):
+        _edges_from_bin_matrix(jnp.asarray(bm), 2)
+
+
+def test_master_context_carries_the_mask_as_a_traced_leaf():
+    """f_sky is static; the mask is a leaf. That asymmetry is the design axis.
+
+    The Wiener context folds its mask into inv_noise at build time and never
+    stores it, which is exactly why sky coverage could not previously be
+    differentiated.
+    """
+    import jax
+
+    ctx, _ = _master_setup(2)
+    leaves = jax.tree_util.tree_leaves(ctx)
+    assert any(leaf.shape == ctx.mask.shape and jnp.allclose(leaf, ctx.mask)
+               for leaf in leaves if hasattr(leaf, "shape"))
+    assert isinstance(ctx.f_sky, float)
+
+
+@pytest.mark.slow
+def test_master_path_has_unit_transfer_and_zero_leakage():
+    """MASTER is unbiased by construction, so there is nothing to calibrate.
+
+    The Wiener path measures a multiplicative transfer and an additive E->B
+    leakage template from two extra per-sim projections. MASTER needs neither, so
+    it runs one leg per sim instead of three -- and the returned transfer/leakage
+    are exactly 1 and 0 rather than approximately so.
+    """
+    ctx, cleaner = _master_setup(6)
+    out = mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner)
+    np.testing.assert_array_equal(np.asarray(out.transfer), 1.0)
+    np.testing.assert_array_equal(np.asarray(out.leakage), 0.0)
+    np.testing.assert_allclose(np.asarray(out.debiased_bandpowers).mean(axis=0),
+                               np.asarray(out.mean_bandpower), rtol=1e-12)
+    assert np.all(np.isfinite(np.asarray(out.covariance)))
+
+
+def test_wiener_path_rejects_a_mask_override():
+    """Silently ignoring it would be worse than refusing it.
+
+    The Wiener mask is baked into inv_noise at context-build time, so a mask=
+    passed to the traced forward could not take effect -- and a caller sweeping
+    the mask would get a flat, entirely wrong answer with no error.
+    """
+    ctx, cleaner = _traced_setup(2)
+    with pytest.raises(ValueError, match="only meaningful for estimator"):
+        mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner,
+                             mask=mk.smooth_gal_cut_mask(16, 25.0, 8.0))
+
+
+@pytest.mark.slow
+def test_master_mask_override_is_differentiable():
+    """d sigma(r) / d(mask parameter) through the full MC forward.
+
+    Step size matters here and a careless choice reads as a broken gradient. The
+    FD error is dominated by curvature, not Monte-Carlo noise: measured at
+    nside=16/lmax=24 with 6 sims, |grad - FD|/|FD| runs 0.44 / 0.087 / 0.021 /
+    0.0051 / 0.0008 at h = 2 / 1 / 0.5 / 0.25 / 0.1 degrees -- clean h^2
+    convergence. A one-degree step alone would fail a 5% gate while the gradient
+    is perfectly correct.
+
+    The test asserts convergence as well as agreement, since the h^2 trend is the
+    part that distinguishes a right answer from a lucky one.
+    """
+    import jax
+
+    from augr.config import cleaned_map_instrument as _inst
+    from augr.optimize import make_optimization_context, sigma_r_from_external_cov
+
+    ctx, cleaner = _master_setup(6)
+    opt_ctx = make_optimization_context(
+        _inst(f_sky=0.6), NullForegroundModel(), CMBSpectra(),
+        {"r": 0.0, "A_lens": 1.0}, priors={}, fixed_params=[],
+        ell_min=2, ell_max=24, delta_ell=8, ell_per_bin_below=2)
+
+    def sigma_of_cut(b_cut):
+        cov = mc_cutsky_cov_traced(
+            jnp.asarray(W_INV), ctx, cleaner,
+            mask=mk.smooth_gal_cut_mask(16, b_cut, 8.0)).covariance
+        return sigma_r_from_external_cov(cov, opt_ctx)
+
+    g = float(jax.grad(sigma_of_cut)(25.0))
+    assert np.isfinite(g)
+    errs = []
+    for h in (0.5, 0.25):
+        fd = (float(sigma_of_cut(25.0 + h)) - float(sigma_of_cut(25.0 - h))) / (2 * h)
+        errs.append(abs(g - fd) / abs(fd))
+    assert errs[-1] < 0.05, f"grad {g:.6e}, FD rel errors {errs}"
+    assert errs[0] > errs[-1], f"FD error should shrink with h: {errs}"
+
+
+@pytest.mark.slow
+def test_master_and_wiener_agree_on_sigma_r():
+    """The two estimators must land close, and this is what guards the E-leak trap.
+
+    They are different estimators with different failure modes -- MASTER is
+    prior-free and unbiased by construction; the masked-Wiener filter carries a
+    signal prior frozen at r=0 and is documented as biased-by-construction, a
+    bias-for-variance trade -- so they will not agree exactly. Measured at
+    nside=16/lmax=24 with 24 sims on shared CRN: 1.95e-3 vs 1.65e-3, a ratio of
+    1.18, with MASTER the looser of the two. That is the expected direction: the
+    prior buys variance by suppressing ambiguous low-l modes.
+
+    A factor-2 gate is deliberately loose on that comparison and deliberately
+    tight on the failure it exists to catch. Feeding MASTER the full cleaned Q/U
+    instead of the cleaned B alm leaks real lensing E (~100x the B power) into
+    pseudo-BB; the 2x2 decoupling removes it in the mean but not in variance, and
+    sigma(r) jumps to 8.7e-2 -- a ratio of ~13, which this test fails loudly.
+    """
+    ctx_m, cleaner = _master_setup(24)
+    ctx_w, _ = _traced_setup(24)
+    from augr.config import cleaned_map_instrument as _inst
+    from augr.optimize import make_optimization_context, sigma_r_from_external_cov
+
+    opt_ctx = make_optimization_context(
+        _inst(f_sky=0.6), NullForegroundModel(), CMBSpectra(),
+        {"r": 0.0, "A_lens": 1.0}, priors={}, fixed_params=[],
+        ell_min=2, ell_max=24, delta_ell=8, ell_per_bin_below=2)
+
+    def sigma(ctx):
+        out = mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner)
+        return float(sigma_r_from_external_cov(out.covariance, opt_ctx))
+
+    s_master, s_wiener = sigma(ctx_m), sigma(ctx_w)
+    ratio = s_master / s_wiener
+    assert 0.5 < ratio < 2.0, (
+        f"MASTER {s_master:.3e} vs Wiener {s_wiener:.3e} (ratio {ratio:.2f}). "
+        "A ratio near 13 means MASTER is being fed the E+B cleaned map instead "
+        "of the cleaned B alm."
+    )

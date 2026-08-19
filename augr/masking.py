@@ -55,6 +55,8 @@ Conventions
 
 from __future__ import annotations
 
+import itertools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -105,6 +107,84 @@ def galactic_mask(nside: int, f_sky: float) -> jax.Array:
     """
     b_cut_deg = float(np.degrees(np.arcsin(np.clip(1.0 - float(f_sky), -1.0, 1.0))))
     return gal_cut_mask(nside, b_cut_deg)
+
+
+def _pixel_abs_lat_deg(nside: int) -> np.ndarray:
+    """|galactic latitude| of each RING pixel centre [deg]. Fixed geometry."""
+    import healpy as hp
+
+    npix = hp.nside2npix(int(nside))
+    theta = hp.pix2ang(int(nside), np.arange(npix))[0]
+    return np.abs(90.0 - np.degrees(theta))
+
+
+def smooth_gal_cut_mask(nside: int, b_cut_deg, width_deg) -> jax.Array:
+    """Sigmoid ``|b|`` cut -- the differentiable counterpart to :func:`gal_cut_mask`.
+
+    ``w(p) = sigmoid((|b_p| - b_cut) / width)``, differentiable in **both**
+    ``b_cut_deg`` and ``width_deg``. The pixel geometry is fixed, so nothing is
+    gridded: the mask is a closed-form function of the two design parameters
+    evaluated at fixed pixel centres, and ``jax.grad`` reaches them.
+
+    ``gal_cut_mask`` and :func:`galactic_mask` threshold with a numpy comparison
+    and therefore carry no gradient at all, which is why a sky-coverage design
+    axis was not previously possible.
+
+    **The width is the apodization.** A MASTER estimator needs a tapered mask, and
+    rather than applying a separate (non-differentiable) apodization step this
+    family is smooth by construction. Keep ``width_deg`` at or above roughly one
+    pixel scale: measured at nside=128, the fraction of ``sum (2l+1) W_l`` above
+    l = 192 is 1.7e-8 at width 1 deg but 1.6e-3 for a hard step, and that tail is
+    what a truncated mask band-limit throws away.
+    """
+    lat = jnp.asarray(_pixel_abs_lat_deg(nside))
+    return jax.nn.sigmoid((lat - jnp.asarray(b_cut_deg)) / jnp.asarray(width_deg))
+
+
+def admission_rank(masks, *, check: bool = True) -> jax.Array:
+    """Per-pixel admission rank of a **nested** family of masks.
+
+    Given masks ordered from most to least aggressive (or the reverse), the sum
+    ``A(p) = sum_k M_k(p)`` counts how many of them admit pixel ``p``. For a
+    nested family the individual masks are exactly the level sets of ``A``, so a
+    single scalar threshold on ``A`` reproduces any of them -- and a *smooth*
+    threshold interpolates continuously between them. See :func:`level_set_mask`.
+
+    The Planck ``HFI_Mask_GalPlane`` stack is the motivating instance (its eight
+    fields are exactly nested, verified: zero subset violations).
+
+    ``check`` verifies nestedness and raises if it fails. Leaving it on is
+    recommended: on a non-nested family ``A`` is still a perfectly well-formed
+    array and ``level_set_mask`` still returns something plausible, but the level
+    sets are no longer the input masks and the interpolation means nothing.
+    """
+    m = jnp.asarray(masks)
+    if m.ndim != 2:
+        raise ValueError(f"masks must be (n_masks, npix), got shape {m.shape}.")
+    if check:
+        binary = np.asarray(m) > 0.5
+        order = np.argsort(binary.sum(axis=1))
+        for a, b in itertools.pairwise(order):
+            if not np.all(binary[b][binary[a]]):
+                raise ValueError(
+                    f"masks are not nested: mask {a} admits pixels that mask {b} "
+                    "cuts, so the summed rank field has no level-set meaning. "
+                    "Pass check=False only if you know why that is acceptable."
+                )
+    return jnp.sum(m, axis=0)
+
+
+def level_set_mask(rank, t, width: float = 0.15) -> jax.Array:
+    """Smoothly threshold an admission-rank field: ``sigmoid((A - t) / width)``.
+
+    Continuous and differentiable in ``t``, which is the sky-coverage design
+    coordinate. At integer ``t`` and small ``width`` this reproduces the
+    corresponding member of the nested family; between integers it interpolates.
+
+    ``f_sky`` is monotone in ``t`` by construction (``A`` is fixed and sigmoid is
+    monotone), so the coordinate has no folds for an optimizer to get caught in.
+    """
+    return jax.nn.sigmoid((jnp.asarray(rank) - jnp.asarray(t)) / float(width))
 
 
 def load_mask(path: str, *, nside: int | None = None, field: int = 0) -> jax.Array:

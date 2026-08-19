@@ -438,3 +438,89 @@ def test_active_subspace_surrogate_validity():
     range_w1 = abs(hl_eig_at(t * w1) - hl_eig_at(-t * w1))
     range_orth = abs(hl_eig_at(t * w_orth) - hl_eig_at(-t * w_orth))
     assert range_w1 > range_orth, (range_w1, range_orth)
+
+
+# --- sky coverage as a design coordinate -------------------------------------
+
+
+def _master_setup_smooth(n_sims, *, nside=16, lmax=24):
+    """A MASTER context on a SMOOTH mask, so the mask is a usable coordinate."""
+    from augr.delensing import load_lensing_spectra
+
+    ls = load_lensing_spectra()
+    cl_ee = jnp.clip(ls.cl_ee_len[: lmax + 1], 0.0, None)
+    cl_bb = jnp.clip(ls.cl_bb_len[: lmax + 1], 0.0, None)
+    sm = SignalModel(
+        instrument=cleaned_map_instrument(f_sky=0.6),
+        foreground_model=NullForegroundModel(), cmb_spectra=CMBSpectra(),
+        ell_min=2, ell_max=24, delta_ell=8, ell_per_bin_below=2)
+    bm = jnp.asarray(sm.bin_matrix)
+    true_b = mk.bin_spectrum(
+        jnp.clip(CMBSpectra().cl_bb(jnp.arange(lmax + 1, dtype=float), 0.0), 0.0, None),
+        bm, 2)
+    cleaner = nilc_cleaner(clean_e=True)
+    w_fid = np.asarray(w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, 0.6))
+    mc_ctx = make_cutsky_mc_context(
+        cleaner=cleaner, freqs_ghz=FREQS, beam_fwhm_arcmin=BEAMS, w_inv=w_fid,
+        nside=nside, lmax=lmax, mask=mk.smooth_gal_cut_mask(nside, 25.0, 8.0),
+        cl_ee=cl_ee, cl_bb_prior_unbeamed=cl_bb, bin_matrix=bm, ell_min=2,
+        true_bb_binned=true_b, n_sims=n_sims, base_seed=0, fg_model=None, r_in=0.0,
+        estimator="master")
+    return mc_ctx, _opt_ctx(), cleaner
+
+
+@pytest.mark.slow
+def test_design_objective_mask_gradient_matches_fd():
+    """jax.grad of the design objective w.r.t. the sky-coverage coordinate.
+
+    argnums=6 is the mask. Two things have to hold for the axis to be usable, and
+    only the second is about differentiability:
+
+    1. The gradient is right -- checked against central FD with the step shrunk
+       until curvature stops dominating (the same h^2 discipline as the
+       spectrum-stages test; a careless step reads as a broken gradient).
+    2. The mask reaches ``w_inv`` as well as the mode count. Without that a wider
+       mask looks like free information and the optimizer runs to full sky.
+       Guarded below by holding everything else fixed and confirming the noise
+       level actually moves with the mask.
+    """
+    mc_ctx, opt_ctx, cleaner = _master_setup_smooth(6)
+    cost_model = CostModel()
+    args = (jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA),
+            jnp.asarray(MISSION_YEARS), jnp.asarray(BEAMS), None)
+
+    def loss(b_cut):
+        mask = mk.smooth_gal_cut_mask(16, b_cut, 8.0)
+        return design_objective(
+            *args, mask, mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner,
+            cost_model=cost_model, budget=1.0e12, freqs_ghz=FREQS,
+            objective="sigma_r")
+
+    g = float(jax.grad(loss)(25.0))
+    assert np.isfinite(g)
+    errs = []
+    for h in (0.5, 0.25):
+        fd = (float(loss(25.0 + h)) - float(loss(25.0 - h))) / (2 * h)
+        errs.append(abs(g - fd) / abs(fd))
+    assert errs[-1] < 0.05, f"grad {g:.6e}, FD rel errors {errs}"
+    assert errs[0] > errs[-1], f"FD error should shrink with h: {errs}"
+
+
+def test_mask_couples_to_the_noise_level_not_just_the_mode_count():
+    """A wider mask must make the map shallower, or the axis is unphysical.
+
+    w_inv_from_noise_design spreads a fixed detector-second budget over the survey
+    area, so f_sky enters the noise. design_objective takes that f_sky from the
+    mask when one is supplied; if it did not, sky coverage would look free and the
+    gradient would push to full sky regardless of foregrounds.
+    """
+    narrow = mk.smooth_gal_cut_mask(16, 50.0, 8.0)   # less sky
+    wide = mk.smooth_gal_cut_mask(16, 10.0, 8.0)     # more sky
+    kw = (jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS)
+    w_narrow = w_inv_from_noise_design(*kw, jnp.mean(narrow))
+    w_wide = w_inv_from_noise_design(*kw, jnp.mean(wide))
+    assert float(jnp.mean(wide)) > float(jnp.mean(narrow))
+    assert np.all(np.asarray(w_wide) > np.asarray(w_narrow)), (
+        "more sky must mean noisier per-pixel maps at fixed detector-seconds"
+    )

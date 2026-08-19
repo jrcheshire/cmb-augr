@@ -75,6 +75,11 @@ def wigner3j_000_vectorized(L: int, l1_arr: np.ndarray,
 
     Returns (l2_grid, w3j) where w3j[i, j] = (l1_arr[i], l2_grid[j], L; 0 0 0).
     Zero where triangle fails or l1+l2+L is odd.
+
+    ``L`` here is the THIRD slot, unlike the spin-2 functions' ``j2``. It makes
+    no numerical difference: with all three magnetic numbers zero the symbol
+    vanishes unless l1+l2+L is even, so the odd-permutation sign
+    (-1)^(l1+l2+L) is +1 and the symbol is fully permutation-symmetric.
     """
     l1 = np.asarray(l1_arr, dtype=int)
     n_l1 = len(l1)
@@ -300,62 +305,65 @@ def wigner3j_recurse(j1: int, j2: int, m1: int, m2: int) -> tuple[np.ndarray, np
 # Vectorized recursion: all l1 simultaneously for fixed L
 # -----------------------------------------------------------------------
 
-def wigner3j_vectorized(L: int, l1_array: np.ndarray,
+def wigner3j_vectorized(j2: int, l1_array: np.ndarray,
                         m1: int = 2, m2: int = -2,
                         l2_min_global: int = 0,
                         l2_max_global: int | None = None
                         ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute (l1, L, l2; m1, m2, m3) for all l1 and valid l2 simultaneously.
+    """Compute (l1, j2, l2; m1, m2, m3) for all l1 and valid l2 simultaneously.
 
     The Schulten-Gordon three-term recursion varies the THIRD angular
-    momentum (here l2), with l1 and L fixed per recursion step.
+    momentum (here l2), with l1 and j2 fixed per recursion step.
     All l1 values are processed in parallel (vectorized backward sweep).
 
-    The 3j symbol ordering is (j1=l1, j2=L, j3=l2) with magnetic quantum
+    The 3j symbol ordering is (l1, j2, l2) in slots (j1, j2, j3), with magnetic
     numbers (m1, m2, m3) where m3 = -(m1+m2).  Column permutations of
-    the 3j symbol differ only by a sign (-1)^{l1+L+l2}, so |w3j|^2 is
+    the 3j symbol differ only by a sign (-1)^{l1+j2+l2}, so |w3j|^2 is
     independent of column ordering.
 
     Args:
-        L:         Fixed second angular momentum (j2 in the recursion).
+        j2:         Fixed SECOND angular-momentum slot, carrying m2. Named for
+                    its slot rather than its physics: the delensing caller
+                    puts the lensing multipole here, the MASTER coupling
+                    matrix puts a data multipole here.
         l1_array:  Array of first angular momentum values (j1).
-        m1, m2:    Magnetic quantum numbers on l1 and L respectively.
+        m1, m2:    Magnetic quantum numbers on l1 and j2 respectively.
                    m3 = -(m1+m2) is assigned to l2.
         l2_min_global: Minimum l2 in output grid.
-        l2_max_global: Maximum l2 in output grid. Default: max(l1) + L.
+        l2_max_global: Maximum l2 in output grid. Default: max(l1) + j2.
 
     Returns:
         l2_grid: 1-D int array of l2 values, shape (n_l2,).
         w3j:     2-D array of shape (n_l1, n_l2).
-               w3j[i, j] = (l1_array[i], L, l2_grid[j]; m1, m2, m3).
-               Zero where triangle condition |l1-L| ≤ l2 ≤ l1+L fails.
+               w3j[i, j] = (l1_array[i], j2, l2_grid[j]; m1, m2, m3).
+               Zero where triangle condition |l1-j2| ≤ l2 ≤ l1+j2 fails.
     """
-    # Recursion on j (=l2) of (j1=l1, j2=L, j=l2; m1, m2, m3=-m1-m2)
+    # Recursion on j (=l2), the THIRD slot, of (l1, j2, l2; m1, m2, m3=-m1-m2)
     m3 = -(m1 + m2)
     l1 = np.asarray(l1_array, dtype=float)
     n_l1 = len(l1)
-    L_f = float(L)
+    j2_f = float(j2)
 
-    # Magnetic-quantum-number constraint on j2=L: if |m2| > L the entire
+    # Magnetic-quantum-number constraint on the j2 slot: if |m2| > j2 the entire
     # 3j vanishes for any (j1, j3). Short-circuit so callers like
-    # _wignerc.wignerc_3j (which sweeps L from 0 upward and routinely
-    # invokes this with L < |m2|) get an honest zero matrix.
+    # _wignerc.wignerc_3j (which sweeps j2 from 0 upward and routinely
+    # invokes this with j2 < |m2|) get an honest zero matrix.
     l2_min = max(l2_min_global, abs(m3))
-    l2_max = int(np.max(l1)) + L if l2_max_global is None else l2_max_global
+    l2_max = int(np.max(l1)) + j2 if l2_max_global is None else l2_max_global
     n_l2 = l2_max - l2_min + 1
 
-    if n_l2 <= 0 or abs(m2) > L:
+    if n_l2 <= 0 or abs(m2) > j2:
         return (np.arange(l2_min, l2_max + 1, dtype=int),
                 np.zeros((n_l1, max(n_l2, 0))))
 
     l2_grid = np.arange(l2_min, l2_max + 1, dtype=float)
 
-    # Per-l1 triangle: l2 in [|l1-L|, l1+L] and l2 >= |m3|. Also
+    # Per-l1 triangle: l2 in [|l1-j2|, l1+j2] and l2 >= |m3|. Also
     # require |m1| <= l1 (the 3j vanishes when this is violated; the
     # recursion would otherwise produce spurious values via its
     # n=1-element closed form for j_min == j_max cases).
-    l2_lo = np.maximum(np.abs(l1 - L_f), abs(m3))
-    l2_hi = l1 + L_f
+    l2_lo = np.maximum(np.abs(l1 - j2_f), abs(m3))
+    l2_hi = l1 + j2_f
     m1_ok = (np.abs(m1) <= l1)
 
     mask = ((l2_grid[None, :] >= l2_lo[:, None])
@@ -364,8 +372,8 @@ def wigner3j_vectorized(L: int, l1_array: np.ndarray,
 
     # --- Backward recursion ---
     # Recursion: a(j)*w(j-1) + b(j)*w(j) + a(j+1)*w(j+1) = 0
-    # where j=l2, j1=l1[:], j2=L.
-    # Vectorized: l1 is an array; L, j are scalars at each step.
+    # where j=l2, j1=l1[:], and the second slot is j2.
+    # Vectorized: l1 is an array; j2, j are scalars at each step.
 
     w = np.zeros((n_l1, n_l2))
     jmax_idx = np.clip((l2_hi - l2_min).astype(int), 0, n_l2 - 1)
@@ -383,9 +391,9 @@ def wigner3j_vectorized(L: int, l1_array: np.ndarray,
         if not m1_ok[i]:
             continue
         jm = int(l2_hi[i])
-        # (j1=l1[i], j2=L, j=jm; m1, m2, m3)
-        a_val = _sg_a(jm, l1[i], L_f, m3)
-        b_val = _sg_b(jm, l1[i], L_f, m1, m2, m3)
+        # (l1[i], j2, jm; m1, m2, m3)
+        a_val = _sg_a(jm, l1[i], j2_f, m3)
+        b_val = _sg_b(jm, l1[i], j2_f, m1, m2, m3)
         if abs(a_val) > 1e-30 and jmax_idx[i] > 0:
             w[i, jmax_m1_idx[i]] = -b_val / a_val
 
@@ -397,10 +405,10 @@ def wigner3j_vectorized(L: int, l1_array: np.ndarray,
         if not np.any(active):
             continue
 
-        # j1=l1[:] (array), j2=L (scalar), j=l2_grid[idx+1] (scalar)
-        a_j = _sg_a_vec(j, l1, L_f, m3)
-        b_j = _sg_b_vec(j, l1, L_f, m1, m2, m3)
-        a_jp1 = _sg_a_vec(j + 1.0, l1, L_f, m3)
+        # j1=l1[:] (array), j2 (scalar), j=l2_grid[idx+1] (scalar)
+        a_j = _sg_a_vec(j, l1, j2_f, m3)
+        b_j = _sg_b_vec(j, l1, j2_f, m1, m2, m3)
+        a_jp1 = _sg_a_vec(j + 1.0, l1, j2_f, m3)
 
         safe_a = np.where(np.abs(a_j) > 1e-30, a_j, 1.0)
         new_val = -(b_j * w[:, idx + 1] + a_jp1 * w[:, idx + 2]) / safe_a
@@ -414,8 +422,8 @@ def wigner3j_vectorized(L: int, l1_array: np.ndarray,
     safe_norm = np.where(norm_sq > 1e-30, np.sqrt(norm_sq), 1.0)
     w /= safe_norm[:, None]
 
-    # --- Fix sign: w at j_max has sign (-1)^{j1-j2-m3} = (-1)^{l1-L-m3} ---
-    target_sign = (-1.0) ** (l1 - L - m3)
+    # --- Fix sign: w at j_max has sign (-1)^{j1-j2-m3} = (-1)^{l1-j2-m3} ---
+    target_sign = (-1.0) ** (l1 - j2 - m3)
     current_val = w[np.arange(n_l1), jmax_idx]
     needs_flip = (current_val * target_sign) < 0
     w[needs_flip] = -w[needs_flip]
