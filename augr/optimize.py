@@ -101,6 +101,106 @@ def _delens_from_combined_bb(spectra: LensingSpectra,
 
 
 @dataclass(frozen=True)
+class DelensCoupling:
+    """Design-dependent residual lensing ``C_ell^BB`` for the **map-based** forward.
+
+    :func:`make_optimization_context` (``delens=...``) couples delensing into the
+    *analytic* forward, where the design's channels live on the context's own
+    instrument. The map-based / EIG forward cannot use that: its
+    ``OptimizationContext`` is built on the single-channel
+    :func:`augr.config.cleaned_map_instrument` placeholder, whose dummy NET says
+    nothing about how well the real design reconstructs lensing. This object carries
+    the same coupling keyed on the *real* design knobs instead, and is the piece
+    :func:`augr.eig.design_objective` threads into the Monte-Carlo sims.
+
+    Build it with :meth:`build` at a reference design; call :meth:`residual` per
+    design. The residual is recomputed by a full iterative-QE solve at each
+    evaluation, so its **value** is exact at every design, not an expansion about the
+    reference.
+
+    **No linearized mode, deliberately.** ``make_optimization_context`` offers
+    ``delens='linearized'`` (a Jacobian precomputed once, ``C_res0 + J dN``), which
+    would be far cheaper here. It is not offered because it was measured to fail:
+    at a 3-band reference design, a **5% change in detector count** sent the
+    linearized residual to ``-0.083 x C_lens`` against a true ``0.467`` (118% error,
+    and negative). The cause is upstream of this class -- ``delens_residual_bb`` has
+    a jump discontinuity in the noise at isolated multipoles (measured at
+    ``ell = 30``: perturbing ``N_ell`` there by any amount of either sign, from 1e-4
+    to 1e-1 relative, shifts the output by a constant ``+4.5e-10``), so autodiff
+    reports a ~6-orders-too-large slope at that coordinate and the Jacobian
+    contraction is dominated by it. Everywhere else AD and finite differences agree
+    to 5 digits.
+
+    **The same discontinuity limits the design gradient through delensing**, in this
+    class and in the analytic ``delens=`` path alike: the *value* is trustworthy,
+    ``jax.grad`` through the QE solve is not, until the upstream jump is fixed.
+    """
+
+    spectra: LensingSpectra
+    ls: jnp.ndarray            # ell grid of the residual
+    ells: jnp.ndarray          # noise grid (spectra.ells)
+    l_max_qe: int
+    n_iter: int
+    nl_bb0: jnp.ndarray        # reference combined white nl_bb (on ells)
+    cl_bb_res0: jnp.ndarray    # reference residual (on ls)
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        lensing_spectra: LensingSpectra,
+        n_det,
+        net,
+        beam,
+        eta,
+        mission_years: float,
+        f_sky: float,
+        l_max_qe: int = 1000,
+        n_iter: int = 5,
+        ls: jnp.ndarray | None = None,
+    ) -> DelensCoupling:
+        """Precompute the coupling at a reference design (one delensing solve).
+
+        ``n_det`` / ``net`` / ``beam`` / ``eta`` are the reference design's
+        per-channel arrays (the same ones :func:`design_to_channels` produces), and
+        ``f_sky`` / ``mission_years`` set the noise normalization. :attr:`cl_bb_res0`
+        is the residual there -- the value to hand the forecast's ``SignalModel`` as
+        ``delensed_bb``, so the model half of the coupling matches the sims at the
+        reference (the frozen-Jacobian convention :func:`sigma_r_from_channels`
+        already uses analytically).
+        """
+        ells = lensing_spectra.ells
+        ls_arr = jnp.arange(2, 301, dtype=float) if ls is None else jnp.asarray(ls)
+        nl_bb0 = _combined_white_nl_bb(
+            jnp.asarray(n_det), jnp.asarray(net), jnp.asarray(beam), jnp.asarray(eta),
+            ells, mission_years, f_sky)
+        cl_res0 = _delens_from_combined_bb(
+            lensing_spectra, nl_bb0, ls_arr, l_max_qe, n_iter)
+        return cls(
+            spectra=lensing_spectra,
+            ls=ls_arr,
+            ells=ells,
+            l_max_qe=int(l_max_qe),
+            n_iter=int(n_iter),
+            nl_bb0=nl_bb0,
+            cl_bb_res0=cl_res0,
+        )
+
+    def residual(self, n_det, net, beam, eta, mission_years, f_sky):
+        """Residual lensing ``C_ell^BB`` on :attr:`ls` for this design.
+
+        Exact at every design (a full solve, not an expansion), and reproduces
+        :attr:`cl_bb_res0` at the reference. Traceable, but see the class docstring
+        before trusting ``jax.grad`` through it.
+        """
+        nl_bb = _combined_white_nl_bb(
+            jnp.asarray(n_det), jnp.asarray(net), jnp.asarray(beam), jnp.asarray(eta),
+            self.ells, mission_years, f_sky)
+        return _delens_from_combined_bb(
+            self.spectra, nl_bb, self.ls, self.l_max_qe, self.n_iter)
+
+
+@dataclass(frozen=True)
 class OptimizationContext:
     """Pre-computed quantities that are static during instrument optimization.
 

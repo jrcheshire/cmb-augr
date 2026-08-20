@@ -104,7 +104,8 @@ def _bin_matrix(ell_min, ell_max, delta_ell, ell_per_bin_below, f_sky=0.6):
     return jnp.asarray(sm.bin_matrix)
 
 
-def _setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2):
+def _setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2,
+           split_lensing=False):
     """Build mc_ctx + opt_ctx + cleaner for the tiny CMB-only config (no PySM)."""
     cl_ee, cl_bb = _priors(lmax)
     bm = _bin_matrix(2, ell_max, delta_ell, ell_per_bin_below)
@@ -136,6 +137,7 @@ def _setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_be
         base_seed=0,
         fg_model=None,
         r_in=0.0,
+        split_lensing=split_lensing,
     )
     opt_ctx = make_optimization_context(
         cleaned_map_instrument(f_sky=0.6),
@@ -307,3 +309,144 @@ def test_noise_design_value_and_grad_jit_matches_eager() -> None:
     g_j_vec = np.concatenate([np.asarray(g).ravel() for g in (*g_j[:3], jnp.atleast_1d(g_j[3]))])
     rel_l2 = float(np.linalg.norm(g_j_vec - g_e_vec) / np.linalg.norm(g_e_vec))
     assert rel_l2 < 1e-4, f"jit-vs-eager design-gradient rel-L2 = {rel_l2:.2e}"
+
+
+# --- the delensing seam: a design-dependent lensing floor in the MC sims ------
+#
+# Without this the map-based forward runs at A_lens = 1 no matter what the design
+# does, so an aperture trade gets no credit for delensing. cl_bb_res= rescales the
+# sims' lensing B to the design's residual; these gates pin that the off-path is
+# untouched, that the rescale does what it says, and that it stays differentiable.
+
+
+@pytest.mark.slow
+def test_delens_off_is_bitwise_identical_to_the_unsplit_context() -> None:
+    """split_lensing=True with no residual reproduces the plain context exactly.
+
+    The split is bookkeeping at r_in = 0, so turning it on must not perturb a
+    single bandpower -- otherwise every existing forecast number would move.
+    """
+    plain_ctx, _opt, cleaner = _setup(6)
+    split_ctx, _opt2, _c2 = _setup(6, split_lensing=True)
+    w_inv = w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, 0.6
+    )
+    a = mc_cutsky_cov_traced(w_inv, plain_ctx, cleaner)
+    b = mc_cutsky_cov_traced(w_inv, split_ctx, cleaner)
+    np.testing.assert_array_equal(
+        np.asarray(a.mean_bandpower), np.asarray(b.mean_bandpower)
+    )
+    np.testing.assert_array_equal(np.asarray(a.covariance), np.asarray(b.covariance))
+
+
+@pytest.mark.slow
+def test_delens_residual_scales_the_lensing_bandpower_exactly() -> None:
+    """The bandpower is exactly quadratic in the alm rescale s = sqrt(C_res / C_lens).
+
+    The map is lensing + noise, so its pseudo-power is
+    ``b(s) = s^2 L + N + 2 s X`` with ``X`` the lensing-noise cross term. Only the
+    ``s^2 L`` piece is the delensing; a naive "25% residual removes 75% of the
+    bandpower" check instead measures ``X``, which at finite n_sims is a few percent
+    and does not vanish. So fit the quadratic from s = 0, 1/2, 1 and predict an
+    unused point: that is exact algebra for a linear estimator, and it pins the
+    amplitude convention (an s-vs-s^2 slip would fail it outright).
+    """
+    split_ctx, opt_ctx, cleaner = _setup(6, split_lensing=True)
+    w_inv = w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, 0.6
+    )
+    ells = jnp.arange(25, dtype=float)
+    full = jnp.clip(CMBSpectra().cl_bb(ells, 0.0), 0.0, None)
+
+    def bandpower(s):  # residual C_res = s^2 * C_lens  ->  alm rescale s
+        traced = mc_cutsky_cov_traced(
+            w_inv, split_ctx, cleaner, cl_bb_res=(s**2) * full, cl_bb_res_ells=ells
+        )
+        return np.asarray(traced.mean_bandpower)
+
+    b0, b_half, b1 = bandpower(0.0), bandpower(0.5), bandpower(1.0)
+    # Solve b(s) = N + 2 X s + L s^2 on {0, 1/2, 1}.
+    n_term = b0
+    l_term = 2.0 * b1 + 2.0 * n_term - 4.0 * b_half
+    x_term = 0.5 * (b1 - n_term - l_term)
+    s = 0.75
+    predicted = n_term + 2.0 * x_term * s + l_term * s**2
+    np.testing.assert_allclose(bandpower(s), predicted, rtol=1e-10)
+
+    # And the lensing term it isolates is positive and dominant over the cross term.
+    assert np.all(l_term > 0.0)
+    assert np.all(np.abs(x_term) < 0.25 * l_term)
+
+    # Less residual lensing -> better sigma(r).
+    quarter = mc_cutsky_cov_traced(
+        w_inv, split_ctx, cleaner, cl_bb_res=0.25 * full, cl_bb_res_ells=ells
+    )
+    base = mc_cutsky_cov_traced(w_inv, split_ctx, cleaner)
+    assert float(sigma_r_from_external_cov(quarter.covariance, opt_ctx)) < float(
+        sigma_r_from_external_cov(base.covariance, opt_ctx)
+    )
+
+
+@pytest.mark.slow
+def test_delens_residual_is_differentiable() -> None:
+    """d sigma(r) / d(residual amplitude) is finite, negative, and FD-matched.
+
+    The gradient is the point: the design forward has to see that spending on
+    lensing reconstruction buys sigma(r), not merely that a delensed sky is quieter.
+    """
+    split_ctx, opt_ctx, cleaner = _setup(6, split_lensing=True)
+    w_inv = w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, 0.6
+    )
+    ells = jnp.arange(25, dtype=float)
+    full = jnp.clip(CMBSpectra().cl_bb(ells, 0.0), 0.0, None)
+
+    def sigma_r_of(a):
+        traced = mc_cutsky_cov_traced(
+            w_inv, split_ctx, cleaner, cl_bb_res=a * full, cl_bb_res_ells=ells
+        )
+        return sigma_r_from_external_cov(traced.covariance, opt_ctx)
+
+    a0 = 0.5
+    g = float(jax.grad(sigma_r_of)(a0))
+    assert np.isfinite(g) and g > 0.0  # more residual lensing -> worse sigma(r)
+    h = 0.05
+    fd = float((sigma_r_of(a0 + h) - sigma_r_of(a0 - h)) / (2 * h))
+    np.testing.assert_allclose(g, fd, rtol=0.05)
+
+
+@pytest.mark.slow
+def test_delens_residual_needs_a_split_context() -> None:
+    """A residual against an unsplit ensemble is refused, not silently ignored."""
+    plain_ctx, _opt, cleaner = _setup(4)
+    w_inv = w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, 0.6
+    )
+    ells = jnp.arange(25, dtype=float)
+    with pytest.raises(ValueError, match="split_lensing=True"):
+        mc_cutsky_cov_traced(
+            w_inv, plain_ctx, cleaner,
+            cl_bb_res=jnp.ones_like(ells), cl_bb_res_ells=ells,
+        )
+
+
+@pytest.mark.slow
+def test_fg_residual_leg_is_exactly_zero_without_foregrounds() -> None:
+    """With no foreground ensemble the residual leg is identically zero, and the
+    data vector is untouched by asking for it.
+
+    The sharp version of "the leg reads the foregrounds": it projects the cleaner's
+    weights onto the foreground maps, so a foreground-free sky must give exactly 0
+    -- not merely something small -- and the main bandpowers must not move.
+    """
+    mc_ctx, _opt, cleaner = _setup(6)  # fg_model=None; 6 sims clears the Hartlap floor
+    w_inv = w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, 0.6
+    )
+    off = mc_cutsky_cov_traced(w_inv, mc_ctx, cleaner)
+    on = mc_cutsky_cov_traced(w_inv, mc_ctx, cleaner, fg_residual=True)
+    assert off.fg_residual_bandpower is None
+    np.testing.assert_array_equal(np.asarray(on.fg_residual_bandpower), 0.0)
+    np.testing.assert_array_equal(
+        np.asarray(on.mean_bandpower), np.asarray(off.mean_bandpower)
+    )

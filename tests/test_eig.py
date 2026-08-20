@@ -31,20 +31,28 @@ from augr.active_subspace import (
 )
 from augr.cleaning import nilc_cleaner
 from augr.config import cleaned_map_instrument
-from augr.cost import CostModel, aperture_from_fwhm, budget_penalty
+from augr.cost import CostModel, aperture_from_fwhm, bias_wall, budget_penalty
 from augr.delensing import load_lensing_spectra
 from augr.design_opt import build_design_objectives
 from augr.eig import (
     HLEIGContext,
+    delta_r_from_residual,
     design_cost,
     design_objective,
     gaussian_eig_from_external_cov,
     hl_eig_from_external_cov,
     marginal_eig_r_from_external_cov,
+    physical_design_objective,
     posterior_fisher_from_external_cov,
+    sigma_r_from_posterior_fisher,
 )
+from augr.fisher import FisherForecast
 from augr.foregrounds import NullForegroundModel
-from augr.optimize import make_optimization_context, sigma_r_from_external_cov
+from augr.optimize import (
+    DelensCoupling,
+    make_optimization_context,
+    sigma_r_from_external_cov,
+)
 from augr.optimize_mapbased import w_inv_from_noise_design
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
@@ -186,7 +194,8 @@ def test_budget_penalty_binds_through_design_cost():
 # --- slow: end-to-end design objective + the design-level EIG/sigma(r) equivalence ---
 
 
-def _setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2):
+def _setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2,
+           split_lensing=False, fg_model=None):
     """mc_ctx + opt_ctx + cleaner for the tiny CMB-only config (mirrors test_optimize_mapbased)."""
     ls = load_lensing_spectra()
     cl_ee = jnp.clip(ls.cl_ee_len[: lmax + 1], 0.0, None)
@@ -225,8 +234,9 @@ def _setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_be
         true_bb_binned=true_b,
         n_sims=n_sims,
         base_seed=0,
-        fg_model=None,
+        fg_model=fg_model,
         r_in=0.0,
+        split_lensing=split_lensing,
     )
     opt_ctx = make_optimization_context(
         cleaned_map_instrument(f_sky=0.6),
@@ -524,3 +534,276 @@ def test_mask_couples_to_the_noise_level_not_just_the_mode_count():
     assert np.all(np.asarray(w_wide) > np.asarray(w_narrow)), (
         "more sky must mean noisier per-pixel maps at fixed detector-seconds"
     )
+
+
+# --- the delensing coupling in the design objective ---------------------------
+
+
+@pytest.mark.slow
+def test_design_objective_credits_delensing() -> None:
+    """delens= lowers the objective (raises EIG), and delens=None is unchanged.
+
+    Without the coupling the map forward runs at A_lens = 1 for every design, so an
+    aperture trade sees none of the delensing benefit. This pins that the residual
+    reaches the Monte-Carlo covariance and that leaving it off changes nothing.
+    """
+    mc_split, opt_ctx, cleaner = _setup(8, split_lensing=True)
+    mc_plain, _o2, _c2 = _setup(8)
+    cm = CostModel()
+    args = (
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS,
+        jnp.asarray(BEAMS), jnp.ones(len(BEAMS)),
+    )
+    kw = dict(
+        opt_ctx=opt_ctx, cleaner=cleaner, cost_model=cm, budget=1.0e12,
+        freqs_ghz=FREQS, objective="marginal_eig_r",
+    )
+    coupling = DelensCoupling.build(
+        lensing_spectra=load_lensing_spectra(),
+        n_det=args[0], net=args[1], beam=args[4], eta=args[2],
+        mission_years=MISSION_YEARS, f_sky=0.6,
+        l_max_qe=500, n_iter=2, ls=jnp.arange(2, 30, dtype=float),
+    )
+    # The residual really is a partial delensing at this design (else the test is vacuous).
+    frac = float(jnp.median(coupling.cl_bb_res0 / CMBSpectra().cl_bb(coupling.ls, 0.0)))
+    assert 0.0 < frac < 1.0
+
+    off_split = float(design_objective(*args, mc_ctx=mc_split, **kw))
+    off_plain = float(design_objective(*args, mc_ctx=mc_plain, **kw))
+    assert off_split == off_plain  # the split alone changes nothing at r_in = 0
+
+    on = float(design_objective(*args, mc_ctx=mc_split, delens=coupling, **kw))
+    assert on < off_split  # objective = -EIG, so delensing must lower it
+
+
+@pytest.mark.slow
+def test_design_objective_delens_requires_a_split_context() -> None:
+    """delens= against an unsplit ensemble raises instead of quietly ignoring it."""
+    mc_plain, opt_ctx, cleaner = _setup(4)
+    args = (
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS,
+        jnp.asarray(BEAMS), jnp.ones(len(BEAMS)),
+    )
+    coupling = DelensCoupling.build(
+        lensing_spectra=load_lensing_spectra(),
+        n_det=args[0], net=args[1], beam=args[4], eta=args[2],
+        mission_years=MISSION_YEARS, f_sky=0.6,
+        l_max_qe=500, n_iter=2, ls=jnp.arange(2, 30, dtype=float),
+    )
+    with pytest.raises(ValueError, match="split_lensing=True"):
+        design_objective(
+            *args, mc_ctx=mc_plain, opt_ctx=opt_ctx, cleaner=cleaner,
+            cost_model=CostModel(), budget=1.0e12, freqs_ghz=FREQS,
+            delens=coupling,
+        )
+
+
+# --- the r-bias wall ----------------------------------------------------------
+#
+# The EIG is -log sigma(r) + const, so it carries NO bias term and will buy a
+# design with small sigma(r) and large Delta r. These gates pin the wall's shape,
+# that Delta r agrees with the eager primitive it mirrors, and that the wall is
+# keyed to sigma(r) rather than to an absolute bias.
+
+
+def test_delta_r_matches_fisher_parameter_bias():
+    """delta_r_from_residual == FisherForecast.parameter_bias on the same inputs.
+
+    The traced readout and the eager primitive must not drift: one is used inside
+    the design objective, the other is what any offline bias check would run.
+    """
+    ctx = _opt_ctx()
+    cov = _synthetic_cov(ctx.J.shape[0], seed=3)
+    rng = np.random.default_rng(11)
+    delta_d = jnp.asarray(1e-3 * rng.standard_normal(ctx.J.shape[0]))
+
+    got = float(delta_r_from_residual(cov, delta_d, ctx))
+
+    ff = FisherForecast(
+        ctx.signal_model,
+        cleaned_map_instrument(f_sky=0.6),
+        {"r": 0.0, "A_lens": 1.0},
+        priors={},
+        fixed_params=[],
+        external_covariance=jnp.asarray(cov),
+    )
+    ff.compute()
+    np.testing.assert_allclose(got, ff.parameter_bias(delta_d)["r"], rtol=1e-9)
+
+
+def test_delta_r_is_linear_and_signed():
+    """Delta r is linear in the residual and flips sign with it (a linear bias)."""
+    ctx = _opt_ctx()
+    cov = _synthetic_cov(ctx.J.shape[0], seed=5)
+    rng = np.random.default_rng(2)
+    d = jnp.asarray(1e-3 * rng.standard_normal(ctx.J.shape[0]))
+    b1 = float(delta_r_from_residual(cov, d, ctx))
+    np.testing.assert_allclose(float(delta_r_from_residual(cov, 3.0 * d, ctx)), 3.0 * b1,
+                               rtol=1e-10)
+    np.testing.assert_allclose(float(delta_r_from_residual(cov, -d, ctx)), -b1, rtol=1e-10)
+
+
+def test_bias_wall_is_zero_inside_the_budget_and_quadratic_outside():
+    """Zero while |Delta r| <= eps*sigma, quadratic past it, C1 at the knee."""
+    sigma, eps = 1e-3, 0.5
+    knee = eps * sigma
+    assert float(bias_wall(0.0, sigma, eps=eps)) == 0.0
+    assert float(bias_wall(0.999 * knee, sigma, eps=eps)) == 0.0
+    assert float(bias_wall(-0.999 * knee, sigma, eps=eps)) == 0.0  # symmetric in sign
+    over = 0.25 * sigma
+    np.testing.assert_allclose(
+        float(bias_wall(knee + over, sigma, eps=eps)), over**2, rtol=1e-12
+    )
+    # C1 at the knee: the derivative approaches 0 from above.
+    g = float(jax.grad(lambda d: bias_wall(d, sigma, eps=eps))(knee + 1e-9))
+    assert abs(g) < 1e-8
+    # and stiffness scales linearly
+    np.testing.assert_allclose(
+        float(bias_wall(knee + over, sigma, eps=eps, weight=7.0)), 7.0 * over**2, rtol=1e-12
+    )
+
+
+def test_bias_wall_tightens_as_the_design_gets_more_precise():
+    """The SAME bias is free at a loose sigma(r) and penalized at a tight one.
+
+    This is the property that makes it a bias/variance statement rather than an
+    absolute bias cap: buying precision raises the bar the design must clear.
+    """
+    delta_r = 1e-3
+    assert float(bias_wall(delta_r, 4e-3, eps=0.5)) == 0.0   # 0.25 sigma -> free
+    assert float(bias_wall(delta_r, 1e-3, eps=0.5)) > 0.0    # 1.0 sigma  -> bites
+
+
+def test_sigma_r_readout_matches_the_eig_framing():
+    """sigma_r_from_posterior_fisher is the sigma(r) the EIG is built on."""
+    ctx = _opt_ctx()
+    cov = _synthetic_cov(ctx.J.shape[0], seed=7)
+    np.testing.assert_allclose(
+        float(sigma_r_from_posterior_fisher(cov, ctx)),
+        float(sigma_r_from_external_cov(cov, ctx)),
+        rtol=1e-12,
+    )
+
+
+@pytest.mark.slow
+def test_design_objective_bias_wall_needs_foregrounds() -> None:
+    """bias_eps against a foreground-free ensemble raises instead of being vacuous."""
+    mc_ctx, opt_ctx, cleaner = _setup(4)  # fg_model=None
+    args = (
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS,
+        jnp.asarray(BEAMS), jnp.ones(len(BEAMS)),
+    )
+    with pytest.raises(ValueError, match="foreground"):
+        design_objective(
+            *args, mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner,
+            cost_model=CostModel(), budget=1.0e12, freqs_ghz=FREQS, bias_eps=0.5,
+        )
+
+
+@pytest.mark.slow
+def test_design_objective_bias_wall_bites_on_a_real_residual() -> None:
+    """End to end with foregrounds: Delta r is finite, and the wall engages only
+    when the bias exceeds its sigma(r) budget.
+
+    Marked slow because it builds a PySM (d1s1) ensemble -- see the `slow` marker
+    note on foreground sims. d1s1 is the cheap stand-in here; the study's nominal
+    truth model is d10s5, which is a run configuration rather than a code path.
+    """
+    mc_ctx, opt_ctx, cleaner = _setup(6, fg_model="d1s1")
+    args = (
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS,
+        jnp.asarray(BEAMS), jnp.ones(len(BEAMS)),
+    )
+    kw = dict(
+        mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner, cost_model=CostModel(),
+        budget=1.0e12, freqs_ghz=FREQS,
+    )
+    # f_sky must be the context's REALIZED mask fraction, which is what
+    # design_objective feeds w_inv_from_noise_design -- passing a nominal 0.6 here
+    # instead perturbs the covariance and the comparison below stops being exact.
+    w_inv = w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS,
+        mc_ctx.f_sky,
+    )
+    traced = mc_cutsky_cov_traced(w_inv, mc_ctx, cleaner, fg_residual=True)
+    res = np.asarray(traced.fg_residual_bandpower)
+    assert traced.fg_residual_bandpower is not None
+    assert np.all(np.isfinite(res)) and res.shape == np.asarray(traced.mean_bandpower).shape
+    # NOT asserted positive per bin: MASTER is unbiased but not positive-definite, so a
+    # low-power bin can deconvolve slightly negative. The residual carries net power,
+    # concentrated at low ell where the Galactic BB is.
+    assert res.sum() > 0.0 and res[0] == res.max()
+    # It is a distinct leg, not the data vector relabelled.
+    assert not np.allclose(res, np.asarray(traced.mean_bandpower))
+
+    delta_r = float(delta_r_from_residual(
+        traced.covariance, traced.fg_residual_bandpower, opt_ctx))
+    sigma_r = float(sigma_r_from_posterior_fisher(traced.covariance, opt_ctx))
+    assert np.isfinite(delta_r) and delta_r != 0.0
+
+    # A budget far above the realized bias leaves the objective untouched; one far
+    # below it must raise the objective by exactly the wall's value.
+    base = float(design_objective(*args, **kw))
+    loose = float(design_objective(*args, bias_eps=100.0 * abs(delta_r) / sigma_r, **kw))
+    np.testing.assert_allclose(loose, base, rtol=1e-10)
+
+    eps_tight = 0.1 * abs(delta_r) / sigma_r
+    tight = float(design_objective(*args, bias_eps=eps_tight, **kw))
+    expected = base + float(bias_wall(delta_r, sigma_r, eps=eps_tight))
+    assert tight > base
+    np.testing.assert_allclose(tight, expected, rtol=1e-10)
+
+
+@pytest.mark.slow
+def test_physical_design_objective_forwards_delens_and_bias_wall() -> None:
+    """The physical entry point forwards delens= and bias_eps= unchanged.
+
+    Both are pure kwarg passthroughs, but this is the entry point the EIG driver
+    actually calls (it is the one that takes aperture), so a forwarding typo would
+    surface only in a production run -- as a design silently credited with no
+    delensing, or an inactive bias wall, both of which look like success.
+
+    Asserted by equivalence: derive the channels the physical path derives, call
+    design_objective directly on them, and require the same scalar.
+    """
+    from augr.optimize import design_to_channels
+
+    mc_ctx, opt_ctx, cleaner = _setup(6, split_lensing=True, fg_model="d1s1")
+    cm = CostModel()
+    freqs_per_group = ((90.0,), (150.0,), (220.0,))
+    fp_diameter_m = 0.3
+    design = {
+        "aperture_m": jnp.asarray(1.2),
+        "f_number": jnp.asarray(2.0),
+        "area_fractions": jnp.asarray([1 / 3, 1 / 3, 1 / 3]),
+        "mission_years": jnp.asarray(MISSION_YEARS),
+    }
+    coupling = DelensCoupling.build(
+        lensing_spectra=load_lensing_spectra(),
+        n_det=jnp.asarray(N_DET), net=jnp.asarray(NET),
+        beam=jnp.asarray(BEAMS), eta=jnp.asarray(ETA),
+        mission_years=MISSION_YEARS, f_sky=0.6,
+        l_max_qe=500, n_iter=2, ls=jnp.arange(2, 30, dtype=float),
+    )
+    shared = dict(
+        mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner, cost_model=cm,
+        budget=1.0e12, delens=coupling, bias_eps=0.5, bias_weight=3.0,
+    )
+
+    got = float(physical_design_objective(
+        design, freqs_per_group=freqs_per_group, fp_diameter_m=fp_diameter_m,
+        eta_total=0.5, galactic_loading=False, **shared,
+    ))
+
+    n_det, net, beam = design_to_channels(
+        design["aperture_m"], design["f_number"], fp_diameter_m,
+        design["area_fractions"], freqs_per_group, extra_loading=None,
+    )
+    freqs_flat = tuple(f for grp in freqs_per_group for f in grp)
+    expected = float(design_objective(
+        n_det, net, jnp.full((len(freqs_flat),), 0.5), design["mission_years"],
+        beam, jnp.ones(len(freqs_flat)),
+        freqs_ghz=freqs_flat, **shared,
+    ))
+    np.testing.assert_allclose(got, expected, rtol=1e-12)
+    assert np.isfinite(got)

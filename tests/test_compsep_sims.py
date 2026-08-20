@@ -21,6 +21,9 @@ from augr.compsep_sims import (
     BandSky,
     assemble_band_maps,
     beam_harmonic_sky,
+    cmb_b_alm,
+    cmb_b_alm_split,
+    cmb_band_qu,
     generate_band_sky,
     harmonic_sky,
     pysm_fg_iqu,
@@ -350,3 +353,112 @@ def test_beam_harmonic_sky_matches_generate_band_sky_with_fg() -> None:
         )
         np.testing.assert_array_equal(np.asarray(reused.fg_qu), np.asarray(fresh.fg_qu))
         np.testing.assert_array_equal(np.asarray(reused.cmb_qu), np.asarray(fresh.cmb_qu))
+
+
+# --- lensing/tensor split + the delensing lens_scale knob ---------------------
+#
+# The split exists so a delensing design knob can rescale the sims' lensing B
+# in-trace (mc_cutsky_cov_traced(cl_bb_res=...)). These gates pin the two
+# properties that make that safe: the split reproduces the un-split realization,
+# and scaling touches ONLY the lensing part (never the tensor signal, i.e. r).
+
+
+def test_cmb_b_alm_split_reproduces_unsplit_at_r0() -> None:
+    """At r=0 the lensing component IS the un-split draw, bit for bit, and no tensor."""
+    sp = CMBSpectra()
+    b_lens, b_tens = cmb_b_alm_split(sp, 0.0, LMAX, seed=3)
+    np.testing.assert_array_equal(np.asarray(b_lens), np.asarray(cmb_b_alm(sp, 0.0, LMAX, seed=3)))
+    assert float(jnp.max(jnp.abs(b_tens))) == 0.0
+
+
+def test_cmb_b_alm_split_tensor_scales_as_sqrt_r() -> None:
+    """The tensor component is the same realization scaled by sqrt(r): 4x r -> 2x alm.
+
+    Fixes the amplitude convention, not just the shape -- a tensor draw that
+    ignored r, or doubled it, would pass a power-spectrum-only check at one r.
+    """
+    sp = CMBSpectra()
+    _l1, t1 = cmb_b_alm_split(sp, 0.01, LMAX, seed=5)
+    _l4, t4 = cmb_b_alm_split(sp, 0.04, LMAX, seed=5)
+    np.testing.assert_allclose(np.asarray(t4), 2.0 * np.asarray(t1), rtol=1e-12)
+
+
+def test_cmb_b_alm_split_components_are_independent_fields() -> None:
+    """Lensing and tensor B are drawn as independent realizations, not one scaled field.
+
+    They are physically independent, and a 100%-correlated pair would have the
+    right total power while giving the wrong sample covariance.
+    """
+    sp = CMBSpectra()
+    b_lens, b_tens = cmb_b_alm_split(sp, 0.1, LMAX, seed=7)
+    x, y = np.asarray(b_lens), np.asarray(b_tens)
+    corr = np.abs(np.vdot(x, y)) / np.sqrt(np.vdot(x, x).real * np.vdot(y, y).real)
+    assert corr < 0.2, f"lensing/tensor correlation {corr:.3f} -- expected independent draws"
+
+
+def test_harmonic_sky_split_lensing_totals_match_at_r0() -> None:
+    """split_lensing=True leaves the r=0 realization unchanged (it only adds bookkeeping)."""
+    kw = dict(spectra=CMBSpectra(), r_in=0.0, nside=NSIDE, lmax=LMAX, fg_model=None)
+    plain = harmonic_sky((90.0, 150.0), cmb_seed=2, **kw)
+    split = harmonic_sky((90.0, 150.0), cmb_seed=2, split_lensing=True, **kw)
+    np.testing.assert_array_equal(np.asarray(split.cmb_b_alm), np.asarray(plain.cmb_b_alm))
+    np.testing.assert_array_equal(
+        np.asarray(split.cmb_b_lens_alm), np.asarray(plain.cmb_b_alm)
+    )
+
+
+def test_lens_scale_one_is_bitwise_identity() -> None:
+    """lens_scale=1 must change nothing -- the delens-off path stays byte-identical."""
+    hs = harmonic_sky(
+        (90.0, 150.0), spectra=CMBSpectra(), r_in=0.05, nside=NSIDE, lmax=LMAX,
+        fg_model=None, split_lensing=True,
+    )
+    base = beam_harmonic_sky(hs, (30.0, 30.0))
+    same = beam_harmonic_sky(hs, (30.0, 30.0), lens_scale=jnp.ones(LMAX + 1))
+    np.testing.assert_array_equal(np.asarray(same.cmb_qu), np.asarray(base.cmb_qu))
+
+
+def test_lens_scale_zero_leaves_exactly_the_tensor_signal() -> None:
+    """lens_scale=0 removes the lensing B and leaves the tensor B untouched.
+
+    The gate that matters for r: perfect delensing must not scale the signal we
+    are trying to measure. Compared against beaming the tensor alm directly.
+    """
+    r_in = 0.05
+    hs = harmonic_sky(
+        (90.0, 150.0), spectra=CMBSpectra(), r_in=r_in, nside=NSIDE, lmax=LMAX,
+        fg_model=None, split_lensing=True,
+    )
+    delensed = beam_harmonic_sky(hs, (30.0, 30.0), lens_scale=jnp.zeros(LMAX + 1))
+    expected = cmb_band_qu(
+        hs.cmb_b_alm - hs.cmb_b_lens_alm, (30.0, 30.0), LMAX, NSIDE, e_alm=hs.cmb_e_alm
+    )
+    np.testing.assert_allclose(
+        np.asarray(delensed.cmb_qu), np.asarray(expected), rtol=1e-10, atol=1e-14
+    )
+
+
+def test_lens_scale_without_split_raises() -> None:
+    """Scaling the total B would rescale r along with the lensing -- refuse, don't guess."""
+    hs = harmonic_sky(
+        (90.0, 150.0), spectra=CMBSpectra(), r_in=0.05, nside=NSIDE, lmax=LMAX,
+        fg_model=None,
+    )
+    with pytest.raises(ValueError, match="split_lensing=True"):
+        beam_harmonic_sky(hs, (30.0, 30.0), lens_scale=jnp.ones(LMAX + 1))
+
+
+def test_lens_scale_is_differentiable() -> None:
+    """The rescale carries a gradient -- it is a design knob, not a preprocessing step."""
+    hs = harmonic_sky(
+        (90.0, 150.0), spectra=CMBSpectra(), r_in=0.0, nside=NSIDE, lmax=LMAX,
+        fg_model=None, split_lensing=True,
+    )
+
+    def power(a):
+        sky = beam_harmonic_sky(hs, (30.0, 30.0), lens_scale=a * jnp.ones(LMAX + 1))
+        return jnp.mean(sky.cmb_qu**2)
+
+    g = float(jax.grad(power)(0.5))
+    # power ~ a^2 * const at r=0 (lensing is the only B), so d/da at 0.5 is > 0.
+    np.testing.assert_allclose(g, 2.0 * 0.5 * float(power(1.0)), rtol=1e-8)

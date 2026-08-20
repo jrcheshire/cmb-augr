@@ -98,6 +98,14 @@ def build_cutsky_signal_model(
     signal so the Bayesian sigma(r) here is apples-to-apples with the Gaussian-Fisher
     number: identical ``A_res`` template, binning, and Jacobian. Returns
     ``(signal_model, instrument)``.
+
+    ``delensed_bb`` / ``delensed_bb_ells`` default to ``None``, i.e. the full lensing
+    B floor (``A_lens = 1``). In the **design** forward that default is a modelling
+    choice, not a neutral one: it gives a design no credit for its own delensing. Pass
+    :attr:`augr.optimize.DelensCoupling.cl_bb_res0` (and its ``ls``) to put the model
+    on the reference design's residual, matching the sims that
+    :func:`augr.eig.design_objective` ``delens=`` produces -- the two halves of the
+    coupling have to agree or the fit is biased against its own data.
     """
     inst = cleaned_map_instrument(f_sky=f_sky)
     kw = dict(

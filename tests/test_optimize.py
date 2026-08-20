@@ -20,6 +20,7 @@ from augr.instrument import (
     white_noise_power_continuous,
 )
 from augr.optimize import (
+    DelensCoupling,
     _combined_white_nl_bb,
     _delens_from_combined_bb,
     make_optimization_context,
@@ -540,3 +541,66 @@ class TestDelensedDesignForward:
         g = jax.grad(
             lambda nd: self._eval(ctx_lin, instrument, n_det=nd))(ctx_lin.n_det)
         assert jnp.all(jnp.isfinite(g))
+
+
+# --- DelensCoupling: the design-keyed residual for the map-based forward ------
+
+
+@pytest.fixture(scope="module")
+def _coupling_design():
+    """A tiny 3-band reference design + a light QE config (keeps the solve fast)."""
+    return dict(
+        n_det=jnp.asarray((200.0, 400.0, 200.0)),
+        net=jnp.asarray((60.0, 50.0, 80.0)),
+        beam=jnp.asarray((40.0, 30.0, 20.0)),
+        eta=jnp.asarray((0.5, 0.5, 0.5)),
+        mission_years=4.0,
+        f_sky=0.6,
+    )
+
+
+@pytest.mark.slow
+def test_delens_coupling_reference_is_exact(_coupling_design):
+    """residual() at the reference design reproduces cl_bb_res0 to the last bit."""
+    d = _coupling_design
+    c = DelensCoupling.build(
+        lensing_spectra=load_lensing_spectra(), l_max_qe=500, n_iter=2,
+        ls=jnp.arange(2, 30, dtype=float), **d,
+    )
+    got = c.residual(d["n_det"], d["net"], d["beam"], d["eta"],
+                     d["mission_years"], d["f_sky"])
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(c.cl_bb_res0))
+
+
+@pytest.mark.slow
+def test_delens_coupling_deeper_design_delenses_better(_coupling_design):
+    """More detectors -> lower noise -> a smaller residual, at every multipole.
+
+    The monotonicity is the physics the design forward is meant to see; a coupling
+    that ignored its arguments would return the reference residual and pass a
+    "finite and positive" check.
+    """
+    d = _coupling_design
+    c = DelensCoupling.build(
+        lensing_spectra=load_lensing_spectra(), l_max_qe=500, n_iter=2,
+        ls=jnp.arange(2, 30, dtype=float), **d,
+    )
+    deeper = c.residual(4.0 * d["n_det"], d["net"], d["beam"], d["eta"],
+                        d["mission_years"], d["f_sky"])
+    ref = np.asarray(c.cl_bb_res0)
+    assert np.all(np.asarray(deeper) < ref)
+    # and it is a real delensing, not a rounding-level move
+    assert np.median(np.asarray(deeper) / ref) < 0.97
+
+
+@pytest.mark.slow
+def test_delens_coupling_residual_is_below_full_lensing(_coupling_design):
+    """The residual is a *fraction* of the lensing BB it replaces -- 0 < res < C_lens."""
+    d = _coupling_design
+    spec = load_lensing_spectra()
+    ls = jnp.arange(2, 30, dtype=float)
+    c = DelensCoupling.build(lensing_spectra=spec, l_max_qe=500, n_iter=2, ls=ls, **d)
+    res = np.asarray(c.cl_bb_res0)
+    full = np.asarray(spec.cl_bb_len[2:30])
+    assert np.all(res > 0.0)
+    assert np.all(res < full)

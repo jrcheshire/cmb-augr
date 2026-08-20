@@ -502,6 +502,11 @@ class CutskyMCContext(eqx.Module):
     # coordinate. The Wiener path never reads it (its mask is already folded into
     # ``inv_noise``), so carrying it costs nothing there.
     mask: jax.Array | None = None
+    # Lensing BB of the realization (ell = 0..lmax), stored when the sky ensemble
+    # was drawn with a lensing/tensor split. It is the DENOMINATOR of the delensing
+    # rescale in mc_cutsky_cov_traced(cl_bb_res=...): the sims carry full lensing B,
+    # and sqrt(C_res / C_lens) turns that into the design's residual in-trace.
+    cl_bb_lens_ref: jax.Array | None = None
     estimator: str = eqx.field(static=True, default="master")
     lmax_mask: int | None = eqx.field(static=True, default=None)
     # Derived eagerly from bin_matrix (a traced leaf, so it cannot be read
@@ -527,6 +532,12 @@ class CutskyMCTraced(eqx.Module):
     mean_bandpower: jax.Array
     f_sky: float = eqx.field(static=True)
     n_sims: int = eqx.field(static=True)
+    # MC-mean BB bandpowers of the cleaner's residual FOREGROUND, i.e. the
+    # cleaner's own weights applied to the foreground-only maps. This is the
+    # unmodelled component the fit does not describe, so it is the Delta-D that
+    # drives the r-bias (eig.delta_r_from_residual). None unless the traced
+    # forward was called with fg_residual=True.
+    fg_residual_bandpower: jax.Array | None = None
 
 
 def make_cutsky_mc_context(
@@ -560,6 +571,7 @@ def make_cutsky_mc_context(
     beam_shape_p=None,
     estimator: str = "master",
     lmax_mask: int | None = None,
+    split_lensing: bool = False,
 ) -> CutskyMCContext:
     """Eager precompute for the differentiable cut-sky MC.
 
@@ -584,6 +596,14 @@ def make_cutsky_mc_context(
     no pysm3. Generate the cache once with :func:`save_sky_cache` on a pysm3-capable
     machine; this decouples the slow FG sim from the GPU forward and pins the FG
     realizations.
+
+    ``split_lensing`` (default False) draws each sim's CMB B as separate lensing +
+    tensor components and records the lensing BB spectrum on the context, which is
+    the precondition for the **delensing design knob**:
+    :func:`mc_cutsky_cov_traced` ``cl_bb_res=`` then rescales the sims' lensing B to
+    the design's residual in-trace. Without it the Monte-Carlo covariance is stuck at
+    ``A_lens = 1`` no matter what the design does. Costs one extra ``synalm`` per sim
+    and one ``(lmax+1)`` array; at ``r_in = 0`` the realizations are unchanged.
     """
     spectra = CMBSpectra() if spectra is None else spectra
     freqs_ghz = tuple(float(f) for f in freqs_ghz)
@@ -608,6 +628,7 @@ def make_cutsky_mc_context(
             cmb_seed=int(seed),
             cl_ee=cl_ee,
             bandpasses=bandpasses,
+            split_lensing=split_lensing,
         )
 
     if harmonic_skies is None:
@@ -634,6 +655,12 @@ def make_cutsky_mc_context(
                 "(the setup clean needs a generated sky otherwise)."
             )
         n_sims = int(harmonic_skies.cmb_b_alm.shape[0])
+        if split_lensing and harmonic_skies.cmb_b_lens_alm is None:
+            raise ValueError(
+                "split_lensing=True but the supplied harmonic_skies carry no "
+                "cmb_b_lens_alm -- regenerate the sky cache with split_lensing=True "
+                "(the split is a property of the draw, not of the context)."
+            )
         if int(noise_keys.shape[0]) != n_sims:
             raise ValueError(
                 f"noise_keys has {int(noise_keys.shape[0])} sims but harmonic_skies has {n_sims}."
@@ -683,6 +710,11 @@ def make_cutsky_mc_context(
         var_pix_ref=float(var_pix_ref),
         f_sky=mk.f_sky_of(mask),
         mask=jnp.asarray(mask),
+        cl_bb_lens_ref=(
+            jnp.asarray(spectra.cl_lensing(jnp.arange(int(lmax) + 1, dtype=float)))
+            if harmonic_skies.cmb_b_lens_alm is not None
+            else None
+        ),
         estimator=str(estimator),
         lmax_mask=None if lmax_mask is None else int(lmax_mask),
         master_bin_edges=(_edges_from_bin_matrix(bin_matrix, ell_min)
@@ -744,11 +776,17 @@ def save_sky_cache(path, ctx: CutskyMCContext, *, fg_model, base_seed: int = 0) 
         fg_model=np.asarray(str(fg_model)),
         has_fg=np.asarray(hs.fg_eb_alm is not None),
         has_cmb_e=np.asarray(hs.cmb_e_alm is not None),
+        # The lensing/tensor split must survive the cache: the production EIG runs
+        # load their skies here (pysm3-less nodes), and a cache that dropped it
+        # would strand them at A_lens = 1.
+        has_cmb_b_lens=np.asarray(hs.cmb_b_lens_alm is not None),
     )
     if hs.fg_eb_alm is not None:
         blob["fg_eb_alm"] = np.asarray(hs.fg_eb_alm)
     if hs.cmb_e_alm is not None:
         blob["cmb_e_alm"] = np.asarray(hs.cmb_e_alm)
+    if hs.cmb_b_lens_alm is not None:
+        blob["cmb_b_lens_alm"] = np.asarray(hs.cmb_b_lens_alm)
     np.savez(path, **blob)
 
 
@@ -757,6 +795,12 @@ def load_sky_cache(path) -> SkyCache:
     z = np.load(path, allow_pickle=False)
     fg = jnp.asarray(z["fg_eb_alm"]) if bool(z["has_fg"]) else None
     cmb_e = jnp.asarray(z["cmb_e_alm"]) if bool(z["has_cmb_e"]) else None
+    # Absent key (not just False) on caches written before the split existed.
+    b_lens = (
+        jnp.asarray(z["cmb_b_lens_alm"])
+        if bool(z.get("has_cmb_b_lens", np.asarray(False)))
+        else None
+    )
     freqs = tuple(float(f) for f in z["freqs_ghz"])
     hs = HarmonicSky(
         freqs_ghz=freqs,
@@ -766,6 +810,7 @@ def load_sky_cache(path) -> SkyCache:
         cmb_b_alm=jnp.asarray(z["cmb_b_alm"]),
         fg_eb_alm=fg,
         cmb_e_alm=cmb_e,
+        cmb_b_lens_alm=b_lens,
     )
     return SkyCache(
         harmonic_skies=hs,
@@ -805,7 +850,46 @@ def _edges_from_bin_matrix(bin_matrix, ell_min: int) -> tuple[tuple[int, int], .
     return tuple(edges)
 
 
-def _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask) -> CutskyMCTraced:
+def _lens_scale(ctx: CutskyMCContext, cl_bb_res, cl_bb_res_ells):
+    """Per-ell factor turning the sims' full lensing B into the design's residual.
+
+    ``sqrt(C_res / C_lens)`` on ``ell = 0..lmax``, with ``C_res`` interpolated onto
+    that grid. Traced in ``cl_bb_res``, so a design-dependent residual (from
+    :class:`augr.optimize.DelensCoupling`) carries its gradient into the Monte-Carlo
+    covariance. Returns ``None`` when no residual is supplied (delensing off).
+
+    Guarded for **gradients**, not just values: ``sqrt`` has an infinite derivative
+    at zero, and both ``C_lens`` (at ell < 2) and ``C_res`` (under perfect delensing)
+    legitimately hit zero, so a plain ``sqrt(clip(res, 0) / lens)`` returns a correct
+    value with a NaN gradient. The double-``where`` keeps the traced branch away from
+    the singular point in both the forward and backward pass; the factor is defined
+    as zero wherever there is no lensing power to rescale.
+    """
+    if cl_bb_res is None:
+        return None
+    if ctx.cl_bb_lens_ref is None:
+        raise ValueError(
+            "cl_bb_res= needs a lensing/tensor-split sky ensemble; build the context "
+            "with make_cutsky_mc_context(split_lensing=True). Without the split there "
+            "is no lensing component to rescale, and scaling the total B would "
+            "rescale the tensor signal (r) with it."
+        )
+    ells = jnp.arange(int(ctx.lmax) + 1, dtype=float)
+    res = jnp.interp(
+        ells, jnp.asarray(cl_bb_res_ells, dtype=float), jnp.asarray(cl_bb_res)
+    )
+    lens = jnp.asarray(ctx.cl_bb_lens_ref)
+    # Double-where: the inner where keeps the *backward* pass off the singular
+    # branch too (a plain where still differentiates the dead branch).
+    ok = lens > 0.0
+    ratio = jnp.where(ok, jnp.clip(res, 0.0, None) / jnp.where(ok, lens, 1.0), 0.0)
+    pos = ratio > 0.0
+    return jnp.where(pos, jnp.sqrt(jnp.where(pos, ratio, 1.0)), 0.0)
+
+
+def _mc_cutsky_cov_master(
+    w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual
+) -> CutskyMCTraced:
     """MASTER branch of :func:`mc_cutsky_cov_traced`.
 
     Structurally simpler than the masked-Wiener branch, in a way that is the
@@ -860,15 +944,23 @@ def _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask) -> CutskyMCTraced:
     )
 
     def _one(hsky, key):
-        band_sky = beam_harmonic_sky(hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin)
+        band_sky = beam_harmonic_sky(
+            hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin, lens_scale=lens_scale
+        )
         total = assemble_band_maps(
             band_sky, w_inv, ctx.hit_map, noise_key=key,
             knee_ell=ctx.knee_ell, alpha_knee=ctx.alpha_knee,
         )
         result = cleaner(total, bf, bp, lmax=ctx.lmax, nside=ctx.nside)
-        return master.bb_from_b_alm(result.cleaned_b_alm)
+        full = master.bb_from_b_alm(result.cleaned_b_alm)
+        if not fg_residual:
+            return full, full  # second slot unused; keeps one lax.map signature
+        # The cleaner's OWN weights applied to the foreground-only maps: what
+        # survives cleaning, in the same estimator and bins as the data vector.
+        # No second cleaner solve -- project() reuses the stored weights.
+        return full, master.bb_from_b_alm(result.project(band_sky.fg_qu))
 
-    rec = jax.lax.map(
+    rec, rec_fg = jax.lax.map(
         lambda bk: _one(bk[0], bk[1]), (ctx.harmonic_skies, ctx.noise_keys)
     )
     n_bins = rec.shape[1]
@@ -880,6 +972,7 @@ def _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask) -> CutskyMCTraced:
         mean_bandpower=jnp.mean(rec, axis=0),
         f_sky=ctx.f_sky,
         n_sims=ctx.n_sims,
+        fg_residual_bandpower=jnp.mean(rec_fg, axis=0) if fg_residual else None,
     )
 
 
@@ -891,6 +984,9 @@ def mc_cutsky_cov_traced(
     beam_fwhm: jax.Array | None = None,
     beam_p: jax.Array | None = None,
     mask: jax.Array | None = None,
+    cl_bb_res=None,
+    cl_bb_res_ells=None,
+    fg_residual: bool = False,
 ) -> CutskyMCTraced:
     """Differentiable cut-sky MC bandpower covariance as a function of ``w_inv`` (and beams).
 
@@ -913,6 +1009,25 @@ def mc_cutsky_cov_traced(
     needlet-channel mask is jnp + ``stop_gradient``, so the beam gradient is exact
     within a mask configuration and frozen across mask-membership jumps.
 
+    ``cl_bb_res`` / ``cl_bb_res_ells`` (optional) are the **delensing design knob**:
+    a residual lensing ``C_ell^BB`` (e.g.
+    ``augr.optimize.DelensCoupling.residual(...)`` evaluated at this design) that the
+    sims' lensing B is rescaled to, by ``sqrt(C_res / C_lens)`` per multipole. It
+    requires a context built with ``split_lensing=True``. Leave both ``None``
+    (default) and the sims stay at full lensing, i.e. ``A_lens = 1`` — which is a
+    *choice about the sky*, not a neutral default: a design that delenses gets no
+    credit for it in ``Sigma_hat``, so an aperture trade run this way is biased
+    against aperture. The companion half of the coupling is the ``SignalModel``'s
+    ``delensed_bb`` (:func:`augr.likelihood.from_cutsky.build_cutsky_signal_model`),
+    which must be given the *same* residual so model and sims agree.
+
+    ``fg_residual`` (default False) adds one extra leg per sim: the cleaner's own
+    weights applied to the **foreground-only** maps, giving the MC-mean residual-FG
+    bandpower on :attr:`CutskyMCTraced.fg_residual_bandpower`. That is the
+    unmodelled component the fit does not describe, i.e. the ``Delta D`` that drives
+    the r-bias -- see :func:`augr.eig.delta_r_from_residual`. It costs no second
+    cleaner solve (``project`` reuses the stored weights), only one more spectrum.
+
     The per-sim loop is a ``jax.lax.map`` (sequential scan, no ``batch_size``) over
     the batched ``ctx.harmonic_skies`` -- the cleaner body is traced once, so compile
     is O(1) in ``n_sims`` and the scan accumulates outputs instead of holding an
@@ -928,8 +1043,18 @@ def mc_cutsky_cov_traced(
     # Supplying beam_fwhm / beam_p makes the beams traced (the beam-design gradient).
     bf = ctx.beam_fwhm_arcmin if beam_fwhm is None else beam_fwhm
     bp = ctx.beam_shape_p if beam_p is None else beam_p
+    # Delensing design knob: rescale the sims' lensing B to this design's residual.
+    lens_scale = _lens_scale(ctx, cl_bb_res, cl_bb_res_ells)
     if ctx.estimator == "master":
-        return _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask)
+        return _mc_cutsky_cov_master(
+            w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual
+        )
+    if fg_residual:
+        raise NotImplementedError(
+            "fg_residual= is implemented for estimator='master' only. The Wiener "
+            "path would need the residual carried through its transfer/leakage "
+            "debiasing, which MASTER does not have (F_b = 1, leakage = 0)."
+        )
     if mask is not None:
         raise ValueError(
             "mask= is only meaningful for estimator='master'. The masked-Wiener "
@@ -949,7 +1074,9 @@ def mc_cutsky_cov_traced(
         # Beam the (frozen, unbeamed) per-sim harmonic sky in-trace, so the beams flow
         # the gradient. The BandSky static beam field carries the concrete reference
         # (metadata only; assemble_band_maps reads only cmb_qu / fg_qu).
-        band_sky = beam_harmonic_sky(hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin)
+        band_sky = beam_harmonic_sky(
+            hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin, lens_scale=lens_scale
+        )
         total = assemble_band_maps(
             band_sky,
             w_inv,

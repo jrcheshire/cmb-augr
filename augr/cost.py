@@ -106,6 +106,43 @@ def budget_penalty(cost, budget, weight: float = 1.0):
     return weight * over**2
 
 
+def bias_wall(delta_r, sigma_r, *, eps: float = 0.5, weight: float = 1.0):
+    """One-sided soft wall on the r-bias: ``weight * max(|Delta r| - eps*sigma(r), 0)**2``.
+
+    The same convex, C1, one-sided shape as :func:`budget_penalty`, and it exists for
+    a structural reason: the r-marginal EIG is ``-log sigma(r) + const``, so it carries
+    **no bias term at all** and will happily buy a design with a small ``sigma(r)`` and
+    a large ``Delta r``. That is not hypothetical -- the mode-disjoint ILC campaign
+    measured foreground-destruction biases of -0.68 / -1.81 / -5.22 sigma while the
+    residual amplitude ``A_res`` was itself unmeasurable, so nothing in the fit would
+    have flagged it.
+
+    Adding this term states the design goal directly: **minimize sigma(r) subject to
+    the bias not becoming significant**. A design may buy statistical precision freely
+    until the bias reaches ``eps`` of the remaining statistical error; past that the
+    wall bites quadratically.
+
+    Preferred over a mean-squared-error figure of merit (``sigma^2 + Delta r^2``),
+    which silently fixes the bias/variance exchange rate at 1:1 -- a choice better left
+    explicit and tunable.
+
+    Args:
+        delta_r:  Bias on r at this design (sign carried; the wall uses |.|).
+        sigma_r:  Marginalized sigma(r) at this design -- the wall MOVES with the
+                  design, which is the point: a more precise design is held to a
+                  correspondingly tighter bias.
+        eps:      Bias budget in units of sigma(r). Default 0.5 (JC, 2026-08-19);
+                  semi-arbitrary by choice, so sensitivity-test it rather than
+                  treating it as derived.
+        weight:   Penalty stiffness, tuned against the EIG scale.
+
+    Returns:
+        Scalar penalty (zero while ``|Delta r| <= eps*sigma(r)``).
+    """
+    over = jnp.maximum(jnp.abs(jnp.asarray(delta_r)) - eps * jnp.asarray(sigma_r), 0.0)
+    return weight * over**2
+
+
 def aperture_from_fwhm(fwhm_arcmin, nu_ghz: float, illumination_factor: float = 1.22):
     """Aperture diameter [m] implied by a diffraction-limited beam FWHM.
 
