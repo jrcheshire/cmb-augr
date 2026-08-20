@@ -42,6 +42,7 @@ from augr.eig import (
     gaussian_eig_from_external_cov,
     hl_eig_from_external_cov,
     marginal_eig_r_from_external_cov,
+    physical_design_objective,
     posterior_fisher_from_external_cov,
     sigma_r_from_posterior_fisher,
 )
@@ -751,3 +752,58 @@ def test_design_objective_bias_wall_bites_on_a_real_residual() -> None:
     expected = base + float(bias_wall(delta_r, sigma_r, eps=eps_tight))
     assert tight > base
     np.testing.assert_allclose(tight, expected, rtol=1e-10)
+
+
+@pytest.mark.slow
+def test_physical_design_objective_forwards_delens_and_bias_wall() -> None:
+    """The physical entry point forwards delens= and bias_eps= unchanged.
+
+    Both are pure kwarg passthroughs, but this is the entry point the EIG driver
+    actually calls (it is the one that takes aperture), so a forwarding typo would
+    surface only in a production run -- as a design silently credited with no
+    delensing, or an inactive bias wall, both of which look like success.
+
+    Asserted by equivalence: derive the channels the physical path derives, call
+    design_objective directly on them, and require the same scalar.
+    """
+    from augr.optimize import design_to_channels
+
+    mc_ctx, opt_ctx, cleaner = _setup(6, split_lensing=True, fg_model="d1s1")
+    cm = CostModel()
+    freqs_per_group = ((90.0,), (150.0,), (220.0,))
+    fp_diameter_m = 0.3
+    design = {
+        "aperture_m": jnp.asarray(1.2),
+        "f_number": jnp.asarray(2.0),
+        "area_fractions": jnp.asarray([1 / 3, 1 / 3, 1 / 3]),
+        "mission_years": jnp.asarray(MISSION_YEARS),
+    }
+    coupling = DelensCoupling.build(
+        lensing_spectra=load_lensing_spectra(),
+        n_det=jnp.asarray(N_DET), net=jnp.asarray(NET),
+        beam=jnp.asarray(BEAMS), eta=jnp.asarray(ETA),
+        mission_years=MISSION_YEARS, f_sky=0.6,
+        l_max_qe=500, n_iter=2, ls=jnp.arange(2, 30, dtype=float),
+    )
+    shared = dict(
+        mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner, cost_model=cm,
+        budget=1.0e12, delens=coupling, bias_eps=0.5, bias_weight=3.0,
+    )
+
+    got = float(physical_design_objective(
+        design, freqs_per_group=freqs_per_group, fp_diameter_m=fp_diameter_m,
+        eta_total=0.5, galactic_loading=False, **shared,
+    ))
+
+    n_det, net, beam = design_to_channels(
+        design["aperture_m"], design["f_number"], fp_diameter_m,
+        design["area_fractions"], freqs_per_group, extra_loading=None,
+    )
+    freqs_flat = tuple(f for grp in freqs_per_group for f in grp)
+    expected = float(design_objective(
+        n_det, net, jnp.full((len(freqs_flat),), 0.5), design["mission_years"],
+        beam, jnp.ones(len(freqs_flat)),
+        freqs_ghz=freqs_flat, **shared,
+    ))
+    np.testing.assert_allclose(got, expected, rtol=1e-12)
+    assert np.isfinite(got)

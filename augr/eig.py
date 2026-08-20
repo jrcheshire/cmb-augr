@@ -553,6 +553,18 @@ def design_objective(
     foreground-free ensemble there is no residual to bias anything and it raises
     rather than silently contributing zero.
 
+    **The wall is only as honest as the fit's residual template.** ``Delta r`` is the
+    bias of the forecast ``opt_ctx`` describes, so if that fit carries a free
+    ``A_res`` whose template was built from the *same* Monte-Carlo residual used as
+    ``Delta D``, the amplitude absorbs it exactly and the wall reads **identically
+    zero for every design** -- measured at -2.6e-16 in a d10s5 smoke, i.e. machine
+    precision, against a bias of 73 sigma with the template absent. That failure is
+    silent and indistinguishable from every design passing. It is not an argument
+    against fitting ``A_res`` (marginalizing it cost 34% on sigma(r) in the same
+    smoke, which is the real trade); it is a requirement that the template not be
+    derived from the truth it is meant to be biased by -- freeze it at one design, or
+    take it from a different sky model, so template mismatch is what the wall sees.
+
     Returns ``-utility + budget_penalty`` (a minimization scalar): descent maximizes EIG
     while staying on the affordable side of the budget surface.
     """
