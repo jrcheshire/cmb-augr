@@ -532,6 +532,12 @@ class CutskyMCTraced(eqx.Module):
     mean_bandpower: jax.Array
     f_sky: float = eqx.field(static=True)
     n_sims: int = eqx.field(static=True)
+    # MC-mean BB bandpowers of the cleaner's residual FOREGROUND, i.e. the
+    # cleaner's own weights applied to the foreground-only maps. This is the
+    # unmodelled component the fit does not describe, so it is the Delta-D that
+    # drives the r-bias (eig.delta_r_from_residual). None unless the traced
+    # forward was called with fg_residual=True.
+    fg_residual_bandpower: jax.Array | None = None
 
 
 def make_cutsky_mc_context(
@@ -881,7 +887,9 @@ def _lens_scale(ctx: CutskyMCContext, cl_bb_res, cl_bb_res_ells):
     return jnp.where(pos, jnp.sqrt(jnp.where(pos, ratio, 1.0)), 0.0)
 
 
-def _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask, lens_scale) -> CutskyMCTraced:
+def _mc_cutsky_cov_master(
+    w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual
+) -> CutskyMCTraced:
     """MASTER branch of :func:`mc_cutsky_cov_traced`.
 
     Structurally simpler than the masked-Wiener branch, in a way that is the
@@ -944,9 +952,15 @@ def _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask, lens_scale) -> Cuts
             knee_ell=ctx.knee_ell, alpha_knee=ctx.alpha_knee,
         )
         result = cleaner(total, bf, bp, lmax=ctx.lmax, nside=ctx.nside)
-        return master.bb_from_b_alm(result.cleaned_b_alm)
+        full = master.bb_from_b_alm(result.cleaned_b_alm)
+        if not fg_residual:
+            return full, full  # second slot unused; keeps one lax.map signature
+        # The cleaner's OWN weights applied to the foreground-only maps: what
+        # survives cleaning, in the same estimator and bins as the data vector.
+        # No second cleaner solve -- project() reuses the stored weights.
+        return full, master.bb_from_b_alm(result.project(band_sky.fg_qu))
 
-    rec = jax.lax.map(
+    rec, rec_fg = jax.lax.map(
         lambda bk: _one(bk[0], bk[1]), (ctx.harmonic_skies, ctx.noise_keys)
     )
     n_bins = rec.shape[1]
@@ -958,6 +972,7 @@ def _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask, lens_scale) -> Cuts
         mean_bandpower=jnp.mean(rec, axis=0),
         f_sky=ctx.f_sky,
         n_sims=ctx.n_sims,
+        fg_residual_bandpower=jnp.mean(rec_fg, axis=0) if fg_residual else None,
     )
 
 
@@ -971,6 +986,7 @@ def mc_cutsky_cov_traced(
     mask: jax.Array | None = None,
     cl_bb_res=None,
     cl_bb_res_ells=None,
+    fg_residual: bool = False,
 ) -> CutskyMCTraced:
     """Differentiable cut-sky MC bandpower covariance as a function of ``w_inv`` (and beams).
 
@@ -1005,6 +1021,13 @@ def mc_cutsky_cov_traced(
     ``delensed_bb`` (:func:`augr.likelihood.from_cutsky.build_cutsky_signal_model`),
     which must be given the *same* residual so model and sims agree.
 
+    ``fg_residual`` (default False) adds one extra leg per sim: the cleaner's own
+    weights applied to the **foreground-only** maps, giving the MC-mean residual-FG
+    bandpower on :attr:`CutskyMCTraced.fg_residual_bandpower`. That is the
+    unmodelled component the fit does not describe, i.e. the ``Delta D`` that drives
+    the r-bias -- see :func:`augr.eig.delta_r_from_residual`. It costs no second
+    cleaner solve (``project`` reuses the stored weights), only one more spectrum.
+
     The per-sim loop is a ``jax.lax.map`` (sequential scan, no ``batch_size``) over
     the batched ``ctx.harmonic_skies`` -- the cleaner body is traced once, so compile
     is O(1) in ``n_sims`` and the scan accumulates outputs instead of holding an
@@ -1023,7 +1046,15 @@ def mc_cutsky_cov_traced(
     # Delensing design knob: rescale the sims' lensing B to this design's residual.
     lens_scale = _lens_scale(ctx, cl_bb_res, cl_bb_res_ells)
     if ctx.estimator == "master":
-        return _mc_cutsky_cov_master(w_inv, ctx, cleaner, bf, bp, mask, lens_scale)
+        return _mc_cutsky_cov_master(
+            w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual
+        )
+    if fg_residual:
+        raise NotImplementedError(
+            "fg_residual= is implemented for estimator='master' only. The Wiener "
+            "path would need the residual carried through its transfer/leakage "
+            "debiasing, which MASTER does not have (F_b = 1, leakage = 0)."
+        )
     if mask is not None:
         raise ValueError(
             "mask= is only meaningful for estimator='master'. The masked-Wiener "

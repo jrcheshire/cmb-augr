@@ -428,3 +428,25 @@ def test_delens_residual_needs_a_split_context() -> None:
             w_inv, plain_ctx, cleaner,
             cl_bb_res=jnp.ones_like(ells), cl_bb_res_ells=ells,
         )
+
+
+@pytest.mark.slow
+def test_fg_residual_leg_is_exactly_zero_without_foregrounds() -> None:
+    """With no foreground ensemble the residual leg is identically zero, and the
+    data vector is untouched by asking for it.
+
+    The sharp version of "the leg reads the foregrounds": it projects the cleaner's
+    weights onto the foreground maps, so a foreground-free sky must give exactly 0
+    -- not merely something small -- and the main bandpowers must not move.
+    """
+    mc_ctx, _opt, cleaner = _setup(6)  # fg_model=None; 6 sims clears the Hartlap floor
+    w_inv = w_inv_from_noise_design(
+        jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, 0.6
+    )
+    off = mc_cutsky_cov_traced(w_inv, mc_ctx, cleaner)
+    on = mc_cutsky_cov_traced(w_inv, mc_ctx, cleaner, fg_residual=True)
+    assert off.fg_residual_bandpower is None
+    np.testing.assert_array_equal(np.asarray(on.fg_residual_bandpower), 0.0)
+    np.testing.assert_array_equal(
+        np.asarray(on.mean_bandpower), np.asarray(off.mean_bandpower)
+    )

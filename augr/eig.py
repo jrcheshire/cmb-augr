@@ -68,7 +68,7 @@ import numpy as np
 from jax.scipy.special import logsumexp
 
 from augr.cleaning import Cleaner
-from augr.cost import CostModel, aperture_from_fwhm, budget_penalty
+from augr.cost import CostModel, aperture_from_fwhm, bias_wall, budget_penalty
 from augr.fisher import _fisher_from_full
 from augr.optimize import DelensCoupling, OptimizationContext, design_to_channels
 from augr.optimize_mapbased import w_inv_from_noise_design
@@ -103,6 +103,38 @@ def marginal_eig_r_from_external_cov(
     F = posterior_fisher_from_external_cov(cov, ctx)
     sigma_r = jnp.sqrt(jnp.linalg.inv(F)[ctx.r_idx, ctx.r_idx])
     return jnp.log(sigma_prior_r) - jnp.log(sigma_r)
+
+
+def delta_r_from_residual(cov, residual_bandpower, ctx: OptimizationContext):
+    """Linear bias on r from an unmodelled residual, ``Delta theta = F^-1 J^T C^-1 Delta D``.
+
+    The traced sibling of :meth:`augr.fisher.FisherForecast.parameter_bias`, sharing
+    the posterior Fisher the EIG utilities already build, so the bias and the variance
+    are read off the *same* forecast rather than two configurations that could drift.
+    ``residual_bandpower`` is the ``Delta D`` -- the part of the data the fit model
+    does not describe -- which the map forward supplies as
+    ``CutskyMCTraced.fg_residual_bandpower`` (``mc_cutsky_cov_traced(fg_residual=True)``).
+
+    Sign convention is ``+`` (Stompor+ 2016, arXiv:1609.03807; Amara & Refregier 2008,
+    arXiv:0710.5171), matching ``parameter_bias``.
+
+    **What counts as unmodelled depends on the fit.** If ``ctx``'s parameter vector
+    carries an ``A_res`` residual amplitude whose template matches this residual's
+    shape, the fit absorbs it and the bias is correspondingly smaller -- correctly so.
+    The number this returns is the bias of the forecast ``ctx`` actually describes.
+
+    Differentiable in ``cov`` and ``residual_bandpower``. Returns a scalar.
+    """
+    F = posterior_fisher_from_external_cov(cov, ctx)
+    d = jnp.asarray(residual_bandpower)
+    rhs = ctx.J.T @ jnp.linalg.solve(jnp.asarray(cov), d)
+    return jnp.linalg.solve(F, rhs)[ctx.r_idx]
+
+
+def sigma_r_from_posterior_fisher(cov, ctx: OptimizationContext):
+    """Marginalized ``sigma(r)`` off the same posterior Fisher the EIG uses."""
+    F = posterior_fisher_from_external_cov(cov, ctx)
+    return jnp.sqrt(jnp.linalg.inv(F)[ctx.r_idx, ctx.r_idx])
 
 
 def gaussian_eig_from_external_cov(
@@ -462,6 +494,8 @@ def design_objective(
     eig_key=None,
     n_outer: int = 256,
     delens: DelensCoupling | None = None,
+    bias_eps: float | None = None,
+    bias_weight: float = 1.0,
 ):
     """Cost-constrained Bayesian-design objective to MINIMIZE.
 
@@ -504,6 +538,21 @@ def design_objective(
     reference design (the same frozen-Jacobian convention
     :func:`augr.optimize.sigma_r_from_channels` uses analytically).
 
+    ``bias_eps`` (default ``None`` = off) turns on the **r-bias wall**
+    ``bias_weight * max(|Delta r| - bias_eps * sigma(r), 0)^2``
+    (:func:`augr.cost.bias_wall`), with ``Delta r`` the linear bias from the residual
+    foreground the fit does not model (:func:`delta_r_from_residual`, fed by the map
+    forward's ``fg_residual=True`` leg). **The EIG carries no bias term** -- it is
+    ``-log sigma(r) + const`` -- so without this the objective will buy a design with
+    a small ``sigma(r)`` and a large ``Delta r``, and nothing in the fit flags it. It
+    matters most for the sky-coverage axis, which costs nothing in the budget model:
+    an unconstrained mask runs to wherever ``sigma(r)`` is smallest, i.e. into the
+    Galaxy. Set ``bias_eps=0.5`` for the nominal half-sigma budget.
+
+    The wall requires an ``mc_ctx`` built with a foreground model; against a
+    foreground-free ensemble there is no residual to bias anything and it raises
+    rather than silently contributing zero.
+
     Returns ``-utility + budget_penalty`` (a minimization scalar): descent maximizes EIG
     while staying on the affordable side of the budget surface.
     """
@@ -518,6 +567,12 @@ def design_objective(
             n_det, net, beam_fwhm, eta_total, mission_years, f_sky_noise
         )
         cl_bb_res_ells = delens.ls
+    if bias_eps is not None and mc_ctx.harmonic_skies.fg_eb_alm is None:
+        raise ValueError(
+            "bias_eps= needs a foreground ensemble: build mc_ctx with a fg_model "
+            "(d10s5 is the nominal truth model). With no foregrounds there is no "
+            "residual, so the wall would be identically zero and silently vacuous."
+        )
     traced = mc_cutsky_cov_traced(
         w_inv,
         mc_ctx,
@@ -527,6 +582,7 @@ def design_objective(
         mask=mask,
         cl_bb_res=cl_bb_res,
         cl_bb_res_ells=cl_bb_res_ells,
+        fg_residual=bias_eps is not None,
     )
     util = _utility(
         traced.covariance,
@@ -541,7 +597,16 @@ def design_objective(
     cost = design_cost(
         n_det, beam_fwhm, mission_years, cost_model=cost_model, freqs_ghz=freqs_ghz
     )
-    return -util + budget_penalty(cost, budget, penalty_weight)
+    loss = -util + budget_penalty(cost, budget, penalty_weight)
+    if bias_eps is not None:
+        delta_r = delta_r_from_residual(
+            traced.covariance, traced.fg_residual_bandpower, opt_ctx
+        )
+        sigma_r = sigma_r_from_posterior_fisher(traced.covariance, opt_ctx)
+        loss = loss + bias_wall(
+            delta_r, sigma_r, eps=bias_eps, weight=bias_weight
+        )
+    return loss
 
 
 def physical_design_objective(
@@ -567,6 +632,8 @@ def physical_design_objective(
     n_outer: int = 256,
     galactic_loading: bool = True,
     delens: DelensCoupling | None = None,
+    bias_eps: float | None = None,
+    bias_weight: float = 1.0,
 ):
     """Cost-constrained EIG objective from the physical horn-packing design knobs.
 
@@ -637,4 +704,6 @@ def physical_design_objective(
         eig_key=eig_key,
         n_outer=n_outer,
         delens=delens,
+        bias_eps=bias_eps,
+        bias_weight=bias_weight,
     )
