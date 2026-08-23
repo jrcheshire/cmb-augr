@@ -271,6 +271,44 @@ def _interp_at(cl: jnp.ndarray, l_vals: jnp.ndarray) -> jnp.ndarray:
     return jnp.interp(l_vals, ells, cl, left=0.0, right=0.0)
 
 
+def _qe_domain(l2, denom, l_min, l_max):
+    """Mask of (l1, phi) cells the QE integral may use.
+
+    The reconstruction cut is **geometric**: the estimator only uses
+    observed modes with ``l_min <= l <= l_max``, and that applies to
+    ``l2 = L - l1`` exactly as it does to ``l1``. It is not a property
+    of the noise.
+
+    Expressing it instead as ``denom > 0`` (the historical behaviour)
+    is wrong twice over:
+
+    1. **It admits modes outside the survey.** ``l2`` runs over
+       ``[|L - l1|, L + l1]``, so it reaches below ``l_min`` and above
+       ``l_max``. Below ``l_min`` the CAMB templates are exactly zero
+       (``cl_tt_len[0:2] == 0``) while the *total* keeps the noise
+       floor, so ``denom`` stays positive at ~1.7e-7 against ~1.1e3 at
+       l=2 -- a ten-decade cliff. Those cells survive the ``denom > 0``
+       test and contribute ``f^2 / denom`` with a denominator ~1e10 too
+       small, which swamps the whole integral. Measured on the TT
+       estimator this made flat-sky N_0 **400-2000x too small**; with
+       the geometric cut, flat-sky matches the plancklens-validated
+       full-sky path to <1% once the known ``(L+1)^2/L^2`` factor is
+       divided out.
+    2. **It makes the integration domain a function of the noise.**
+       ``jax.grad`` then picks up a term from a moving boundary, which
+       is the isolated-multipole gradient blowup documented in
+       ``optimize.DelensCoupling``.
+
+    The full-sky path has always cut geometrically -- it passes
+    ``l2_min=l_min, l2_max=l_max`` straight into the Wigner grids -- so
+    this also removes a flat-vs-full-sky inconsistency.
+
+    ``denom`` is still tested, but only as a genuine divide-by-zero
+    guard rather than as the definition of the domain.
+    """
+    return (l2 >= l_min) & (l2 <= l_max) & (denom > 0)
+
+
 #: Valid ``te_filter`` choices; see ``compute_n0_te``.
 _TE_FILTERS = ('ho02_exact', 'ho02_diag_approx', 'strict_diagonal')
 
@@ -332,9 +370,8 @@ def compute_n0_eb(Ls: jnp.ndarray,
         # Filter: F_EB = f_EB / (C_{l₁}^{EE,tot} × C_{l₂}^{BB,tot})
         denom = _interp_at(cl_ee_tot, l1) * _interp_at(cl_bb_tot, l2)
         # Avoid division by zero for out-of-range l₂
-        safe_denom = jnp.where(denom > 0, denom, 1.0)
-        F_eb = f_eb / safe_denom
-        F_eb = jnp.where(denom > 0, F_eb, 0.0)
+        ok = _qe_domain(l2, denom, l_min, l_max)
+        F_eb = jnp.where(ok, f_eb / jnp.where(ok, denom, 1.0), 0.0)
 
         # Integrand: f × F × l₁ / (2π)²  weighted by φ quadrature
         # d²l₁ = l₁ dl₁ dφ, so integrand per dl₁ is l₁ × ∫dφ (f×F) / (2π)²
@@ -379,8 +416,8 @@ def compute_n0_tb(Ls: jnp.ndarray,
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         f = _interp_at(cl_te_unl, l1) * Ldotl1 * sin2phi12
         denom = _interp_at(cl_tt_tot, l1) * _interp_at(cl_bb_tot, l2)
-        safe_denom = jnp.where(denom > 0, denom, 1.0)
-        F = jnp.where(denom > 0, f / safe_denom, 0.0)
+        ok = _qe_domain(l2, denom, l_min, l_max)
+        F = jnp.where(ok, f / jnp.where(ok, denom, 1.0), 0.0)
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
@@ -419,8 +456,8 @@ def compute_n0_tt(Ls: jnp.ndarray,
         f = (_interp_at(cl_tt_unl, l1) * Ldotl1
              + _interp_at(cl_tt_unl, l2) * Ldotl2)
         denom = 2.0 * _interp_at(cl_tt_tot, l1) * _interp_at(cl_tt_tot, l2)
-        safe_denom = jnp.where(denom > 0, denom, 1.0)
-        F = jnp.where(denom > 0, f / safe_denom, 0.0)
+        ok = _qe_domain(l2, denom, l_min, l_max)
+        F = jnp.where(ok, f / jnp.where(ok, denom, 1.0), 0.0)
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
@@ -455,8 +492,8 @@ def compute_n0_ee(Ls: jnp.ndarray,
         f = (_interp_at(cl_ee_unl, l1) * Ldotl1
              + _interp_at(cl_ee_unl, l2) * Ldotl2) * cos2phi12
         denom = 2.0 * _interp_at(cl_ee_tot, l1) * _interp_at(cl_ee_tot, l2)
-        safe_denom = jnp.where(denom > 0, denom, 1.0)
-        F = jnp.where(denom > 0, f / safe_denom, 0.0)
+        ok = _qe_domain(l2, denom, l_min, l_max)
+        F = jnp.where(ok, f / jnp.where(ok, denom, 1.0), 0.0)
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
@@ -561,17 +598,17 @@ def compute_n0_te(Ls: jnp.ndarray,
             te2 = _interp_at(cl_te_tot, l2)
             num = ee1 * tt2 * f - te1 * te2 * f_swap
             denom = tt1 * ee2 * ee1 * tt2 - (te1 * te2) ** 2
-            ok = denom > 0
+            ok = _qe_domain(l2, denom, l_min, l_max)
             F = jnp.where(ok, num / jnp.where(ok, denom, 1.0), 0.0)
         elif te_filter == 'ho02_diag_approx':
             te1 = _interp_at(cl_te_tot, l1)
             te2 = _interp_at(cl_te_tot, l2)
             denom = tt1 * ee2 + te1 * te2
-            ok = jnp.abs(denom) > 0
+            ok = (_qe_domain(l2, jnp.abs(denom), l_min, l_max))
             F = jnp.where(ok, f / jnp.where(ok, denom, 1.0), 0.0)
         else:  # 'strict_diagonal'
             denom = tt1 * ee2
-            ok = denom > 0
+            ok = _qe_domain(l2, denom, l_min, l_max)
             F = jnp.where(ok, f / jnp.where(ok, denom, 1.0), 0.0)
 
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2

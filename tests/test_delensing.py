@@ -13,6 +13,7 @@ from augr.delensing import (
     LensingSpectra,
     _gl_nodes,
     _interp_at,
+    _qe_domain,
     _triangle_geometry,
     compute_n0_eb,
     compute_n0_ee,
@@ -339,6 +340,108 @@ class TestDifferentiableDelensing:
         fd = float((f_plus - f_minus) / (2 * h))
         ad = float(jnp.dot(g_bb, nl_bb))
         np.testing.assert_allclose(fd, ad, rtol=1e-4)
+
+
+# -----------------------------------------------------------------------
+# QE domain cut (l_min <= l2 <= l_max)
+# -----------------------------------------------------------------------
+
+class TestQEDomainCut:
+    """The QE reconstruction cut is geometric, not a property of the noise.
+
+    ``l2 = L - l1`` runs over ``[|L - l1|, L + l1]``, so it leaves
+    ``[l_min, l_max]``. Below ``l_min`` the CAMB templates are exactly
+    zero while the *total* retains the noise floor, so the historical
+    ``denom > 0`` test let those cells through with a denominator ~1e10
+    too small. Measured on TT that made flat-sky N_0 400-2000x too
+    small versus the plancklens-validated full-sky path.
+    """
+
+    _KW: ClassVar = {"ls": jnp.arange(2, 101, dtype=float), "L_max": 200,
+                     "l_min_qe": 2, "l_max_qe": 200, "n_iter": 1}
+
+    def test_qe_domain_excludes_out_of_range_l2(self):
+        """Cells with l2 outside [l_min, l_max] are masked out even when
+        the denominator is comfortably positive."""
+        l2 = jnp.array([0.5, 1.0, 2.0, 100.0, 200.0, 200.5, 300.0])
+        denom = jnp.ones_like(l2)          # positive everywhere
+        ok = np.asarray(_qe_domain(l2, denom, 2, 200))
+        assert list(ok) == [False, False, True, True, True, False, False]
+
+    def test_positive_denominator_alone_is_not_enough(self):
+        """Regression on the specific failure: at l=0,1 the templates are
+        zero but the total is the (positive) noise floor, so `denom > 0`
+        passes and the geometric cut is what rejects the cell."""
+        l2 = jnp.array([1.0])
+        denom = jnp.array([1.7e-7])        # noise-floor-sized, but > 0
+        assert bool(denom[0] > 0)
+        assert not bool(_qe_domain(l2, denom, 2, 200)[0])
+
+    def test_residual_converges_under_phi_refinement(self, spectra, noise):
+        """C_res must settle as n_phi grows; it used to wobble at ~1e-3.
+
+        Measured in THIS config (simple_probe, l_max_qe=200, n_iter=1):
+        max relative change over 128 -> 256 is 3.0e-6. The pre-fix code
+        gives ~1e-3 and non-monotone, so the 1e-4 gate separates them by
+        ~30x on both sides.
+        """
+        a = np.asarray(delens_residual_bb(spectra, noise["tt"], noise["bb"],
+                                          noise["bb"], n_phi=128, **self._KW))
+        b = np.asarray(delens_residual_bb(spectra, noise["tt"], noise["bb"],
+                                          noise["bb"], n_phi=256, **self._KW))
+        assert np.max(np.abs(b / a - 1.0)) < 1e-4
+
+    @pytest.mark.parametrize("fwhm_arcmin", [30.0, 12.0])
+    def test_grad_matches_fd_along_ell_reweighting_direction(
+            self, spectra, noise, fwhm_arcmin):
+        """AD vs FD along a direction that reweights ell, on two designs.
+
+        The other gradient gates in this file and in test_optimize.py all
+        step along a *uniform rescale* of nl_bb (or of n_det, which
+        `_combined_white_nl_bb` turns into one). That direction averages
+        the per-multipole quadrature error away and cannot move the
+        domain boundary, so it passed even against the pre-fix gradient.
+        A beam change is the honest design direction:
+        d(nl)/d(fwhm) ~ nl * l(l+1) * fwhm / (4 ln 2).
+
+        Measured here: rel = 1.4e-9 (30') and 3.8e-9 (12'); the pre-fix
+        code gives 3e-4 at the same step and its AD is wrong in
+        magnitude by ~31x, not merely noisy.
+        """
+        arcmin = np.pi / 180.0 / 60.0
+        ells = np.asarray(spectra.ells)
+        f = fwhm_arcmin * arcmin
+        nl = noise["bb"]
+        v = nl * jnp.array(ells * (ells + 1) * (f * arcmin) / (4 * np.log(2)))
+
+        def scalar(n):
+            return jnp.sum(delens_residual_bb(spectra, noise["tt"], n, n,
+                                              n_phi=128, **self._KW))
+
+        ad = float(jnp.dot(jax.grad(scalar)(nl), v))
+        h = 1e-4
+        fd = float((scalar(nl + h * v) - scalar(nl - h * v)) / (2 * h))
+        assert abs(fd / ad - 1.0) < 1e-6
+
+    @pytest.mark.slow
+    def test_flat_sky_agrees_with_fullsky_after_geometric_factor(
+            self, spectra, noise):
+        """Flat-sky N_0^TT must track the plancklens-validated full-sky
+        path up to the known (L+1)^2/L^2 flat-vs-full geometric factor
+        (quantified in scripts/n0_validation/controlled_input_test.py).
+
+        Measured: 0.993 / 1.003 / 1.005 / 1.005 at L = 10/30/80/150.
+        Pre-fix the same ratio was 5e-4 to 7e-3 -- i.e. flat-sky N_0 was
+        400-2000x too small. Gate at 5%.
+        """
+        Ls = jnp.array([10.0, 30.0, 80.0, 150.0])
+        flat = np.asarray(compute_n0_tt(Ls, spectra, noise["tt"], 2, 300,
+                                        n_phi=512))
+        full = np.asarray(compute_n0_tt(Ls, spectra, noise["tt"], 2, 300,
+                                        fullsky=True))
+        Lv = np.asarray(Ls)
+        ratio = (flat / full) / ((Lv + 1) ** 2 / Lv ** 2)
+        assert np.all(np.abs(ratio - 1.0) < 0.05)
 
 
 # -----------------------------------------------------------------------
