@@ -188,10 +188,29 @@ Knowing how the modules chain together matters more than any one file:
      zero-crossings near l~1850 amplify this to 10-20% relative
      residual where the response amplitude vanishes — the bulk-L
      band stops at L=1800 to keep the test gate informative.
-     Production `compute_n0_te(fullsky=True)` keeps HO02 Eq. 13's
-     diagonal-approximation filter `1/(C_TT*C_EE + C_TE^2)`; the
-     test calls with `te_filter='strict_diagonal'` to align with
-     plancklens's `fal['te']=0` apples-to-apples. Per
+     Production `compute_n0_te` now defaults to
+     `te_filter='ho02_exact'` — HO02 Eq. 13 in full, on **both** the
+     flat-sky and full-sky paths (`te_filter` used to be silently
+     ignored unless `fullsky=True`). The numerator's first factor is
+     `C_EE(l1)*C_TT(l2)`, transposed relative to the denominator's
+     leading term; the denominator
+     `C_TT(l1)C_EE(l2)C_EE(l1)C_TT(l2) - (C_TE(l1)C_TE(l2))^2` is
+     non-negative by Cauchy-Schwarz. The previous default
+     `'ho02_diag_approx'` (`C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2)`) is
+     **defective and retained only for reproducing pre-fix numbers**:
+     it is not sign-definite, so ~2.1% of the (l1, phi) plane
+     contributes negatively to an inverse variance, and
+     N_0^TE(L=200) flips sign under phi-refinement
+     (+5.1e13 -> -1.1e14 -> +5.7e13 at n_phi=128/256/512), tripping
+     the `total > 0` guard and returning `inf`. The exact filter is
+     finite and converges (<1e-3 across a 256->512 refinement).
+     Impact is modest — L=2 agrees with the old default to 2e-4, L=50
+     to 1.8% — and since TE carries ~2% of the MV inverse-variance,
+     N_0^MV moves ~0.05%. Gate: `TestTEFilter` in
+     `tests/test_delensing.py`. The plancklens harness still calls
+     with `te_filter='strict_diagonal'` to align with
+     `fal['te']=0` apples-to-apples, and that path is bit-identical
+     to pre-fix. Per
      `compute_n0_te`'s docstring TE contributes ~1-2% to N_0^MV at
      space-experiment noise levels, so the 5% TE residual propagates
      as <0.1% on N_0^MV and <1% on A_L for realistic delensing

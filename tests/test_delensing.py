@@ -1,6 +1,7 @@
 """Tests for delensing.py — QE lensing reconstruction and residual BB."""
 
 from pathlib import Path
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -338,6 +339,87 @@ class TestDifferentiableDelensing:
         fd = float((f_plus - f_minus) / (2 * h))
         ad = float(jnp.dot(g_bb, nl_bb))
         np.testing.assert_allclose(fd, ad, rtol=1e-4)
+
+
+# -----------------------------------------------------------------------
+# TE filter (HO02 Eq. 13)
+# -----------------------------------------------------------------------
+
+class TestTEFilter:
+    """The TE filter is HO02 Eq. 13, not a diagonal approximation.
+
+    Unlike the other four estimators TE has C^{xx'} != 0, so neither
+    Eq. 14 (x = x') nor Eq. 15 (C~^{xx'} = 0) applies. The historical
+    'ho02_diag_approx' denominator C_TT(l1)C_EE(l2) + C_TE(l1)C_TE(l2)
+    is not sign-definite (the arguments differ -- it is not a square),
+    which puts a negative contribution into an inverse variance.
+    """
+
+    _LS: ClassVar = jnp.array([2.0, 50.0, 200.0, 350.0])
+    _KW: ClassVar = {"l_min": 2, "l_max": 500}
+
+    def test_cauchy_schwarz_holds_on_total_spectra(self, spectra, noise):
+        """Eq. 13's denominator is non-negative because C_TE^2 <= C_TT*C_EE.
+
+        Checked on the actual *total* (lensed + noise) spectra the filter
+        uses, not just in principle -- the guarantee is what makes the
+        exact filter's integrand sign-definite.
+        """
+        tt = np.asarray(spectra.cl_tt_len + noise["tt"])
+        ee = np.asarray(spectra.cl_ee_len + noise["ee"])
+        te = np.asarray(spectra.cl_te_len)
+        assert np.all(te**2 <= tt * ee)
+
+    def test_exact_filter_is_finite_where_diag_approx_diverges(
+            self, spectra, noise):
+        """The historical filter returns inf / flips sign; Eq. 13 does not.
+
+        n_phi=256 at L=200 is the measured failure point:  goes
+        negative there under 'ho02_diag_approx' and trips the total>0
+        guard. Eq. 13 is finite at every n_phi.
+        """
+        for n_phi in (128, 256, 512):
+            exact = compute_n0_te(self._LS, spectra, noise["tt"], noise["ee"],
+                                  n_phi=n_phi, te_filter="ho02_exact",
+                                  **self._KW)
+            assert np.all(np.isfinite(np.asarray(exact)))
+            assert np.all(np.asarray(exact) > 0)
+
+    def test_exact_filter_converges_under_phi_refinement(
+            self, spectra, noise):
+        """Refining n_phi must shrink the change; the old filter wobbles.
+
+        Tolerance measured in this configuration (simple_probe noise,
+        l_max=500): the 256->512 step moves N_0^TE by <1e-3 at every L
+        tested, against O(1) swings (and an inf) for 'ho02_diag_approx'.
+        """
+        a = np.asarray(compute_n0_te(self._LS, spectra, noise["tt"],
+                                     noise["ee"], n_phi=256,
+                                     te_filter="ho02_exact", **self._KW))
+        b = np.asarray(compute_n0_te(self._LS, spectra, noise["tt"],
+                                     noise["ee"], n_phi=512,
+                                     te_filter="ho02_exact", **self._KW))
+        assert np.all(np.abs(b / a - 1.0) < 1e-3)
+
+    def test_te_filter_is_honoured_on_the_flat_sky_path(
+            self, spectra, noise):
+        """te_filter used to be silently ignored unless fullsky=True."""
+        vals = [
+            np.asarray(compute_n0_te(self._LS, spectra, noise["tt"],
+                                     noise["ee"], n_phi=128, te_filter=f,
+                                     **self._KW))
+            for f in ("ho02_exact", "ho02_diag_approx", "strict_diagonal")
+        ]
+        # Compare RELATIVE differences: every value here is below
+        # np.allclose's default atol=1e-8, so allclose would call them
+        # equal no matter how far apart they are.
+        assert np.max(np.abs(vals[1] / vals[0] - 1.0)) > 1e-3
+        assert np.max(np.abs(vals[2] / vals[0] - 1.0)) > 1e-3
+
+    def test_unknown_te_filter_raises(self, spectra, noise):
+        with pytest.raises(ValueError, match="te_filter must be one of"):
+            compute_n0_te(self._LS, spectra, noise["tt"], noise["ee"],
+                          te_filter="not_a_filter")
 
 
 # -----------------------------------------------------------------------
