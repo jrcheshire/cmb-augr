@@ -72,8 +72,18 @@ def _combined_white_nl_bb(n_det: jnp.ndarray,
     per-design eval regardless of the covariance-side ``knee_ell``. Same
     channel parameters that feed the covariance noise, so it tracks the
     design differentiably.
+
+    ``net`` / ``beam`` / ``eta`` may each be a scalar, which is broadcast across
+    the channels ``n_det`` defines. ``eta`` in particular reaches here as
+    :func:`augr.eig.design_objective`'s ``eta_total``, whose documented default
+    at the physical entry point (:func:`augr.eig.physical_design_objective`) is
+    the scalar ``0.5`` -- indexing that per channel raised ``IndexError: array is
+    0-dimensional``, so ``delens=`` was unusable from the physical entry point
+    even though the channel-level one worked.
     """
     n_chan = n_det.shape[0]
+    net, beam, eta = (jnp.broadcast_to(jnp.asarray(x, dtype=float), (n_chan,))
+                      for x in (net, beam, eta))
     inv = jnp.zeros_like(ells, dtype=float)
     for i in range(n_chan):
         nl_i = noise_nl_continuous(net[i], n_det[i], beam[i], eta[i], ells,
