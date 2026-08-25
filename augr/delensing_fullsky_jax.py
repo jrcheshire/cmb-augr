@@ -251,12 +251,18 @@ def compute_n0_ee_fullsky_jax(Ls, spectra: LensingSpectra, nl_ee,
 
 def compute_n0_te_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt, nl_ee,
                               l_min: int = 2, l_max: int = 3000,
-                              te_filter: str = "ho02_diag_approx") -> jnp.ndarray:
-    """jnp full-sky N_0^{TE}(L) (spin-mixed). Mirrors ``_per_L_te``."""
-    if te_filter not in ("ho02_diag_approx", "strict_diagonal"):
+                              te_filter: str = "ho02_exact") -> jnp.ndarray:
+    """jnp full-sky N_0^{TE}(L) (spin-mixed). Mirrors ``_per_L_te``.
+
+    ``te_filter`` must track :func:`augr.delensing.compute_n0_te` -- this backend
+    is gated against the numpy one at rtol 1e-5, so a default that differs there
+    is a silent 1.8x disagreement on N_0^TE (0.065% on the MV-combined residual,
+    small enough to look like drift rather than a bug).
+    """
+    if te_filter not in ("ho02_exact", "ho02_diag_approx", "strict_diagonal"):
         raise ValueError(
-            f"te_filter must be 'ho02_diag_approx' or 'strict_diagonal', "
-            f"got {te_filter!r}")
+            f"te_filter must be 'ho02_exact', 'ho02_diag_approx' or "
+            f"'strict_diagonal', got {te_filter!r}")
     Ls_np = np.asarray(Ls)
     L_samples = _fullsky_L_samples(Ls_np)
 
@@ -277,7 +283,9 @@ def compute_n0_te_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt, nl_ee,
     te_l2 = _gather_spectrum_jax(cl_te_unl, l2_grid)
     ee_l2 = _gather_spectrum_jax(cl_ee_tot, l2_grid)
     te_tot_l2 = _gather_spectrum_jax(cl_te_tot, l2_grid)
-    use_ho02 = te_filter == "ho02_diag_approx"
+    # Eq. 13's transposed leg: C_EE on l1 and C_TT on l2.
+    ee_l1 = cl_ee_tot[l_min:l_max + 1]
+    tt_l2 = _gather_spectrum_jax(cl_tt_tot, l2_grid)
 
     def body(L_f):
         w000 = spin0_body(L_f, l1_arr, l2_min, l2_max)
@@ -290,17 +298,32 @@ def compute_n0_te_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt, nl_ee,
         even_L = _even_mask(l1_arr, l2_grid, L_f)
         f_2 = te_l1[:, None] * alpha1 * pf * w2F * even_L
         f_0 = te_l2[None, :] * alpha2 * pf * w000
-        f_total_sq = (f_2 + f_0) ** 2
-        if use_ho02:
+        f_total = f_2 + f_0
+        if te_filter == "ho02_exact":
+            # f(l2, l1): the spin-2 leg moves onto l2. The Wigner arrays are
+            # unchanged -- (l2 L l1; -2 0 2) == (l1 L l2; -2 0 2), the
+            # column-exchange and all-m-sign-flip factors (both (-1)^(l1+L+l2))
+            # cancelling -- so only alpha and C^TE swap legs.
+            f_swap = (te_l2[None, :] * alpha2 * pf * w2F * even_L
+                      + te_l1[:, None] * alpha1 * pf * w000)
+            cross = te_tot_l1[:, None] * te_tot_l2[None, :]
+            num = ee_l1[:, None] * tt_l2[None, :] * f_total - cross * f_swap
+            denom = (tt_l1[:, None] * ee_l2[None, :]
+                     * ee_l1[:, None] * tt_l2[None, :] - cross ** 2)
+            # Non-negative by Cauchy-Schwarz (C_TE(l)^2 <= C_TT(l) C_EE(l)).
+            weight = jnp.where(denom > 0,
+                               num / jnp.where(denom > 0, denom, 1.0), 0.0)
+            return jnp.sum(f_total * weight) / (2 * L_f + 1.0)
+        if te_filter == "ho02_diag_approx":
             denom = (tt_l1[:, None] * ee_l2[None, :]
                      + te_tot_l1[:, None] * te_tot_l2[None, :])
             inv_denom = jnp.where(jnp.abs(denom) > 0,
                                   1.0 / jnp.where(jnp.abs(denom) > 0, denom, 1.0), 0.0)
-        else:
+        else:  # 'strict_diagonal'
             denom = tt_l1[:, None] * ee_l2[None, :]
             inv_denom = jnp.where(denom > 0,
                                   1.0 / jnp.where(denom > 0, denom, 1.0), 0.0)
-        return jnp.sum(f_total_sq * inv_denom) / (2 * L_f + 1.0)
+        return jnp.sum(f_total ** 2 * inv_denom) / (2 * L_f + 1.0)
 
     n0_inv = lax.map(body, jnp.asarray(L_samples, dtype=float))
     return _interp_n0(n0_inv, L_samples, Ls_np, use_abs=True)

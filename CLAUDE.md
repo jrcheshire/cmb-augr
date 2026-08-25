@@ -204,9 +204,16 @@ Knowing how the modules chain together matters more than any one file:
      (+5.1e13 -> -1.1e14 -> +5.7e13 at n_phi=128/256/512), tripping
      the `total > 0` guard and returning `inf`. The exact filter is
      finite and converges (<1e-3 across a 256->512 refinement).
-     Impact is modest — L=2 agrees with the old default to 2e-4, L=50
-     to 1.8% — and since TE carries ~2% of the MV inverse-variance,
-     N_0^MV moves ~0.05%. Gate: `TestTEFilter` in
+     Impact **on the flat-sky path** is modest — L=2 agrees with the
+     old default to 2e-4, L=50 to 1.8%. On the **full-sky** path it is
+     not: N_0^TE moves ~1.8x at L=2 (measured jax-vs-numpy at
+     l_min=2, l_max=250). Since TE carries only ~2% of the MV
+     inverse-variance that still dilutes to ~0.065% on the MV-combined
+     residual, which is why it reads as drift rather than a bug —
+     `delensing_fullsky_jax.py` had to be ported in step with
+     `delensing.py` or `TestFullSkyJaxBackend` fails at rtol 1e-6.
+     Both backends default to `'ho02_exact'`; keep them in lockstep.
+     Gate: `TestTEFilter` in
      `tests/test_delensing.py`. The plancklens harness still calls
      with `te_filter='strict_diagonal'` to align with
      `fal['te']=0` apples-to-apples, and that path is bit-identical
