@@ -1,6 +1,7 @@
 """Tests for delensing.py — QE lensing reconstruction and residual BB."""
 
 from pathlib import Path
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +13,7 @@ from augr.delensing import (
     LensingSpectra,
     _gl_nodes,
     _interp_at,
+    _qe_domain,
     _triangle_geometry,
     compute_n0_eb,
     compute_n0_ee,
@@ -338,6 +340,189 @@ class TestDifferentiableDelensing:
         fd = float((f_plus - f_minus) / (2 * h))
         ad = float(jnp.dot(g_bb, nl_bb))
         np.testing.assert_allclose(fd, ad, rtol=1e-4)
+
+
+# -----------------------------------------------------------------------
+# QE domain cut (l_min <= l2 <= l_max)
+# -----------------------------------------------------------------------
+
+class TestQEDomainCut:
+    """The QE reconstruction cut is geometric, not a property of the noise.
+
+    ``l2 = L - l1`` runs over ``[|L - l1|, L + l1]``, so it leaves
+    ``[l_min, l_max]``. Below ``l_min`` the CAMB templates are exactly
+    zero while the *total* retains the noise floor, so the historical
+    ``denom > 0`` test let those cells through with a denominator ~1e10
+    too small. Measured on TT that made flat-sky N_0 400-2000x too
+    small versus the plancklens-validated full-sky path.
+    """
+
+    _KW: ClassVar = {"ls": jnp.arange(2, 101, dtype=float), "L_max": 200,
+                     "l_min_qe": 2, "l_max_qe": 200, "n_iter": 1}
+
+    def test_qe_domain_excludes_out_of_range_l2(self):
+        """Cells with l2 outside [l_min, l_max] are masked out even when
+        the denominator is comfortably positive."""
+        l2 = jnp.array([0.5, 1.0, 2.0, 100.0, 200.0, 200.5, 300.0])
+        denom = jnp.ones_like(l2)          # positive everywhere
+        ok = np.asarray(_qe_domain(l2, denom, 2, 200))
+        assert list(ok) == [False, False, True, True, True, False, False]
+
+    def test_positive_denominator_alone_is_not_enough(self):
+        """Regression on the specific failure: at l=0,1 the templates are
+        zero but the total is the (positive) noise floor, so `denom > 0`
+        passes and the geometric cut is what rejects the cell."""
+        l2 = jnp.array([1.0])
+        denom = jnp.array([1.7e-7])        # noise-floor-sized, but > 0
+        assert bool(denom[0] > 0)
+        assert not bool(_qe_domain(l2, denom, 2, 200)[0])
+
+    def test_residual_converges_under_phi_refinement(self, spectra, noise):
+        """C_res must settle as n_phi grows; it used to wobble at ~1e-3.
+
+        Measured in THIS config (simple_probe, l_max_qe=200, n_iter=1):
+        max relative change over 128 -> 256 is 3.0e-6. The pre-fix code
+        gives ~1e-3 and non-monotone, so the 1e-4 gate separates them by
+        ~30x on both sides.
+        """
+        a = np.asarray(delens_residual_bb(spectra, noise["tt"], noise["bb"],
+                                          noise["bb"], n_phi=128, **self._KW))
+        b = np.asarray(delens_residual_bb(spectra, noise["tt"], noise["bb"],
+                                          noise["bb"], n_phi=256, **self._KW))
+        assert np.max(np.abs(b / a - 1.0)) < 1e-4
+
+    @pytest.mark.parametrize("fwhm_arcmin", [30.0, 12.0])
+    def test_grad_matches_fd_along_ell_reweighting_direction(
+            self, spectra, noise, fwhm_arcmin):
+        """AD vs FD along a direction that reweights ell, on two designs.
+
+        The other gradient gates in this file and in test_optimize.py all
+        step along a *uniform rescale* of nl_bb (or of n_det, which
+        `_combined_white_nl_bb` turns into one). That direction averages
+        the per-multipole quadrature error away and cannot move the
+        domain boundary, so it passed even against the pre-fix gradient.
+        A beam change is the honest design direction:
+        d(nl)/d(fwhm) ~ nl * l(l+1) * fwhm / (4 ln 2).
+
+        Measured here: rel = 1.4e-9 (30') and 3.8e-9 (12'); the pre-fix
+        code gives 3e-4 at the same step and its AD is wrong in
+        magnitude by ~31x, not merely noisy.
+        """
+        arcmin = np.pi / 180.0 / 60.0
+        ells = np.asarray(spectra.ells)
+        f = fwhm_arcmin * arcmin
+        nl = noise["bb"]
+        v = nl * jnp.array(ells * (ells + 1) * (f * arcmin) / (4 * np.log(2)))
+
+        def scalar(n):
+            return jnp.sum(delens_residual_bb(spectra, noise["tt"], n, n,
+                                              n_phi=128, **self._KW))
+
+        ad = float(jnp.dot(jax.grad(scalar)(nl), v))
+        h = 1e-4
+        fd = float((scalar(nl + h * v) - scalar(nl - h * v)) / (2 * h))
+        assert abs(fd / ad - 1.0) < 1e-6
+
+    @pytest.mark.slow
+    def test_flat_sky_agrees_with_fullsky_after_geometric_factor(
+            self, spectra, noise):
+        """Flat-sky N_0^TT must track the plancklens-validated full-sky
+        path up to the known (L+1)^2/L^2 flat-vs-full geometric factor
+        (quantified in scripts/n0_validation/controlled_input_test.py).
+
+        Measured: 0.993 / 1.003 / 1.005 / 1.005 at L = 10/30/80/150.
+        Pre-fix the same ratio was 5e-4 to 7e-3 -- i.e. flat-sky N_0 was
+        400-2000x too small. Gate at 5%.
+        """
+        Ls = jnp.array([10.0, 30.0, 80.0, 150.0])
+        flat = np.asarray(compute_n0_tt(Ls, spectra, noise["tt"], 2, 300,
+                                        n_phi=512))
+        full = np.asarray(compute_n0_tt(Ls, spectra, noise["tt"], 2, 300,
+                                        fullsky=True))
+        Lv = np.asarray(Ls)
+        ratio = (flat / full) / ((Lv + 1) ** 2 / Lv ** 2)
+        assert np.all(np.abs(ratio - 1.0) < 0.05)
+
+
+# -----------------------------------------------------------------------
+# TE filter (HO02 Eq. 13)
+# -----------------------------------------------------------------------
+
+class TestTEFilter:
+    """The TE filter is HO02 Eq. 13, not a diagonal approximation.
+
+    Unlike the other four estimators TE has C^{xx'} != 0, so neither
+    Eq. 14 (x = x') nor Eq. 15 (C~^{xx'} = 0) applies. The historical
+    'ho02_diag_approx' denominator C_TT(l1)C_EE(l2) + C_TE(l1)C_TE(l2)
+    is not sign-definite (the arguments differ -- it is not a square),
+    which puts a negative contribution into an inverse variance.
+    """
+
+    _LS: ClassVar = jnp.array([2.0, 50.0, 200.0, 350.0])
+    _KW: ClassVar = {"l_min": 2, "l_max": 500}
+
+    def test_cauchy_schwarz_holds_on_total_spectra(self, spectra, noise):
+        """Eq. 13's denominator is non-negative because C_TE^2 <= C_TT*C_EE.
+
+        Checked on the actual *total* (lensed + noise) spectra the filter
+        uses, not just in principle -- the guarantee is what makes the
+        exact filter's integrand sign-definite.
+        """
+        tt = np.asarray(spectra.cl_tt_len + noise["tt"])
+        ee = np.asarray(spectra.cl_ee_len + noise["ee"])
+        te = np.asarray(spectra.cl_te_len)
+        assert np.all(te**2 <= tt * ee)
+
+    def test_exact_filter_is_finite_where_diag_approx_diverges(
+            self, spectra, noise):
+        """The historical filter returns inf / flips sign; Eq. 13 does not.
+
+        n_phi=256 at L=200 is the measured failure point:  goes
+        negative there under 'ho02_diag_approx' and trips the total>0
+        guard. Eq. 13 is finite at every n_phi.
+        """
+        for n_phi in (128, 256, 512):
+            exact = compute_n0_te(self._LS, spectra, noise["tt"], noise["ee"],
+                                  n_phi=n_phi, te_filter="ho02_exact",
+                                  **self._KW)
+            assert np.all(np.isfinite(np.asarray(exact)))
+            assert np.all(np.asarray(exact) > 0)
+
+    def test_exact_filter_converges_under_phi_refinement(
+            self, spectra, noise):
+        """Refining n_phi must shrink the change; the old filter wobbles.
+
+        Tolerance measured in this configuration (simple_probe noise,
+        l_max=500): the 256->512 step moves N_0^TE by <1e-3 at every L
+        tested, against O(1) swings (and an inf) for 'ho02_diag_approx'.
+        """
+        a = np.asarray(compute_n0_te(self._LS, spectra, noise["tt"],
+                                     noise["ee"], n_phi=256,
+                                     te_filter="ho02_exact", **self._KW))
+        b = np.asarray(compute_n0_te(self._LS, spectra, noise["tt"],
+                                     noise["ee"], n_phi=512,
+                                     te_filter="ho02_exact", **self._KW))
+        assert np.all(np.abs(b / a - 1.0) < 1e-3)
+
+    def test_te_filter_is_honoured_on_the_flat_sky_path(
+            self, spectra, noise):
+        """te_filter used to be silently ignored unless fullsky=True."""
+        vals = [
+            np.asarray(compute_n0_te(self._LS, spectra, noise["tt"],
+                                     noise["ee"], n_phi=128, te_filter=f,
+                                     **self._KW))
+            for f in ("ho02_exact", "ho02_diag_approx", "strict_diagonal")
+        ]
+        # Compare RELATIVE differences: every value here is below
+        # np.allclose's default atol=1e-8, so allclose would call them
+        # equal no matter how far apart they are.
+        assert np.max(np.abs(vals[1] / vals[0] - 1.0)) > 1e-3
+        assert np.max(np.abs(vals[2] / vals[0] - 1.0)) > 1e-3
+
+    def test_unknown_te_filter_raises(self, spectra, noise):
+        with pytest.raises(ValueError, match="te_filter must be one of"):
+            compute_n0_te(self._LS, spectra, noise["tt"], noise["ee"],
+                          te_filter="not_a_filter")
 
 
 # -----------------------------------------------------------------------

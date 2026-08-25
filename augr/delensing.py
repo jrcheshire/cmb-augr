@@ -271,6 +271,48 @@ def _interp_at(cl: jnp.ndarray, l_vals: jnp.ndarray) -> jnp.ndarray:
     return jnp.interp(l_vals, ells, cl, left=0.0, right=0.0)
 
 
+def _qe_domain(l2, denom, l_min, l_max):
+    """Mask of (l1, phi) cells the QE integral may use.
+
+    The reconstruction cut is **geometric**: the estimator only uses
+    observed modes with ``l_min <= l <= l_max``, and that applies to
+    ``l2 = L - l1`` exactly as it does to ``l1``. It is not a property
+    of the noise.
+
+    Expressing it instead as ``denom > 0`` (the historical behaviour)
+    is wrong twice over:
+
+    1. **It admits modes outside the survey.** ``l2`` runs over
+       ``[|L - l1|, L + l1]``, so it reaches below ``l_min`` and above
+       ``l_max``. Below ``l_min`` the CAMB templates are exactly zero
+       (``cl_tt_len[0:2] == 0``) while the *total* keeps the noise
+       floor, so ``denom`` stays positive at ~1.7e-7 against ~1.1e3 at
+       l=2 -- a ten-decade cliff. Those cells survive the ``denom > 0``
+       test and contribute ``f^2 / denom`` with a denominator ~1e10 too
+       small, which swamps the whole integral. Measured on the TT
+       estimator this made flat-sky N_0 **400-2000x too small**; with
+       the geometric cut, flat-sky matches the plancklens-validated
+       full-sky path to <1% once the known ``(L+1)^2/L^2`` factor is
+       divided out.
+    2. **It makes the integration domain a function of the noise.**
+       ``jax.grad`` then picks up a term from a moving boundary, which
+       is the isolated-multipole gradient blowup documented in
+       ``optimize.DelensCoupling``.
+
+    The full-sky path has always cut geometrically -- it passes
+    ``l2_min=l_min, l2_max=l_max`` straight into the Wigner grids -- so
+    this also removes a flat-vs-full-sky inconsistency.
+
+    ``denom`` is still tested, but only as a genuine divide-by-zero
+    guard rather than as the definition of the domain.
+    """
+    return (l2 >= l_min) & (l2 <= l_max) & (denom > 0)
+
+
+#: Valid ``te_filter`` choices; see ``compute_n0_te``.
+_TE_FILTERS = ('ho02_exact', 'ho02_diag_approx', 'strict_diagonal')
+
+
 # -----------------------------------------------------------------------
 # QE reconstruction noise N_0
 # -----------------------------------------------------------------------
@@ -328,9 +370,8 @@ def compute_n0_eb(Ls: jnp.ndarray,
         # Filter: F_EB = f_EB / (C_{l₁}^{EE,tot} × C_{l₂}^{BB,tot})
         denom = _interp_at(cl_ee_tot, l1) * _interp_at(cl_bb_tot, l2)
         # Avoid division by zero for out-of-range l₂
-        safe_denom = jnp.where(denom > 0, denom, 1.0)
-        F_eb = f_eb / safe_denom
-        F_eb = jnp.where(denom > 0, F_eb, 0.0)
+        ok = _qe_domain(l2, denom, l_min, l_max)
+        F_eb = jnp.where(ok, f_eb / jnp.where(ok, denom, 1.0), 0.0)
 
         # Integrand: f × F × l₁ / (2π)²  weighted by φ quadrature
         # d²l₁ = l₁ dl₁ dφ, so integrand per dl₁ is l₁ × ∫dφ (f×F) / (2π)²
@@ -375,8 +416,8 @@ def compute_n0_tb(Ls: jnp.ndarray,
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         f = _interp_at(cl_te_unl, l1) * Ldotl1 * sin2phi12
         denom = _interp_at(cl_tt_tot, l1) * _interp_at(cl_bb_tot, l2)
-        safe_denom = jnp.where(denom > 0, denom, 1.0)
-        F = jnp.where(denom > 0, f / safe_denom, 0.0)
+        ok = _qe_domain(l2, denom, l_min, l_max)
+        F = jnp.where(ok, f / jnp.where(ok, denom, 1.0), 0.0)
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
@@ -415,8 +456,8 @@ def compute_n0_tt(Ls: jnp.ndarray,
         f = (_interp_at(cl_tt_unl, l1) * Ldotl1
              + _interp_at(cl_tt_unl, l2) * Ldotl2)
         denom = 2.0 * _interp_at(cl_tt_tot, l1) * _interp_at(cl_tt_tot, l2)
-        safe_denom = jnp.where(denom > 0, denom, 1.0)
-        F = jnp.where(denom > 0, f / safe_denom, 0.0)
+        ok = _qe_domain(l2, denom, l_min, l_max)
+        F = jnp.where(ok, f / jnp.where(ok, denom, 1.0), 0.0)
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
@@ -451,8 +492,8 @@ def compute_n0_ee(Ls: jnp.ndarray,
         f = (_interp_at(cl_ee_unl, l1) * Ldotl1
              + _interp_at(cl_ee_unl, l2) * Ldotl2) * cos2phi12
         denom = 2.0 * _interp_at(cl_ee_tot, l1) * _interp_at(cl_ee_tot, l2)
-        safe_denom = jnp.where(denom > 0, denom, 1.0)
-        F = jnp.where(denom > 0, f / safe_denom, 0.0)
+        ok = _qe_domain(l2, denom, l_min, l_max)
+        F = jnp.where(ok, f / jnp.where(ok, denom, 1.0), 0.0)
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
@@ -468,7 +509,7 @@ def compute_n0_te(Ls: jnp.ndarray,
                   l_max: int = 3000,
                   n_phi: int = 128,
                   fullsky: bool = False,
-                  te_filter: str = 'ho02_diag_approx') -> jnp.ndarray:
+                  te_filter: str = 'ho02_exact') -> jnp.ndarray:
     """N_0^{TE}(L) — QE reconstruction noise for the TE estimator.
 
     Follows Hu & Okamoto 2002 (astro-ph/0111606) Table 1 with α = ΘE:
@@ -480,28 +521,50 @@ def compute_n0_te(Ls: jnp.ndarray,
     (The E-field is still what's being deflected — it's just evaluated
     against the l₁ momentum.)
 
-    The exact filter requires a 2×2 covariance inversion at each
-    (l₁, l₂) pair (HO02 Eq. 13). The default ``te_filter`` is augr's
-    diagonal approximation with denominator
-    ``C_TT(l₁) C_EE(l₂) + C_TE(l₁) C_TE(l₂)``. Unlike the full HO02
-    denominator (always positive by Cauchy-Schwarz), this form can
-    flip sign at (l₁, l₂) where C_TE(l₁)C_TE(l₂) is negative and
-    large — hence the abs() guard in the full-sky variant. Since TE
-    contributes ~1-2% to N_0^{MV} at space-experiment noise levels,
-    the approximation is adequate for production.
+    Unlike the other four estimators, TE has C^{xx'} ≠ 0, so neither
+    HO02 Eq. 14 (x = x') nor Eq. 15 (C̃^{xx'} = 0) applies: the filter
+    is the general Eq. 13 form, which requires the 2×2 covariance
+    inversion at each (l₁, l₂).
 
     Parameters
     ----------
-    te_filter : {'ho02_diag_approx', 'strict_diagonal'}
-        ONLY affects the full-sky path (``fullsky=True``); the flat-sky
-        path always uses HO02 Eq. 13's diagonal approximation, which is
-        validated against the closed-form constant-Cl test.
-        ``'ho02_diag_approx'`` (default) reproduces the production
-        filter described above. ``'strict_diagonal'`` drops the
-        ``C_TE * C_TE`` cross term, giving ``C_TT(l₁) C_EE(l₂)``; this
-        matches plancklens with ``fal['te']=0`` for the apples-to-apples
-        N_0 validation harness in ``scripts/n0_validation/``.
+    te_filter : {'ho02_exact', 'ho02_diag_approx', 'strict_diagonal'}
+        Filter denominator. Unlike the historical behaviour, this now
+        takes effect on the **flat-sky path as well as** the full-sky
+        one.
+
+        ``'ho02_exact'`` (default) is HO02 Eq. 13 in full::
+
+            F = [C_EE(l₁) C_TT(l₂) f(l₁,l₂) − C_TE(l₁) C_TE(l₂) f(l₂,l₁)]
+                / [C_TT(l₁) C_EE(l₂) C_EE(l₁) C_TT(l₂)
+                   − (C_TE(l₁) C_TE(l₂))²]
+
+        Note the numerator's first factor is ``C_EE(l₁) C_TT(l₂)``, not
+        ``C_TT(l₁) C_EE(l₂)`` — the spectra are transposed relative to
+        the denominator's leading term. The denominator is non-negative
+        by Cauchy-Schwarz (``C_TE(l)² ≤ C_TT(l) C_EE(l)`` at every ℓ),
+        so the integrand cannot change sign.
+
+        ``'ho02_diag_approx'`` is the **historical default and is
+        defective**: denominator ``C_TT(l₁) C_EE(l₂) + C_TE(l₁) C_TE(l₂)``
+        is *not* positive-definite (the arguments differ — this is not a
+        square). Measured at 2 µK-arcmin / 30′ / l_max=500, ~2.1% of the
+        (l₁, φ) plane has ``denom < 0``, where ``f²/denom < 0`` makes a
+        negative contribution to what is an inverse variance. The
+        integral becomes a difference of large opposite-sign pieces, so
+        N_0^{TE}(L=200) flips sign under φ-refinement (+5.1e13 → −1.1e14
+        → +5.7e13 across n_phi = 128/256/512) and trips the ``total > 0``
+        guard, returning ``inf``. Retained only for reproducing
+        pre-fix numbers.
+
+        ``'strict_diagonal'`` drops the cross term, giving
+        ``C_TT(l₁) C_EE(l₂)``; positive by construction. Matches
+        plancklens with ``fal['te']=0`` for the apples-to-apples N_0
+        validation harness in ``scripts/n0_validation/``.
     """
+    if te_filter not in _TE_FILTERS:
+        raise ValueError(
+            f"te_filter must be one of {_TE_FILTERS}, got {te_filter!r}")
     if fullsky:
         return _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
                                       te_filter=te_filter)
@@ -517,22 +580,47 @@ def compute_n0_te(Ls: jnp.ndarray,
         Ldotl1 = Ls[:, None] * l1 * jnp.cos(phi[None, :])
         Ldotl2 = Ls[:, None] * (Ls[:, None] - l1 * jnp.cos(phi[None, :]))
 
-        # Response
-        f = (_interp_at(cl_te_unl, l1) * Ldotl1 * cos2phi12
-             + _interp_at(cl_te_unl, l2) * Ldotl2)
+        te1u = _interp_at(cl_te_unl, l1)
+        te2u = _interp_at(cl_te_unl, l2)
+        # Response, HO02 Table 1 (alpha = ThetaE)
+        f = te1u * Ldotl1 * cos2phi12 + te2u * Ldotl2
 
-        # Diagonal approximation to the TE filter (see docstring).
-        denom = (_interp_at(cl_tt_tot, l1) * _interp_at(cl_ee_tot, l2)
-                 + _interp_at(cl_te_tot, l1) * _interp_at(cl_te_tot, l2))
-        safe_denom = jnp.where(jnp.abs(denom) > 0, denom, 1.0)
-        F = jnp.where(jnp.abs(denom) > 0, f / safe_denom, 0.0)
+        tt1 = _interp_at(cl_tt_tot, l1)
+        ee2 = _interp_at(cl_ee_tot, l2)
+
+        if te_filter == 'ho02_exact':
+            # Same response with l1 and l2 exchanged; cos(2 phi_{l2 l1})
+            # = cos(2 phi_{l1 l2}) because cosine is even.
+            f_swap = te2u * Ldotl2 * cos2phi12 + te1u * Ldotl1
+            ee1 = _interp_at(cl_ee_tot, l1)
+            tt2 = _interp_at(cl_tt_tot, l2)
+            te1 = _interp_at(cl_te_tot, l1)
+            te2 = _interp_at(cl_te_tot, l2)
+            num = ee1 * tt2 * f - te1 * te2 * f_swap
+            denom = tt1 * ee2 * ee1 * tt2 - (te1 * te2) ** 2
+            ok = _qe_domain(l2, denom, l_min, l_max)
+            F = jnp.where(ok, num / jnp.where(ok, denom, 1.0), 0.0)
+        elif te_filter == 'ho02_diag_approx':
+            te1 = _interp_at(cl_te_tot, l1)
+            te2 = _interp_at(cl_te_tot, l2)
+            denom = tt1 * ee2 + te1 * te2
+            ok = (_qe_domain(l2, jnp.abs(denom), l_min, l_max))
+            F = jnp.where(ok, f / jnp.where(ok, denom, 1.0), 0.0)
+        else:  # 'strict_diagonal'
+            denom = tt1 * ee2
+            ok = _qe_domain(l2, denom, l_min, l_max)
+            F = jnp.where(ok, f / jnp.where(ok, denom, 1.0), 0.0)
+
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
     total, _ = lax.scan(scan_fn, jnp.zeros_like(Ls), l1_vals)
-    # TE denominator C_TT*C_EE + C_TE^2 is always non-negative
+    # Under 'ho02_exact' the Eq. 13 denominator is non-negative by
+    # Cauchy-Schwarz, so `total` is a genuine inverse variance and this
+    # guard is defensive only. Under 'ho02_diag_approx' the denominator
+    # is NOT sign-definite and `total` really can go negative -- see the
+    # te_filter docs above.
     return jnp.where(total > 0, 1.0 / total, jnp.inf)
-
 
 def compute_n0_mv(Ls: jnp.ndarray,
                   spectra: LensingSpectra,
@@ -946,8 +1034,9 @@ def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
     return jnp.where(n0_inv_jax > 0, 1.0 / n0_inv_jax, jnp.inf)
 
 
-def _per_L_te(L_in, *, l1_arr, l1_ll1, te_l1, tt_l1, te_tot_l1,
-              cl_te_unl, cl_te_tot, cl_ee_tot, l_min, l_max, te_filter):
+def _per_L_te(L_in, *, l1_arr, l1_ll1, te_l1, tt_l1, te_tot_l1, ee_l1,
+              cl_te_unl, cl_te_tot, cl_ee_tot, cl_tt_tot, l_min, l_max,
+              te_filter):
     """N_0^{TE}(L) per-L worker (spin-mixed coupling)."""
     from augr.wigner import wigner3j_000_vectorized, wigner3j_vectorized
     L = int(L_in)
@@ -979,12 +1068,31 @@ def _per_L_te(L_in, *, l1_arr, l1_ll1, te_l1, tt_l1, te_tot_l1,
                   + l2_grid.astype(int)[None, :] + L)
     even_mask = (parity_sum % 2 == 0).astype(float)
 
+    # Spin-2 leg on l1, spin-0 leg on l2 (OkaHu Table I single projection).
     f_2 = te_l1[:, None] * alpha1 * pf * w2F * even_mask
     f_0 = te_l2[None, :] * alpha2 * pf * w000
-    f_total_sq = (f_2 + f_0) ** 2
+    f_total = f_2 + f_0
 
     ee_l2 = np.zeros(len(l2_grid))
     ee_l2[valid] = cl_ee_tot[l2_grid[valid]]
+
+    if te_filter == 'ho02_exact':
+        # f(l2, l1): the spin-2 leg moves onto l2. The Wigner arrays are
+        # unchanged -- (l2 L l1; -2 0 2) == (l1 L l2; -2 0 2), because the
+        # column-exchange factor (-1)^(l1+L+l2) and the all-m-sign-flip
+        # factor (-1)^(l1+L+l2) cancel -- so only alpha and C^TE swap legs.
+        f_swap = (te_l2[None, :] * alpha2 * pf * w2F * even_mask
+                  + te_l1[:, None] * alpha1 * pf * w000)
+        tt_l2 = np.zeros(len(l2_grid))
+        tt_l2[valid] = cl_tt_tot[l2_grid[valid]]
+        te_tot_l2 = np.zeros(len(l2_grid))
+        te_tot_l2[valid] = cl_te_tot[l2_grid[valid]]
+        cross = te_tot_l1[:, None] * te_tot_l2[None, :]
+        num = (ee_l1[:, None] * tt_l2[None, :] * f_total - cross * f_swap)
+        denom = (tt_l1[:, None] * ee_l2[None, :]
+                 * ee_l1[:, None] * tt_l2[None, :] - cross ** 2)
+        weight = np.where(denom > 0, num / np.where(denom > 0, denom, 1.0), 0.0)
+        return np.sum(f_total * weight) / (2 * L + 1)
 
     if te_filter == 'ho02_diag_approx':
         te_tot_l2 = np.zeros(len(l2_grid))
@@ -998,11 +1106,10 @@ def _per_L_te(L_in, *, l1_arr, l1_ll1, te_l1, tt_l1, te_tot_l1,
         safe_denom = np.where(denom > 0, denom, 1.0)
         inv_denom = np.where(denom > 0, 1.0 / safe_denom, 0.0)
 
-    return np.sum(f_total_sq * inv_denom) / (2 * L + 1)
-
+    return np.sum(f_total ** 2 * inv_denom) / (2 * L + 1)
 
 def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
-                           te_filter='ho02_diag_approx'):
+                           te_filter='ho02_exact'):
     """Full-sky N_0^{TE} using OkaHu Table I spin-mixed coupling.
 
     Implements the spin-mixed response per Okamoto & Hu 2003 Table I:
@@ -1054,20 +1161,18 @@ def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
 
     Parameters
     ----------
-    te_filter : {'ho02_diag_approx', 'strict_diagonal'}
-        Filter denominator. Default 'ho02_diag_approx' matches the
-        production flat-sky path: HO02 Eq. 13 diagonal approximation
-        ``C_TT(l1)*C_EE(l2) + C_TE(l1)*C_TE(l2)``. The combination can
-        flip sign at (l1, l2) where C_TE(l1)*C_TE(l2) is negative and
-        large, hence the abs() guard. 'strict_diagonal' uses
-        ``C_TT(l1)*C_EE(l2)`` only -- matches plancklens with
-        ``fal['te']=0`` for the apples-to-apples validation harness.
+    te_filter : {'ho02_exact', 'ho02_diag_approx', 'strict_diagonal'}
+        Filter denominator; see ``compute_n0_te`` for the full
+        description. Default 'ho02_exact' is HO02 Eq. 13 in full and
+        is positive-definite by Cauchy-Schwarz. 'ho02_diag_approx' is
+        the historical default and is defective (not sign-definite;
+        produces negative contributions to an inverse variance).
+        'strict_diagonal' uses ``C_TT(l1)*C_EE(l2)`` only -- matches
+        plancklens with ``fal['te']=0`` for the validation harness.
     """
-    if te_filter not in ('ho02_diag_approx', 'strict_diagonal'):
+    if te_filter not in _TE_FILTERS:
         raise ValueError(
-            f"te_filter must be 'ho02_diag_approx' or 'strict_diagonal', "
-            f"got {te_filter!r}"
-        )
+            f"te_filter must be one of {_TE_FILTERS}, got {te_filter!r}")
 
     cl_tt_tot = np.asarray(spectra.cl_tt_len + nl_tt)
     cl_ee_tot = np.asarray(spectra.cl_ee_len + nl_ee)
@@ -1082,11 +1187,13 @@ def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
     te_l1 = cl_te_unl[l1_arr]
     tt_l1 = cl_tt_tot[l1_arr]
     te_tot_l1 = cl_te_tot[l1_arr]
+    ee_l1 = cl_ee_tot[l1_arr]
 
     n0_inv_samples = np.array(_per_L_map(
         partial(_per_L_te, l1_arr=l1_arr, l1_ll1=l1_ll1, te_l1=te_l1,
-                tt_l1=tt_l1, te_tot_l1=te_tot_l1, cl_te_unl=cl_te_unl,
-                cl_te_tot=cl_te_tot, cl_ee_tot=cl_ee_tot,
+                tt_l1=tt_l1, te_tot_l1=te_tot_l1, ee_l1=ee_l1,
+                cl_te_unl=cl_te_unl, cl_te_tot=cl_te_tot,
+                cl_ee_tot=cl_ee_tot, cl_tt_tot=cl_tt_tot,
                 l_min=l_min, l_max=l_max, te_filter=te_filter),
         L_samples))
 
