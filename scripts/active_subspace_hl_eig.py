@@ -61,7 +61,7 @@ from augr.eig import (
     physical_design_objective,
 )
 from augr.foregrounds import NullForegroundModel
-from augr.optimize import design_to_channels, make_optimization_context
+from augr.optimize import DelensCoupling, design_to_channels, make_optimization_context
 from augr.optimize_mapbased import w_inv_from_noise_design
 from augr.parallel import parallel_map
 from augr.signal import SignalModel
@@ -97,6 +97,10 @@ FP_DIAMETER_M = 0.3  # m (fixed cold focal-plane diameter)
 ETA_TOTAL = 0.5
 F_SKY = 0.6
 SEED_STRIDE = 100_000  # disjoint CRN seed blocks (cf. mapbased_grad_characterization.py)
+# cmb-augr #50: augr.cleaning's 1e-10 default scales the ILC ridge by the arithmetic mean
+# of a covariance diagonal spanning ~10 decades, which swamps the CMB-carrying channels.
+# 1e-14 is NOT converged either; 1e-18 is the workaround the JPL f_sky scripts already use.
+RIDGE = 1e-18
 
 
 def _spec() -> PackingDesignSpec:
@@ -113,8 +117,17 @@ def _spec() -> PackingDesignSpec:
     )
 
 
-def _static_pieces(nside, lmax):
-    """Design-independent pieces shared by every mc_ctx + the opt_ctx (built once)."""
+def _static_pieces(nside, lmax, *, ridge=RIDGE, delens_cfg=None):
+    """Design-independent pieces shared by every mc_ctx + the opt_ctx (built once).
+
+    ``delens_cfg`` (``None`` = off) is ``{l_max_qe, n_iter}``: with it, a
+    :class:`augr.optimize.DelensCoupling` is built at the *fiducial* design and the
+    returned ``opt_ctx`` carries its reference residual as ``delensed_bb``. That is
+    the frozen-Jacobian convention -- the model half of the coupling sits at the
+    reference while the sims follow each design -- and it is what makes the aperture
+    axis see any delensing benefit at all. Without it the forward runs ``A_lens = 1``
+    and the trade is tilted against aperture by construction.
+    """
     ell_max, delta_ell, ell_per_bin_below = lmax, 8, 2
     ls = load_lensing_spectra()
     cl_ee = jnp.clip(ls.cl_ee_len[: lmax + 1], 0.0, None)
@@ -134,8 +147,27 @@ def _static_pieces(nside, lmax):
         bm,
         2,
     )
-    cleaner = nilc_cleaner(clean_e=True)
+    cleaner = nilc_cleaner(clean_e=True, ridge=ridge)
     mask = mk.galactic_mask(nside, F_SKY)
+
+    delens = None
+    delensed_kw = {}
+    if delens_cfg is not None:
+        spec = _spec()
+        n_det_fid, net_fid, beam_fid = _fiducial_channels(spec)
+        delens = DelensCoupling.build(
+            lensing_spectra=ls,
+            n_det=n_det_fid,
+            net=net_fid,
+            beam=beam_fid,
+            eta=spec.eta_total,
+            mission_years=spec.years_fid,
+            f_sky=F_SKY,
+            l_max_qe=delens_cfg["l_max_qe"],
+            n_iter=delens_cfg["n_iter"],
+        )
+        delensed_kw = dict(delensed_bb=delens.cl_bb_res0, delensed_bb_ells=delens.ls)
+
     opt_ctx = make_optimization_context(
         cleaned_map_instrument(f_sky=F_SKY),
         NullForegroundModel(),
@@ -147,6 +179,7 @@ def _static_pieces(nside, lmax):
         ell_max=ell_max,
         delta_ell=delta_ell,
         ell_per_bin_below=ell_per_bin_below,
+        **delensed_kw,
     )
     return dict(
         cl_ee=cl_ee,
@@ -156,6 +189,7 @@ def _static_pieces(nside, lmax):
         cleaner=cleaner,
         mask=mask,
         opt_ctx=opt_ctx,
+        delens=delens,
     )
 
 
@@ -208,6 +242,9 @@ def _build_mc_ctx(static, spec, *, base_seed, n_sims, nside, lmax, fg_model, sky
         harmonic_skies=hs,
         noise_keys=nk,
         var_pix_ref=vpr,
+        # The sims' lensing B has to be separately addressable for a design-dependent
+        # residual to rescale it; without the split the forward is stuck at A_lens = 1.
+        split_lensing=static.get("delens") is not None,
     )
 
 
@@ -227,6 +264,7 @@ def _make_loss(spec, static, cost_model, budget):
             budget=budget,
             eta_total=spec.eta_total,
             objective="marginal_eig_r",
+            delens=static["delens"],
         )
 
     return loss
@@ -401,6 +439,9 @@ def _scan_part_valid(part, t, w1, cfg):
 
 
 def _pieces_key(cfg):
+    # The delens knobs and the ridge change what _static_pieces builds, so they have to
+    # key the cache -- otherwise a worker silently reuses pieces built under other settings.
+    dc = cfg.get("delens_cfg")
     return (
         cfg["nside"],
         cfg["lmax"],
@@ -408,6 +449,8 @@ def _pieces_key(cfg):
         cfg["backend"],
         cfg["fg_model"],
         cfg["fft_mode"],
+        cfg.get("ridge", RIDGE),
+        None if dc is None else (dc["l_max_qe"], dc["n_iter"]),
     )
 
 
@@ -419,7 +462,12 @@ def _worker_pieces(cfg):
         _set_fft_mode(cfg["fft_mode"])
         _set_compile_cache(cfg["compile_cache"])
         spec = _spec()
-        static = _static_pieces(cfg["nside"], cfg["lmax"])
+        static = _static_pieces(
+            cfg["nside"],
+            cfg["lmax"],
+            ridge=cfg.get("ridge", RIDGE),
+            delens_cfg=cfg.get("delens_cfg"),
+        )
         value_fn, vg_fn = build_design_objectives(
             _make_loss(spec, static, CostModel(), cfg["budget"])
         )
@@ -551,6 +599,12 @@ def _fanout_cfg(args, fg_model, budget):
         eval_index=args.eval_index,
         sigma_prior_r=args.sigma_prior_r,
         n_outer=args.n_outer,
+        ridge=args.ridge,
+        delens_cfg=(
+            None
+            if args.no_delens
+            else {"l_max_qe": args.delens_l_max_qe, "n_iter": args.delens_n_iter}
+        ),
     )
 
 
@@ -586,9 +640,42 @@ def main():
     p.add_argument(
         "--budget-factor",
         type=float,
-        default=1e12,
-        help="budget = factor x fiducial cost",
+        default=None,
+        help="budget = factor x fiducial cost. Overrides --budget-musd when set. The "
+        "old 1e12 default made the cost penalty identically zero, so nothing bounded "
+        "the optimizer and 'bigger mirror, longer mission' was free.",
     )
+    p.add_argument(
+        "--budget-musd",
+        type=float,
+        default=2000.0,
+        help="absolute budget in $M (default 2000 = $2B, the demo budget in "
+        "paper_scope_decisions.md). Ignored if --budget-factor is given.",
+    )
+    p.add_argument(
+        "--ridge",
+        type=float,
+        default=RIDGE,
+        help=f"ILC ridge regularization (default {RIDGE:g}; cmb-augr #50 -- the library "
+        "default 1e-10 is unconverged and 1e-14 is not converged either)",
+    )
+    p.add_argument(
+        "--no-delens",
+        action="store_true",
+        help="run at A_lens = 1 with no design-dependent delensing. Credits aperture "
+        "with none of its delensing benefit, so an aperture trade is tilted against "
+        "aperture by construction -- for mechanics tests and A/B checks only.",
+    )
+    p.add_argument(
+        "--delens-l-max-qe",
+        type=int,
+        default=1000,
+        help="max QE multipole for the delensing solve. NOTE: N_0^MV saturation is "
+        "beam-dependent (~1500 at 30', ~3000 at 10', ~4000 at 5'), so 1000 under-credits "
+        "delensing for small-beam/large-aperture designs -- an aperture-directional bias. "
+        "Unresolved; see the threads file.",
+    )
+    p.add_argument("--delens-n-iter", type=int, default=5)
     p.add_argument("--backend", choices=["ducc", "jht"], default="ducc")
     p.add_argument(
         "--fft-mode",
@@ -667,7 +754,14 @@ def main():
         print("  WARNING: --backend jht but JAX is on CPU -- the GPU was not initialized.")
     t0 = time.time()
 
-    static = _static_pieces(args.nside, args.lmax)
+    delens_cfg = (
+        None
+        if args.no_delens
+        else {"l_max_qe": args.delens_l_max_qe, "n_iter": args.delens_n_iter}
+    )
+    static = _static_pieces(
+        args.nside, args.lmax, ridge=args.ridge, delens_cfg=delens_cfg
+    )
     cost_model = CostModel()
     spec = _spec()
     n_det_fid, _, beam_fid = _fiducial_channels(spec)
@@ -680,10 +774,26 @@ def main():
             freqs_ghz=spec.freqs_flat,
         )
     )
-    budget = args.budget_factor * cost_fid
-    print(
-        f"D={spec.n_dim}  fiducial cost=${cost_fid:.0f}M  total n_det={float(jnp.sum(n_det_fid)):.0f}"
+    budget = (
+        args.budget_factor * cost_fid
+        if args.budget_factor is not None
+        else args.budget_musd
     )
+    print(
+        f"D={spec.n_dim}  fiducial cost=${cost_fid:.0f}M  "
+        f"budget=${budget:.0f}M  total n_det={float(jnp.sum(n_det_fid)):.0f}"
+    )
+    if budget > 100.0 * cost_fid:
+        print(
+            f"  WARNING: budget is {budget / cost_fid:.3g}x the fiducial cost -- the "
+            "penalty is effectively off and the optimizer is unbounded upward."
+        )
+    print(
+        "  delensing: OFF (A_lens = 1)"
+        if delens_cfg is None
+        else f"  delensing: l_max_qe={delens_cfg['l_max_qe']} n_iter={delens_cfg['n_iter']}"
+    )
+    print(f"  ILC ridge: {args.ridge:g}")
 
     loss = _make_loss(spec, static, cost_model, budget)
     value_fn, vg_fn = build_design_objectives(loss)
