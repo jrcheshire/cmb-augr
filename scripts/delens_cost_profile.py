@@ -81,6 +81,10 @@ def _timeit(fn, *args, repeat=3):
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--l-max-qe", type=int, nargs="+", default=[500, 1000, 1500])
+    p.add_argument("--remat", action=argparse.BooleanOptionalAction, default=True,
+                   help="gradient-checkpoint the QE scans (default on). "
+                        "--no-remat reproduces the pre-fix O(l_max_qe^2) tape, "
+                        "which OOMs a 124 GB node at l_max_qe=1500.")
     p.add_argument("--n-iter", type=int, default=5)
     p.add_argument("--repeat", type=int, default=3)
     p.add_argument("--out", type=str, default=None, help="write JSON here")
@@ -104,10 +108,11 @@ def main() -> None:
           f"n_det={float(jnp.sum(n_det)):.0f}, "
           f"beam {float(jnp.min(beam)):.1f}-{float(jnp.max(beam)):.1f} arcmin",
           flush=True)
-    print(f"n_iter={args.n_iter}  repeat={args.repeat}\n", flush=True)
+    print(f"n_iter={args.n_iter}  repeat={args.repeat}  "
+          f"remat={args.remat}\n", flush=True)
 
     hdr = (f"{'l_max_qe':>9} {'build/s':>9} {'value/s':>9} {'grad/s':>9} "
-           f"{'g/v':>6} {'compile/s':>10} {'peakRSS/GB':>11}")
+           f"{'g/v':>6} {'compile/s':>10} {'gradtemp/MB':>12} {'peakRSS/GB':>11}")
     print(hdr, flush=True)
     print("-" * len(hdr), flush=True)
 
@@ -118,7 +123,7 @@ def main() -> None:
         dc = DelensCoupling.build(
             lensing_spectra=ls_spec, n_det=n_det, net=net, beam=beam,
             eta=ETA_TOTAL, mission_years=YEARS_FID, f_sky=F_SKY,
-            l_max_qe=lmq, n_iter=args.n_iter,
+            l_max_qe=lmq, n_iter=args.n_iter, remat=args.remat,
         )
         t_build = time.perf_counter() - t0
 
@@ -131,15 +136,22 @@ def main() -> None:
         jv = jax.jit(value)
         jg = jax.jit(jax.grad(value))
 
+        # XLA's own temp-buffer size for the gradient. Deterministic for a
+        # given HLO, machine-independent, and -- unlike peak RSS -- readable
+        # without the process having to survive the allocation.
+        # NOT peak_memory_in_bytes: that field reads ~0 on a 655 MB tape.
+        gradtemp = (jg.lower(beam).compile()
+                    .memory_analysis().temp_size_in_bytes)
         _, t_value = _timeit(jv, beam, repeat=args.repeat)
         t_gc, t_grad = _timeit(jg, beam, repeat=args.repeat)
         peak = _peak_rss_gb()
 
         print(f"{lmq:>9d} {t_build:>9.2f} {t_value:>9.2f} {t_grad:>9.2f} "
-              f"{t_grad / t_value:>6.2f} {t_gc:>10.2f} {peak:>11.2f}",
-              flush=True)
-        rows.append(dict(l_max_qe=lmq, n_iter=args.n_iter, build_s=t_build,
-                         value_s=t_value, grad_s=t_grad, compile_s=t_gc,
+              f"{t_grad / t_value:>6.2f} {t_gc:>10.2f} {gradtemp / 1e6:>12.2f} "
+              f"{peak:>11.2f}", flush=True)
+        rows.append(dict(l_max_qe=lmq, n_iter=args.n_iter, remat=bool(args.remat),
+                         build_s=t_build, value_s=t_value, grad_s=t_grad,
+                         compile_s=t_gc, grad_temp_mb=gradtemp / 1e6,
                          peak_rss_gb=peak))
 
     if len(rows) > 1:
@@ -148,7 +160,11 @@ def main() -> None:
             y = np.log([r[key] for r in rows])
             return np.polyfit(x, y, 1)[0]
         print(f"\nscaling in l_max_qe:  grad ~ L^{expo('grad_s'):.2f}   "
+              f"gradtemp ~ L^{expo('grad_temp_mb'):.2f}   "
               f"peakRSS ~ L^{expo('peak_rss_gb'):.2f}", flush=True)
+        print("  (peakRSS is a cgroup high-water mark and never resets, so each\n"
+              "   row includes prior rows; gradtemp is per-configuration.)",
+              flush=True)
 
     if args.out:
         with open(args.out, "w") as fh:

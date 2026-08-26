@@ -46,11 +46,32 @@ echo "cpus=${SLURM_CPUS_PER_TASK:-?}  mem=${SLURM_MEM_PER_NODE:-?}MB"
 free -g | head -2
 echo
 
+# Two legs. The --no-remat leg is the control: it must reproduce the pre-fix
+# numbers (23.9 GB / 91.5 GB peak RSS, 20.7 s / 68.2 s grad at 500 / 1000) or the
+# harness changed under us and nothing else here is interpretable. It is capped
+# at 1000 deliberately -- 1500 OOMs a 124 GB node with a 217 GB allocation.
 pixi run python scripts/delens_cost_profile.py \
-    --l-max-qe 500 1000 1500 2000 \
+    --no-remat \
+    --l-max-qe 500 1000 \
     --n-iter 5 \
     --repeat 3 \
-    --out "delens_cost_${SLURM_JOB_ID:-local}.json"
+    --out "delens_cost_noremat_${SLURM_JOB_ID:-local}.json"
+
+echo
+echo "=========== remat leg ==========="
+echo
+
+# The acceptance run. Expect peakRSS roughly flat, gradtemp linear in l_max_qe
+# (~0.033 MB per unit L, extrapolating to ~134 MB at 4000), grad/s about 2x the
+# --no-remat figure at the same L, and the gradtemp exponent dropping from ~1.99
+# to ~1. l_max_qe=4000 is the point of the exercise: it is where N_0^MV
+# saturation stops under-crediting small-beam / large-aperture designs.
+pixi run python scripts/delens_cost_profile.py \
+    --remat \
+    --l-max-qe 500 1000 1500 2000 3000 4000 \
+    --n-iter 5 \
+    --repeat 3 \
+    --out "delens_cost_remat_${SLURM_JOB_ID:-local}.json"
 
 echo
 echo "--- cgroup peak ---"
