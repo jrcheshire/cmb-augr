@@ -106,41 +106,47 @@ def budget_penalty(cost, budget, weight: float = 1.0):
     return weight * over**2
 
 
-def bias_wall(delta_r, sigma_r, *, eps: float = 0.5, weight: float = 1.0):
-    """One-sided soft wall on the r-bias: ``weight * max(|Delta r| - eps*sigma(r), 0)**2``.
+def total_error_r(sigma_r, delta_r, *, bias_w: float = 1.0):
+    """Effective error on r with the bias folded in: ``sqrt(sigma^2 + bias_w*Delta r^2)``.
 
-    The same convex, C1, one-sided shape as :func:`budget_penalty`, and it exists for
-    a structural reason: the r-marginal EIG is ``-log sigma(r) + const``, so it carries
-    **no bias term at all** and will happily buy a design with a small ``sigma(r)`` and
-    a large ``Delta r``. That is not hypothetical -- the mode-disjoint ILC campaign
-    measured foreground-destruction biases of -0.68 / -1.81 / -5.22 sigma while the
-    residual amplitude ``A_res`` was itself unmeasurable, so nothing in the fit would
-    have flagged it.
+    The r-marginal EIG is ``log(sigma_prior/sigma(r))`` -- it carries **no bias term at
+    all**, so on its own it will buy a design with a small ``sigma(r)`` and a large
+    ``Delta r`` and nothing in the fit flags it. That is not hypothetical: the
+    mode-disjoint ILC campaign measured foreground-destruction biases of -0.68 / -1.81 /
+    -5.22 sigma while the residual amplitude ``A_res`` was itself unmeasurable.
 
-    Adding this term states the design goal directly: **minimize sigma(r) subject to
-    the bias not becoming significant**. A design may buy statistical precision freely
-    until the bias reaches ``eps`` of the remaining statistical error; past that the
-    wall bites quadratically.
+    This is the standard quadrature error budget -- statistical and systematic added in
+    quadrature -- and it is deliberately preferred to a one-sided "wall" on the bias in
+    units of sigma(r), i.e. ``max(|Delta r|/sigma - eps, 0)**2``. That form has a
+    perverse stationary point: it *decreases* as sigma(r) grows, so a design can satisfy
+    it by making the error bar worse rather than the bias smaller. Against a utility of
+    ``-log sigma`` the balance sits at ``2w*u(u - eps) = 1`` for ``u = |Delta r|/sigma``
+    -- a local minimum at ``u = 1`` for ``w = 1, eps = 0.5``, reachable by inflating
+    sigma. Nothing here decreases in sigma, so that mechanism is absent:
+    ``d/dsigma = w1*sigma/sqrt(.) > 0`` and ``d/dDelta r = w2*Delta r/sqrt(.) > 0``
+    always. Smaller is better on both axes.
 
-    Preferred over a mean-squared-error figure of merit (``sigma^2 + Delta r^2``),
-    which silently fixes the bias/variance exchange rate at 1:1 -- a choice better left
-    explicit and tunable.
+    **Only the ratio of the two weights matters.** A general ``w1*sigma^2 + w2*dr^2``
+    factorizes as ``w1*(sigma^2 + (w2/w1)*dr^2)``, and consumers take a logarithm, so
+    ``w1`` is a design-independent additive constant with zero gradient. ``bias_w`` is
+    that ratio: ``1.0`` weights a unit of bias exactly like a unit of statistical error
+    (plain total error), larger values weight bias more.
+
+    Both terms are in ``r^2``, so ``bias_w`` is dimensionless and O(1) -- unlike a
+    penalty added to an EIG in nats, which needs a stiffness of ~1e8 at a PICO-class
+    sigma(r) before it influences anything.
 
     Args:
-        delta_r:  Bias on r at this design (sign carried; the wall uses |.|).
-        sigma_r:  Marginalized sigma(r) at this design -- the wall MOVES with the
-                  design, which is the point: a more precise design is held to a
-                  correspondingly tighter bias.
-        eps:      Bias budget in units of sigma(r). Default 0.5 (JC, 2026-08-19);
-                  semi-arbitrary by choice, so sensitivity-test it rather than
-                  treating it as derived.
-        weight:   Penalty stiffness, tuned against the EIG scale.
+        sigma_r:  Marginalized sigma(r) at this design.
+        delta_r:  Bias on r at this design (sign carried; only the square is used).
+        bias_w:   Weight on the bias term relative to the variance term.
 
     Returns:
-        Scalar penalty (zero while ``|Delta r| <= eps*sigma(r)``).
+        Effective 1-sigma error on r, in the same units as ``sigma_r``.
     """
-    over = jnp.maximum(jnp.abs(jnp.asarray(delta_r)) - eps * jnp.asarray(sigma_r), 0.0)
-    return weight * over**2
+    sigma = jnp.asarray(sigma_r)
+    dr = jnp.asarray(delta_r)
+    return jnp.sqrt(sigma**2 + bias_w * dr**2)
 
 
 def aperture_from_fwhm(fwhm_arcmin, nu_ghz: float, illumination_factor: float = 1.22):
