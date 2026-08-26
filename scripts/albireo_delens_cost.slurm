@@ -46,20 +46,11 @@ echo "cpus=${SLURM_CPUS_PER_TASK:-?}  mem=${SLURM_MEM_PER_NODE:-?}MB"
 free -g | head -2
 echo
 
-# Two legs. The --no-remat leg is the control: it must reproduce the pre-fix
-# numbers (23.9 GB / 91.5 GB peak RSS, 20.7 s / 68.2 s grad at 500 / 1000) or the
-# harness changed under us and nothing else here is interpretable. It is capped
-# at 1000 deliberately -- 1500 OOMs a 124 GB node with a 217 GB allocation.
-pixi run python scripts/delens_cost_profile.py \
-    --no-remat \
-    --l-max-qe 500 1000 \
-    --n-iter 5 \
-    --repeat 3 \
-    --out "delens_cost_noremat_${SLURM_JOB_ID:-local}.json"
-
-echo
-echo "=========== remat leg ==========="
-echo
+# Two legs, ACCEPTANCE FIRST. The control leg peaks at 91.5 GB against this job's
+# 100G cgroup cap (92%), and peak RSS is polled, so it can be cgroup-killed at a
+# peak the previous run merely failed to observe. Under `set -e` that kill would
+# abort the job before the acceptance leg -- the whole point of the exercise --
+# ever ran. So the deliverable goes first, and the control is non-fatal.
 
 # The acceptance run. Expect peakRSS roughly flat, gradtemp linear in l_max_qe
 # (~0.033 MB per unit L, extrapolating to ~134 MB at 4000), grad/s about 2x the
@@ -72,6 +63,23 @@ pixi run python scripts/delens_cost_profile.py \
     --n-iter 5 \
     --repeat 3 \
     --out "delens_cost_remat_${SLURM_JOB_ID:-local}.json"
+
+echo
+echo "=========== control leg (--no-remat, non-fatal) ==========="
+echo
+
+# The control: it must reproduce the pre-fix numbers (23.9 GB / 91.5 GB peak RSS,
+# 20.7 s / 68.2 s grad at 500 / 1000) or the harness changed under us and the
+# comparison is not interpretable. Capped at 1000 deliberately -- 1500 OOMs a
+# 124 GB node with a 217 GB allocation. `|| echo` because a cgroup kill here is a
+# plausible outcome that must not discard the acceptance results above.
+pixi run python scripts/delens_cost_profile.py \
+    --no-remat \
+    --l-max-qe 500 1000 \
+    --n-iter 5 \
+    --repeat 3 \
+    --out "delens_cost_noremat_${SLURM_JOB_ID:-local}.json" \
+  || echo "CONTROL LEG FAILED (exit $?) -- acceptance results above still stand"
 
 echo
 echo "--- cgroup peak ---"
