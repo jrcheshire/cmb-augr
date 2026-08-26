@@ -604,3 +604,57 @@ def test_delens_coupling_residual_is_below_full_lensing(_coupling_design):
     full = np.asarray(spec.cl_bb_len[2:30])
     assert np.all(res > 0.0)
     assert np.all(res < full)
+
+
+@pytest.mark.slow
+def test_delens_coupling_accepts_scalar_eta(_coupling_design):
+    """A SCALAR eta must work: it is what the physical entry point defaults to.
+
+    ``physical_design_objective``'s ``eta_total`` defaults to the scalar 0.5 and is
+    forwarded verbatim into ``DelensCoupling.residual``, but every other test here
+    passes a per-channel array. ``_combined_white_nl_bb`` indexes ``eta[i]``, so the
+    scalar raised ``IndexError: array is 0-dimensional`` and ``delens=`` was
+    unusable from the physical entry point -- the exact combination a design run
+    uses. Broadcasting a scalar must agree with passing it per channel.
+    """
+    d = dict(_coupling_design)
+    eta_scalar = 0.5
+    assert np.allclose(np.asarray(d["eta"]), eta_scalar), "fixture eta must be uniform"
+    kw = dict(lensing_spectra=load_lensing_spectra(), l_max_qe=500, n_iter=2,
+              ls=jnp.arange(2, 30, dtype=float))
+
+    c_arr = DelensCoupling.build(**kw, **d)
+    c_sca = DelensCoupling.build(**kw, **{**d, "eta": eta_scalar})
+    np.testing.assert_allclose(np.asarray(c_sca.cl_bb_res0),
+                               np.asarray(c_arr.cl_bb_res0), rtol=0, atol=0)
+
+    # and through residual(), which is the per-design eval path
+    got = c_sca.residual(d["n_det"], d["net"], d["beam"], eta_scalar,
+                         d["mission_years"], d["f_sky"])
+    np.testing.assert_allclose(np.asarray(got), np.asarray(c_arr.cl_bb_res0),
+                               rtol=0, atol=0)
+
+
+@pytest.mark.slow
+def test_delens_coupling_remat_flag_is_transparent(_coupling_design):
+    """``remat`` must reach BOTH build() and residual(), and change nothing.
+
+    The failure mode this guards is asymmetry, not arithmetic: remat is
+    forward-transparent, so wiring it into ``build`` but not ``residual`` (or
+    vice versa) leaves one path on the O(l_max_qe**2) reverse-mode tape while
+    every value assertion in this file still passes. Compare both halves.
+    """
+    d = _coupling_design
+    kw = dict(lensing_spectra=load_lensing_spectra(), l_max_qe=300, n_iter=2,
+              ls=jnp.arange(2, 30, dtype=float))
+    c_on = DelensCoupling.build(**kw, **d, remat=True)
+    c_off = DelensCoupling.build(**kw, **d, remat=False)
+
+    assert c_on.remat is True and c_off.remat is False
+    np.testing.assert_array_equal(np.asarray(c_on.cl_bb_res0),
+                                  np.asarray(c_off.cl_bb_res0))
+
+    args = (d["n_det"], d["net"], d["beam"], d["eta"],
+            d["mission_years"], d["f_sky"])
+    np.testing.assert_array_equal(np.asarray(c_on.residual(*args)),
+                                  np.asarray(c_off.residual(*args)))

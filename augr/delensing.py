@@ -40,6 +40,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
@@ -313,6 +314,43 @@ def _qe_domain(l2, denom, l_min, l_max):
 _TE_FILTERS = ('ho02_exact', 'ho02_diag_approx', 'strict_diagonal')
 
 
+def _scan(body, init, xs, *, remat: bool):
+    """``lax.scan`` over ``body``, optionally gradient-checkpointed.
+
+    The N_0 scan bodies are pure accumulations -- carry ``(n_L,)``, per-step
+    output ``None`` -- but each step builds a dozen or more ``(n_L, n_phi)``
+    intermediates, and reverse mode retains every one of them for all
+    ``l_max_qe`` steps. Since ``optimize._delens_from_combined_bb`` ties
+    ``L_max`` to ``l_max_qe``, that tape grows as ``l_max_qe**2 * n_phi``:
+    measured 560 MB at ``l_max_qe=200`` and 2.2 GB at 400 (exponent 1.994),
+    which extrapolates to ~90 GB at the production 1000 and OOMs a 124 GB node
+    at 1500.
+
+    ``remat=True`` rewrites that to "store nothing per step, recompute on the
+    backward pass", leaving only the ``(n_L,)`` carry trajectory. Measured
+    200x smaller at ``l_max_qe=200`` and 520x at 400. Forward values are
+    **bit-identical** and reverse-mode gradients move by 1-2 ulp (3.4e-16
+    relative) from XLA re-fusing the recomputed forward; forward-mode is
+    untouched. The cost is roughly 2x on gradient runtime and nothing on the
+    value.
+
+    ``prevent_cse=False`` is the documented setting inside ``scan``/``jit``:
+    the barriers ``prevent_cse=True`` inserts only block fusion here, and
+    ``scan`` already prevents CSE from undoing the remat.
+
+    No ``policy=``. These bodies are trig / ``jnp.where`` / ``jnp.interp`` with
+    zero ``dot_general`` ops -- the only matmuls (``K @ cl_pp_res`` in
+    :func:`residual_cl_bb`) are *outside* the scans -- so every
+    ``dots_*_saveable`` policy is a no-op. And every candidate intermediate is
+    the same ``(n_L, n_phi)`` shape, so there is no small-and-expensive tensor
+    for ``save_only_these_names`` to pin: saving any one of them re-introduces
+    the full quadratic term. Do not "optimize" a policy in here.
+    """
+    if remat:
+        body = jax.checkpoint(body, prevent_cse=False)
+    return lax.scan(body, init, xs)
+
+
 # -----------------------------------------------------------------------
 # QE reconstruction noise N_0
 # -----------------------------------------------------------------------
@@ -324,7 +362,9 @@ def compute_n0_eb(Ls: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
                   n_phi: int = 128,
-                  fullsky: bool = False) -> jnp.ndarray:
+                  fullsky: bool = False,
+                  *,
+                  remat: bool = True) -> jnp.ndarray:
     """N_0^{EB}(L) — QE reconstruction noise for the EB estimator.
 
     Hu & Okamoto (2002) Eq. 11 with Table 1 weight functions.
@@ -382,7 +422,7 @@ def compute_n0_eb(Ls: jnp.ndarray,
         contribution = integral_l1 * l1 / (2.0 * jnp.pi)**2
         return integral_acc + contribution, None
 
-    total_integral, _ = lax.scan(scan_fn, jnp.zeros_like(Ls), l1_vals)
+    total_integral, _ = _scan(scan_fn, jnp.zeros_like(Ls), l1_vals, remat=remat)
 
     # N_0^{φφ} = 1 / integral.
     # HO02 Eq. 11 gives A(L) = L²/∫ for the deflection field d = ∇φ.
@@ -397,7 +437,9 @@ def compute_n0_tb(Ls: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
                   n_phi: int = 128,
-                  fullsky: bool = False) -> jnp.ndarray:
+                  fullsky: bool = False,
+                  *,
+                  remat: bool = True) -> jnp.ndarray:
     """N_0^{TB}(L) — QE reconstruction noise for the TB estimator.
 
     Response: f_TB = C_{l₁}^{TE,unl} × (L·l₁) × sin(2φ_{l₁,l₂})
@@ -421,7 +463,7 @@ def compute_n0_tb(Ls: jnp.ndarray,
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
-    total, _ = lax.scan(scan_fn, jnp.zeros_like(Ls), l1_vals)
+    total, _ = _scan(scan_fn, jnp.zeros_like(Ls), l1_vals, remat=remat)
     return jnp.where(total > 0, 1.0 / total, jnp.inf)
 
 
@@ -431,7 +473,9 @@ def compute_n0_tt(Ls: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
                   n_phi: int = 128,
-                  fullsky: bool = False) -> jnp.ndarray:
+                  fullsky: bool = False,
+                  *,
+                  remat: bool = True) -> jnp.ndarray:
     """N_0^{TT}(L) — QE reconstruction noise for the TT estimator.
 
     Response: f_TT = C_{l₁}^{TT,unl} (L·l₁) + C_{l₂}^{TT,unl} (L·l₂)
@@ -461,7 +505,7 @@ def compute_n0_tt(Ls: jnp.ndarray,
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
-    total, _ = lax.scan(scan_fn, jnp.zeros_like(Ls), l1_vals)
+    total, _ = _scan(scan_fn, jnp.zeros_like(Ls), l1_vals, remat=remat)
     return jnp.where(total > 0, 1.0 / total, jnp.inf)
 
 
@@ -471,7 +515,9 @@ def compute_n0_ee(Ls: jnp.ndarray,
                   l_min: int = 2,
                   l_max: int = 3000,
                   n_phi: int = 128,
-                  fullsky: bool = False) -> jnp.ndarray:
+                  fullsky: bool = False,
+                  *,
+                  remat: bool = True) -> jnp.ndarray:
     """N_0^{EE}(L) — QE reconstruction noise for the EE estimator.
 
     Response: f_EE = [C_{l₁}^{EE,unl} (L·l₁) + C_{l₂}^{EE,unl} (L·l₂)] cos(2φ_{l₁,l₂})
@@ -497,7 +543,7 @@ def compute_n0_ee(Ls: jnp.ndarray,
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
-    total, _ = lax.scan(scan_fn, jnp.zeros_like(Ls), l1_vals)
+    total, _ = _scan(scan_fn, jnp.zeros_like(Ls), l1_vals, remat=remat)
     return jnp.where(total > 0, 1.0 / total, jnp.inf)
 
 
@@ -509,7 +555,9 @@ def compute_n0_te(Ls: jnp.ndarray,
                   l_max: int = 3000,
                   n_phi: int = 128,
                   fullsky: bool = False,
-                  te_filter: str = 'ho02_exact') -> jnp.ndarray:
+                  te_filter: str = 'ho02_exact',
+                  *,
+                  remat: bool = True) -> jnp.ndarray:
     """N_0^{TE}(L) — QE reconstruction noise for the TE estimator.
 
     Follows Hu & Okamoto 2002 (astro-ph/0111606) Table 1 with α = ΘE:
@@ -614,7 +662,7 @@ def compute_n0_te(Ls: jnp.ndarray,
         contrib = jnp.sum(f * F * w_phi[None, :], axis=1) * l1 / (2 * jnp.pi)**2
         return acc + contrib, None
 
-    total, _ = lax.scan(scan_fn, jnp.zeros_like(Ls), l1_vals)
+    total, _ = _scan(scan_fn, jnp.zeros_like(Ls), l1_vals, remat=remat)
     # Under 'ho02_exact' the Eq. 13 denominator is non-negative by
     # Cauchy-Schwarz, so `total` is a genuine inverse variance and this
     # guard is defensive only. Under 'ho02_diag_approx' the denominator
@@ -633,7 +681,8 @@ def compute_n0_mv(Ls: jnp.ndarray,
                   fullsky: bool = False,
                   *,
                   max_workers: int | None = None,
-                  backend: str = "numpy") -> jnp.ndarray:
+                  backend: str = "numpy",
+                  remat: bool = True) -> jnp.ndarray:
     """Minimum-variance combination of all five QE estimators.
 
     1/N_0^{MV}(L) = Σ_α 1/N_0^α(L)    (HO02 Eq. 22)
@@ -670,26 +719,26 @@ def compute_n0_mv(Ls: jnp.ndarray,
         try:
             return _compute_n0_mv_body(
                 Ls, spectra, nl_tt, nl_ee, nl_bb,
-                l_min, l_max, n_phi, fullsky)
+                l_min, l_max, n_phi, fullsky, remat)
         finally:
             _force_serial = prev_force
     return _compute_n0_mv_body(
         Ls, spectra, nl_tt, nl_ee, nl_bb,
-        l_min, l_max, n_phi, fullsky)
+        l_min, l_max, n_phi, fullsky, remat)
 
 
 def _compute_n0_mv_body(Ls, spectra, nl_tt, nl_ee, nl_bb,
-                         l_min, l_max, n_phi, fullsky):
+                         l_min, l_max, n_phi, fullsky, remat=True):
     n0_tt = compute_n0_tt(Ls, spectra, nl_tt, l_min, l_max, n_phi,
-                          fullsky=fullsky)
+                          fullsky=fullsky, remat=remat)
     n0_ee = compute_n0_ee(Ls, spectra, nl_ee, l_min, l_max, n_phi,
-                          fullsky=fullsky)
+                          fullsky=fullsky, remat=remat)
     n0_te = compute_n0_te(Ls, spectra, nl_tt, nl_ee, l_min, l_max, n_phi,
-                          fullsky=fullsky)
+                          fullsky=fullsky, remat=remat)
     n0_eb = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, l_min, l_max, n_phi,
-                          fullsky=fullsky)
+                          fullsky=fullsky, remat=remat)
     n0_tb = compute_n0_tb(Ls, spectra, nl_tt, nl_bb, l_min, l_max, n_phi,
-                          fullsky=fullsky)
+                          fullsky=fullsky, remat=remat)
 
     inv_n0_mv = (1.0 / n0_tt + 1.0 / n0_ee + 1.0 / n0_te
                  + 1.0 / n0_eb + 1.0 / n0_tb)
@@ -1305,7 +1354,8 @@ def lensing_kernel(ls: jnp.ndarray, Ls: jnp.ndarray,
                    n_phi: int = 128,
                    fullsky: bool = False,
                    *,
-                   w_ee: jnp.ndarray | None = None) -> jnp.ndarray:
+                   w_ee: jnp.ndarray | None = None,
+                   remat: bool = True) -> jnp.ndarray:
     """Lensing kernel K(l, L) such that C_l^{BB,lens} = Σ_L K(l,L) C_L^{φφ}.
 
     The kernel encodes how lensing power at multipole L generates B-mode
@@ -1391,7 +1441,7 @@ def lensing_kernel(ls: jnp.ndarray, Ls: jnp.ndarray,
     def scan_K(_, L_val):
         return None, compute_K_column(L_val)
 
-    _, K_columns = lax.scan(scan_K, None, Ls)
+    _, K_columns = _scan(scan_K, None, Ls, remat=remat)
     # K_columns shape: (n_L, n_l) -> transpose to (n_l, n_L)
     return K_columns.T
 
@@ -1405,7 +1455,8 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
                    fullsky: bool = False,
                    *,
                    nl_ee: jnp.ndarray | None = None,
-                   backend: str = "numpy") -> jnp.ndarray:
+                   backend: str = "numpy",
+                   remat: bool = True) -> jnp.ndarray:
     """Residual lensing BB after QE delensing (Smith et al. 2012, Eq. 12).
 
     The full Smith+ 2012 formula is
@@ -1450,7 +1501,7 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
 
     if nl_ee is None:
         K = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
-                           fullsky=fullsky)
+                           fullsky=fullsky, remat=remat)
         return K @ cl_pp_res
 
     # Exact Smith+ 2012 Eq. 12: build K_WEE with the extra W_EE(ℓ_E)
@@ -1463,9 +1514,9 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
     nl_ee_arr = jnp.asarray(nl_ee)
     w_ee = cl_ee / (cl_ee + nl_ee_arr)
     K = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
-                       fullsky=fullsky)
+                       fullsky=fullsky, remat=remat)
     K_wee = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
-                           fullsky=fullsky, w_ee=w_ee)
+                           fullsky=fullsky, w_ee=w_ee, remat=remat)
     return K @ cl_pp_res + (K - K_wee) @ (cl_pp_at_L * w_pp)
 
 
@@ -1505,7 +1556,8 @@ def _delens_core(spectra: LensingSpectra,
                  l_max_qe: int,
                  n_phi: int,
                  fullsky: bool,
-                 backend: str = "numpy") -> tuple[jnp.ndarray, jnp.ndarray,
+                 backend: str = "numpy",
+                 remat: bool = True) -> tuple[jnp.ndarray, jnp.ndarray,
                                                   jnp.ndarray, jnp.ndarray]:
     """Pure iterative-delensing core -- no host-side casts or I/O.
 
@@ -1545,13 +1597,13 @@ def _delens_core(spectra: LensingSpectra,
         # MV N_0 with the current BB in the EB/TB filters.
         n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb_eff,
                            l_min_qe, l_max_qe, n_phi, fullsky=fullsky,
-                           backend=backend)
+                           backend=backend, remat=remat)
 
         # Residual BB (exact Smith+ Eq. 12 with the W_EE Wiener filter).
         cl_bb_res = residual_cl_bb(ls, Ls, spectra, n0,
                                    l_min_qe, l_max_qe, n_phi,
                                    fullsky=fullsky, nl_ee=nl_ee,
-                                   backend=backend)
+                                   backend=backend, remat=remat)
 
         # Interpolate the residual onto the full ell grid for the next
         # iteration's filters.  Outside the QE ls range we fall back to the
@@ -1582,7 +1634,9 @@ def delens_residual_bb(spectra: LensingSpectra,
                        l_min_qe: int = 2,
                        l_max_qe: int = 3000,
                        n_phi: int = 128,
-                       n_iter: int = 5) -> jnp.ndarray:
+                       n_iter: int = 5,
+                       *,
+                       remat: bool = True) -> jnp.ndarray:
     """Differentiable residual lensing BB from iterative flat-sky QE delensing.
 
     Flat-sky, pure-jnp entry point for the residual C_l^{BB} the design
@@ -1591,6 +1645,16 @@ def delens_residual_bb(spectra: LensingSpectra,
     are compile-time constants).  Equivalent to
     iterate_delensing(..., fullsky=False).cl_bb_res without the host-side
     dataclass packaging.  Returns C_l^{BB,res} at ls.
+
+    ``remat`` (default True) gradient-checkpoints the QE scan bodies, which is
+    what keeps a ``jax.grad`` through this function from allocating
+    ``O(l_max_qe**2 * n_phi)`` of reverse-mode tape -- ~90 GB at
+    ``l_max_qe=1000`` without it, and an OOM at 1500. Forward values are
+    bit-identical either way; only the gradient's runtime (~2x) and memory
+    (~200-500x less) change. See :func:`_scan`. Flat-sky only.
+
+    ``remat`` is read at trace time, so it must be a Python ``bool``, not a
+    traced value -- do not pass it through ``jax.jit``'s traced arguments.
     """
     if ls is None:
         ls = jnp.arange(2, 301, dtype=float)
@@ -1598,7 +1662,7 @@ def delens_residual_bb(spectra: LensingSpectra,
     cl_bb_res, _n0, _a, _hist = _delens_core(
         spectra, nl_tt, nl_ee, nl_bb, ls, Ls,
         n_iter=n_iter, l_min_qe=l_min_qe, l_max_qe=l_max_qe,
-        n_phi=n_phi, fullsky=False)
+        n_phi=n_phi, fullsky=False, remat=remat)
     return cl_bb_res
 
 
@@ -1614,7 +1678,8 @@ def iterate_delensing(spectra: LensingSpectra,
                       n_iter: int = 5,
                       verbose: bool = False,
                       fullsky: bool = False,
-                      backend: str = "numpy") -> DelensedSpectra:
+                      backend: str = "numpy",
+                      remat: bool = True) -> DelensedSpectra:
     """Iterative QE delensing: compute residual lensing BB self-consistently.
 
     The key insight (Smith et al. 2012 §3.1): lensed B-mode power acts as
@@ -1671,7 +1736,7 @@ def iterate_delensing(spectra: LensingSpectra,
     cl_bb_res, n0, A_lens_eff, a_lens_hist = _delens_core(
         spectra, nl_tt, nl_ee, nl_bb, ls, Ls,
         n_iter=n_iter, l_min_qe=l_min_qe, l_max_qe=l_max_qe,
-        n_phi=n_phi, fullsky=fullsky, backend=backend)
+        n_phi=n_phi, fullsky=fullsky, backend=backend, remat=remat)
 
     if verbose:
         for i in range(n_iter):
