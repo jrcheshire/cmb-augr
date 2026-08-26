@@ -703,6 +703,7 @@ def test_total_error_r_never_rewards_a_worse_sigma():
     np.testing.assert_allclose(float(gw(dr)), 0.0, atol=1e-9)  # attractor at u = 1
 
 
+@pytest.mark.slow
 def test_design_objective_bias_term_needs_foregrounds() -> None:
     """bias_w against a foreground-free ensemble raises instead of being vacuous."""
     mc_ctx, opt_ctx, cleaner = _setup(4)  # fg_model=None
