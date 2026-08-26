@@ -42,22 +42,7 @@ jobs:
 
       - name: Run pytest (fast subset)
         if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.run_slow != 'true')
-        env:
-          AUGR_DELENS_WORKERS: "1"
-          AUGR_SHT_NTHREADS: "1"
-          OMP_NUM_THREADS: "1"
-          OPENBLAS_NUM_THREADS: "1"
-          MKL_NUM_THREADS: "1"
-        run: |
-          echo "--- cpus/mem/disk before ---"
-          nproc; free -m; df -h /
-          # TEMPORARY DIAGNOSTIC: -v so the log names the test we die on. The dots-only
-          # output of `pixi run test` cannot say which test stalls after 71%.
-          # Mirrors the `test` task exactly apart from -v and the pinned -n 2.
-          pixi run pytest tests/ -m 'not slow' -n 2 -v \
-            --timeout=180 --timeout-method=thread --max-worker-restart=0 -ra
-          echo "--- mem/disk after ---"
-          free -m; df -h /
+        run: pixi run test
 
       - name: Run pytest (full suite, includes slow)
         if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_slow == 'true')
