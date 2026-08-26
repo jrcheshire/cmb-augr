@@ -1086,3 +1086,139 @@ class TestFullSkyJaxBackend:
         g = jax.grad(f)(noise["bb"])
         assert jnp.all(jnp.isfinite(g))
         assert float(jnp.linalg.norm(g)) > 0
+
+
+# -----------------------------------------------------------------------
+# Gradient checkpointing of the QE scans (remat)
+# -----------------------------------------------------------------------
+
+#: Small enough to stay inside the fast gate's --timeout=180.
+_REMAT_KW = dict(ls=jnp.arange(2, 30, dtype=float), n_phi=32, n_iter=2)
+
+
+def _grad_temp_bytes(spectra, nl, l_max_qe, remat):
+    """XLA's own temp-buffer size for a jitted grad through the QE solve."""
+    def f(n):
+        return jnp.sum(delens_residual_bb(
+            spectra, n / 2.0, n, n, L_max=l_max_qe, l_max_qe=l_max_qe,
+            remat=remat, **_REMAT_KW))
+    return (jax.jit(jax.grad(f)).lower(nl).compile()
+            .memory_analysis().temp_size_in_bytes)
+
+
+class TestRematMemory:
+    """``remat=True`` is what stands between the design gradient and an OOM.
+
+    ``optimize._delens_from_combined_bb`` ties ``L_max`` to ``l_max_qe``, so the
+    reverse-mode tape over the five N_0 scans grows as ``l_max_qe**2 * n_phi``.
+    Measured on antares: 91.5 GB peak RSS at ``l_max_qe=1000`` and a 217 GB
+    single allocation at 1500, against a 124 GB node.
+
+    Gated on ``memory_analysis().temp_size_in_bytes`` -- XLA's buffer
+    assignment, which is deterministic for a given HLO -- rather than sampled
+    RSS, which depends on the allocator, the machine, and whatever else the
+    process did, and is meaningless under the ``-n auto`` parallel gate.
+
+    NOT ``peak_memory_in_bytes``: that field read 0.00 MB on a case whose temp
+    was 655 MB, i.e. it does not track the tape at all.
+
+    Ratios, not absolute byte counts -- absolutes are not portable across XLA
+    versions or backends.
+    """
+
+    def test_remat_collapses_the_tape(self, spectra, noise):
+        """Measured 200.7x at l_max_qe=200 (560.6 MB -> 2.79 MB). Gate at 20x,
+        leaving an order of magnitude of margin."""
+        plain = _grad_temp_bytes(spectra, noise["bb"], 200, False)
+        remat = _grad_temp_bytes(spectra, noise["bb"], 200, True)
+        assert remat < plain / 20.0, f"{plain / remat:.1f}x, expected >20x"
+
+    def test_remat_makes_memory_subquadratic_in_l_max_qe(self, spectra, noise):
+        """The whole point. Plain fits L^1.994 (measured 560.6 -> 2233.5 MB
+        over 200 -> 400); remat fits L^0.62 (2.79 -> 4.30 MB). Doubling
+        l_max_qe must at most double the remat tape."""
+        lo = _grad_temp_bytes(spectra, noise["bb"], 200, True)
+        hi = _grad_temp_bytes(spectra, noise["bb"], 400, True)
+        assert hi / lo < 2.5, f"remat tape grew {hi / lo:.2f}x for a 2x in L"
+
+        plain_lo = _grad_temp_bytes(spectra, noise["bb"], 200, False)
+        plain_hi = _grad_temp_bytes(spectra, noise["bb"], 400, False)
+        # Sanity: the thing we are fixing really is ~quadratic here, so a
+        # future refactor that removes the quadratic growth for some other
+        # reason does not leave this test silently vacuous.
+        assert plain_hi / plain_lo > 3.0
+
+
+class TestRematIsNumericallyTransparent:
+    """``jax.checkpoint`` rewrites the reverse-mode tape, not the forward jaxpr.
+
+    So values must be bit-identical and gradients must agree to a couple of ulp
+    (measured 3.4e-16 relative; the residual difference is XLA re-fusing the
+    recomputed forward). If any of these move, the premise is wrong and the
+    memory win is not free.
+    """
+
+    _KW: ClassVar[dict] = dict(l_min=2, l_max=200, n_phi=32)
+
+    def test_delens_residual_bb_value_bit_identical(self, spectra, noise):
+        a = delens_residual_bb(spectra, noise["tt"], noise["ee"], noise["bb"],
+                               L_max=200, l_max_qe=200, remat=True, **_REMAT_KW)
+        b = delens_residual_bb(spectra, noise["tt"], noise["ee"], noise["bb"],
+                               L_max=200, l_max_qe=200, remat=False, **_REMAT_KW)
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_iterate_delensing_value_bit_identical(self, spectra, noise):
+        """The other public wrapper -- both must honour the flag, or the
+        bit-exact ``test_matches_iterate`` would pass for the wrong reason."""
+        a = iterate_delensing(spectra, noise["tt"], noise["ee"], noise["bb"],
+                              L_max=200, l_max_qe=200, remat=True, **_REMAT_KW)
+        b = iterate_delensing(spectra, noise["tt"], noise["ee"], noise["bb"],
+                              L_max=200, l_max_qe=200, remat=False, **_REMAT_KW)
+        np.testing.assert_array_equal(np.asarray(a.cl_bb_res),
+                                      np.asarray(b.cl_bb_res))
+
+    def test_grad_agrees_to_a_few_ulp(self, spectra, noise):
+        """Measured max relative difference 3.4e-16. 1e-13 leaves ~300x."""
+        def scalar(n, remat):
+            return jnp.sum(delens_residual_bb(
+                spectra, n / 2.0, n, n, L_max=200, l_max_qe=200,
+                remat=remat, **_REMAT_KW))
+        g1 = np.asarray(jax.grad(scalar)(noise["bb"], True))
+        g0 = np.asarray(jax.grad(scalar)(noise["bb"], False))
+        assert np.all(np.isfinite(g1))
+        np.testing.assert_allclose(g1, g0, rtol=1e-13, atol=0.0)
+
+    def test_n0_estimators_bit_identical(self, spectra, noise):
+        Ls = jnp.arange(2, 40, dtype=float)
+        pairs = [
+            (compute_n0_tt, (Ls, spectra, noise["tt"])),
+            (compute_n0_ee, (Ls, spectra, noise["ee"])),
+            (compute_n0_eb, (Ls, spectra, noise["ee"], noise["bb"])),
+            (compute_n0_tb, (Ls, spectra, noise["tt"], noise["bb"])),
+            (compute_n0_te, (Ls, spectra, noise["tt"], noise["ee"])),
+        ]
+        for fn, args in pairs:
+            a = fn(*args, remat=True, **self._KW)
+            b = fn(*args, remat=False, **self._KW)
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_mv_and_kernel_bit_identical(self, spectra, noise):
+        """The kernel scan is only linear in l_max_qe, but it is remat'd too --
+        the linear term reaches GB scale at the l_max_qe the saturation wants."""
+        Ls = jnp.arange(2, 40, dtype=float)
+        ls = jnp.arange(2, 30, dtype=float)
+        mv_a = compute_n0_mv(Ls, spectra, noise["tt"], noise["ee"], noise["bb"],
+                             remat=True, **self._KW)
+        mv_b = compute_n0_mv(Ls, spectra, noise["tt"], noise["ee"], noise["bb"],
+                             remat=False, **self._KW)
+        np.testing.assert_array_equal(np.asarray(mv_a), np.asarray(mv_b))
+
+        k_a = lensing_kernel(ls, Ls, spectra, remat=True, **self._KW)
+        k_b = lensing_kernel(ls, Ls, spectra, remat=False, **self._KW)
+        np.testing.assert_array_equal(np.asarray(k_a), np.asarray(k_b))
+
+        r_a = residual_cl_bb(ls, Ls, spectra, mv_a, nl_ee=noise["ee"],
+                             remat=True, **self._KW)
+        r_b = residual_cl_bb(ls, Ls, spectra, mv_b, nl_ee=noise["ee"],
+                             remat=False, **self._KW)
+        np.testing.assert_array_equal(np.asarray(r_a), np.asarray(r_b))

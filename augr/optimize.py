@@ -96,7 +96,8 @@ def _delens_from_combined_bb(spectra: LensingSpectra,
                              nl_bb: jnp.ndarray,
                              ls: jnp.ndarray,
                              l_max_qe: int,
-                             n_iter: int) -> jnp.ndarray:
+                             n_iter: int,
+                             remat: bool = True) -> jnp.ndarray:
     """Residual lensing BB from the single combined polarization noise.
 
     In the design forward the inverse-variance-combined noise obeys the
@@ -107,7 +108,8 @@ def _delens_from_combined_bb(spectra: LensingSpectra,
     """
     return delens_residual_bb(
         spectra, nl_bb / 2.0, nl_bb, nl_bb,
-        ls=ls, L_max=l_max_qe, l_max_qe=l_max_qe, n_iter=n_iter)
+        ls=ls, L_max=l_max_qe, l_max_qe=l_max_qe, n_iter=n_iter,
+        remat=remat)
 
 
 @dataclass(frozen=True)
@@ -153,6 +155,11 @@ class DelensCoupling:
     n_iter: int
     nl_bb0: jnp.ndarray        # reference combined white nl_bb (on ells)
     cl_bb_res0: jnp.ndarray    # reference residual (on ls)
+    remat: bool = True         # gradient-checkpoint the QE scans
+    #: ``remat`` must be read by BOTH :meth:`build` and :meth:`residual`.
+    #: Setting it on only one of them still passes every value test (remat is
+    #: forward-transparent) while silently leaving the other path on the
+    #: O(l_max_qe**2) tape -- i.e. it would pass for the wrong reason.
 
     @classmethod
     def build(
@@ -168,6 +175,7 @@ class DelensCoupling:
         l_max_qe: int = 1000,
         n_iter: int = 5,
         ls: jnp.ndarray | None = None,
+        remat: bool = True,
     ) -> DelensCoupling:
         """Precompute the coupling at a reference design (one delensing solve).
 
@@ -185,7 +193,7 @@ class DelensCoupling:
             jnp.asarray(n_det), jnp.asarray(net), jnp.asarray(beam), jnp.asarray(eta),
             ells, mission_years, f_sky)
         cl_res0 = _delens_from_combined_bb(
-            lensing_spectra, nl_bb0, ls_arr, l_max_qe, n_iter)
+            lensing_spectra, nl_bb0, ls_arr, l_max_qe, n_iter, remat)
         return cls(
             spectra=lensing_spectra,
             ls=ls_arr,
@@ -194,6 +202,7 @@ class DelensCoupling:
             n_iter=int(n_iter),
             nl_bb0=nl_bb0,
             cl_bb_res0=cl_res0,
+            remat=bool(remat),
         )
 
     def residual(self, n_det, net, beam, eta, mission_years, f_sky):
@@ -207,7 +216,8 @@ class DelensCoupling:
             jnp.asarray(n_det), jnp.asarray(net), jnp.asarray(beam), jnp.asarray(eta),
             self.ells, mission_years, f_sky)
         return _delens_from_combined_bb(
-            self.spectra, nl_bb, self.ls, self.l_max_qe, self.n_iter)
+            self.spectra, nl_bb, self.ls, self.l_max_qe, self.n_iter,
+            self.remat)
 
 
 @dataclass(frozen=True)
@@ -260,6 +270,7 @@ class OptimizationContext:
     delens_cl_bb_res0: jnp.ndarray | None = None  # reference residual (on delens_ls)
     delens_nl_bb0: jnp.ndarray | None = None      # reference combined nl_bb (on delens_ells)
     delens_jac: jnp.ndarray | None = None         # d(cl_bb_res)/d(nl_bb), linearized mode
+    delens_remat: bool = True                     # checkpoint the QE scans (see delensing._scan)
 
 
 def make_optimization_context(
@@ -275,6 +286,7 @@ def make_optimization_context(
     delens_l_max_qe: int = 1000,
     delens_n_iter: int = 5,
     delens_ls: jnp.ndarray | None = None,
+    delens_remat: bool = True,
     **signal_kwargs,
 ) -> OptimizationContext:
     """One-time setup for differentiable sigma(r) optimization.
@@ -302,6 +314,10 @@ def make_optimization_context(
         lensing_spectra: LensingSpectra for the QE delensing (delens only).
         delens_l_max_qe: Max QE multipole for the delensing (delens only).
         delens_n_iter:   Delensing iterations (delens only).
+        delens_remat:    gradient-checkpoint the QE scans (delens only).
+                         Default True; without it a jax.grad through the
+                         recompute path allocates O(l_max_qe**2) of tape
+                         (~90 GB at l_max_qe=1000). Forward-transparent.
         delens_ls:       ell grid for the residual (delens only; default
                          2..300, must span the SignalModel [ell_min, ell_max]).
         **signal_kwargs: Passed to SignalModel (ell_min, ell_max, delta_ell,
@@ -351,7 +367,7 @@ def make_optimization_context(
             instrument.mission_duration_years, instrument.f_sky)
         delens_cl_bb_res0 = _delens_from_combined_bb(
             lensing_spectra, delens_nl_bb0, delens_ls_arr,
-            delens_l_max_qe, delens_n_iter)
+            delens_l_max_qe, delens_n_iter, delens_remat)
         if delens == "linearized":
             # J = d(cl_bb_res)/d(nl_bb) at the reference (reverse-mode: output
             # dim n_ls << input dim n_ells). This precompute costs O(n_ls)
@@ -359,7 +375,8 @@ def make_optimization_context(
             delens_jac = jax.jacrev(
                 lambda nlbb: _delens_from_combined_bb(
                     lensing_spectra, nlbb, delens_ls_arr,
-                    delens_l_max_qe, delens_n_iter))(delens_nl_bb0)
+                    delens_l_max_qe, delens_n_iter,
+                    delens_remat))(delens_nl_bb0)
         # Put the SignalModel in delensed mode at the reference residual.
         signal_kwargs = dict(signal_kwargs)
         signal_kwargs["delensed_bb"] = delens_cl_bb_res0
@@ -413,6 +430,7 @@ def make_optimization_context(
         delens_ls=delens_ls_arr,
         delens_ells=delens_ells_arr,
         delens_l_max_qe=delens_l_max_qe,
+        delens_remat=delens_remat,
         delens_n_iter=delens_n_iter,
         delens_cl_bb_res0=delens_cl_bb_res0,
         delens_nl_bb0=delens_nl_bb0,
@@ -501,7 +519,7 @@ def sigma_r_from_channels(
         if ctx.delens_mode == "recompute":
             cl_res = _delens_from_combined_bb(
                 ctx.lensing_spectra, nl_bb_del, ctx.delens_ls,
-                ctx.delens_l_max_qe, ctx.delens_n_iter)
+                ctx.delens_l_max_qe, ctx.delens_n_iter, ctx.delens_remat)
         else:  # 'linearized': cl_bb_res0 + J (nl_bb - nl_bb0)
             cl_res = ctx.delens_cl_bb_res0 + ctx.delens_jac @ (
                 nl_bb_del - ctx.delens_nl_bb0)

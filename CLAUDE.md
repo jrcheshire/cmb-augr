@@ -139,6 +139,38 @@ Knowing how the modules chain together matters more than any one file:
    gives ~2.2× over eager (FLOP-bound scan); one jitted grad solve is
    ~20 s at l_max_qe=1000 / ~90 s at l_max_qe=1500 on CPU.
 
+   **Gradient checkpointing (`remat=`, default True).** The five N_0
+   scans and the `lensing_kernel` scan run their bodies under
+   `jax.checkpoint(..., prevent_cse=False)` via the `_scan` helper.
+   Without it the reverse-mode tape is `O(l_max_qe² · n_phi)` — because
+   `optimize._delens_from_combined_bb` ties `L_max` to `l_max_qe`, so a
+   scan of length `l_max_qe` retains a dozen `(L_max, n_phi)`
+   intermediates per step. Measured: 560 MB at l_max_qe=200 and 2.2 GB
+   at 400 (exponent **1.994**), extrapolating to ~90 GB at the
+   production 1000 — which is what `jax.grad` through
+   `DelensCoupling.residual` actually allocated, and it OOM'd a 124 GB
+   node at 1500 (217 GB single allocation). With `remat=True` the same
+   tape is 2.79 MB / 4.30 MB (**200×** and **520×** smaller), and at
+   full production config (n_phi=128, n_iter=5) grows at only
+   ~0.033 MB per unit `l_max_qe`, i.e. **~134 MB at l_max_qe=4000**.
+   Forward values are **bit-identical**; `jax.grad` moves by 1-2 ulp
+   (3.4e-16 relative) from XLA re-fusing the recomputed forward, and
+   `jax.jacfwd` is untouched. Cost is ~2× on gradient runtime, nothing
+   on the value — the right trade, since at today's `l_max_qe` the
+   gradient is ~0.2% of a design evaluation while memory was the whole
+   constraint. **The kernel scan is remat'd too** even though it is only
+   *linear* in `l_max_qe`: measured 1.65 MB per unit L, i.e. 6.6 GB at
+   l_max_qe=4000, for ~1% extra runtime. Pass `remat=False` to opt out
+   (time-bound, memory-rich callers); flat-sky only, ignored when
+   `fullsky=True`. `remat` is read at **trace time**, so it must be a
+   Python bool, never a traced value. Gates: `TestRematMemory` and
+   `TestRematIsNumericallyTransparent` in `tests/test_delensing.py` —
+   the memory one is deterministic on
+   `memory_analysis().temp_size_in_bytes` (**not**
+   `peak_memory_in_bytes`, which reads ~0 on a 655 MB tape) and gates
+   ratios rather than absolute bytes, which are not portable across XLA
+   versions.
+
    **Differentiable full-sky delensing (issue #45, Stage 3).**
    `fullsky=True` also has a pure-jnp, `jax.grad`-traceable path: pass
    `backend='jax'` to `iterate_delensing` (or `compute_n0_mv` /
