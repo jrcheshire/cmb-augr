@@ -1,5 +1,7 @@
 """Tests for optimize.py — differentiable Fisher forecast for instrument optimization."""
 
+from typing import ClassVar
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -658,3 +660,74 @@ def test_delens_coupling_remat_flag_is_transparent(_coupling_design):
             d["mission_years"], d["f_sky"])
     np.testing.assert_array_equal(np.asarray(c_on.residual(*args)),
                                   np.asarray(c_off.residual(*args)))
+
+
+class TestCombinedWhiteNoiseOverflow:
+    """``_combined_white_nl_bb`` accumulates ``b_l**2 / w_inv``, not ``1 / nl_i``.
+
+    Regression for the NaN that killed a 96-design Vista EIG production run
+    (job 945271): every gradient came back non-finite while every *value* was
+    exact, and the only symptom was ``np.linalg.eigh`` raising "Eigenvalues did
+    not converge" seven hours in.
+    """
+
+    ELLS = jnp.arange(0.0, 5001.0)
+    #: 20 GHz on a ~1.3 m aperture. The lowest band of a probe-class design has
+    #: the largest beam, so it is the one whose b_l**2 underflows first.
+    BIG_BEAM = 47.83
+    ARGS: ClassVar[dict] = dict(mission_years=4.0, f_sky=0.6)
+
+    @staticmethod
+    def _naive(n_det, net, beam, eta, ells, mission_years, f_sky):
+        """The pre-fix accumulation, kept as the negative control."""
+        inv = jnp.zeros_like(ells)
+        for i in range(n_det.shape[0]):
+            inv = inv + 1.0 / noise_nl_continuous(
+                net[i], n_det[i], beam[i], eta[i], ells, mission_years, f_sky, 0.0, 1.0)
+        return 1.0 / inv
+
+    def _design(self, big_beam):
+        return (jnp.array([22.4, 2.1e4]),          # n_det
+                jnp.array([49.8, 61.2]),           # net
+                jnp.array([big_beam, 1.56]),       # beam: one huge, one small
+                jnp.array([0.5, 0.5]))             # eta
+
+    def test_large_beam_gradient_is_finite(self):
+        """The whole point: a large-beam channel must not poison the gradient."""
+        n_det, net, beam, eta = self._design(self.BIG_BEAM)
+
+        def f(b):
+            return jnp.sum(_combined_white_nl_bb(
+                n_det, net, b, eta, self.ELLS, **self.ARGS))
+
+        val = f(beam)
+        grad = jax.grad(f)(beam)
+        assert jnp.isfinite(val), "forward was never the broken half"
+        assert jnp.all(jnp.isfinite(grad)), f"non-finite beam gradient: {grad}"
+
+    def test_naive_accumulation_is_the_negative_control(self):
+        """Pin the mechanism: forming ``nl_i = w_inv / b_l**2`` overflows, and the
+        backward pass then multiplies ``-1/nl**2 -> -0`` by ``dnl/dbeam -> inf``.
+        Value finite, gradient NaN -- exactly the production signature.
+        """
+        n_det, net, beam, eta = self._design(self.BIG_BEAM)
+
+        def f_naive(b):
+            return jnp.sum(self._naive(n_det, net, b, eta, self.ELLS, **self.ARGS))
+
+        assert jnp.isfinite(f_naive(beam)), "the naive form's *value* is fine"
+        assert not jnp.all(jnp.isfinite(jax.grad(f_naive)(beam))), (
+            "the naive accumulation no longer overflows -- if fp64 or the beam "
+            "convention changed, re-derive BIG_BEAM/ELLS rather than deleting this"
+        )
+
+    def test_matches_naive_form_where_nothing_overflows(self):
+        """Away from the overflow the two forms are the same number: the fix is a
+        reassociation of a division, not a change of physics.
+        """
+        n_det, net, beam, eta = self._design(big_beam=8.0)
+        ells = jnp.arange(0.0, 1001.0)
+        got = _combined_white_nl_bb(n_det, net, beam, eta, ells, **self.ARGS)
+        want = self._naive(n_det, net, beam, eta, ells, **self.ARGS)
+        assert jnp.all(jnp.isfinite(want)), "control regime must not overflow"
+        np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-14)

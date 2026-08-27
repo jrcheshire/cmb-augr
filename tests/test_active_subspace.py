@@ -11,6 +11,7 @@ forward) is exercised by the driver / a slow test elsewhere.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from augr.active_subspace import (
     DesignSpec,
@@ -124,3 +125,25 @@ def test_designspec_log_roundtrip_and_zspace_gradient():
     g = np.asarray(jax.grad(loss_z)(np.zeros(3)))
     expected = w * spec.xi_fid_flat**2  # grad_xi = w*xi; *xi (chain) = w*xi^2 at z=0
     np.testing.assert_allclose(g, expected, rtol=1e-10)
+
+
+def test_active_subspace_rejects_non_finite_gradients():
+    """A NaN row must be named, not handed to eigh.
+
+    LAPACK reports it only as "Eigenvalues did not converge", which is what a
+    96-design production run surfaced after seven hours of compute.
+    """
+    g = np.ones((5, 3))
+    g[2, 1] = np.nan
+    g[4, :] = np.inf
+    with pytest.raises(ValueError, match=r"non-finite gradients in 2 of 5"):
+        active_subspace(g)
+
+
+def test_active_subspace_accepts_finite_gradients():
+    """The guard is not in the way of the normal path."""
+    rng = np.random.default_rng(0)
+    g = rng.standard_normal((12, 4))
+    sub = active_subspace(g)
+    assert np.all(np.isfinite(sub.eigenvalues))
+    np.testing.assert_allclose(np.sum(sub.energy), 1.0, rtol=1e-12)

@@ -41,7 +41,12 @@ import jax.numpy as jnp
 from augr.covariance import bandpower_covariance_blocks_from_noise
 from augr.delensing import LensingSpectra, delens_residual_bb
 from augr.fisher import _fisher_from_blocks, _fisher_from_full
-from augr.instrument import Instrument, noise_nl_continuous
+from augr.instrument import (
+    Instrument,
+    beam_bl,
+    noise_nl_continuous,
+    white_noise_power_continuous,
+)
 from augr.signal import SignalModel, flatten_params
 from augr.telescope import (
     beam_fwhm_arcmin,
@@ -80,15 +85,27 @@ def _combined_white_nl_bb(n_det: jnp.ndarray,
     the scalar ``0.5`` -- indexing that per channel raised ``IndexError: array is
     0-dimensional``, so ``delens=`` was unusable from the physical entry point
     even though the channel-level one worked.
+
+    **The per-channel inverse weight is accumulated as ``b_l**2 / w_inv``, never
+    as ``1 / (w_inv / b_l**2)``.** The two are algebraically identical and agree
+    to fp64 round-off, but the second overflows: on the delensing noise grid
+    (``ell`` to 5000) a large-beam channel's ``b_l**2`` decays past what fp64
+    holds, so ``noise_nl_continuous``'s ``w_inv / b_l**2`` reaches ``+inf``. The
+    *value* survives -- ``1 / inf`` is 0, i.e. the channel correctly drops out of
+    the combine where its beam has killed all signal -- but the backward pass
+    multiplies ``d(1/nl)/d(nl) = -1/nl**2 -> -0`` by ``d(nl)/d(beam) -> inf`` and
+    ``0 * inf`` is **NaN**. Accumulating the reciprocal directly keeps the
+    underflowed channel at a clean zero contribution with a zero derivative.
     """
     n_chan = n_det.shape[0]
     net, beam, eta = (jnp.broadcast_to(jnp.asarray(x, dtype=float), (n_chan,))
                       for x in (net, beam, eta))
     inv = jnp.zeros_like(ells, dtype=float)
     for i in range(n_chan):
-        nl_i = noise_nl_continuous(net[i], n_det[i], beam[i], eta[i], ells,
-                                   mission_years, f_sky, 0.0, 1.0)
-        inv = inv + 1.0 / nl_i
+        # 1 / nl_i, formed without ever materializing nl_i = w_inv / b_l**2.
+        w_inv_i = white_noise_power_continuous(
+            net[i], n_det[i], eta[i], mission_years, f_sky)
+        inv = inv + beam_bl(ells, beam[i]) ** 2 / w_inv_i
     return 1.0 / inv
 
 
