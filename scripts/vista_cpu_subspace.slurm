@@ -37,17 +37,18 @@ export PYTHONUNBUFFERED=1
 # Let pin_blas own the thread count (OMP=1 per worker). Clear any inherited cap.
 unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS 2>/dev/null || true
 
-cd "$WORK/vista/cmb-augr"
+cd "$WORK/cmb-augr"   # $WORK is already .../vista on Vista
 
 # lmax=192 is jht's HEALPix band-limit ceiling at nside=128 (lmax <= 1.5*nside, enforced by
 # jht.wiener even under --backend ducc), still clean through the recomb bump. M=96 designs
 # (>> D=8) gives a robust C. n_sims=30 clears the Hartlap floor (n_bins+2 = 26 at these
 # bins); n_sims=100 needs the array pattern (see header). pysm3 runs on the Grace cores
-# (--fg-model d1s1 generates inline), but the TEMPLATES must be pre-cached from the LOGIN
-# node (compute nodes have no internet):
-#   pixi run -e cpu python -c "import pysm3, pysm3.units as u; \
-#       pysm3.Sky(nside=128, preset_strings=['d1','s1']).get_emission(100*u.GHz)"
-pixi run -e cpu python scripts/active_subspace_hl_eig.py \
+# (--fg-model d1s1 generates inline), but the TEMPLATES must already be in the astropy
+# cache: compute nodes have no network AND pixi is not usable on login nodes, so copy the
+# 9 d1s1 files (108 MB) from a machine that has them into ~/.cache/astropy/download/url/
+# (astropy >= 8 reads ~/.cache/astropy, not ~/.astropy/cache). See
+# scripts/vista_smoke_one_design.slurm for the smoke that sizes --workers for this run.
+"$HOME/.pixi/bin/pixi" run --frozen -e cpu python scripts/active_subspace_hl_eig.py \
     --backend ducc --fft-mode looped --nside 128 --lmax 192 \
     --n-sims 30 --n-designs 96 --n-crn 1 \
     --workers 8 \
