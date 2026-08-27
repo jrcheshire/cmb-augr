@@ -408,8 +408,13 @@ def _load_part(path):
 
 
 def _grad_part_valid(part, z_row, cfg):
+    # Finiteness is part of validity, not a downstream concern: a NaN gradient is a
+    # dead run, and without this check 96 of them wrote cleanly and only surfaced
+    # 7 h later as "Eigenvalues did not converge" out of np.linalg.eigh.
     return (
         part is not None
+        and np.all(np.isfinite(part["grad"]))
+        and np.isfinite(part["value"])
         and part["z"].shape == np.shape(z_row)
         and np.allclose(part["z"], z_row, rtol=1e-12, atol=0.0)
         and int(part["nside"]) == cfg["nside"]
@@ -521,6 +526,14 @@ def _grad_worker(payload):
         vs.append(float(v))
         gs.append(g)
     g_stack = np.stack(gs, axis=0)
+    if not (np.all(np.isfinite(g_stack)) and np.all(np.isfinite(vs))):
+        bad = sorted({int(k) for k in np.where(~np.isfinite(g_stack))[1]})
+        raise FloatingPointError(
+            f"design {i}: non-finite gradient, no part written. Knobs {bad} "
+            f"(value={np.mean(vs):.6g}). A finite value with a NaN gradient is the "
+            "signature of a 0 * inf in the backward pass -- run the design alone "
+            "under JAX_DEBUG_NANS=1 rather than letting the sweep continue."
+        )
     _write_part(
         path,
         z=np.asarray(z_row),

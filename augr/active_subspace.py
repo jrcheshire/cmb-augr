@@ -215,6 +215,13 @@ def active_subspace(grads: np.ndarray, *, weights: np.ndarray | None = None) -> 
     energy spectrum (a gap reveals the active dimension), the eigenvectors the design directions.
     """
     g = np.asarray(grads)
+    if not np.all(np.isfinite(g)):
+        rows = np.where(~np.all(np.isfinite(g), axis=1))[0]
+        raise ValueError(
+            f"non-finite gradients in {rows.size} of {g.shape[0]} samples "
+            f"(e.g. rows {rows[:8].tolist()}). eigh reports these only as the "
+            "opaque 'Eigenvalues did not converge', so they are rejected here."
+        )
     m = g.shape[0]
     w = np.ones(m) / m if weights is None else np.asarray(weights) / np.sum(weights)
     c = (g * w[:, None]).T @ g  # (D, D) = sum_i w_i g_i g_i^T
