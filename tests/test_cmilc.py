@@ -154,6 +154,22 @@ def test_cilc_constraint_holds_batched() -> None:
     np.testing.assert_allclose(np.asarray(resid), 0.0, atol=1e-12)
 
 
+def test_cilc_prewhitened_solve_matches_direct() -> None:
+    """cmb-augr #50: the whitened constrained solve equals the direct
+    ``C⁻¹A(AᵀC⁻¹A)⁻¹e`` at a diagonal spread (1e8) fp64 still handles unwhitened."""
+    rng = np.random.default_rng(3)
+    n, k = 7, 4
+    a = rng.normal(size=(n, n))
+    scale = 10.0 ** np.linspace(-2, 2, n)
+    cov_np = (a @ a.T + n * np.eye(n)) * np.outer(scale, scale)
+    A = rng.normal(size=(n, k))
+    e = np.array([1.0, 0.0, 0.0, 0.0])
+    cia = np.linalg.solve(cov_np, A)
+    w_direct = cia @ np.linalg.solve(A.T @ cia, e)
+    w = _cilc_weights_from_cov(jnp.asarray(cov_np), jnp.asarray(A), jnp.asarray(e))
+    np.testing.assert_allclose(np.asarray(w), w_direct, rtol=1e-11, atol=1e-14)
+
+
 # --- moment SED mixing matrix ----------------------------------------------
 
 

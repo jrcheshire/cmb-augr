@@ -308,3 +308,21 @@ def test_gnilc_localized_reduces_near_plane_residual() -> None:
 # forward-only (a diagnostic / realism cross-check); the *global* GNILC
 # (test_gnilc_template_differentiable_in_noise) is the differentiable path for optimization.
 # cMILC's localized path is solve-based (no eigenvector projector) and is unaffected.
+
+
+def test_gnilc_estimator_is_covariant_under_channel_rescaling() -> None:
+    """cmb-augr #50: GNILC needs only the per-channel ridge, not a prewhitened solve,
+    because ``W`` is covariant under ``C -> D C D``: ``W(DCD, DC_nD) = D W(C, C_n) D⁻¹``
+    (the generalized eigenproblem ``R v = λ R_n v`` is invariant, ``m`` included)."""
+    rng = np.random.default_rng(7)
+    n, n_fg = 6, 2
+    fg = rng.normal(size=(n, n_fg))
+    cov_n = np.diag(rng.uniform(0.5, 2.0, n))
+    cov_t = fg @ fg.T * 50.0 + cov_n
+    d = 10.0 ** np.linspace(-2, 2, n)
+    dd = np.outer(d, d)
+    w, m = _gnilc_fg_estimator(jnp.asarray(cov_t), jnp.asarray(cov_n), ridge=0.0)
+    w_s, m_s = _gnilc_fg_estimator(jnp.asarray(cov_t * dd), jnp.asarray(cov_n * dd), ridge=0.0)
+    assert int(m) == int(m_s) == n_fg
+    np.testing.assert_allclose(np.asarray(w_s), np.asarray(w) * np.outer(d, 1 / d),
+                               rtol=1e-9, atol=1e-12)

@@ -97,9 +97,9 @@ FP_DIAMETER_M = 0.3  # m (fixed cold focal-plane diameter)
 ETA_TOTAL = 0.5
 F_SKY = 0.6
 SEED_STRIDE = 100_000  # disjoint CRN seed blocks (cf. mapbased_grad_characterization.py)
-# cmb-augr #50: augr.cleaning's 1e-10 default scales the ILC ridge by the arithmetic mean
-# of a covariance diagonal spanning ~10 decades, which swamps the CMB-carrying channels.
-# 1e-14 is NOT converged either; 1e-18 is the workaround the JPL f_sky scripts already use.
+# cmb-augr #50 (fixed): the ridge is now a fraction of each channel's own variance and
+# the library default 1e-10 sits on the plateau even at a 10-1000 GHz band set. 1e-18
+# is kept so production stays on the value the smoke and 945271 ran with.
 RIDGE = 1e-18
 
 

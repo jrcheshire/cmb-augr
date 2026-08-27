@@ -99,12 +99,11 @@ class ForecastConfig:
     # residual-template source
     residual_source: ResidualTemplateSource = ResidualTemplateSource.ORACLE
     gnilc_m_bias: int = 1
-    #: Ridge regularization for the GNILC template's channel covariances. The library
-    #: default is ``1e-10``, which is cmb-augr #50: ``_ridge`` scales the regularization
-    #: by an *arithmetic mean* of a covariance diagonal spanning ~10 decades in CMB
-    #: units, so at a wide band set it swamps the CMB-carrying channels. Exposed here
-    #: because this path had no override at all -- the GNILC template silently inherited
-    #: the pathological value. Set ``1e-18`` for a wide (10-1000 GHz) band set.
+    #: Ridge regularization for the GNILC template's channel covariances, a fraction of
+    #: each channel's own variance (see :func:`augr.nilc._ridge`; cmb-augr #50 -- the
+    #: pre-fix arithmetic-mean scaling made the ``1e-10`` default pathological at a wide
+    #: band set, which is why this path grew an override). Exposed so the GNILC
+    #: template can be regularized independently of the cleaner's own ``ridge``.
     gnilc_ridge: float = 1e-10
     # forecast
     f_sky: float = 1.0
