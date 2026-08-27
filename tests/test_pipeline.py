@@ -8,6 +8,8 @@ gates pysm-free, and the meaningful GNILC-with-foreground gate is marked slow.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -180,6 +182,47 @@ def test_run_forecast_cutsky_mc_runs() -> None:
     )
     out = run_forecast(cfg)
     assert np.isfinite(out.sigma_r_baseline) and out.sigma_r_baseline > 0
+
+
+def test_gnilc_ridge_reaches_the_template_call() -> None:
+    """``ForecastConfig.gnilc_ridge`` must actually arrive at the GNILC template.
+
+    A threaded-but-ignored parameter and a correctly-threaded one are
+    indistinguishable downstream: the forecast still runs, still returns finite
+    numbers, and silently uses the library default ``1e-10`` -- which is cmb-augr #50,
+    measured at 4.3x total / 7.6x on the FG residual for a wide band set. Before this
+    knob existed the GNILC path had no override at all, so assert the forwarding
+    directly rather than inferring it from a spectrum.
+
+    Recorded rather than run end-to-end: this needs no pysm3 and no cleaning, so it
+    stays in the fast tier where a regression is caught on every PR.
+    """
+    import augr.pipeline as pipeline_mod
+
+    seen = {}
+
+    def _recorder(*args, **kwargs):
+        seen.update(kwargs)
+        return (np.arange(4.0), np.zeros(4))
+
+    cfg = _nilc_config(
+        residual_source=ResidualTemplateSource.GNILC, gnilc_ridge=1.234e-18
+    )
+    cleaned = SimpleNamespace(
+        spectra=SimpleNamespace(cl_residual_fg=np.zeros(4), ells=np.arange(4.0)),
+        total_qu=None,
+        cmb_qu=None,
+        noise_qu=None,
+    )
+
+    orig = pipeline_mod.gnilc_residual_template
+    pipeline_mod.gnilc_residual_template = _recorder
+    try:
+        pipeline_mod._residual_template(cleaned, cfg)
+    finally:
+        pipeline_mod.gnilc_residual_template = orig
+
+    assert seen["ridge"] == 1.234e-18, seen
 
 
 @pytest.mark.slow

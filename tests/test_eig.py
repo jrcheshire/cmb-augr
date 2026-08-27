@@ -31,7 +31,7 @@ from augr.active_subspace import (
 )
 from augr.cleaning import nilc_cleaner
 from augr.config import cleaned_map_instrument
-from augr.cost import CostModel, aperture_from_fwhm, bias_wall, budget_penalty
+from augr.cost import CostModel, aperture_from_fwhm, budget_penalty, total_error_r
 from augr.delensing import load_lensing_spectra
 from augr.design_opt import build_design_objectives
 from augr.eig import (
@@ -643,51 +643,69 @@ def test_delta_r_is_linear_and_signed():
     np.testing.assert_allclose(float(delta_r_from_residual(cov, -d, ctx)), -b1, rtol=1e-10)
 
 
-def test_bias_wall_is_zero_inside_the_budget_and_quadratic_outside():
-    """Zero while |Delta r| <= eps*sigma, quadratic past it, C1 at the knee."""
-    sigma, eps = 1e-3, 0.5
-    knee = eps * sigma
-    assert float(bias_wall(0.0, sigma, eps=eps)) == 0.0
-    assert float(bias_wall(0.999 * knee, sigma, eps=eps)) == 0.0
-    assert float(bias_wall(-0.999 * knee, sigma, eps=eps)) == 0.0  # symmetric in sign
-    over = 0.25 * sigma
+def test_total_error_r_is_the_quadrature_sum():
+    """sqrt(sigma^2 + bias_w*dr^2), and bias_w=0 returns sigma untouched."""
+    sigma, dr = 1e-3, 4e-4
     np.testing.assert_allclose(
-        float(bias_wall(knee + over, sigma, eps=eps)), over**2, rtol=1e-12
+        float(total_error_r(sigma, dr, bias_w=1.0)),
+        np.hypot(sigma, dr),
+        rtol=1e-12,
     )
-    # C1 at the knee: the derivative approaches 0 from above.
-    g = float(jax.grad(lambda d: bias_wall(d, sigma, eps=eps))(knee + 1e-9))
-    assert abs(g) < 1e-8
-    # and stiffness scales linearly
     np.testing.assert_allclose(
-        float(bias_wall(knee + over, sigma, eps=eps, weight=7.0)), 7.0 * over**2, rtol=1e-12
+        float(total_error_r(sigma, dr, bias_w=0.0)), sigma, rtol=1e-12
     )
-
-
-def test_bias_wall_tightens_as_the_design_gets_more_precise():
-    """The SAME bias is free at a loose sigma(r) and penalized at a tight one.
-
-    This is the property that makes it a bias/variance statement rather than an
-    absolute bias cap: buying precision raises the bar the design must clear.
-    """
-    delta_r = 1e-3
-    assert float(bias_wall(delta_r, 4e-3, eps=0.5)) == 0.0   # 0.25 sigma -> free
-    assert float(bias_wall(delta_r, 1e-3, eps=0.5)) > 0.0    # 1.0 sigma  -> bites
-
-
-def test_sigma_r_readout_matches_the_eig_framing():
-    """sigma_r_from_posterior_fisher is the sigma(r) the EIG is built on."""
-    ctx = _opt_ctx()
-    cov = _synthetic_cov(ctx.J.shape[0], seed=7)
+    # sign of the bias is irrelevant; only the square enters
     np.testing.assert_allclose(
-        float(sigma_r_from_posterior_fisher(cov, ctx)),
-        float(sigma_r_from_external_cov(cov, ctx)),
+        float(total_error_r(sigma, -dr, bias_w=2.0)),
+        float(total_error_r(sigma, dr, bias_w=2.0)),
+        rtol=0,
+        atol=0,
+    )
+    # and the weight scales the bias term, not the variance term
+    np.testing.assert_allclose(
+        float(total_error_r(sigma, dr, bias_w=4.0)),
+        np.sqrt(sigma**2 + 4.0 * dr**2),
         rtol=1e-12,
     )
 
 
+def test_total_error_r_never_rewards_a_worse_sigma():
+    """The property the one-sided sigma-normalized wall failed.
+
+    A penalty of the form ``max(|dr|/sigma - eps, 0)**2`` DECREASES as sigma grows, so
+    against a ``-log sigma`` utility it has a stationary point at ``2w*u(u-eps) = 1``
+    for ``u = |dr|/sigma`` -- a local minimum at ``u = 1`` when ``w = 1, eps = 0.5``,
+    which the optimizer can reach by degrading precision rather than reducing the bias.
+    The quadrature form must be strictly increasing in sigma at fixed bias, so that
+    mechanism cannot exist. Checked on the objective's actual utility, ``-log``.
+    """
+    dr = 1e-3
+    sigmas = np.array([1e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2])
+
+    err = np.array([float(total_error_r(sg, dr, bias_w=1.0)) for sg in sigmas])
+    assert np.all(np.diff(err) > 0), err
+
+    # the same statement where it actually bites: the loss the optimizer descends
+    loss = np.log(err)
+    assert np.all(np.diff(loss) > 0), loss
+
+    # gradient is strictly positive in sigma everywhere, not merely monotone on a grid
+    g = jax.grad(lambda sg: jnp.log(total_error_r(sg, dr, bias_w=1.0)))
+    for sg in sigmas:
+        assert float(g(sg)) > 0.0, sg
+
+    # and the withdrawn wall really did have the defect, at the predicted location
+    def wall_loss(sg):
+        return jnp.log(sg) + jnp.maximum(jnp.abs(dr) / sg - 0.5, 0.0) ** 2
+
+    gw = jax.grad(wall_loss)
+    assert float(gw(dr / 2.0)) < 0.0, "wall should reward inflating sigma at u = 2"
+    np.testing.assert_allclose(float(gw(dr)), 0.0, atol=1e-9)  # attractor at u = 1
+
+
 @pytest.mark.slow
-def test_design_objective_bias_wall_needs_foregrounds() -> None:
-    """bias_eps against a foreground-free ensemble raises instead of being vacuous."""
+def test_design_objective_bias_term_needs_foregrounds() -> None:
+    """bias_w against a foreground-free ensemble raises instead of being vacuous."""
     mc_ctx, opt_ctx, cleaner = _setup(4)  # fg_model=None
     args = (
         jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS,
@@ -696,12 +714,12 @@ def test_design_objective_bias_wall_needs_foregrounds() -> None:
     with pytest.raises(ValueError, match="foreground"):
         design_objective(
             *args, mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner,
-            cost_model=CostModel(), budget=1.0e12, freqs_ghz=FREQS, bias_eps=0.5,
+            cost_model=CostModel(), budget=1.0e12, freqs_ghz=FREQS, bias_w=1.0,
         )
 
 
 @pytest.mark.slow
-def test_design_objective_bias_wall_bites_on_a_real_residual() -> None:
+def test_design_objective_bias_term_bites_on_a_real_residual() -> None:
     """End to end with foregrounds: Delta r is finite, and the wall engages only
     when the bias exceeds its sigma(r) budget.
 
@@ -741,27 +759,30 @@ def test_design_objective_bias_wall_bites_on_a_real_residual() -> None:
     sigma_r = float(sigma_r_from_posterior_fisher(traced.covariance, opt_ctx))
     assert np.isfinite(delta_r) and delta_r != 0.0
 
-    # A budget far above the realized bias leaves the objective untouched; one far
-    # below it must raise the objective by exactly the wall's value.
+    # bias_w=0 must reproduce the no-bias objective analytically (the utility becomes
+    # log(sigma_prior/sqrt(sigma^2)) = log(sigma_prior/sigma)); a positive weight must
+    # raise the loss by exactly the quadrature form's value.
     base = float(design_objective(*args, **kw))
-    loose = float(design_objective(*args, bias_eps=100.0 * abs(delta_r) / sigma_r, **kw))
-    np.testing.assert_allclose(loose, base, rtol=1e-10)
+    off = float(design_objective(*args, bias_w=0.0, **kw))
+    np.testing.assert_allclose(off, base, rtol=1e-10)
 
-    eps_tight = 0.1 * abs(delta_r) / sigma_r
-    tight = float(design_objective(*args, bias_eps=eps_tight, **kw))
-    expected = base + float(bias_wall(delta_r, sigma_r, eps=eps_tight))
-    assert tight > base
-    np.testing.assert_allclose(tight, expected, rtol=1e-10)
+    for w in (1.0, 5.0):
+        got = float(design_objective(*args, bias_w=w, **kw))
+        expected = base + float(
+            jnp.log(total_error_r(sigma_r, delta_r, bias_w=w)) - jnp.log(sigma_r)
+        )
+        assert got > base, w
+        np.testing.assert_allclose(got, expected, rtol=1e-10)
 
 
 @pytest.mark.slow
-def test_physical_design_objective_forwards_delens_and_bias_wall() -> None:
-    """The physical entry point forwards delens= and bias_eps= unchanged.
+def test_physical_design_objective_forwards_delens_and_bias_term() -> None:
+    """The physical entry point forwards delens= and bias_w= unchanged.
 
     Both are pure kwarg passthroughs, but this is the entry point the EIG driver
     actually calls (it is the one that takes aperture), so a forwarding typo would
     surface only in a production run -- as a design silently credited with no
-    delensing, or an inactive bias wall, both of which look like success.
+    delensing, or an inactive bias term, both of which look like success.
 
     Asserted by equivalence: derive the channels the physical path derives, call
     design_objective directly on them, and require the same scalar.
@@ -787,7 +808,7 @@ def test_physical_design_objective_forwards_delens_and_bias_wall() -> None:
     )
     shared = dict(
         mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner, cost_model=cm,
-        budget=1.0e12, delens=coupling, bias_eps=0.5, bias_weight=3.0,
+        budget=1.0e12, delens=coupling, bias_w=3.0,
     )
 
     got = float(physical_design_objective(

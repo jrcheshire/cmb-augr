@@ -68,7 +68,7 @@ import numpy as np
 from jax.scipy.special import logsumexp
 
 from augr.cleaning import Cleaner
-from augr.cost import CostModel, aperture_from_fwhm, bias_wall, budget_penalty
+from augr.cost import CostModel, aperture_from_fwhm, budget_penalty, total_error_r
 from augr.fisher import _fisher_from_full
 from augr.optimize import DelensCoupling, OptimizationContext, design_to_channels
 from augr.optimize_mapbased import w_inv_from_noise_design
@@ -494,8 +494,7 @@ def design_objective(
     eig_key=None,
     n_outer: int = 256,
     delens: DelensCoupling | None = None,
-    bias_eps: float | None = None,
-    bias_weight: float = 1.0,
+    bias_w: float | None = None,
 ):
     """Cost-constrained Bayesian-design objective to MINIMIZE.
 
@@ -538,32 +537,42 @@ def design_objective(
     reference design (the same frozen-Jacobian convention
     :func:`augr.optimize.sigma_r_from_channels` uses analytically).
 
-    ``bias_eps`` (default ``None`` = off) turns on the **r-bias wall**
-    ``bias_weight * max(|Delta r| - bias_eps * sigma(r), 0)^2``
-    (:func:`augr.cost.bias_wall`), with ``Delta r`` the linear bias from the residual
-    foreground the fit does not model (:func:`delta_r_from_residual`, fed by the map
-    forward's ``fg_residual=True`` leg). **The EIG carries no bias term** -- it is
-    ``-log sigma(r) + const`` -- so without this the objective will buy a design with
-    a small ``sigma(r)`` and a large ``Delta r``, and nothing in the fit flags it. It
-    matters most for the sky-coverage axis, which costs nothing in the budget model:
-    an unconstrained mask runs to wherever ``sigma(r)`` is smallest, i.e. into the
-    Galaxy. Set ``bias_eps=0.5`` for the nominal half-sigma budget.
+    ``bias_w`` (default ``None`` = off) folds the **r-bias** into the utility, which
+    becomes ``log(sigma_prior / sqrt(sigma(r)^2 + bias_w*Delta r^2))``
+    (:func:`augr.cost.total_error_r`) -- the standard quadrature error budget, with
+    ``Delta r`` the linear bias from the residual foreground the fit does not model
+    (:func:`delta_r_from_residual`, fed by the map forward's ``fg_residual=True`` leg).
+    **The EIG carries no bias term** -- it is ``-log sigma(r) + const`` -- so without
+    this the objective will buy a design with a small ``sigma(r)`` and a large
+    ``Delta r``, and nothing in the fit flags it. It matters most for the sky-coverage
+    axis, which costs nothing in the budget model: an unconstrained mask runs to
+    wherever ``sigma(r)`` is smallest, i.e. into the Galaxy. ``bias_w=1.0`` weights a
+    unit of bias exactly like a unit of statistical error; only the ratio to the
+    variance weight is meaningful, so there is one knob rather than two.
 
-    The wall requires an ``mc_ctx`` built with a foreground model; against a
-    foreground-free ensemble there is no residual to bias anything and it raises
-    rather than silently contributing zero.
+    This replaced a one-sided wall on the bias *in units of sigma(r)*,
+    ``weight * max(|Delta r|/sigma - eps, 0)^2``, which was withdrawn because it
+    decreases as ``sigma(r)`` grows: a design could satisfy it by making its error bar
+    worse instead of its bias smaller. Against the ``-log sigma`` utility that produces
+    a genuine attractor at ``|Delta r| = sigma(r)``, reachable by degrading precision.
+    Nothing in the quadrature form decreases in ``sigma``, so the mechanism is gone.
+    See :func:`augr.cost.total_error_r`.
 
-    **The wall is only as honest as the fit's residual template.** ``Delta r`` is the
-    bias of the forecast ``opt_ctx`` describes, so if that fit carries a free
-    ``A_res`` whose template was built from the *same* Monte-Carlo residual used as
-    ``Delta D``, the amplitude absorbs it exactly and the wall reads **identically
-    zero for every design** -- measured at -2.6e-16 in a d10s5 smoke, i.e. machine
-    precision, against a bias of 73 sigma with the template absent. That failure is
-    silent and indistinguishable from every design passing. It is not an argument
-    against fitting ``A_res`` (marginalizing it cost 34% on sigma(r) in the same
-    smoke, which is the real trade); it is a requirement that the template not be
-    derived from the truth it is meant to be biased by -- freeze it at one design, or
-    take it from a different sky model, so template mismatch is what the wall sees.
+    Requires an ``mc_ctx`` built with a foreground model; against a foreground-free
+    ensemble there is no residual to bias anything and it raises rather than silently
+    contributing zero.
+
+    **It is only as honest as the fit's residual template.** ``Delta r`` is the bias of
+    the forecast ``opt_ctx`` describes, so if that fit carries a free ``A_res`` whose
+    template was built from the *same* Monte-Carlo residual used as ``Delta D``, the
+    amplitude absorbs it exactly and the bias term reads **identically zero for every
+    design** -- measured at -2.6e-16 in a d10s5 smoke, i.e. machine precision, against a
+    bias of 73 sigma with the template absent. That failure is silent and
+    indistinguishable from every design passing. It is not an argument against fitting
+    ``A_res`` (marginalizing it cost 34% on sigma(r) in the same smoke, which is the
+    real trade); it is a requirement that the template not be derived from the truth it
+    is meant to be biased by -- freeze it at one design, or take it from a different sky
+    model, so template mismatch is what it sees.
 
     Returns ``-utility + budget_penalty`` (a minimization scalar): descent maximizes EIG
     while staying on the affordable side of the budget surface.
@@ -579,9 +588,9 @@ def design_objective(
             n_det, net, beam_fwhm, eta_total, mission_years, f_sky_noise
         )
         cl_bb_res_ells = delens.ls
-    if bias_eps is not None and mc_ctx.harmonic_skies.fg_eb_alm is None:
+    if bias_w is not None and mc_ctx.harmonic_skies.fg_eb_alm is None:
         raise ValueError(
-            "bias_eps= needs a foreground ensemble: build mc_ctx with a fg_model "
+            "bias_w= needs a foreground ensemble: build mc_ctx with a fg_model "
             "(d10s5 is the nominal truth model). With no foregrounds there is no "
             "residual, so the wall would be identically zero and silently vacuous."
         )
@@ -594,7 +603,7 @@ def design_objective(
         mask=mask,
         cl_bb_res=cl_bb_res,
         cl_bb_res_ells=cl_bb_res_ells,
-        fg_residual=bias_eps is not None,
+        fg_residual=bias_w is not None,
     )
     util = _utility(
         traced.covariance,
@@ -609,16 +618,20 @@ def design_objective(
     cost = design_cost(
         n_det, beam_fwhm, mission_years, cost_model=cost_model, freqs_ghz=freqs_ghz
     )
-    loss = -util + budget_penalty(cost, budget, penalty_weight)
-    if bias_eps is not None:
+    if bias_w is not None:
+        # Fold the bias into the utility rather than adding a penalty beside it: the
+        # r-marginal EIG is log(sigma_prior/sigma_r), so replacing sigma_r by the
+        # effective error sqrt(sigma^2 + bias_w*dr^2) generalizes it in place. At
+        # bias_w=0 the two agree analytically; `None` keeps the old expression exactly,
+        # so the no-bias path stays byte-identical rather than round-tripping a sqrt.
         delta_r = delta_r_from_residual(
             traced.covariance, traced.fg_residual_bandpower, opt_ctx
         )
         sigma_r = sigma_r_from_posterior_fisher(traced.covariance, opt_ctx)
-        loss = loss + bias_wall(
-            delta_r, sigma_r, eps=bias_eps, weight=bias_weight
+        util = jnp.log(sigma_prior_r) - jnp.log(
+            total_error_r(sigma_r, delta_r, bias_w=bias_w)
         )
-    return loss
+    return -util + budget_penalty(cost, budget, penalty_weight)
 
 
 def physical_design_objective(
@@ -644,8 +657,7 @@ def physical_design_objective(
     n_outer: int = 256,
     galactic_loading: bool = True,
     delens: DelensCoupling | None = None,
-    bias_eps: float | None = None,
-    bias_weight: float = 1.0,
+    bias_w: float | None = None,
 ):
     """Cost-constrained EIG objective from the physical horn-packing design knobs.
 
@@ -716,6 +728,5 @@ def physical_design_objective(
         eig_key=eig_key,
         n_outer=n_outer,
         delens=delens,
-        bias_eps=bias_eps,
-        bias_weight=bias_weight,
+        bias_w=bias_w,
     )
