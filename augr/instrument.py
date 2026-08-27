@@ -103,6 +103,19 @@ GROUND_EFFICIENCY = ScalarEfficiency(
 # Idealized space mission ("idealized" telescope-design variants): PICO-like
 # observing efficiency assumption; everything else matches L2.
 # η_total = 0.762.
+# PICO's own accounting (arXiv:1902.10541 Table 3.2): the CBE per-band array NET
+# already folds in everything except 90% detector operability and 95% survey
+# efficiency, so those are the only two factors that turn its NETs into its
+# published map depths. Used by ``config.pico_like`` so the preset reproduces the
+# published depths; NOT a recommendation for a new design (see L2_EFFICIENCY).
+PICO_EFFICIENCY = ScalarEfficiency(
+    detector_yield=0.90,
+    observing_efficiency=0.95,
+    data_cut_fraction=1.0,
+    cosmic_ray_deadtime=1.0,
+    polarization_efficiency=1.0,
+)
+
 IDEALIZED_EFFICIENCY = ScalarEfficiency(
     detector_yield=0.85,
     observing_efficiency=0.95,   # PICO assumption

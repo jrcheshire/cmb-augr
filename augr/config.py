@@ -36,9 +36,13 @@ References:
 
 from __future__ import annotations
 
+import math
+from dataclasses import replace
+
 from augr.instrument import (
     GROUND_EFFICIENCY,
     L2_EFFICIENCY,
+    PICO_EFFICIENCY,
     Channel,
     Instrument,
     ScalarEfficiency,
@@ -208,16 +212,25 @@ _PICO_REFERENCE_APERTURE_M = 1.4
 
 
 def pico_like(aperture_m: float = _PICO_REFERENCE_APERTURE_M) -> Instrument:
-    """PICO-like probe-class instrument (arXiv:1902.10541).
+    """PICO-like probe-class instrument (arXiv:1902.10541, Table 3.2).
 
     21 frequency bands from 21 to 799 GHz, 12,996 TES bolometers at 0.1 K,
     5-year L2 mission. Targets σ(r) ≈ 5×10⁻⁴ at 5σ.
 
-    NET values are CBE per-bolometer temperature NETs from the PICO
-    mission study report's instrument-specifications table. Detector
-    counts include both polarizations per pixel (factor of 2 already
-    in N_bolo). Beam FWHM = 6.2' × (155 GHz / ν_c).
-    PICO assumed ~95% survey efficiency and 90% detector yield from L2.
+    Reproduces PICO's published CBE polarization map depths (Table 1.2 /
+    3.2): per band to ≤4 % and the inverse-variance aggregate 0.605 vs
+    0.612 µK·arcmin (gated by ``tests/test_config.py``). Each channel is
+    anchored on the table's CBE *array* NET — the quantity that sets the
+    published depth — spread over its ``N_bolo`` with PICO's own efficiency
+    accounting (:data:`augr.instrument.PICO_EFFICIENCY`: 90 % operability ×
+    95 % survey efficiency; the 25 and 30 GHz bands lose a further 4 h/day to
+    Ka-band telecom). The table's per-bolometer NET column is kept for
+    reference but is NOT what ``net_per_detector`` carries: at 186–321 and
+    555–799 GHz ``bolo_NET / sqrt(0.9 N_bolo)`` is 1.2–1.4× worse than the
+    array NET printed beside it (the report counts multichroic pixels
+    differently in the two columns), and the array NET is the one that
+    combines to the published 0.61 µK·arcmin. cmb-augr #49 records the
+    previous hand-transcribed table, which was 1.8× too deep in aggregate.
 
     Args:
         aperture_m: Primary mirror diameter [m]. Default 1.4 m
@@ -230,43 +243,46 @@ def pico_like(aperture_m: float = _PICO_REFERENCE_APERTURE_M) -> Instrument:
             "does aperture give the low-ν channels enough resolution
             to clean at r-relevant scales" axis.
     """
-    eff = L2_EFFICIENCY
     beam_scale = _PICO_REFERENCE_APERTURE_M / aperture_m
-    # (nu_ghz, n_bolo, CBE bolo NET [μK_CMB √s], FWHM [arcmin])
-    # Source: PICO mission study report instrument-specs table
-    # (arXiv:1902.10541; the same table appears in the 10-page
-    # whitepaper companion arXiv:1908.07495).
-    # NET is per-bolometer temperature NET; code applies √2 for polarization.
-    # N_bolo = (tiles) × (pixels/tile) × 2 polarizations.
+    # arXiv:1902.10541 Table 3.2, transcribed verbatim (checked 2026-08-27):
+    # (nu_c [GHz], FWHM [arcmin], CBE bolo NET [uK_CMB sqrt(s)], N_bolo,
+    #  CBE array NET [uK_CMB sqrt(s)]).  N_bolo = tiles x pixels/tile x 2 pols.
     _bands = [
-        ( 21.0,  120,  175.0, 38.4),
-        ( 25.0,  200,  108.0, 32.0),
-        ( 30.0,  120,   75.8, 28.3),
-        ( 36.0,  200,   52.6, 23.6),
-        ( 43.0,  120,   41.5, 22.2),
-        ( 52.0,  200,   30.5, 18.4),
-        ( 62.0,  732,   22.8, 12.8),
-        ( 75.0, 1020,   17.3, 10.7),
-        ( 90.0,  732,   15.9,  9.5),
-        (108.0, 1020,   14.0,  7.9),
-        (129.0,  732,   15.4,  7.4),
-        (155.0, 1020,   27.5,  6.2),
-        (186.0,  960,   27.0,  4.3),
-        (223.0,  900,   37.0,  3.6),
-        (268.0,  960,   62.0,  3.2),
-        (321.0,  900,  144.0,  2.6),
-        (385.0,  960,  384.0,  2.5),
-        (462.0,  900, 1240.0,  2.1),
-        (555.0,  440, 4650.0,  1.5),
-        (666.0,  400, 19400.0, 1.3),
-        (799.0,  360, 50000.0, 1.1),  # highest band — placeholder NET
+        ( 21.0, 38.4,   112.0,  120,  12.0),
+        ( 25.0, 32.0,   103.0,  200,   8.4),
+        ( 30.0, 28.3,    59.4,  120,   5.7),
+        ( 36.0, 23.6,    54.4,  200,   4.0),
+        ( 43.0, 22.2,    41.7,  120,   4.0),
+        ( 52.0, 18.4,    38.4,  200,   2.8),
+        ( 62.0, 12.8,    69.2,  732,   2.7),
+        ( 75.0, 10.7,    65.4, 1020,   2.1),
+        ( 90.0,  9.5,    37.7,  732,   1.4),
+        (108.0,  7.9,    36.2, 1020,   1.1),
+        (129.0,  7.4,    27.8,  732,   1.1),
+        (155.0,  6.2,    27.5, 1020,   0.9),
+        (186.0,  4.3,    70.8,  960,   2.0),
+        (223.0,  3.6,    84.2,  900,   2.3),
+        (268.0,  3.2,    54.8,  960,   1.5),
+        (321.0,  2.6,    77.6,  900,   2.1),
+        (385.0,  2.5,    69.1,  960,   2.3),
+        (462.0,  2.1,   133.0,  900,   4.5),
+        (555.0,  1.5,   658.0,  440,  23.0),
+        (666.0,  1.3,  2210.0,  400,  89.0),
+        (799.0,  1.1, 10400.0,  360, 526.0),
     ]
-    channels = tuple(
-        Channel(nu_ghz=nu, n_detectors=nd, net_per_detector=net,
-                beam_fwhm_arcmin=fwhm * beam_scale, efficiency=eff)
-        for nu, nd, net, fwhm in _bands
-    )
-    return Instrument(channels=channels, mission_duration_years=5.0, f_sky=0.7)
+    telecom_duty = 20.0 / 24.0  # 25 & 30 GHz excluded during 4 h/day Ka-band telecom
+    channels = []
+    for nu, fwhm, _bolo_net, n_bolo, array_net in _bands:
+        eff = PICO_EFFICIENCY
+        if nu in (25.0, 30.0):
+            eff = replace(eff, observing_efficiency=eff.observing_efficiency * telecom_duty)
+        # effective per-bolometer NET such that array NET = NET / sqrt(yield * N_bolo)
+        net = array_net * math.sqrt(PICO_EFFICIENCY.detector_yield * n_bolo)
+        channels.append(
+            Channel(nu_ghz=nu, n_detectors=n_bolo, net_per_detector=net,
+                    beam_fwhm_arcmin=fwhm * beam_scale, efficiency=eff)
+        )
+    return Instrument(channels=tuple(channels), mission_duration_years=5.0, f_sky=0.7)
 
 
 def litebird_like() -> Instrument:

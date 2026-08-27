@@ -67,6 +67,7 @@ from .nilc import (
     _gaussian_smooth_map,
     _needlet_channel_mask,
     _ridge,
+    _whiten,
     combine_needlets,
     common_resolution_b_alm,
     common_resolution_eb,
@@ -192,15 +193,18 @@ def _cilc_weights_from_cov(cov: jax.Array, A: jax.Array, e: jax.Array) -> jax.Ar
     ``(..., n)``. ``Aᵀ w = e`` holds exactly. Reduces to
     :func:`augr.nilc._ilc_weights_from_cov` when ``A = ones((n, 1))`` and ``e = [1]``.
     Batches over a leading pixel dimension (the localized path) like the ``a = 1`` form.
+    The solve is prewhitened like the blind form (:func:`augr.nilc._whiten`): with
+    ``C = D C̃ D`` and ``Ã = D⁻¹ A``, ``w = D⁻¹ C̃⁻¹ Ã (Ãᵀ C̃⁻¹ Ã)⁻¹ e``.
     """
     n, k = A.shape
     batch = cov.shape[:-2]
-    a_b = jnp.broadcast_to(A, (*batch, n, k))
-    cia = jnp.linalg.solve(cov, a_b)  # (..., n, k) = C⁻¹ A
-    atcia = jnp.einsum("...nk,...nl->...kl", a_b, cia)  # (..., k, k) = Aᵀ C⁻¹ A
+    ct, d = _whiten(cov)
+    a_b = jnp.broadcast_to(A, (*batch, n, k)) / d[..., :, None]  # Ã = D⁻¹ A
+    cia = jnp.linalg.solve(ct, a_b)  # (..., n, k) = C̃⁻¹ Ã
+    atcia = jnp.einsum("...nk,...nl->...kl", a_b, cia)  # (..., k, k) = Ãᵀ C̃⁻¹ Ã
     e_b = jnp.broadcast_to(e, (*batch, k))
-    x = jnp.linalg.solve(atcia, e_b[..., None])[..., 0]  # (..., k) = (Aᵀ C⁻¹ A)⁻¹ e
-    return jnp.einsum("...nk,...k->...n", cia, x)  # (..., n)
+    x = jnp.linalg.solve(atcia, e_b[..., None])[..., 0]  # (..., k) = (Ãᵀ C̃⁻¹ Ã)⁻¹ e
+    return jnp.einsum("...nk,...k->...n", cia, x) / d  # (..., n)
 
 
 def _retained_k(k_full: int, n_act: int) -> int:

@@ -230,54 +230,82 @@ def combine_needlets(
 # ---------------------------------------------------------------------------
 
 
+def _whiten(cov: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Prewhiten a channel covariance: ``C = D C̃ D`` with ``D = diag(sqrt(diag C))``.
+
+    Returns ``(C̃, d)`` with ``C̃`` of unit diagonal and ``d = diag(D)``, ``(..., n)``.
+    A zero diagonal (a channel with no data) maps to ``d = 1`` so the row stays
+    finite; such channels are always inactive and decouple in the masked solve.
+    In CMB thermodynamic units a wide band set has a diagonal spanning ~10 decades,
+    so solving in the whitened basis (condition number set by the correlation
+    structure, not the unit dynamic range) is the same treatment the Fisher path got
+    in PRs #5/#6. The ILC weights are analytically invariant under the rescaling:
+    ``C⁻¹ a = D⁻¹ C̃⁻¹ (D⁻¹ a)``.
+    """
+    diag = jnp.diagonal(cov, axis1=-2, axis2=-1)
+    d = jnp.sqrt(jnp.where(diag > 0, diag, 1.0))
+    return cov / (d[..., :, None] * d[..., None, :]), d
+
+
 def _ilc_weights_from_cov(cov: jax.Array) -> jax.Array:
     """ILC weights ``w = C⁻¹ a / (aᵀ C⁻¹ a)`` with ``a = 1``.
 
     ``cov`` is ``(..., n_band, n_band)``; returns ``(..., n_band)``. The
-    constraint ``Σ_b w_b = 1`` holds exactly.
+    constraint ``Σ_b w_b = 1`` holds exactly. The solve is prewhitened
+    (:func:`_whiten`); ``cov`` is used as given, so apply :func:`_ridge` first if a
+    ridge is wanted.
     """
     n_band = cov.shape[-1]
     a = jnp.ones((*cov.shape[:-2], n_band))
+    ct, d = _whiten(cov)
     # Explicit rhs column so the batched (npix, n_band, n_band) solve is unambiguous.
-    cinv_a = jnp.linalg.solve(cov, a[..., None])[..., 0]
+    cinv_a = jnp.linalg.solve(ct, (a / d)[..., None])[..., 0] / d
     return cinv_a / jnp.sum(a * cinv_a, axis=-1, keepdims=True)
 
 
 def _ridge(cov: jax.Array, ridge: float) -> jax.Array:
-    """Add a relative diagonal ridge ``ridge · tr(C)/n · I`` for invertibility."""
+    """Add a per-channel relative ridge ``ridge · diag(diag C)`` for invertibility.
+
+    ``ridge`` is a fraction of *each channel's own* variance, so the regularization
+    is independent of the dynamic range across channels. cmb-augr #50: the earlier
+    form ``ridge · tr(C)/n · I`` scaled by the *arithmetic mean* of the diagonal,
+    which in CMB units at a 10-1000 GHz band set is set entirely by the submm
+    channels and swamped the CMB-carrying ones (4.3× on the total residual, 7.6× on
+    the foreground residual for NILC; 7.7× for cMILC), so that *adding* channels made
+    the cleaning worse.
+    """
     n_band = cov.shape[-1]
-    scale = jnp.trace(cov, axis1=-2, axis2=-1) / n_band
-    eye = jnp.eye(n_band)
-    eye = jnp.broadcast_to(eye, cov.shape)
-    return cov + ridge * scale[..., None, None] * eye
+    diag = jnp.diagonal(cov, axis1=-2, axis2=-1)  # (..., n_band)
+    eye = jnp.broadcast_to(jnp.eye(n_band), cov.shape)
+    return cov + ridge * diag[..., :, None] * eye
 
 
 def _ilc_weights_masked(cov: jax.Array, m: jax.Array, ridge: float) -> jax.Array:
     """ILC weights over the *active* channels of a band, ``(..., n_band)``.
 
     ``m`` is a ``(..., n_band)`` float 0/1 active mask. Reproduces the active-only
-    solve ``w_A = (C_AA + ridge·d_A·I)⁻¹ 1 / norm`` with inactive ``w = 0`` — but
+    solve ``w_A = (C_AA + ridge·diag(C_AA))⁻¹ 1 / norm`` with inactive ``w = 0`` — but
     over the full, fixed-shape ``n_band`` covariance so the cleaner stays
     ``jax.jit``-able and differentiable in the beams (the gather form
-    ``np.nonzero(active)`` needs a *concrete* mask). Build the block-decoupled matrix
-    ``C' = (m⊗m)·C + diag((1-m)·d_A)`` — zero every inactive cross-term and fill the
-    inactive diagonal with the active scale ``d_A = Σ m·diagC / Σ m`` — ridge only the
-    active diagonal, and solve ``C' w = m``. The active block is then identical to the
+    ``np.nonzero(active)`` needs a *concrete* mask). Ridge the active diagonal
+    (:func:`_ridge` restricted to ``m``), prewhiten (:func:`_whiten`, unit diagonal),
+    then build the block-decoupled matrix ``C̃' = (m⊗m)·C̃ + diag(1-m)`` — zero every
+    inactive cross-term and put a unit entry on the inactive diagonal — and solve
+    ``C̃' x = D⁻¹ m``, ``w = D⁻¹ x``. The active block is then identical to the
     active-only system, the inactive rows decouple to ``w = 0``, and the normalization
     ``mᵀw`` is the active-only normalization. So the weights match the gather form to
-    fp64, and are byte-identical when the mask is all-active (then ``C' = _ridge(C)``
-    and ``m = 1``).
+    fp64, and are byte-identical when the mask is all-active (then the matrix is
+    exactly the whitened ``_ridge(C)`` and ``m = 1``).
     """
     n_band = cov.shape[-1]
     eye = jnp.broadcast_to(jnp.eye(n_band), cov.shape)
     diag_c = jnp.diagonal(cov, axis1=-2, axis2=-1)  # (..., n_band)
-    n_active = jnp.sum(m, axis=-1, keepdims=True)  # (..., 1); ≥1 (finest band always active)
-    d_a = jnp.sum(m * diag_c, axis=-1, keepdims=True) / n_active  # (..., 1) active diagonal scale
+    cov_r = cov + (ridge * m * diag_c)[..., :, None] * eye  # ridge the active diagonal only
+    ct, d = _whiten(cov_r)
     m_outer = m[..., :, None] * m[..., None, :]  # (..., n_band, n_band)
-    inactive_diag = ((1.0 - m) * d_a)[..., None] * eye  # diag((1-m)·d_A)
-    ridge_diag = (ridge * d_a * m)[..., None] * eye  # ridge on the active diagonal only
-    cov_masked = m_outer * cov + inactive_diag + ridge_diag
-    cinv_m = jnp.linalg.solve(cov_masked, m[..., None])[..., 0]  # (..., n_band)
+    inactive_diag = (1.0 - m)[..., :, None] * eye  # unit entry on the inactive diagonal
+    cov_masked = m_outer * ct + inactive_diag
+    cinv_m = jnp.linalg.solve(cov_masked, (m / d)[..., None])[..., 0] / d  # (..., n_band)
     return cinv_m / jnp.sum(m * cinv_m, axis=-1, keepdims=True)
 
 
@@ -567,7 +595,12 @@ def nilc_clean(
     n_iter
         ``map2alm`` Jacobi iterations.
     ridge
-        Relative diagonal regularization on the covariance before inversion.
+        Diagonal regularization on the covariance before inversion, as a fraction of
+        *each channel's own* variance (``C + ridge · diag(diag C)``); the solve is
+        prewhitened so the result is independent of the dynamic range across
+        channels (cmb-augr #50). The default is on the plateau even at a 10-1000 GHz
+        band set; it exists for invertibility when a needlet band's empirical
+        covariance is rank-deficient.
     beam_band_limit
         A channel joins a needlet band only where ``B_ν/B_c >= beam_band_limit``
         at the band's upper edge, capping the deconvolution amplification at
