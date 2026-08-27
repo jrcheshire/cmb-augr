@@ -41,8 +41,7 @@ PIXI="$HOME/.pixi/bin/pixi"
 OUT="$SCRATCH/augr_smoke"
 PARTS="$SCRATCH/augr_smoke_parts"
 MEMLOG="$REPO/smoke1_${SLURM_JOB_ID}_mem.log"
-L_MAX_QE=4000   # JC 2026-08-26: >=3000, target 4000; the driver default (1000) under-credits
-                # delensing for small-beam designs. Pass it explicitly until the default moves.
+L_MAX_QE=4000   # now also the driver default; kept explicit so the smoke states what it measured
 
 # One worker => the driver runs serially in this process. Pin the numerics to ONE thread so
 # the timing is the production per-worker rate (augr.parallel pins workers to 1 thread), and

@@ -669,11 +669,13 @@ def main():
     p.add_argument(
         "--delens-l-max-qe",
         type=int,
-        default=1000,
-        help="max QE multipole for the delensing solve. NOTE: N_0^MV saturation is "
-        "beam-dependent (~1500 at 30', ~3000 at 10', ~4000 at 5'), so 1000 under-credits "
-        "delensing for small-beam/large-aperture designs -- an aperture-directional bias. "
-        "Unresolved; see the threads file.",
+        default=4000,
+        help="max QE multipole for the delensing solve (default 4000). N_0^MV saturation "
+        "is beam-dependent (~1500 at 30', ~3000 at 10', ~4000 at 5'), so a lower cap "
+        "under-credits delensing for small-beam/large-aperture designs -- an "
+        "aperture-directional bias. 4000 is affordable with remat (134.6 MB tape; "
+        "18.6 GB/worker, ~27 min/design on Vista gg at production shape). Lower it only "
+        "for mechanics tests.",
     )
     p.add_argument("--delens-n-iter", type=int, default=5)
     p.add_argument("--backend", choices=["ducc", "jht"], default="ducc")
