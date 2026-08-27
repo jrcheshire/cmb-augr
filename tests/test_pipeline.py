@@ -70,7 +70,11 @@ def _mono_instrument(f_sky: float = 1.0, *, fractional_bandwidth: float = 0.0) -
 def test_from_instrument_populates_fields() -> None:
     inst = _mono_instrument(f_sky=0.6)
     cfg = ForecastConfig.from_instrument(
-        inst, nilc_cleaner(needlet_peaks=PEAKS), nside=NSIDE, lmax=LMAX
+        inst,
+        nilc_cleaner(needlet_peaks=PEAKS),
+        nside=NSIDE,
+        lmax=LMAX,
+        allow_scalar_fsky_without_mask=True,
     )
     assert cfg.freqs_ghz == FREQS
     assert cfg.beam_fwhm_arcmin == BEAMS
@@ -78,6 +82,30 @@ def test_from_instrument_populates_fields() -> None:
     assert cfg.bandpasses is None  # monochromatic instrument
     expected_w = tuple(float(white_noise_power(c, 3.0, 0.6)) for c in inst.channels)
     np.testing.assert_allclose(cfg.w_inv, expected_w, rtol=1e-12)
+
+
+def test_scalar_fsky_without_mask_is_refused() -> None:
+    """cmb-augr #51: FULLSKY_SCALAR + f_sky != 1 + no mask/hit_map is the
+    full-sky-over-the-plane-then-divide-by-f_sky configuration; refuse it by default.
+    ``from_instrument`` reaches it through the preset's f_sky, so that is the entry
+    point tested; f_sky=1, a mask (CUTSKY_MC), a hit_map, or the opt-in all pass."""
+    inst = _mono_instrument(f_sky=0.6)
+    cl = nilc_cleaner(needlet_peaks=PEAKS)
+    with pytest.raises(ValueError, match="cmb-augr #51"):
+        ForecastConfig.from_instrument(inst, cl, nside=NSIDE, lmax=LMAX)
+    with pytest.raises(ValueError, match="cmb-augr #51"):
+        _nilc_config(f_sky=0.6)
+    # the four consistent configurations
+    assert ForecastConfig.from_instrument(inst, cl, nside=NSIDE, lmax=LMAX, f_sky=1.0).f_sky == 1.0
+    npix = 12 * NSIDE**2
+    assert _nilc_config(f_sky=0.6, hit_map=jnp.ones(npix)).f_sky == 0.6
+    assert (
+        _nilc_config(
+            f_sky=0.6, mask=jnp.ones(npix), spectrum_source=SpectrumSource.CUTSKY_MC
+        ).f_sky
+        == 0.6
+    )
+    assert _nilc_config(f_sky=0.6, allow_scalar_fsky_without_mask=True).f_sky == 0.6
 
 
 def test_from_instrument_finite_bandwidth_builds_bandpasses() -> None:

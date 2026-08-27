@@ -128,6 +128,32 @@ class ForecastConfig:
     cl_ee_prior: jax.Array | None = None
     cl_bb_prior: jax.Array | None = None
     mc_workers: int = 1
+    #: Opt in to the scalar-``1/f_sky`` full-sky approximation with NO sky cut: ILC
+    #: weights and the residual are then computed over the whole sky (Galactic plane
+    #: included) and every spectrum is divided by ``f_sky`` as if modes had been lost
+    #: to a mask. cmb-augr #51: that combination inflated the foreground residual
+    #: 2.4-3.8x in the JPL detector-count study, and ``from_instrument`` reaches it by
+    #: default because every probe preset ships ``f_sky=0.7``. Refused unless set.
+    allow_scalar_fsky_without_mask: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.spectrum_source is SpectrumSource.FULLSKY_SCALAR
+            and self.mask is None
+            and self.hit_map is None
+            and float(self.f_sky) != 1.0
+            and not self.allow_scalar_fsky_without_mask
+        ):
+            raise ValueError(
+                f"ForecastConfig: f_sky={self.f_sky} on the FULLSKY_SCALAR path with no "
+                "mask and no hit_map (cmb-augr #51). The cleaner and the residual would "
+                "run over the full sky, Galactic plane included, and the spectra would then "
+                "be divided by f_sky as if a mask had removed modes -- measured 2.4-3.8x "
+                "too high a foreground residual. Either pass mask= (with "
+                "spectrum_source=SpectrumSource.CUTSKY_MC) for a real sky cut, set "
+                "f_sky=1.0 for an honest full-sky forecast, or set "
+                "allow_scalar_fsky_without_mask=True to opt in to the approximation."
+            )
 
     @classmethod
     def from_instrument(
@@ -147,8 +173,11 @@ class ForecastConfig:
         :func:`augr.instrument.bandpasses_from_instrument`), and ``w_inv`` (per
         :func:`augr.instrument.white_noise_power`, so the bandwidth→NET→``w_inv``
         link stays consistent) from the instrument's channels. ``f_sky`` defaults to
-        ``instrument.f_sky``. Any other :class:`ForecastConfig` knob is forwarded via
-        ``kwargs``.
+        ``instrument.f_sky`` -- which sets the per-channel depth through ``w_inv`` *and*
+        the spectrum stage's ``1/f_sky``; on the default ``FULLSKY_SCALAR`` path with no
+        ``mask``/``hit_map`` a preset ``f_sky < 1`` is refused (cmb-augr #51), so pass a
+        ``mask`` (cut-sky MC), ``f_sky=1.0``, or ``allow_scalar_fsky_without_mask=True``.
+        Any other :class:`ForecastConfig` knob is forwarded via ``kwargs``.
 
         A fully-monochromatic instrument yields ``bandpasses=None`` → the byte-identical
         legacy path. For a cMILC forecast, build the cleaner with the matching bandpasses
