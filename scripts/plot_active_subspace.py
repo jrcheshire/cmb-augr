@@ -52,7 +52,13 @@ def _score_label(v: float) -> str:
     return f"{v / 10**exp:.0f}×10$^{{{exp}}}$"
 
 
-def make_figure(summary: dict) -> plt.Figure:
+def make_figure(summary: dict, *, with_scan: bool = False) -> plt.Figure:
+    """Two panels (spectrum + activity scores) by default -- the poster form.
+
+    ``with_scan=True`` appends the Gaussian-EIG profile along the leading
+    direction as a third panel: a validation view for the paper, hard to read
+    cold on a poster.
+    """
     eig = np.asarray(summary["eigenvalues"])
     p16 = np.asarray(summary["bootstrap"]["eig_p16"])
     p84 = np.asarray(summary["bootstrap"]["eig_p84"])
@@ -75,9 +81,15 @@ def make_figure(summary: dict) -> plt.Figure:
             "axes.spines.right": False,
         }
     )
-    fig, (ax_a, ax_b, ax_c) = plt.subplots(
-        1, 3, figsize=(11.5, 3.6), layout="constrained", width_ratios=[1.0, 1.25, 1.0]
-    )
+    if with_scan:
+        fig, (ax_a, ax_b, ax_c) = plt.subplots(
+            1, 3, figsize=(11.5, 3.6), layout="constrained", width_ratios=[1.0, 1.25, 1.0]
+        )
+    else:
+        fig, (ax_a, ax_b) = plt.subplots(
+            1, 2, figsize=(8.2, 3.6), layout="constrained", width_ratios=[1.0, 1.25]
+        )
+        ax_c = None
 
     # (a) eigenvalue spectrum with bootstrap 16-84 bars
     idx = np.arange(1, eig.size + 1)
@@ -126,7 +138,9 @@ def make_figure(summary: dict) -> plt.Figure:
     ax_b.grid(True, axis="x", color=GRID, lw=0.6)
     ax_b.set_axisbelow(True)
 
-    # (c) Gaussian-EIG profile along the leading direction
+    # (c) Gaussian-EIG profile along the leading direction (paper/validation view)
+    if ax_c is None:
+        return fig
     ax_c.axvline(0.0, color=GRID, lw=1.0)
     ax_c.plot(
         ts,
@@ -159,12 +173,18 @@ def main() -> None:
         default=Path(__file__).parent.parent / "plots",
         help="output directory (png + pdf)",
     )
+    p.add_argument(
+        "--with-scan",
+        action="store_true",
+        help="append the direction-1 Gaussian-EIG profile as a third panel "
+        "(paper/validation view; output gets a _scan suffix)",
+    )
     args = p.parse_args()
 
     summary = json.loads(args.json.read_text())
-    fig = make_figure(summary)
+    fig = make_figure(summary, with_scan=args.with_scan)
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    stem = args.out_dir / args.json.stem
+    stem = args.out_dir / (args.json.stem + ("_scan" if args.with_scan else ""))
     for ext in ("png", "pdf"):
         path = stem.with_suffix(f".{ext}")
         fig.savefig(path, dpi=300)
