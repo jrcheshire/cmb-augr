@@ -59,6 +59,18 @@ def make_figure(summary: dict) -> plt.Figure:
     cbar = fig.colorbar(cf, ax=ax)
     cbar.set_label("expected information gain on $r$ (nats)")
 
+    # Iso-cost overlay, drawn only when the plane has meaningful cost variation
+    # (the mid-band pair is cost-flat to ~±6%; the monitor pair varies ~±15%).
+    cost = np.asarray(summary["cost_musd"])
+    rel = (cost.max() - cost.min()) / cost.mean()
+    if rel > 0.10:
+        lo = np.ceil(cost.min() / 100) * 100
+        hi = np.floor(cost.max() / 100) * 100
+        levels = np.arange(lo, hi + 1, 100.0)
+        cs = ax.contour(f1, f2, cost, levels=levels, colors="w", linewidths=1.0)
+        ax.clabel(cs, fmt=lambda v: f"${v / 1000:g}B" if v >= 1000 else f"${v:.0f}M",
+                  fontsize=9)
+
     # Equal-area fiducial and the sampled optimum.
     n_groups = fracs.shape[-1]
     ax.plot(
