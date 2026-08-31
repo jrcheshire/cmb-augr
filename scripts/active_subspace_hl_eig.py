@@ -595,6 +595,352 @@ def _scan_worker(payload):
     return k
 
 
+# --- iso-cost grid mode (poster/paper figure) ----------------------------------------------
+# A value-only 2-D grid over (aperture, focal-plane diameter): the substitution question
+# "more detectors or more aperture?" from eig_production_scoping.md, evaluated on the same
+# map-based MC forward as the subspace run. Detector count enters as the total-focal-plane
+# scale (n_det ~ fp_diameter^2 at fixed relative allocation and f-number); aperture enters
+# through the existing z knob. Both are TRACED arguments of one jitted loss, so the whole
+# grid shares a single compile. The budget penalty is disabled (GRID_BUDGET_MUSD) so the
+# surface is pure marginal Gaussian EIG; the dollar cost of every grid point is stored
+# alongside, and iso-cost contours are drawn by the plotting side, not baked into the value.
+# Every point is evaluated on ONE fixed held-out CRN ensemble (--eval-index, the scan
+# convention), so neighboring points differ by design, not by realization.
+
+GRID_BUDGET_MUSD = 1.0e9
+
+
+def _make_grid_loss(spec, static, cost_model):
+    """params = (z_ap, fp_diameter_m) -> Gaussian-EIG loss (budget penalty inert)."""
+
+    def loss(params, mc_ctx):
+        z_ap, fp_d = params
+        z = jnp.zeros(spec.n_dim).at[spec.n_groups - 1].set(z_ap)
+        d = spec.design_pytree(z)
+        return physical_design_objective(
+            d,
+            freqs_per_group=spec.freqs_per_group,
+            fp_diameter_m=fp_d,
+            mc_ctx=mc_ctx,
+            opt_ctx=static["opt_ctx"],
+            cleaner=static["cleaner"],
+            cost_model=cost_model,
+            budget=GRID_BUDGET_MUSD,
+            eta_total=spec.eta_total,
+            objective="marginal_eig_r",
+            delens=static["delens"],
+        )
+
+    return loss
+
+
+def _iso_part_valid(part, a_m, fp_d, cfg):
+    dc = cfg.get("delens_cfg")
+    return (
+        part is not None
+        and np.isfinite(part["eig"])
+        and np.isclose(float(part["aperture_m"]), a_m)
+        and np.isclose(float(part["fp_diameter_m"]), fp_d)
+        and int(part["nside"]) == cfg["nside"]
+        and int(part["lmax"]) == cfg["lmax"]
+        and int(part["n_sims"]) == cfg["n_sims"]
+        and int(part["eval_index"]) == cfg["eval_index"]
+        and str(part["fg_model"]) == str(cfg["fg_model"])
+        and int(part["delens_lmq"]) == (-1 if dc is None else dc["l_max_qe"])
+    )
+
+
+def _iso_worker(payload):
+    """One (aperture, fp_diameter) grid point's Gaussian EIG + cost -> iso_<k>.npz."""
+    k, a_m, fp_d, cfg = payload
+    path = _part_path(cfg["parts_dir"], "iso", k)
+    if _iso_part_valid(_load_part(path), a_m, fp_d, cfg):
+        print(f"    [pid {os.getpid()}] iso point {k}: cached", flush=True)
+        return k
+    w = _worker_pieces(cfg)
+    if "grid_fn" not in w:  # one jitted loss + one held-out ensemble per worker
+        w["grid_fn"] = build_design_objectives(
+            _make_grid_loss(w["spec"], w["static"], CostModel())
+        )[0]
+    if "eval" not in w:
+        w["eval"] = _ctx_for(cfg, w, cfg["eval_index"])
+    spec = w["spec"]
+    z_ap = float(np.log(a_m / spec.aperture_fid))
+    t0 = time.time()
+    eig = -float(w["grid_fn"]((jnp.asarray(z_ap), jnp.asarray(fp_d)), w["eval"]))
+    n_det, _, beam = design_to_channels(
+        a_m,
+        spec.f_number_fid,
+        fp_d,
+        jnp.asarray(spec.frac_fid),
+        spec.freqs_per_group,
+    )
+    cost = float(
+        design_cost(
+            n_det,
+            beam,
+            spec.years_fid,
+            cost_model=CostModel(),
+            freqs_ghz=spec.freqs_flat,
+        )
+    )
+    if not np.isfinite(eig):
+        raise FloatingPointError(
+            f"iso point {k} (aperture={a_m:.3f} m, fp_d={fp_d:.3f} m): non-finite EIG, "
+            "no part written."
+        )
+    note = " (includes jit compile)" if time.time() - t0 > 300 else ""
+    print(
+        f"    [pid {os.getpid()}] iso point {k} (D={a_m:.2f} m, fp={fp_d:.3f} m): "
+        f"{time.time() - t0:.0f}s{note}",
+        flush=True,
+    )
+    dc = cfg.get("delens_cfg")
+    _write_part(
+        path,
+        aperture_m=a_m,
+        fp_diameter_m=fp_d,
+        eig=eig,
+        cost=cost,
+        n_det_total=float(jnp.sum(n_det)),
+        nside=cfg["nside"],
+        lmax=cfg["lmax"],
+        n_sims=cfg["n_sims"],
+        eval_index=cfg["eval_index"],
+        fg_model=str(cfg["fg_model"]),
+        delens_lmq=(-1 if dc is None else dc["l_max_qe"]),
+    )
+    return k
+
+
+def _run_iso_grid(args, fg_model, t0):
+    """Grid-only mode: fan the (aperture x fp_diameter) points out, assemble from disk."""
+    a_lo, a_hi, n_a = args.grid_aperture
+    d_lo, d_hi, n_d = args.grid_fpd
+    apertures = np.geomspace(a_lo, a_hi, int(n_a))
+    fp_ds = np.geomspace(d_lo, d_hi, int(n_d))
+    cfg = _fanout_cfg(args, fg_model, GRID_BUDGET_MUSD)
+    print(
+        f"\niso-cost grid: {int(n_a)} apertures [{a_lo:g}, {a_hi:g}] m x "
+        f"{int(n_d)} fp diameters [{d_lo:g}, {d_hi:g}] m, value-only, "
+        f"held-out ensemble {args.eval_index}"
+    )
+    payloads = [
+        (i * int(n_d) + j, float(a), float(d), cfg)
+        for i, a in enumerate(apertures)
+        for j, d in enumerate(fp_ds)
+    ]
+    parallel_map(_iso_worker, payloads, workers=args.workers)
+    parts = {
+        k: p
+        for k, a, d, _ in payloads
+        if _iso_part_valid(p := _load_part(_part_path(args.parts_dir, "iso", k)), a, d, cfg)
+    }
+    if len(parts) < len(payloads):
+        missing = sorted({k for k, *_ in payloads} - set(parts))
+        print(
+            f"  [{time.time() - t0:.0f}s] iso grid partial: {len(parts)}/{len(payloads)} "
+            f"parts in {args.parts_dir} (missing e.g. {missing[:8]}); rerun to continue."
+        )
+        return
+    shape = (int(n_a), int(n_d))
+    grid = {
+        key: np.array([float(parts[k][key]) for k, *_ in payloads]).reshape(shape)
+        for key in ("eig", "cost", "n_det_total")
+    }
+    out = {
+        "aperture_m": apertures.tolist(),
+        "fp_diameter_m": fp_ds.tolist(),
+        "eig": grid["eig"].tolist(),
+        "cost_musd": grid["cost"].tolist(),
+        "n_det_total": grid["n_det_total"].tolist(),
+        "config": vars(args),
+    }
+    with open(args.out + ".json", "w") as fh:
+        json.dump(out, fh, indent=2)
+    print(f"  [{time.time() - t0:.0f}s] wrote {args.out}.json")
+    _iso_plot(args.out + ".png", apertures, fp_ds, grid["eig"], grid["cost"])
+    print(f"  wrote {args.out}.png")
+
+
+def _iso_plot(path, apertures, fp_ds, eig, cost):
+    """Quick diagnostic contour (the poster figure has its own plotting script)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6.5, 5.0))
+    cf = ax.contourf(apertures, fp_ds, eig.T, levels=15, cmap="viridis")
+    cs = ax.contour(apertures, fp_ds, cost.T, levels=8, colors="w", linewidths=1.0)
+    ax.clabel(cs, fmt="$%.0fM")
+    fig.colorbar(cf, ax=ax, label="Gaussian EIG (nats)")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("aperture (m)")
+    ax.set_ylabel("focal-plane diameter (m)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+
+
+# --- z-pair grid mode (e.g. the focal-plane allocation plane) ------------------------------
+# Value-only 2-D grid over any two z knobs (by label), everything else at fiducial. Same
+# structure as the iso-cost grid: one jitted loss traced in the full z vector (one compile
+# for any knob pair), one fixed held-out ensemble, budget penalty off, cost stored per
+# point. Written for the allocation plane (alloc@160+225 x alloc@80+115) where the
+# substitution question is best-measured by this forward; aperture stays at fiducial.
+
+
+def _make_zgrid_loss(spec, static, cost_model):
+    """params = full z vector -> Gaussian-EIG loss (budget penalty inert)."""
+
+    def loss(z, mc_ctx):
+        d = spec.design_pytree(z)
+        return physical_design_objective(
+            d,
+            freqs_per_group=spec.freqs_per_group,
+            fp_diameter_m=spec.fp_diameter_m,
+            mc_ctx=mc_ctx,
+            opt_ctx=static["opt_ctx"],
+            cleaner=static["cleaner"],
+            cost_model=cost_model,
+            budget=GRID_BUDGET_MUSD,
+            eta_total=spec.eta_total,
+            objective="marginal_eig_r",
+            delens=static["delens"],
+        )
+
+    return loss
+
+
+def _zgrid_part_valid(part, z_row, cfg):
+    dc = cfg.get("delens_cfg")
+    return (
+        part is not None
+        and np.isfinite(part["eig"])
+        and part["z"].shape == np.shape(z_row)
+        and np.allclose(part["z"], z_row, rtol=1e-12, atol=0.0)
+        and int(part["nside"]) == cfg["nside"]
+        and int(part["lmax"]) == cfg["lmax"]
+        and int(part["n_sims"]) == cfg["n_sims"]
+        and int(part["eval_index"]) == cfg["eval_index"]
+        and str(part["fg_model"]) == str(cfg["fg_model"])
+        and int(part["delens_lmq"]) == (-1 if dc is None else dc["l_max_qe"])
+    )
+
+
+def _zgrid_worker(payload):
+    """One z-grid point's Gaussian EIG + cost -> zg_<k>.npz (skipped if cached)."""
+    k, z_row, cfg = payload
+    path = _part_path(cfg["parts_dir"], "zg", k)
+    if _zgrid_part_valid(_load_part(path), z_row, cfg):
+        print(f"    [pid {os.getpid()}] zg point {k}: cached", flush=True)
+        return k
+    w = _worker_pieces(cfg)
+    if "zgrid_fn" not in w:
+        w["zgrid_fn"] = build_design_objectives(
+            _make_zgrid_loss(w["spec"], w["static"], CostModel())
+        )[0]
+    if "eval" not in w:
+        w["eval"] = _ctx_for(cfg, w, cfg["eval_index"])
+    spec = w["spec"]
+    t0 = time.time()
+    eig = -float(w["zgrid_fn"](jnp.asarray(z_row), w["eval"]))
+    if not np.isfinite(eig):
+        raise FloatingPointError(f"zg point {k} (z={z_row}): non-finite EIG, no part written.")
+    d = spec.design_pytree(jnp.asarray(z_row))
+    n_det, _, beam = design_to_channels(
+        d["aperture_m"],
+        d["f_number"],
+        spec.fp_diameter_m,
+        d["area_fractions"],
+        spec.freqs_per_group,
+    )
+    cost = float(
+        design_cost(
+            n_det,
+            beam,
+            d["mission_years"],
+            cost_model=CostModel(),
+            freqs_ghz=spec.freqs_flat,
+        )
+    )
+    print(f"    [pid {os.getpid()}] zg point {k}: {time.time() - t0:.0f}s", flush=True)
+    dc = cfg.get("delens_cfg")
+    _write_part(
+        path,
+        z=np.asarray(z_row),
+        eig=eig,
+        cost=cost,
+        area_fractions=np.asarray(d["area_fractions"]),
+        nside=cfg["nside"],
+        lmax=cfg["lmax"],
+        n_sims=cfg["n_sims"],
+        eval_index=cfg["eval_index"],
+        fg_model=str(cfg["fg_model"]),
+        delens_lmq=(-1 if dc is None else dc["l_max_qe"]),
+    )
+    return k
+
+
+def _run_z_grid(args, fg_model, t0):
+    """Grid-only mode over two named z knobs; assemble from disk."""
+    spec = _spec()
+    labels = list(spec.knob_labels)
+    (k1, lo1, hi1, n1), (k2, lo2, hi2, n2) = args.grid_knob1, args.grid_knob2
+    for name in (k1, k2):
+        if name not in labels:
+            raise SystemExit(f"unknown knob {name!r}; choose from {labels}")
+    i1, i2 = labels.index(k1), labels.index(k2)
+    ax1 = np.linspace(float(lo1), float(hi1), int(float(n1)))
+    ax2 = np.linspace(float(lo2), float(hi2), int(float(n2)))
+    cfg = _fanout_cfg(args, fg_model, GRID_BUDGET_MUSD)
+    print(
+        f"\nz-pair grid: {k1} x {k2}, {ax1.size} x {ax2.size} points "
+        f"(z ranges [{lo1}, {hi1}] x [{lo2}, {hi2}]), held-out ensemble {args.eval_index}"
+    )
+    payloads = []
+    for a, z1 in enumerate(ax1):
+        for b, z2 in enumerate(ax2):
+            z = np.zeros(spec.n_dim)
+            z[i1], z[i2] = z1, z2
+            payloads.append((a * ax2.size + b, z, cfg))
+    parallel_map(_zgrid_worker, payloads, workers=args.workers)
+    parts = {
+        k: p
+        for k, z, _ in payloads
+        if _zgrid_part_valid(p := _load_part(_part_path(args.parts_dir, "zg", k)), z, cfg)
+    }
+    if len(parts) < len(payloads):
+        missing = sorted({k for k, *_ in payloads} - set(parts))
+        print(
+            f"  [{time.time() - t0:.0f}s] z grid partial: {len(parts)}/{len(payloads)} "
+            f"parts in {args.parts_dir} (missing e.g. {missing[:8]}); rerun to continue."
+        )
+        return
+    shape = (ax1.size, ax2.size)
+    eig = np.array([float(parts[k]["eig"]) for k, *_ in payloads]).reshape(shape)
+    cost = np.array([float(parts[k]["cost"]) for k, *_ in payloads]).reshape(shape)
+    fracs = np.stack([parts[k]["area_fractions"] for k, *_ in payloads]).reshape(
+        (*shape, spec.n_groups)
+    )
+    out = {
+        "knob1": k1,
+        "knob2": k2,
+        "z1": ax1.tolist(),
+        "z2": ax2.tolist(),
+        "eig": eig.tolist(),
+        "cost_musd": cost.tolist(),
+        "area_fractions": fracs.tolist(),
+        "free_groups": list(spec.free_groups),
+        "knob_labels": labels,
+        "config": vars(args),
+    }
+    with open(args.out + ".json", "w") as fh:
+        json.dump(out, fh, indent=2)
+    print(f"  [{time.time() - t0:.0f}s] wrote {args.out}.json")
+
+
 def _fanout_cfg(args, fg_model, budget):
     """Picklable config dict carried to the pool workers."""
     return dict(
@@ -748,6 +1094,43 @@ def main():
         "While any design is missing from --parts-dir the run exits 0 after its range, "
         "before the eigendecomp; the run that completes the set continues to the scan.",
     )
+    p.add_argument(
+        "--grid-aperture",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("MIN", "MAX", "N"),
+        help="with --grid-fpd, run the iso-cost grid mode instead of the subspace + scan: "
+        "N geometrically spaced apertures [m] between MIN and MAX, value-only Gaussian "
+        "EIG on the held-out ensemble, budget penalty off, dollar cost stored per point.",
+    )
+    p.add_argument(
+        "--grid-fpd",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("MIN", "MAX", "N"),
+        help="focal-plane-diameter axis [m] of the iso-cost grid (detector-count scale: "
+        "n_det ~ fp_diameter^2 at fixed relative allocation and f-number).",
+    )
+    p.add_argument(
+        "--grid-knob1",
+        type=str,
+        nargs=4,
+        default=None,
+        metavar=("KNOB", "MIN", "MAX", "N"),
+        help="with --grid-knob2, run a value-only 2-D grid over two named z knobs "
+        "(everything else at fiducial), e.g. --grid-knob1 alloc@160+225 -0.75 0.75 9. "
+        "Ranges are in standardized z units (allocation logits / log knobs).",
+    )
+    p.add_argument(
+        "--grid-knob2",
+        type=str,
+        nargs=4,
+        default=None,
+        metavar=("KNOB", "MIN", "MAX", "N"),
+        help="second axis of the z-pair grid; see --grid-knob1.",
+    )
     p.add_argument("--out", type=str, default="/tmp/active_subspace_hl_eig")
     args = p.parse_args()
     if args.parts_dir is None:
@@ -768,6 +1151,17 @@ def main():
     if args.backend == "jht" and jax.default_backend() == "cpu":
         print("  WARNING: --backend jht but JAX is on CPU -- the GPU was not initialized.")
     t0 = time.time()
+
+    if (args.grid_aperture is None) != (args.grid_fpd is None):
+        p.error("--grid-aperture and --grid-fpd must be given together")
+    if args.grid_aperture is not None:
+        _run_iso_grid(args, fg_model, t0)
+        return
+    if (args.grid_knob1 is None) != (args.grid_knob2 is None):
+        p.error("--grid-knob1 and --grid-knob2 must be given together")
+    if args.grid_knob1 is not None:
+        _run_z_grid(args, fg_model, t0)
+        return
 
     delens_cfg = (
         None
