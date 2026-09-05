@@ -105,11 +105,15 @@ augr/
                    via lensing kernel, flat-sky and full-sky (Wigner 3j)
                    modes. Fully jax.jit / jax.grad-traceable in the noise
                    spectra (flat-sky natively; full-sky via backend="jax")
-  wigner.py        Wigner 3j symbols: closed-form (0,0,0) via log-gamma,
-                   Schulten-Gordon backward recursion for spin-2, vectorized
-                   over l1 for fixed L
-  wigner_jax.py    JAX-native Wigner 3j (Racah closed form + Schulten-Gordon
-                   recursion as a lax.scan sweep); L may be traced
+  wigner_closed.py Closed-form Wigner 3j tables (Kiddier & Gratton 2026):
+                   (0,0,0) from an O(lmax) g(p) lookup table, (0,-2,2) from
+                   two shifted (0,0,0) symbols (both J parities); one
+                   numpy/JAX implementation, elementwise over the (l1,l2) table
+  wigner.py        numpy Wigner 3j tables: closed-form (0,0,0); Schulten-Gordon
+                   recursion for spin-2 (general m, and the numpy production path)
+  wigner_jax.py    JAX Wigner 3j cores (spin2_body / spin0_body, L may be traced):
+                   closed form for every (0,+-2,-+2) permutation, Schulten-Gordon
+                   lax.scan fallback for other m
   delensing_fullsky_jax.py  Pure-jnp full-sky N_0 estimators + lensing
                    kernel (lax.map over L, no ProcessPool) -- the
                    differentiable backend="jax" full-sky path
@@ -206,7 +210,7 @@ All times on a single machine (Ryzen 9 5900X, 32 GB). First call includes JAX JI
 | MultiPatchFisher (probe, 3-patch Gaussian) | — | **7 s** |
 | MultiPatchFisher (probe, 3-patch Moment) | — | **16 s** |
 | `iterate_delensing` (flat-sky, 5 iter, l_max=3000) | ~2 min | ~25 s |
-| `iterate_delensing` (full-sky Wigner 3j, 5 iter) | — | ~10 min |
+| `iterate_delensing` (full-sky Wigner 3j, 5 iter) | — | see below |
 | `sigma_r_from_channels` forward pass | ~4 s | **90 ms** |
 | `jax.grad(sigma_r)` w.r.t. (n_det, NET, beam) | ~20 s | **470 ms** |
 
@@ -295,7 +299,7 @@ The `delensing.py` module computes self-consistent iterative QE delensing, repla
 Two modes are available:
 
 - **Flat-sky** (`fullsky=False`, current default): Gauss-Legendre quadrature over the azimuthal angle. Fast (~2 min for 5 iterations at l_max=3000). Default for runtime convenience.
-- **Full-sky** (`fullsky=True`): Wigner 3j coupling via Schulten-Gordon backward recursion, vectorized over l1 for fixed L with log-spaced L sampling. ~10 minutes for 5 iterations at `l_max = 3000`. TT, EE, EB, TB validated against `plancklens` to <1e-3 in bulk-L (10..2000) at the LiteBIRD-PTEP fiducial; TE validated to <6e-2 in (10, 1800) — see `scripts/n0_validation/derivation.md` for the structural-residual diagnosis (single-projection OkaHu Table I form vs plancklens's symmetric `pte+pet`; <0.1% effect on `N_0^MV` and <1% on `A_L`). **Production-grade for space-mission applications** (where the reionization bump `l ≲ 10` dominates the σ(r) constraint and the `(L+1)²/L²` flat-vs-full geometric correction matters at low L); flat-sky remains the default for runtime (~5× faster) but is no longer the math/physics preference for full-sky surveys.
+- **Full-sky** (`fullsky=True`): Wigner 3j coupling from closed-form lookup tables (Kiddier & Gratton 2026, `augr.wigner_closed`; issue #48), one fused kernel per L instead of a Schulten-Gordon recursion — per-L table 2.3× (spin-2) to 12× (m=0) faster than the recursion it replaced — and the five N_0 estimators evaluated on a sampled L grid (`n_L_sample="auto"`: every L < 20 plus ~100-130 log-spaced points, `N_0^{-1}` log-interpolated; `None` restores the exact every-L sweep). The sampled grid was set by a value-and-derivative convergence study (`scripts/n0_validation/l_sampling_convergence.py`): at the default, `A_lens_eff` and its noise derivative are within 5e-4 of the dense grid on PICO-like and LiteBIRD-like noise at `l_max_qe` 1000-1500, for ~13× fewer Wigner sweeps per estimator at 1500. Run `scripts/bench_wigner_closed.py` on an idle machine for the before/after wall-clock table. TT, EE, EB, TB validated against `plancklens` to <1e-3 in bulk-L (10..2000) at the LiteBIRD-PTEP fiducial; TE to <3e-2 in (10, 1800) (2.35e-2 measured; the remaining residual is the single-projection OkaHu Table I form vs plancklens's symmetric `pte+pet`, see `scripts/n0_validation/derivation.md`; <0.1% effect on `N_0^MV` and <1% on `A_L`). **Production-grade for space-mission applications** (where the reionization bump `l ≲ 10` dominates the σ(r) constraint and the `(L+1)²/L²` flat-vs-full geometric correction matters at low L), and available inside the design forward via `delens_residual_bb(fullsky=True)` / `DelensCoupling.build(fullsky=True)` / `make_optimization_context(delens_fullsky=True)`; flat-sky remains the default there.
 
 ```python
 from augr.delensing import load_lensing_spectra, iterate_delensing
@@ -309,7 +313,7 @@ result = iterate_delensing(spec, nl_tt, nl_ee, nl_bb, fullsky=True, n_iter=5)
 # result.A_lens_eff ~ 0.29 for probe-class, result.cl_bb_res for Fisher input
 ```
 
-**Differentiable end-to-end.** Both paths are `jax.jit` / `jax.grad`-traceable in the noise spectra. The flat-sky path is native (`augr.delensing.delens_residual_bb` is the differentiable entry point returning `cl_bb_res`); the full-sky path becomes differentiable with `backend="jax"`, which routes through the JAX-native Wigner 3j in `wigner_jax.py` and the pure-jnp drivers in `delensing_fullsky_jax.py` (validated bit-for-bit against the numpy/ProcessPool reference to ~1e-15). This lets σ(r) credit the delensing a given instrument can *achieve*: `make_optimization_context(..., delens="recompute", lensing_spectra=...)` recomputes the residual lensing BB from each design's noise inside the differentiable forward, so `jax.grad(sigma_r_from_design)` accounts for the design-dependence of delensing efficiency (a cheap first-order `delens="linearized"` surrogate is also provided).
+**Differentiable end-to-end.** Both paths are `jax.jit` / `jax.grad`-traceable in the noise spectra. The flat-sky path is native (`augr.delensing.delens_residual_bb` is the differentiable entry point returning `cl_bb_res`); the full-sky path becomes differentiable with `backend="jax"`, which routes through the closed-form Wigner 3j tables in `wigner_jax.py` / `wigner_closed.py` and the pure-jnp, per-L gradient-checkpointed drivers in `delensing_fullsky_jax.py` (validated against the numpy/ProcessPool reference to 1e-6 and against plancklens to 1e-3). `delens_residual_bb(..., fullsky=True)` / `DelensCoupling.build(..., fullsky=True)` / `make_optimization_context(..., delens_fullsky=True)` put that full-sky solve inside the design forward. This lets σ(r) credit the delensing a given instrument can *achieve*: `make_optimization_context(..., delens="recompute", lensing_spectra=...)` recomputes the residual lensing BB from each design's noise inside the differentiable forward, so `jax.grad(sigma_r_from_design)` accounts for the design-dependence of delensing efficiency (a cheap first-order `delens="linearized"` surrogate is also provided).
 
 ## Scan strategy
 

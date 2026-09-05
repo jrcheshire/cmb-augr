@@ -34,6 +34,7 @@ All spectra in C_ell convention [μK²] for CMB, dimensionless for φφ.
 from __future__ import annotations
 
 import atexit
+import math
 import multiprocessing as mp
 import os
 from concurrent.futures import ProcessPoolExecutor
@@ -57,10 +58,16 @@ from augr.parallel import cpu_count as _cpu_count
 # a separate child process -- no GIL contention from the
 # Schulten-Gordon recursion's Python loop, no nested-thread
 # oversubscription against Apple Accelerate's intrinsic BLAS
-# parallelism. On a 16-core machine at PICO l_max_qe=1500 fullsky=True,
-# ProcessPool max_workers=cpu_count delivers ~10× speedup vs
-# sequential (1825s -> ~180s); ThreadPool was actively *slower* than
-# sequential due to GIL contention.
+# parallelism. On a 16-core machine at PICO l_max_qe=1500 fullsky=True
+# with the pre-#48 every-L grid, ProcessPool max_workers=cpu_count
+# delivered ~10× speedup vs sequential (1825s -> ~180s); ThreadPool was
+# actively *slower* than sequential due to GIL contention.
+#
+# Since issue #48 the fast path is ``backend="jax"`` (closed-form Wigner
+# tables, one fused kernel per L) on the sampled L grid
+# (``n_L_sample="auto"``, ~13x fewer sweeps per estimator at l_max_qe=1500);
+# the numpy pool remains the reference implementation and the sampled grid
+# applies to it too.
 #
 # AUGR_DELENS_WORKERS overrides the worker count; set to 1 to disable
 # the pool (useful for debugging, profiling, or when the caller is
@@ -842,8 +849,34 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
     return jnp.where(n0_inv_jax > 0, 1.0 / n0_inv_jax, jnp.inf)
 
 
+#: Sentinel: resolve ``n_L_sample`` to :func:`default_n_L_sample` at the L_max in use.
+AUTO_N_L_SAMPLE = "auto"
+
+
+def default_n_L_sample(L_max: int) -> int:
+    """Production N_0 L-sample count for ``n_L_sample="auto"``: 100 at L_max=1000, 108 at 1500, 125 at 3000, 132 at 4000.
+
+    Set by ``scripts/n0_validation/l_sampling_convergence.py`` (results in
+    ``l_sampling_convergence_results.json``): value AND derivative of
+    ``A_lens_eff`` against the dense grid, PICO-like and LiteBIRD-like noise,
+    l_max_qe = 1000 and 1500, n_iter = 2. The log-L interpolation error falls
+    as ~1/n^2 (25 -> 50 -> 100 points: 6.4e-3 -> 1.6e-3 -> 3.9e-4 on
+    dA_L/dln N_bb at PICO/1000) and is set by points per e-fold of L, so the
+    count grows with ``ln(L_max / 20)``. At n = 100-118 grid points the
+    measured worst cases over the four configurations are: A_lens_eff
+    derivative 4.2e-4 relative, A_lens_eff 4.1e-4, cl_bb_res 4.7e-4,
+    N_0^MV 6.8e-3 max / 1.4e-3 median over L (exact below L = 20). Cost:
+    dense 1499 sweeps -> 118 per estimator at l_max_qe=1500 (forward 111 s
+    -> 8.3 s, gradient 419 s -> 33 s on an M4 Max).
+    """
+    return max(100, round(_N_L_PER_EFOLD * math.log(max(int(L_max), 21) / 20.0)))
+
+
+_N_L_PER_EFOLD = 25.0
+
+
 def _fullsky_L_samples(Ls_np: np.ndarray,
-                       n_L_sample: int | None = None) -> np.ndarray:
+                       n_L_sample: int | str | None = None) -> np.ndarray:
     """Generate L sample points for the full-sky N_0 evaluation.
 
     The full-sky path computes the (l1, l2) sum at these sample L values
@@ -863,12 +896,18 @@ def _fullsky_L_samples(Ls_np: np.ndarray,
     bump end of the range, where N_0 changes fastest) plus ``n`` log-spaced
     samples from 20 to ``L_max``, with the requested ``Ls`` *not* unioned in;
     ``N_0^{-1}`` is log-interpolated onto them. This is the same construction
-    the lensing kernel has always used (:func:`lensing_kernel`); see
+    the lensing kernel has always used (:func:`lensing_kernel`).
+    ``n_L_sample="auto"`` (:data:`AUTO_N_L_SAMPLE`) uses
+    :func:`default_n_L_sample` at this ``L_max``; see
     ``scripts/n0_validation/l_sampling_convergence.py`` for the value and
-    derivative convergence that sets the production default.
+    derivative convergence that sets it.
     """
     L_min = max(2, int(Ls_np.min()))
     L_max = int(Ls_np.max())
+    if isinstance(n_L_sample, str):
+        if n_L_sample != AUTO_N_L_SAMPLE:
+            raise ValueError(f"n_L_sample must be an int, None or 'auto'; got {n_L_sample!r}")
+        n_L_sample = default_n_L_sample(L_max)
     if n_L_sample is None:
         n_sample = max(50, L_max // 20)
         return np.unique(np.concatenate([
@@ -1596,8 +1635,8 @@ def _delens_core(spectra: LensingSpectra,
                  fullsky: bool,
                  backend: str = "numpy",
                  remat: bool = True,
-                 n_L_sample: int | None = None) -> tuple[jnp.ndarray, jnp.ndarray,
-                                                             jnp.ndarray, jnp.ndarray]:
+                 n_L_sample: int | str | None = AUTO_N_L_SAMPLE
+                 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Pure iterative-delensing core -- no host-side casts or I/O.
 
     Runs the Smith+ 2012 self-consistent QE-delensing iteration and returns
@@ -1677,7 +1716,7 @@ def delens_residual_bb(spectra: LensingSpectra,
                        n_iter: int = 5,
                        *,
                        remat: bool = True,
-                       n_L_sample: int | None = None,
+                       n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
                        fullsky: bool = False) -> jnp.ndarray:
     """Differentiable residual lensing BB from iterative QE delensing.
 
@@ -1731,7 +1770,7 @@ def iterate_delensing(spectra: LensingSpectra,
                       fullsky: bool = False,
                       backend: str = "numpy",
                       remat: bool = True,
-                      n_L_sample: int | None = None) -> DelensedSpectra:
+                      n_L_sample: int | str | None = AUTO_N_L_SAMPLE) -> DelensedSpectra:
     """Iterative QE delensing: compute residual lensing BB self-consistently.
 
     The key insight (Smith et al. 2012 §3.1): lensed B-mode power acts as
@@ -1776,13 +1815,14 @@ def iterate_delensing(spectra: LensingSpectra,
                     whole full-sky solve is jax.jit / jax.grad-traceable
                     in the noise spectra (issue #45 Stage 3). The flat-sky
                     path is already jnp regardless of backend.
-        n_L_sample: Full-sky only. ``None`` evaluates the five N_0
-                    estimators at every requested L (exact; ~L_max Wigner
-                    sweeps per estimator). An int evaluates them at every
-                    L < 20 plus that many log-spaced samples and
+        n_L_sample: Full-sky only. ``"auto"`` (default) evaluates the five
+                    N_0 estimators at every L < 20 plus
+                    :func:`default_n_L_sample` log-spaced samples and
                     log-interpolates ``N_0^{-1}`` -- the construction the
-                    lensing kernel already uses. See
-                    :func:`_fullsky_L_samples`.
+                    lensing kernel already uses; an int sets that count;
+                    ``None`` evaluates at every requested L (exact; ~L_max
+                    Wigner sweeps per estimator, the pre-#48 behaviour).
+                    See :func:`_fullsky_L_samples`.
 
     Returns:
         DelensedSpectra with residual BB, final N_0, and effective A_lens.

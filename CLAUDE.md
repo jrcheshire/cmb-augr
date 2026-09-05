@@ -123,7 +123,18 @@ Knowing how the modules chain together matters more than any one file:
    EB, TB), MV-combines, Wiener-filters to get C_L^{φ,res}, applies
    the lensing kernel for residual C_ℓ^{BB}, and iterates. Flat-sky
    uses Gauss-Legendre quadrature (~2 min / 5 iter); full-sky uses
-   `wigner.py` Schulten-Gordon recursion (~10 min / 5 iter).
+   Wigner-3j tables. Since issue #48 those tables are closed-form
+   lookups (`augr/wigner_closed.py`, Kiddier & Gratton 2026: the (0,0,0)
+   symbol from an O(lmax) `g(p)` table, the (0,-2,2) symbol from two
+   shifted (0,0,0) symbols; the odd-J branch is derived in-house and
+   gated against sympy/pywigxjpf) and the five N_0 estimators evaluate
+   on a sampled L grid (`n_L_sample="auto"`, every L<20 plus
+   `default_n_L_sample(L_max)` log-spaced points; `None` = every L, the
+   old behaviour) -- see the runtime table in `README.md`. The numpy
+   spin-2 production table stays on Schulten-Gordon (memory-bound as
+   numpy elementwise work); `wigner3j_vectorized` refuses a grid that
+   truncates any row's triangle, which is how the full-sky TE N_0 was
+   ~20x too small at low L before #48.
 
    **Differentiable flat-sky delensing (issue #45, Stage 1).** The
    flat-sky path is `lax.scan` + `jnp` throughout, so it is a single
@@ -174,20 +185,27 @@ Knowing how the modules chain together matters more than any one file:
    **Differentiable full-sky delensing (issue #45, Stage 3).**
    `fullsky=True` also has a pure-jnp, `jax.grad`-traceable path: pass
    `backend='jax'` to `iterate_delensing` (or `compute_n0_mv` /
-   `residual_cl_bb`). `augr/wigner_jax.py` ports both Wigner-3j paths
-   (spin-0 Racah via `jax.scipy.special.gammaln`; spin-2 Schulten-Gordon
-   as a `lax.scan` backward sweep — `spin2_body` / `spin0_body` are the
-   traced-L cores), and `augr/delensing_fullsky_jax.py` reimplements all
-   five N_0 estimators + the lensing kernel with those, driving the per-L
-   sweep via `lax.map` over the static `_fullsky_L_samples` grid (uniform
+   `residual_cl_bb`). `augr/wigner_jax.py` holds the traced-L Wigner
+   cores `spin2_body` / `spin0_body` (closed-form tables for every
+   (0,+-2,-+2) permutation -- one fused kernel per L -- with the
+   Schulten-Gordon `lax.scan` retained as `_spin2_body_sg` for other m
+   and as the test reference), and `augr/delensing_fullsky_jax.py`
+   reimplements all five N_0 estimators + the lensing kernel with those,
+   driving the per-L sweep via `_map` (= `lax.map`, `jax.checkpoint`ed
+   per L when `remat`) over the static `_fullsky_L_samples` grid (uniform
    shapes via a global `l2_max = l_max + max(L_sample)`; no ProcessPool).
-   Validated bit-for-bit against the sympy-locked numpy Wigner (rel
-   ~1e-11) and the numpy full-sky drivers (rel ~1e-13, TE ~1e-11); the
-   whole `iterate_delensing(fullsky=True, backend='jax')` reproduces the
-   numpy full-sky solve to ~1e-15 and is grad-finite. `backend='numpy'`
-   (default) keeps the ProcessPool Wigner path as the reference. The
-   design forward still uses flat-sky for speed; the differentiable
-   full-sky path is the accuracy cross-check.
+   Validated against sympy/pywigxjpf (1e-14 / 1e-13) and the numpy
+   full-sky drivers (1e-6); `iterate_delensing(fullsky=True,
+   backend='jax')` matches the numpy solve to 1e-6 and is grad-finite,
+   with the remat'd tape 53 GB -> 324 MB at l_max_qe=800.
+   `backend='numpy'` (default for `iterate_delensing`) keeps the
+   ProcessPool path as the reference. **The design forward can now run
+   full-sky**: `delens_residual_bb(fullsky=True)`,
+   `DelensCoupling.build(fullsky=True)`,
+   `make_optimization_context(delens_fullsky=True)`; default stays
+   flat-sky (byte-identical when off). On the 3-band fixture the
+   full-sky residual is 1.1-1.4% below flat-sky and its `jax.grad`
+   matches finite differences to 1e-8.
 
    **N₀ validation status (2026-05-07).** Validated against `plancklens`
    at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:

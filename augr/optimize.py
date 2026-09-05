@@ -39,7 +39,7 @@ import jax
 import jax.numpy as jnp
 
 from augr.covariance import bandpower_covariance_blocks_from_noise
-from augr.delensing import LensingSpectra, delens_residual_bb
+from augr.delensing import AUTO_N_L_SAMPLE, LensingSpectra, delens_residual_bb
 from augr.fisher import _fisher_from_blocks, _fisher_from_full
 from augr.instrument import (
     Instrument,
@@ -116,7 +116,7 @@ def _delens_from_combined_bb(spectra: LensingSpectra,
                              n_iter: int,
                              remat: bool = True,
                              fullsky: bool = False,
-                             n_L_sample: int | None = None) -> jnp.ndarray:
+                             n_L_sample: int | str | None = AUTO_N_L_SAMPLE) -> jnp.ndarray:
     """Residual lensing BB from the single combined polarization noise.
 
     In the design forward the inverse-variance-combined noise obeys the
@@ -181,7 +181,7 @@ class DelensCoupling:
     #: forward-transparent) while silently leaving the other path on the
     #: O(l_max_qe**2) tape -- i.e. it would pass for the wrong reason.
     fullsky: bool = False      # full-sky Wigner-3j QE (JAX backend) instead of flat-sky
-    n_L_sample: int | None = None  # full-sky N_0 L-sample grid; None = every L
+    n_L_sample: int | str | None = AUTO_N_L_SAMPLE  # full-sky N_0 L grid; None = every L
     #: ``fullsky`` / ``n_L_sample`` likewise enter BOTH solves: the reference
     #: residual and the per-design one must be the same approximation, or the
     #: "reproduces cl_bb_res0 at the reference" contract breaks silently.
@@ -202,7 +202,7 @@ class DelensCoupling:
         ls: jnp.ndarray | None = None,
         remat: bool = True,
         fullsky: bool = False,
-        n_L_sample: int | None = None,
+        n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
     ) -> DelensCoupling:
         """Precompute the coupling at a reference design (one delensing solve).
 
@@ -237,7 +237,8 @@ class DelensCoupling:
             cl_bb_res0=cl_res0,
             remat=bool(remat),
             fullsky=bool(fullsky),
-            n_L_sample=None if n_L_sample is None else int(n_L_sample),
+            n_L_sample=(n_L_sample if n_L_sample is None or isinstance(n_L_sample, str)
+                        else int(n_L_sample)),
         )
 
     def residual(self, n_det, net, beam, eta, mission_years, f_sky):
@@ -307,7 +308,7 @@ class OptimizationContext:
     delens_jac: jnp.ndarray | None = None         # d(cl_bb_res)/d(nl_bb), linearized mode
     delens_remat: bool = True                     # checkpoint the QE scans (see delensing._scan)
     delens_fullsky: bool = False                  # full-sky Wigner-3j QE (JAX) instead of flat-sky
-    delens_n_L_sample: int | None = None          # full-sky N_0 L-sample grid; None = every L
+    delens_n_L_sample: int | str | None = AUTO_N_L_SAMPLE  # full-sky N_0 L grid; None = every L
 
 
 def make_optimization_context(
@@ -325,7 +326,7 @@ def make_optimization_context(
     delens_ls: jnp.ndarray | None = None,
     delens_remat: bool = True,
     delens_fullsky: bool = False,
-    delens_n_L_sample: int | None = None,
+    delens_n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
     **signal_kwargs,
 ) -> OptimizationContext:
     """One-time setup for differentiable sigma(r) optimization.
@@ -361,8 +362,9 @@ def make_optimization_context(
                          2..300, must span the SignalModel [ell_min, ell_max]).
         delens_fullsky:  run the full-sky Wigner-3j QE (JAX backend, remat
                          per L) instead of the flat-sky Gauss-Legendre one.
-        delens_n_L_sample: full-sky only; N_0 L-sample grid (``None`` =
-                         every L, see ``delensing._fullsky_L_samples``).
+        delens_n_L_sample: full-sky only; N_0 L-sample grid (``"auto"`` =
+                         ``delensing.default_n_L_sample``, ``None`` = every L,
+                         see ``delensing._fullsky_L_samples``).
         **signal_kwargs: Passed to SignalModel (ell_min, ell_max, delta_ell,
                          ell_per_bin_below, delensed_bb, etc.)
 

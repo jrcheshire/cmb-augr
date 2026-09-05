@@ -1,8 +1,8 @@
 """Tests for optimize.py — differentiable Fisher forecast for instrument optimization."""
 
+import dataclasses
 from typing import ClassVar
 
-import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -841,7 +841,7 @@ def test_make_optimization_context_delens_fullsky(_coupling_design):
                                          delens_fullsky=True, delens_n_L_sample=50)
     ctx_flat = make_optimization_context(**common, delens="recompute")
     assert ctx_full.delens_fullsky is True and ctx_full.delens_n_L_sample == 50
-    assert ctx_flat.delens_fullsky is False and ctx_flat.delens_n_L_sample is None
+    assert ctx_flat.delens_fullsky is False and ctx_flat.delens_n_L_sample == "auto"
     assert not np.array_equal(np.asarray(ctx_full.delens_cl_bb_res0),
                               np.asarray(ctx_flat.delens_cl_bb_res0))
     s_full = float(sigma_r_from_channels(ctx_full.n_det, ctx_full.net, ctx_full.beam,

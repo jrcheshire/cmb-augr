@@ -1329,6 +1329,21 @@ class TestFullSkyLSamples:
         from augr.delensing import _fullsky_L_samples
         with pytest.raises(ValueError):
             _fullsky_L_samples(np.arange(2, 100), 1)
+        with pytest.raises(ValueError):
+            _fullsky_L_samples(np.arange(2, 100), "dense")
+
+    def test_auto_default_resolves_to_default_n_L_sample(self):
+        """``"auto"`` = ``default_n_L_sample(L_max)``; the rule is 25/e-fold above a floor of 100.
+
+        Values pinned from the convergence study (see the docstring): 100 at
+        L_max=1000, 108 at 1500, 125 at 3000, 132 at 4000.
+        """
+        from augr.delensing import AUTO_N_L_SAMPLE, _fullsky_L_samples, default_n_L_sample
+        assert [default_n_L_sample(L) for L in (300, 1000, 1500, 3000, 4000)] == [100, 100, 108, 125, 132]
+        Ls = np.arange(2, 1501)
+        np.testing.assert_array_equal(_fullsky_L_samples(Ls, AUTO_N_L_SAMPLE),
+                                      _fullsky_L_samples(Ls, default_n_L_sample(1500)))
+        assert len(_fullsky_L_samples(Ls, "auto")) == 125  # 18 + 108 - 1 rounding collision
 
     def test_sampled_n0_matches_dense_small_lmax(self):
         """Sampled-grid N_0^MV (jax) vs the dense grid at l_max=250.
