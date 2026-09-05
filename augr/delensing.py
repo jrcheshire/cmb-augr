@@ -1677,15 +1677,22 @@ def delens_residual_bb(spectra: LensingSpectra,
                        n_iter: int = 5,
                        *,
                        remat: bool = True,
-                       n_L_sample: int | None = None) -> jnp.ndarray:
-    """Differentiable residual lensing BB from iterative flat-sky QE delensing.
+                       n_L_sample: int | None = None,
+                       fullsky: bool = False) -> jnp.ndarray:
+    """Differentiable residual lensing BB from iterative QE delensing.
 
-    Flat-sky, pure-jnp entry point for the residual C_l^{BB} the design
-    forward needs: jax.jit / jax.grad-traceable in the noise spectra
-    (nl_tt, nl_ee, nl_bb) (close over spectra and the integer knobs, which
-    are compile-time constants).  Equivalent to
-    iterate_delensing(..., fullsky=False).cl_bb_res without the host-side
-    dataclass packaging.  Returns C_l^{BB,res} at ls.
+    Pure-jnp entry point for the residual C_l^{BB} the design forward needs:
+    jax.jit / jax.grad-traceable in the noise spectra (nl_tt, nl_ee, nl_bb)
+    (close over spectra and the integer knobs, which are compile-time
+    constants).  Equivalent to ``iterate_delensing(..., backend="jax")
+    .cl_bb_res`` without the host-side dataclass packaging.  Returns
+    C_l^{BB,res} at ls.
+
+    ``fullsky=False`` (default) is the flat-sky Gauss-Legendre QE;
+    ``fullsky=True`` runs the full-sky Wigner-3j drivers on the JAX backend
+    (closed-form tables since issue #48, gradient-checkpointed per L when
+    ``remat``), with ``n_L_sample`` selecting the N_0 L-sample grid (see
+    :func:`_fullsky_L_samples`).
 
     ``remat`` (default True) gradient-checkpoints the QE scan bodies, which is
     what keeps a ``jax.grad`` through this function from allocating
@@ -1705,7 +1712,8 @@ def delens_residual_bb(spectra: LensingSpectra,
     cl_bb_res, _n0, _a, _hist = _delens_core(
         spectra, nl_tt, nl_ee, nl_bb, ls, Ls,
         n_iter=n_iter, l_min_qe=l_min_qe, l_max_qe=l_max_qe,
-        n_phi=n_phi, fullsky=False, remat=remat, n_L_sample=n_L_sample)
+        n_phi=n_phi, fullsky=fullsky, backend="jax", remat=remat,
+        n_L_sample=n_L_sample)
     return cl_bb_res
 
 

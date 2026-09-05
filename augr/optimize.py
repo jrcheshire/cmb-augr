@@ -114,19 +114,22 @@ def _delens_from_combined_bb(spectra: LensingSpectra,
                              ls: jnp.ndarray,
                              l_max_qe: int,
                              n_iter: int,
-                             remat: bool = True) -> jnp.ndarray:
+                             remat: bool = True,
+                             fullsky: bool = False,
+                             n_L_sample: int | None = None) -> jnp.ndarray:
     """Residual lensing BB from the single combined polarization noise.
 
     In the design forward the inverse-variance-combined noise obeys the
     pol/temperature relation ``nl_ee = nl_bb`` and ``nl_tt = nl_bb / 2``, so
     the iterative-QE residual is a function of ``nl_bb`` alone. ``nl_bb`` is
     indexed on ``spectra.ells`` (the LensingSpectra grid).  Differentiable
-    (flat-sky ``delens_residual_bb``), so this composes into ``jax.grad``.
+    (``delens_residual_bb``, flat-sky or full-sky), so this composes into
+    ``jax.grad``.
     """
     return delens_residual_bb(
         spectra, nl_bb / 2.0, nl_bb, nl_bb,
         ls=ls, L_max=l_max_qe, l_max_qe=l_max_qe, n_iter=n_iter,
-        remat=remat)
+        remat=remat, fullsky=fullsky, n_L_sample=n_L_sample)
 
 
 @dataclass(frozen=True)
@@ -177,6 +180,11 @@ class DelensCoupling:
     #: Setting it on only one of them still passes every value test (remat is
     #: forward-transparent) while silently leaving the other path on the
     #: O(l_max_qe**2) tape -- i.e. it would pass for the wrong reason.
+    fullsky: bool = False      # full-sky Wigner-3j QE (JAX backend) instead of flat-sky
+    n_L_sample: int | None = None  # full-sky N_0 L-sample grid; None = every L
+    #: ``fullsky`` / ``n_L_sample`` likewise enter BOTH solves: the reference
+    #: residual and the per-design one must be the same approximation, or the
+    #: "reproduces cl_bb_res0 at the reference" contract breaks silently.
 
     @classmethod
     def build(
@@ -193,8 +201,15 @@ class DelensCoupling:
         n_iter: int = 5,
         ls: jnp.ndarray | None = None,
         remat: bool = True,
+        fullsky: bool = False,
+        n_L_sample: int | None = None,
     ) -> DelensCoupling:
         """Precompute the coupling at a reference design (one delensing solve).
+
+        ``fullsky=True`` runs the full-sky Wigner-3j QE (JAX backend, remat per L)
+        instead of the flat-sky Gauss-Legendre one; ``n_L_sample`` picks its N_0
+        L-sample grid (``None`` = every L; see
+        :func:`augr.delensing._fullsky_L_samples`).
 
         ``n_det`` / ``net`` / ``beam`` / ``eta`` are the reference design's
         per-channel arrays (the same ones :func:`design_to_channels` produces), and
@@ -210,7 +225,8 @@ class DelensCoupling:
             jnp.asarray(n_det), jnp.asarray(net), jnp.asarray(beam), jnp.asarray(eta),
             ells, mission_years, f_sky)
         cl_res0 = _delens_from_combined_bb(
-            lensing_spectra, nl_bb0, ls_arr, l_max_qe, n_iter, remat)
+            lensing_spectra, nl_bb0, ls_arr, l_max_qe, n_iter, remat,
+            fullsky=fullsky, n_L_sample=n_L_sample)
         return cls(
             spectra=lensing_spectra,
             ls=ls_arr,
@@ -220,6 +236,8 @@ class DelensCoupling:
             nl_bb0=nl_bb0,
             cl_bb_res0=cl_res0,
             remat=bool(remat),
+            fullsky=bool(fullsky),
+            n_L_sample=None if n_L_sample is None else int(n_L_sample),
         )
 
     def residual(self, n_det, net, beam, eta, mission_years, f_sky):
@@ -234,7 +252,7 @@ class DelensCoupling:
             self.ells, mission_years, f_sky)
         return _delens_from_combined_bb(
             self.spectra, nl_bb, self.ls, self.l_max_qe, self.n_iter,
-            self.remat)
+            self.remat, fullsky=self.fullsky, n_L_sample=self.n_L_sample)
 
 
 @dataclass(frozen=True)
@@ -288,6 +306,8 @@ class OptimizationContext:
     delens_nl_bb0: jnp.ndarray | None = None      # reference combined nl_bb (on delens_ells)
     delens_jac: jnp.ndarray | None = None         # d(cl_bb_res)/d(nl_bb), linearized mode
     delens_remat: bool = True                     # checkpoint the QE scans (see delensing._scan)
+    delens_fullsky: bool = False                  # full-sky Wigner-3j QE (JAX) instead of flat-sky
+    delens_n_L_sample: int | None = None          # full-sky N_0 L-sample grid; None = every L
 
 
 def make_optimization_context(
@@ -304,6 +324,8 @@ def make_optimization_context(
     delens_n_iter: int = 5,
     delens_ls: jnp.ndarray | None = None,
     delens_remat: bool = True,
+    delens_fullsky: bool = False,
+    delens_n_L_sample: int | None = None,
     **signal_kwargs,
 ) -> OptimizationContext:
     """One-time setup for differentiable sigma(r) optimization.
@@ -337,6 +359,10 @@ def make_optimization_context(
                          (~90 GB at l_max_qe=1000). Forward-transparent.
         delens_ls:       ell grid for the residual (delens only; default
                          2..300, must span the SignalModel [ell_min, ell_max]).
+        delens_fullsky:  run the full-sky Wigner-3j QE (JAX backend, remat
+                         per L) instead of the flat-sky Gauss-Legendre one.
+        delens_n_L_sample: full-sky only; N_0 L-sample grid (``None`` =
+                         every L, see ``delensing._fullsky_L_samples``).
         **signal_kwargs: Passed to SignalModel (ell_min, ell_max, delta_ell,
                          ell_per_bin_below, delensed_bb, etc.)
 
@@ -384,7 +410,8 @@ def make_optimization_context(
             instrument.mission_duration_years, instrument.f_sky)
         delens_cl_bb_res0 = _delens_from_combined_bb(
             lensing_spectra, delens_nl_bb0, delens_ls_arr,
-            delens_l_max_qe, delens_n_iter, delens_remat)
+            delens_l_max_qe, delens_n_iter, delens_remat,
+            fullsky=delens_fullsky, n_L_sample=delens_n_L_sample)
         if delens == "linearized":
             # J = d(cl_bb_res)/d(nl_bb) at the reference (reverse-mode: output
             # dim n_ls << input dim n_ells). This precompute costs O(n_ls)
@@ -393,7 +420,8 @@ def make_optimization_context(
                 lambda nlbb: _delens_from_combined_bb(
                     lensing_spectra, nlbb, delens_ls_arr,
                     delens_l_max_qe, delens_n_iter,
-                    delens_remat))(delens_nl_bb0)
+                    delens_remat, fullsky=delens_fullsky,
+                    n_L_sample=delens_n_L_sample))(delens_nl_bb0)
         # Put the SignalModel in delensed mode at the reference residual.
         signal_kwargs = dict(signal_kwargs)
         signal_kwargs["delensed_bb"] = delens_cl_bb_res0
@@ -448,6 +476,8 @@ def make_optimization_context(
         delens_ells=delens_ells_arr,
         delens_l_max_qe=delens_l_max_qe,
         delens_remat=delens_remat,
+        delens_fullsky=delens_fullsky,
+        delens_n_L_sample=delens_n_L_sample,
         delens_n_iter=delens_n_iter,
         delens_cl_bb_res0=delens_cl_bb_res0,
         delens_nl_bb0=delens_nl_bb0,
@@ -536,7 +566,8 @@ def sigma_r_from_channels(
         if ctx.delens_mode == "recompute":
             cl_res = _delens_from_combined_bb(
                 ctx.lensing_spectra, nl_bb_del, ctx.delens_ls,
-                ctx.delens_l_max_qe, ctx.delens_n_iter, ctx.delens_remat)
+                ctx.delens_l_max_qe, ctx.delens_n_iter, ctx.delens_remat,
+                fullsky=ctx.delens_fullsky, n_L_sample=ctx.delens_n_L_sample)
         else:  # 'linearized': cl_bb_res0 + J (nl_bb - nl_bb0)
             cl_res = ctx.delens_cl_bb_res0 + ctx.delens_jac @ (
                 nl_bb_del - ctx.delens_nl_bb0)
