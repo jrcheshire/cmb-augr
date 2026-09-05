@@ -614,6 +614,73 @@ class TestWigner3j:
         pywigxjpf.wig_temp_free()
         pywigxjpf.wig_table_free()
 
+    @pytest.mark.parametrize("m1,m2,m3,L,l1_lo,l1_hi,l2_min", [
+        (-2, 0, 2, 1500, 1000, 3000, 2),   # delensing config on its own grid
+        (2, -2, 0, 2000, 500, 2600, 0),    # MASTER config on its own grid
+    ])
+    def test_closed_form_spin2_large_l(self, m1, m2, m3, L, l1_lo, l1_hi, l2_min):
+        """Closed-form spin-2 table (issue #48) vs pywigxjpf at production multipoles.
+
+        Both J parities, sampled every 50 in l2 along rows l1 = l1_lo, +250, ...
+        Measured worst 8.5e-14 relative (the SG table it replaces measured
+        6.2e-13 on the same cells); gate 1e-11 on cells with |ref| > 1e-3 of the
+        row's largest symbol, exact zeros on the |m| <= j rows.
+        """
+        pywigxjpf = pytest.importorskip("pywigxjpf")
+        from augr.wigner_jax import spin2_body
+        pywigxjpf.wig_table_init(2 * 8000, 3)
+        pywigxjpf.wig_temp_init(2 * 8000)
+        try:
+            l1 = jnp.arange(l1_lo, l1_hi + 1, 250, dtype=float)
+            l2_max = l1_hi + L
+            w = np.asarray(spin2_body(float(L), l1, m1, m2, m3, l2_min, l2_max))
+            checked = 0
+            for i, a in enumerate(l1.astype(int)):
+                a = int(a)
+                scale = np.abs(w[i]).max()
+                for l2 in range(max(abs(a - L), l2_min), min(a + L, l2_max) + 1, 50):
+                    ref = pywigxjpf.wig3jj(2 * a, 2 * L, 2 * l2, 2 * m1, 2 * m2, 2 * m3)
+                    got = w[i, l2 - l2_min]
+                    if abs(ref) > 1e-3 * scale:
+                        assert abs(got - ref) / abs(ref) < 1e-11, (a, L, l2, got, ref)
+                        checked += 1
+                    else:
+                        assert abs(got - ref) < 1e-11 * scale, (a, L, l2, got, ref)
+            assert checked > 200
+        finally:
+            pywigxjpf.wig_temp_free()
+            pywigxjpf.wig_table_free()
+
+    def test_closed_form_000_large_l(self):
+        """Closed-form (l1 l2 L; 0 0 0) table vs pywigxjpf at production multipoles.
+
+        Measured worst 4e-16 relative with the exact g table (a gammaln-built
+        table sat at 1e-11); gate 1e-12.
+        """
+        pywigxjpf = pytest.importorskip("pywigxjpf")
+        from augr.wigner_jax import spin0_body
+        pywigxjpf.wig_table_init(2 * 8000, 3)
+        pywigxjpf.wig_temp_init(2 * 8000)
+        try:
+            L = 1200
+            l1 = jnp.arange(500, 3001, 250, dtype=float)
+            w = np.asarray(spin0_body(float(L), l1, 2, 3000))
+            checked = 0
+            for i, a in enumerate(l1.astype(int)):
+                a = int(a)
+                for l2 in range(max(abs(a - L), 2), min(a + L, 3000) + 1, 37):
+                    ref = pywigxjpf.wig3jj(2 * a, 2 * l2, 2 * L, 0, 0, 0)
+                    got = w[i, l2 - 2]
+                    if ref == 0.0:
+                        assert got == 0.0
+                    else:
+                        assert abs(got - ref) / abs(ref) < 1e-12, (a, l2, L, got, ref)
+                        checked += 1
+            assert checked > 100
+        finally:
+            pywigxjpf.wig_temp_free()
+            pywigxjpf.wig_table_free()
+
 
 # -----------------------------------------------------------------------
 # Full-sky tests

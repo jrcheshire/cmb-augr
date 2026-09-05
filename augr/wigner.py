@@ -1,17 +1,23 @@
 """
 wigner.py — Wigner 3j symbol computation for full-sky CMB lensing coupling.
 
-Provides two computation methods:
-  1. Closed-form via log-gamma for (l1 l2 L; 0 0 0) — exact, stable at
-     all ell. Used for scalar (TT, TE) QE estimators.
-  2. Schulten-Gordon three-term recursion for general (j1 j2 j; m1 m2 m3).
-     Used for spin-2 (EB, TB, EE) QE estimators and the lensing kernel.
+Provides three computation methods:
+  1. Closed-form ``g(p)`` lookup table (Kiddier & Gratton 2026; issue #48)
+     for the (l1 l2 L; 0 0 0) table ``wigner3j_000_vectorized`` -- exact to
+     rounding, no ``gammaln``; shared with the JAX module via
+     ``augr.wigner_closed``, which also holds the spin-2 closed form the JAX
+     production path uses.
+  2. Closed-form Racah via log-gamma for a single (l1 l2 L; 0 0 0)
+     (``wigner3j_000``) — exact, stable at all ell.
+  3. Schulten-Gordon three-term recursion for general (j1 j2 j; m1 m2 m3)
+     (``wigner3j_recurse``, ``wigner3j_vectorized``). The numpy spin-2
+     production table stays on this path: see ``wigner3j_vectorized`` for
+     why the numpy closed form loses on speed.
 
 The vectorized recursion processes all l1 values simultaneously for a
-fixed L, enabling efficient computation of the full coupling matrix
-needed for the N_0 and kernel sums. The recursion is bidirectional
-(forward from j_min, backward from j_max) with median-ratio matching
-at the midpoint for numerical stability across the full j range.
+fixed L. The scalar recursion is bidirectional (forward from j_min,
+backward from j_max) with median-ratio matching at the midpoint for
+numerical stability across the full j range.
 
 The delensing module calls this with two m-value configurations:
   - m1=-2, m2=0 (m3=2): computes (l_E, L, l_B; -2, 0, 2), which
@@ -30,6 +36,8 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.special import gammaln
+
+from augr.wigner_closed import g_table, j000_table, p_max_for
 
 # -----------------------------------------------------------------------
 # (l1 l2 L; 0 0 0) — closed-form via log-gamma
@@ -82,35 +90,13 @@ def wigner3j_000_vectorized(L: int, l1_arr: np.ndarray,
     (-1)^(l1+l2+L) is +1 and the symbol is fully permutation-symmetric.
     """
     l1 = np.asarray(l1_arr, dtype=int)
-    n_l1 = len(l1)
     if l2_max is None:
         l2_max = int(np.max(l1)) + L
     l2_grid = np.arange(l2_min, l2_max + 1, dtype=int)
-    n_l2 = len(l2_grid)
-    w = np.zeros((n_l1, n_l2))
-
-    for j in range(n_l2):
-        l2 = l2_grid[j]
-        # Triangle: |l1-l2| <= L <= l1+l2 and parity: l1+l2+L even
-        tri_ok = (np.abs(l1 - l2) <= L) & (l1 + l2 >= L)
-        parity_ok = ((l1 + l2 + L) % 2 == 0)
-        valid = tri_ok & parity_ok
-        if not np.any(valid):
-            continue
-
-        idx = np.where(valid)[0]
-        l1_v = l1[idx]
-        s = (l1_v + l2 + L) // 2
-        a = s - l1_v
-        b = s - l2
-        c = s - L
-        sign = (-1.0) ** s
-        log_w = (gammaln(s + 1)
-                 - gammaln(a + 1) - gammaln(b + 1) - gammaln(c + 1)
-                 + 0.5 * (gammaln(2*a + 1) + gammaln(2*b + 1)
-                          + gammaln(2*c + 1) - gammaln(2*s + 2)))
-        w[idx, j] = sign * np.exp(log_w)
-
+    if len(l1) == 0 or len(l2_grid) == 0:
+        return l2_grid, np.zeros((len(l1), len(l2_grid)))
+    g = g_table(p_max_for(int(np.max(l1)), l2_max))
+    w = j000_table(float(L), l1.astype(float), l2_min, l2_max, g, xp=np)
     return l2_grid, w
 
 
@@ -316,6 +302,17 @@ def wigner3j_vectorized(j2: int, l1_array: np.ndarray,
     momentum (here l2), with l1 and j2 fixed per recursion step.
     All l1 values are processed in parallel (vectorized backward sweep).
 
+    The numpy spin-2 table deliberately stays on this recursion: the
+    closed-form ``augr.wigner_closed.spin2_table(xp=np)`` is exact but
+    memory-bound as numpy elementwise work over the full ``(n_l1, n_l2)``
+    table (measured 0.37 s vs 0.066 s here at l_max=1500), whereas the JAX
+    core (``wigner_jax.spin2_body``) fuses it into one kernel and wins. The
+    numpy closed form is still the cross-backend reference in the tests.
+
+    Because the sum-rule normalization runs over the supplied grid, the grid
+    must cover every row's full triangle ``[|l1-j2|, l1+j2]`` (clipped by
+    ``|m3|``); a truncated grid silently renormalizes the clipped rows.
+
     The 3j symbol ordering is (l1, j2, l2) in slots (j1, j2, j3), with magnetic
     numbers (m1, m2, m3) where m3 = -(m1+m2).  Column permutations of
     the 3j symbol differ only by a sign (-1)^{l1+j2+l2}, so |w3j|^2 is
@@ -345,9 +342,8 @@ def wigner3j_vectorized(j2: int, l1_array: np.ndarray,
     j2_f = float(j2)
 
     # Magnetic-quantum-number constraint on the j2 slot: if |m2| > j2 the entire
-    # 3j vanishes for any (j1, j3). Short-circuit so callers like
-    # _wignerc.wignerc_3j (which sweeps j2 from 0 upward and routinely
-    # invokes this with j2 < |m2|) get an honest zero matrix.
+    # 3j vanishes for any (j1, j3). Short-circuit so callers that sweep j2
+    # from 0 upward get an honest zero matrix.
     l2_min = max(l2_min_global, abs(m3))
     l2_max = int(np.max(l1)) + j2 if l2_max_global is None else l2_max_global
     n_l2 = l2_max - l2_min + 1
@@ -355,6 +351,24 @@ def wigner3j_vectorized(j2: int, l1_array: np.ndarray,
     if n_l2 <= 0 or abs(m2) > j2:
         return (np.arange(l2_min, l2_max + 1, dtype=int),
                 np.zeros((n_l1, max(n_l2, 0))))
+
+    # The recursion is seeded at each row's j_max = l1 + j2 and normalized by
+    # the sum rule over the grid, so a grid that cuts any row's triangle
+    # [max(|l1 - j2|, |m3|), l1 + j2] returns a wrong row, not a clipped one
+    # (the seed lands on the grid edge with the wrong coefficients). Refuse
+    # rather than return it: the full-sky TE N_0 was ~20x off for exactly
+    # this reason (issue #48 follow-up). Slice a covering table instead.
+    rows = l1[np.abs(m1) <= l1]
+    if rows.size:
+        need_lo = int(np.min(np.maximum(np.abs(rows - j2_f), abs(m3))))
+        need_hi = int(np.max(rows) + j2)
+        if l2_min > need_lo or l2_max < need_hi:
+            raise ValueError(
+                f"wigner3j_vectorized: l2 grid [{l2_min}, {l2_max}] truncates "
+                f"the recursion triangle [{need_lo}, {need_hi}] for some row; "
+                "the SG normalization would silently return wrong rows. Build "
+                "the table on a covering grid and slice, or use the closed form "
+                "(augr.wigner_closed.spin2_table).")
 
     l2_grid = np.arange(l2_min, l2_max + 1, dtype=float)
 

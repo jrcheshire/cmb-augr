@@ -4,10 +4,12 @@ delensing_fullsky_jax.py -- pure-jnp full-sky QE N_0 and lensing kernel.
 Differentiable (jax.jit / jax.grad) counterparts of the numpy full-sky
 drivers in ``delensing.py`` (issue #45 Stage 3). Each per-L body is
 ``jnp`` throughout and uses the traced-L Wigner cores in ``wigner_jax``
-(``spin2_body`` / ``spin0_body``); the per-L sweep is a ``lax.map`` over the
-static ``_fullsky_L_samples`` grid (sequential -> one Wigner table live at a
-time), replacing the numpy ProcessPool. The log-interp onto the requested Ls
-is a differentiable ``jnp.interp``.
+(``spin2_body`` / ``spin0_body`` -- closed-form lookup tables since issue
+#48, one fused kernel per L instead of an l2-length recursion); the per-L
+sweep is a ``lax.map`` over the static ``_fullsky_L_samples`` grid
+(sequential -> one Wigner table live at a time), replacing the numpy
+ProcessPool. The log-interp onto the requested Ls is a differentiable
+``jnp.interp``.
 
 Shape contract: ``L`` is traced inside ``lax.map``; the l2 grid bounds are
 static (a *global* l2_max = l_max + max(L_sample) for the spin-2 estimators,

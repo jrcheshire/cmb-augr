@@ -1094,10 +1094,20 @@ def _per_L_te(L_in, *, l1_arr, l1_ll1, te_l1, tt_l1, te_tot_l1, ee_l1,
     l2_grid, w000 = wigner3j_000_vectorized(
         L, l1_arr, l2_min=l_min, l2_max=l_max,
     )
-    l2_grid_2, w2F = wigner3j_vectorized(
+    # The spin-2 table is a Schulten-Gordon recursion normalized over the grid
+    # it is handed, so it must see every row's full triangle [|l1-L|, l1+L]
+    # (issue #48 follow-up). Build it on the covering grid and slice the QE
+    # domain [l_min, l_max] out afterwards. Handing it the square grid
+    # directly -- what this worker did before -- seeded rows with
+    # l1 + L > l_max off-grid and made N_0^TE up to ~20x too small at low L
+    # (both backends agreed because both made the same cut; the JAX side now
+    # uses the closed form, which has no grid dependence).
+    l2_full, w2F_full = wigner3j_vectorized(
         L, l1_arr, m1=-2, m2=0,
-        l2_min_global=l_min, l2_max_global=l_max,
+        l2_min_global=0, l2_max_global=int(np.max(l1_arr)) + L,
     )
+    sel = (l2_full >= l_min) & (l2_full <= l_max)
+    l2_grid_2, w2F = l2_full[sel], w2F_full[:, sel]
     assert l2_grid.shape == l2_grid_2.shape and np.array_equal(
         l2_grid, l2_grid_2
     ), "w000 and w2F l2 grids disagree"

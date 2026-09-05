@@ -32,12 +32,14 @@ absorbs the common-resolution beam ``B_c^2`` into the multiplicative transfer
 ``F_b`` (see :func:`augr.spectrum_stages.beamed_prior`), so applying it twice
 would double-count.
 
-**The l3 grid runs to ``2 * lmax``, not to ``lmax_mask``.**
-:func:`augr.wigner_jax.spin2_body` normalizes by ``sum_j (2j+1) w^2 = 1`` over
-whatever grid it is handed, so a row whose support runs past the end is
-renormalized against a partial sum (measured: 73-162% error). ``W_l`` is
-zero-padded above ``lmax_mask`` instead. The extra columns cost 0.6 MB at
-lmax=192.
+**The l3 grid runs to ``2 * lmax``, not to ``lmax_mask``.** The sum over l3
+is physically supported out to ``l1 + l2 = 2 lmax``; ``W_l`` is zero-padded
+above ``lmax_mask`` rather than the grid being cut there. (Historically this
+was also required by the Schulten-Gordon table's sum-rule normalization,
+which renormalized clipped rows against a partial sum -- 73-162% error; the
+closed-form table :func:`augr.wigner_jax.spin2_body` now uses has no such
+dependence, but the support argument stands.) The extra columns cost 0.6 MB
+at lmax=192.
 """
 
 from __future__ import annotations

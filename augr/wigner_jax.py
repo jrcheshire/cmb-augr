@@ -1,33 +1,49 @@
 """
-wigner_jax.py -- JAX port of augr.wigner for differentiable full-sky delensing.
+wigner_jax.py -- JAX Wigner-3j tables for differentiable full-sky delensing.
 
-Mirrors the two computation paths of the numpy ``augr.wigner`` module so the
-full-sky QE / lensing-kernel drivers can run inside ``jax.jit`` / ``jax.grad``
-(issue #45 Stage 3):
+Mirrors the numpy ``augr.wigner`` module so the full-sky QE / lensing-kernel
+drivers can run inside ``jax.jit`` / ``jax.grad`` (issue #45 Stage 3).
 
-  1. ``wigner3j_000_vectorized_jax`` -- (l1 l2 L; 0 0 0) closed-form Racah via
-     ``jax.scipy.special.gammaln``. Fully vectorized, no recursion.
-  2. ``wigner3j_vectorized_jax`` -- spin-2 Schulten-Gordon three-term
-     recursion. The numpy version is a backward-only sweep over l2 with
-     per-l1 seeds; here that sweep is a ``lax.scan`` carrying the two most
-     recent columns. All l1 rows are processed in parallel.
+The production cores are closed-form lookup-table evaluations (Kiddier &
+Gratton 2026, arXiv:2602.15605; issue #48) shared with the numpy module via
+``augr.wigner_closed``:
 
-Conventions, coefficient signs (including the ``_sg_b`` m_3 term), the sum-rule
-normalization ``sum_j (2j+1) w^2 = 1``, and the ``(-1)^{l1-L-m3}`` sign fix are
-identical to ``augr.wigner``; ``tests/test_wigner.py`` locks the numpy version
-to sympy truth, and the ``wigner_jax`` port is validated bit-for-bit against it.
+  * ``spin0_body`` -- (l1 l2 L; 0 0 0) from the ``g(p)`` table: four gathers,
+    no ``gammaln``.
+  * ``spin2_body`` -- (l1, j2, l2; m1, m2, m3) for any permutation of
+    ``(0, -2, 2)`` as an elementwise combination of ``(0 0 0)`` symbols, so a
+    whole ``(n_l1, n_l2)`` table is one fused kernel instead of an
+    ``n_l2``-step ``lax.scan``. Other magnetic configurations fall back to the
+    Schulten-Gordon recursion (``_spin2_body_sg``), which is retained -- along
+    with ``_spin0_body_gammaln`` -- as the reference the tests compare against.
 
-Static-shape contract: ``L`` and the l2 grid bounds are Python ints (they set
-array shapes), so these functions trace with static shapes -- l1 values are the
-only array input.
+The SG fallback keeps the conventions of ``augr.wigner``: coefficient signs
+(including the ``_sg_b`` m_3 term), the sum-rule normalization
+``sum_j (2j+1) w^2 = 1``, and the ``(-1)^{l1-L-m3}`` sign fix.
+
+Static-shape contract: the l2 grid bounds are Python ints (they set array
+shapes); ``L`` / ``j2`` may be traced (``lax.map`` callers). The closed-form
+table is sized by ``max(l1) + l2_max + 1`` (``wigner_closed.p_max_for``); when
+``l1`` is itself a tracer (any ``jnp.arange`` under ``jit``) the bound falls
+back to ``2 * l2_max + 1``, exact whenever the grid reaches the rows' own
+multipoles -- pass ``l1_max=`` to override (see ``_concrete_l1_max``).
 """
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
 from jax.scipy.special import gammaln
+
+from augr.wigner_closed import (
+    canonical_slots,
+    g_table,
+    j000_table,
+    p_max_for,
+    spin2_table,
+)
 
 _TINY = 1e-30
 
@@ -41,14 +57,41 @@ def _parity_sign(x: jnp.ndarray) -> jnp.ndarray:
 # (l1 l2 L; 0 0 0) -- closed-form via log-gamma
 # -----------------------------------------------------------------------
 
-def spin0_body(L_f, l1, l2_min: int, l2_max: int) -> jnp.ndarray:
-    """(l1 l2 L; 0 0 0) closed-form table for a single L; ``L`` may be traced.
+def _concrete_l1_max(l1, l1_max: int | None, l2_max: int) -> int:
+    """``max(l1)`` as a Python int for sizing the ``g`` table.
 
-    ``L_f`` scalar value (concrete or tracer); ``l1`` jnp array; ``l2_min,
-    l2_max`` static ints. ``lax.map``-friendly core of
-    :func:`wigner3j_000_vectorized_jax`. Returns w of shape
-    ``(len(l1), l2_max - l2_min + 1)``.
+    Concrete ``l1`` is read directly. Under ``jax.jit`` even a constant
+    ``jnp.arange`` is a tracer (every production caller builds ``l1`` that
+    way), so with no ``l1_max`` given the bound falls back to ``l2_max``: exact
+    whenever the l2 grid reaches the rows' own multipoles (``max(l1) <=
+    l2_max``), which any grid that covers the triangle does, since the
+    triangle for row ``l1`` extends to ``l1 + j2``. Pass ``l1_max`` explicitly
+    for a traced ``l1`` on a grid truncated below ``max(l1)``.
     """
+    if l1_max is not None:
+        return int(l1_max)
+    try:
+        return int(np.max(np.asarray(l1)))
+    except (jax.errors.TracerArrayConversionError,
+            jax.errors.ConcretizationTypeError):
+        return int(l2_max)
+
+
+def spin0_body(L_f, l1, l2_min: int, l2_max: int, *,
+               l1_max: int | None = None) -> jnp.ndarray:
+    """(l1 l2 L; 0 0 0) table for a single L via the ``g(p)`` lookup; ``L`` may be traced.
+
+    ``L_f`` scalar value (concrete or tracer); ``l1`` jnp array (concrete, or
+    pass ``l1_max``); ``l2_min, l2_max`` static ints. ``lax.map``-friendly core
+    of :func:`wigner3j_000_vectorized_jax`. Returns w of shape
+    ``(len(l1), l2_max - l2_min + 1)``. Reference: :func:`_spin0_body_gammaln`.
+    """
+    g = jnp.asarray(g_table(p_max_for(_concrete_l1_max(l1, l1_max, l2_max), l2_max)))
+    return j000_table(L_f, l1, l2_min, l2_max, g, xp=jnp)
+
+
+def _spin0_body_gammaln(L_f, l1, l2_min: int, l2_max: int) -> jnp.ndarray:
+    """Racah closed form via ``gammaln`` -- the pre-#48 ``spin0_body``, kept as a reference."""
     l2_grid = jnp.arange(l2_min, l2_max + 1, dtype=float)   # (n_l2,)
     l1c = l1[:, None]                 # (n_l1, 1)
     l2c = l2_grid[None, :]            # (1, n_l2)
@@ -76,7 +119,8 @@ def spin0_body(L_f, l1, l2_min: int, l2_max: int) -> jnp.ndarray:
 
 def wigner3j_000_vectorized_jax(L: int, l1_arr,
                                 l2_min: int = 0,
-                                l2_max: int | None = None
+                                l2_max: int | None = None,
+                                *, l1_max: int | None = None
                                 ) -> tuple[np.ndarray, jnp.ndarray]:
     """JAX port of ``wigner.wigner3j_000_vectorized`` (concrete ``L``).
 
@@ -88,7 +132,7 @@ def wigner3j_000_vectorized_jax(L: int, l1_arr,
     if l2_max is None:
         l2_max = int(np.max(np.asarray(l1_arr))) + int(L)
     l2_grid = jnp.arange(l2_min, l2_max + 1, dtype=float)
-    w = spin0_body(float(L), l1, l2_min, l2_max)
+    w = spin0_body(float(L), l1, l2_min, l2_max, l1_max=l1_max)
     return l2_grid.astype(int), w
 
 
@@ -127,15 +171,43 @@ def _sg_b_jax(j, j1, j2, m1, m2, m3):
 # -----------------------------------------------------------------------
 
 def spin2_body(j2, l1, m1: int, m2: int, m3: int,
-               l2_min: int, l2_max: int) -> jnp.ndarray:
-    """Spin-2 Schulten-Gordon table for a single j2, ``j2`` may be traced.
+               l2_min: int, l2_max: int, *,
+               l1_max: int | None = None) -> jnp.ndarray:
+    """Spin-2 table ``(l1[i], j2, l2[j]; m1, m2, m3)`` for a single j2; ``j2`` may be traced.
 
     ``j2`` is a scalar value (concrete or a JAX tracer); ``l1`` is a jnp
-    array; ``m1, m2, m3, l2_min, l2_max`` are static Python ints (they set
-    array shapes and carry no control flow on ``j2``). This is the
-    ``lax.map``-friendly core; the public ``wigner3j_vectorized_jax`` wraps
-    it with the concrete-``j2`` grid bookkeeping and edge cases. Returns
-    w_full of shape ``(len(l1), l2_max - l2_min + 1)``.
+    array (concrete, or pass ``l1_max``); ``m1, m2, m3, l2_min, l2_max`` are
+    static Python ints (they set array shapes and carry no control flow on
+    ``j2``). This is the ``lax.map``-friendly core; the public
+    ``wigner3j_vectorized_jax`` wraps it with the concrete-``j2`` grid
+    bookkeeping and edge cases. Returns w of shape
+    ``(len(l1), l2_max - l2_min + 1)``, signed, zero off the triangle and
+    wherever a ``|m| <= j`` constraint fails.
+
+    Any permutation of ``(0, -2, 2)`` -- every production caller -- goes
+    through the closed form (``augr.wigner_closed.spin2_table``), which needs
+    no normalization and is independent of the l2 grid extent. Other magnetic
+    configurations use the Schulten-Gordon recursion :func:`_spin2_body_sg`.
+    """
+    try:
+        canonical_slots(m1, m2, m3)
+    except ValueError:
+        return _spin2_body_sg(j2, l1, m1, m2, m3, l2_min, l2_max)
+    g = jnp.asarray(g_table(p_max_for(_concrete_l1_max(l1, l1_max, l2_max), l2_max)))
+    w = spin2_table(j2, l1, m1, m2, m3, l2_min, l2_max, g, xp=jnp)
+    # Already implied by the canonical-form masks; kept so the contract is
+    # stated in one place for both paths.
+    return jnp.where(jnp.abs(m2) <= j2, w, 0.0)
+
+
+def _spin2_body_sg(j2, l1, m1: int, m2: int, m3: int,
+                   l2_min: int, l2_max: int) -> jnp.ndarray:
+    """Spin-2 Schulten-Gordon table for a single j2 -- the pre-#48 ``spin2_body``.
+
+    Backward SG sweep as a ``lax.scan`` over l2, sum-rule normalized over the
+    supplied grid (so the grid must cover the full triangle), sign-fixed at
+    ``j_max``. General in ``(m1, m2, m3)``; used as the fallback for magnetic
+    configurations the closed form does not cover and as the test reference.
     """
     n_l1 = l1.shape[0]
     n_l2 = l2_max - l2_min + 1
@@ -227,14 +299,15 @@ def spin2_body(j2, l1, m1: int, m2: int, m3: int,
 def wigner3j_vectorized_jax(j2: int, l1_array,
                             m1: int = 2, m2: int = -2,
                             l2_min_global: int = 0,
-                            l2_max_global: int | None = None
+                            l2_max_global: int | None = None,
+                            *, l1_max: int | None = None
                             ) -> tuple[np.ndarray, jnp.ndarray]:
-    """JAX port of ``wigner.wigner3j_vectorized`` (backward SG sweep as scan).
+    """JAX port of ``wigner.wigner3j_vectorized``.
 
-    Computes (l1, j2, l2; m1, m2, m3) for all l1 and valid l2. Same seeds,
-    coefficient signs, normalization, and sign fix as the numpy version.
-    ``j2`` is a concrete int here; the ``lax.map``-friendly traced-``j2`` core
-    is :func:`spin2_body`.
+    Computes (l1, j2, l2; m1, m2, m3) for all l1 and valid l2 (closed form for
+    the ``(0, -2, 2)`` permutations, SG recursion otherwise -- see
+    :func:`spin2_body`). ``j2`` is a concrete int here; the ``lax.map``-friendly
+    traced-``j2`` core is :func:`spin2_body`.
     """
     m3 = -(m1 + m2)
     l1 = jnp.asarray(l1_array, dtype=float)
@@ -249,6 +322,6 @@ def wigner3j_vectorized_jax(j2: int, l1_array,
         return (np.arange(l2_min, l2_max + 1, dtype=int),
                 jnp.zeros((n_l1, max(n_l2, 0))))
 
-    w_full = spin2_body(float(j2), l1, m1, m2, m3, l2_min, l2_max)
+    w_full = spin2_body(float(j2), l1, m1, m2, m3, l2_min, l2_max, l1_max=l1_max)
     l2_grid = jnp.arange(l2_min, l2_max + 1, dtype=float)
     return l2_grid.astype(int), w_full
