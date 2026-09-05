@@ -13,8 +13,9 @@ most). This module is the cheap, low-dimensional half of the HL-EIG capstone: th
 built from the cheap, validated Gaussian-EIG / ``sigma(r)`` gradient (see
 :func:`augr.optimize_mapbased.sigma_r_from_noise_design`, :func:`augr.eig.design_objective`),
 and the expensive non-Gaussian HL-EIG (:func:`augr.eig.hl_eig_from_external_cov`) is then
-*evaluated* only along the 1--3 surviving directions (the driver,
-``scripts/active_subspace_hl_eig.py``).
+*evaluated* only along the 1--3 surviving directions. The driver that composes them is
+study-specific (it fixes a band set, aperture and budget) and so lives outside this
+package, alongside the study it belongs to.
 
 **Standardization.** Design knobs are heterogeneous in scale (n_det ~ 100s, NET ~ 10s,
 beam_fwhm ~ arcmin, mission_years ~ few), so ``C`` must be formed in a dimensionless space or
