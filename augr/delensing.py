@@ -364,7 +364,8 @@ def compute_n0_eb(Ls: jnp.ndarray,
                   n_phi: int = 128,
                   fullsky: bool = False,
                   *,
-                  remat: bool = True) -> jnp.ndarray:
+                  remat: bool = True,
+                  n_L_sample: int | None = None) -> jnp.ndarray:
     """N_0^{EB}(L) — QE reconstruction noise for the EB estimator.
 
     Hu & Okamoto (2002) Eq. 11 with Table 1 weight functions.
@@ -386,7 +387,8 @@ def compute_n0_eb(Ls: jnp.ndarray,
         N_0^{EB}(L), array of shape (n_L,).
     """
     if fullsky:
-        return _compute_n0_eb_fullsky(Ls, spectra, nl_ee, nl_bb, l_min, l_max)
+        return _compute_n0_eb_fullsky(Ls, spectra, nl_ee, nl_bb, l_min, l_max,
+                                      n_L_sample=n_L_sample)
     phi, w_phi = _gl_nodes(n_phi)
 
     # Total observed spectra (lensed + noise)
@@ -439,14 +441,16 @@ def compute_n0_tb(Ls: jnp.ndarray,
                   n_phi: int = 128,
                   fullsky: bool = False,
                   *,
-                  remat: bool = True) -> jnp.ndarray:
+                  remat: bool = True,
+                  n_L_sample: int | None = None) -> jnp.ndarray:
     """N_0^{TB}(L) — QE reconstruction noise for the TB estimator.
 
     Response: f_TB = C_{l₁}^{TE,unl} × (L·l₁) × sin(2φ_{l₁,l₂})
     Filter:   F_TB = f_TB / (C_{l₁}^{TT,tot} × C_{l₂}^{BB,tot})
     """
     if fullsky:
-        return _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max)
+        return _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max,
+                                      n_L_sample=n_L_sample)
     phi, w_phi = _gl_nodes(n_phi)
     cl_tt_tot = spectra.cl_tt_len + nl_tt
     cl_bb_tot = spectra.cl_bb_len + nl_bb
@@ -475,7 +479,8 @@ def compute_n0_tt(Ls: jnp.ndarray,
                   n_phi: int = 128,
                   fullsky: bool = False,
                   *,
-                  remat: bool = True) -> jnp.ndarray:
+                  remat: bool = True,
+                  n_L_sample: int | None = None) -> jnp.ndarray:
     """N_0^{TT}(L) — QE reconstruction noise for the TT estimator.
 
     Response: f_TT = C_{l₁}^{TT,unl} (L·l₁) + C_{l₂}^{TT,unl} (L·l₂)
@@ -483,7 +488,8 @@ def compute_n0_tt(Ls: jnp.ndarray,
     Factor of 2 from same-field estimator.
     """
     if fullsky:
-        return _compute_n0_tt_fullsky(Ls, spectra, nl_tt, l_min, l_max)
+        return _compute_n0_tt_fullsky(Ls, spectra, nl_tt, l_min, l_max,
+                                      n_L_sample=n_L_sample)
     phi, w_phi = _gl_nodes(n_phi)
     cl_tt_tot = spectra.cl_tt_len + nl_tt
     cl_tt_unl = spectra.cl_tt_unl
@@ -517,14 +523,16 @@ def compute_n0_ee(Ls: jnp.ndarray,
                   n_phi: int = 128,
                   fullsky: bool = False,
                   *,
-                  remat: bool = True) -> jnp.ndarray:
+                  remat: bool = True,
+                  n_L_sample: int | None = None) -> jnp.ndarray:
     """N_0^{EE}(L) — QE reconstruction noise for the EE estimator.
 
     Response: f_EE = [C_{l₁}^{EE,unl} (L·l₁) + C_{l₂}^{EE,unl} (L·l₂)] cos(2φ_{l₁,l₂})
     Filter:   F_EE = f_EE / (2 × C_{l₁}^{EE,tot} × C_{l₂}^{EE,tot})
     """
     if fullsky:
-        return _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max)
+        return _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max,
+                                      n_L_sample=n_L_sample)
     phi, w_phi = _gl_nodes(n_phi)
     cl_ee_tot = spectra.cl_ee_len + nl_ee
     cl_ee_unl = spectra.cl_ee_unl
@@ -557,7 +565,8 @@ def compute_n0_te(Ls: jnp.ndarray,
                   fullsky: bool = False,
                   te_filter: str = 'ho02_exact',
                   *,
-                  remat: bool = True) -> jnp.ndarray:
+                  remat: bool = True,
+                  n_L_sample: int | None = None) -> jnp.ndarray:
     """N_0^{TE}(L) — QE reconstruction noise for the TE estimator.
 
     Follows Hu & Okamoto 2002 (astro-ph/0111606) Table 1 with α = ΘE:
@@ -615,7 +624,7 @@ def compute_n0_te(Ls: jnp.ndarray,
             f"te_filter must be one of {_TE_FILTERS}, got {te_filter!r}")
     if fullsky:
         return _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
-                                      te_filter=te_filter)
+                                      te_filter=te_filter, n_L_sample=n_L_sample)
     phi, w_phi = _gl_nodes(n_phi)
     cl_tt_tot = spectra.cl_tt_len + nl_tt
     cl_ee_tot = spectra.cl_ee_len + nl_ee
@@ -682,7 +691,8 @@ def compute_n0_mv(Ls: jnp.ndarray,
                   *,
                   max_workers: int | None = None,
                   backend: str = "numpy",
-                  remat: bool = True) -> jnp.ndarray:
+                  remat: bool = True,
+                  n_L_sample: int | None = None) -> jnp.ndarray:
     """Minimum-variance combination of all five QE estimators.
 
     1/N_0^{MV}(L) = Σ_α 1/N_0^α(L)    (HO02 Eq. 22)
@@ -708,7 +718,8 @@ def compute_n0_mv(Ls: jnp.ndarray,
         # Differentiable jnp full-sky MV (issue #45 Stage 3). No ProcessPool.
         from augr.delensing_fullsky_jax import compute_n0_mv_fullsky_jax
         return compute_n0_mv_fullsky_jax(
-            Ls, spectra, nl_tt, nl_ee, nl_bb, l_min, l_max)
+            Ls, spectra, nl_tt, nl_ee, nl_bb, l_min, l_max,
+            n_L_sample=n_L_sample, remat=remat)
     if backend not in ("numpy", "jax"):
         raise ValueError(f"backend must be 'numpy' or 'jax'; got {backend!r}")
 
@@ -719,26 +730,23 @@ def compute_n0_mv(Ls: jnp.ndarray,
         try:
             return _compute_n0_mv_body(
                 Ls, spectra, nl_tt, nl_ee, nl_bb,
-                l_min, l_max, n_phi, fullsky, remat)
+                l_min, l_max, n_phi, fullsky, remat, n_L_sample)
         finally:
             _force_serial = prev_force
     return _compute_n0_mv_body(
         Ls, spectra, nl_tt, nl_ee, nl_bb,
-        l_min, l_max, n_phi, fullsky, remat)
+        l_min, l_max, n_phi, fullsky, remat, n_L_sample)
 
 
 def _compute_n0_mv_body(Ls, spectra, nl_tt, nl_ee, nl_bb,
-                         l_min, l_max, n_phi, fullsky, remat=True):
-    n0_tt = compute_n0_tt(Ls, spectra, nl_tt, l_min, l_max, n_phi,
-                          fullsky=fullsky, remat=remat)
-    n0_ee = compute_n0_ee(Ls, spectra, nl_ee, l_min, l_max, n_phi,
-                          fullsky=fullsky, remat=remat)
-    n0_te = compute_n0_te(Ls, spectra, nl_tt, nl_ee, l_min, l_max, n_phi,
-                          fullsky=fullsky, remat=remat)
-    n0_eb = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, l_min, l_max, n_phi,
-                          fullsky=fullsky, remat=remat)
-    n0_tb = compute_n0_tb(Ls, spectra, nl_tt, nl_bb, l_min, l_max, n_phi,
-                          fullsky=fullsky, remat=remat)
+                         l_min, l_max, n_phi, fullsky, remat=True,
+                         n_L_sample=None):
+    kw = dict(fullsky=fullsky, remat=remat, n_L_sample=n_L_sample)
+    n0_tt = compute_n0_tt(Ls, spectra, nl_tt, l_min, l_max, n_phi, **kw)
+    n0_ee = compute_n0_ee(Ls, spectra, nl_ee, l_min, l_max, n_phi, **kw)
+    n0_te = compute_n0_te(Ls, spectra, nl_tt, nl_ee, l_min, l_max, n_phi, **kw)
+    n0_eb = compute_n0_eb(Ls, spectra, nl_ee, nl_bb, l_min, l_max, n_phi, **kw)
+    n0_tb = compute_n0_tb(Ls, spectra, nl_tt, nl_bb, l_min, l_max, n_phi, **kw)
 
     inv_n0_mv = (1.0 / n0_tt + 1.0 / n0_ee + 1.0 / n0_te
                  + 1.0 / n0_eb + 1.0 / n0_tb)
@@ -789,7 +797,8 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
                            nl_ee: jnp.ndarray,
                            nl_bb: jnp.ndarray,
                            l_min: int = 2,
-                           l_max: int = 3000) -> jnp.ndarray:
+                           l_max: int = 3000,
+                           n_L_sample: int | None = None) -> jnp.ndarray:
     """Full-sky N_0^{EB}(L) using Smith et al. (2012) Eq. 6-7.
 
     [N_0(L)]^{-1} = 1/(2L+1) × sum_{l_E, l_B, odd}
@@ -811,7 +820,7 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
     Ls_np = np.asarray(Ls)
     l_E_arr = np.arange(l_min, l_max + 1, dtype=float)
 
-    L_samples = _fullsky_L_samples(Ls_np)
+    L_samples = _fullsky_L_samples(Ls_np, n_L_sample)
 
     # Spectrum weights: C_EE^2 / C_EE_tot (indexed by l_E) -- L-independent.
     ee_unl_sq = cl_ee_unl[l_min:l_max + 1] ** 2
@@ -833,29 +842,47 @@ def _compute_n0_eb_fullsky(Ls: jnp.ndarray,
     return jnp.where(n0_inv_jax > 0, 1.0 / n0_inv_jax, jnp.inf)
 
 
-def _fullsky_L_samples(Ls_np: np.ndarray) -> np.ndarray:
+def _fullsky_L_samples(Ls_np: np.ndarray,
+                       n_L_sample: int | None = None) -> np.ndarray:
     """Generate L sample points for the full-sky N_0 evaluation.
 
     The full-sky path computes the (l1, l2) sum at these sample L values
-    and log-interpolates onto the requested ``Ls``. To keep the interp a
-    no-op at every requested point, the requested ``Ls`` are *included*
-    in the sample grid; an internal log-spaced grid then fills in any
-    gaps so monotone interp at intermediate user-queried L values still
-    works smoothly.
+    and log-interpolates ``N_0^{-1}`` onto the requested ``Ls``.
 
-    A previous version capped ``n_sample`` by ``len(Ls_np)``, which
-    silently collapsed the internal grid when the user passed sparse
-    Ls (e.g. 7 points) and gave ~10-20% interp error at intermediate L.
-    The fix is to (a) drop that cap, (b) always include the input Ls in
-    the sample grid.
+    ``n_L_sample=None`` (the exact, slow grid): the requested ``Ls`` are
+    *included* in the sample grid so the interp is a no-op at every
+    requested point, and an internal log-spaced grid fills any gaps so
+    monotone interp at intermediate user-queried L values still works. A
+    previous version capped ``n_sample`` by ``len(Ls_np)``, which silently
+    collapsed the internal grid when the user passed sparse Ls (e.g. 7
+    points) and gave ~10-20% interp error at intermediate L. With the dense
+    ``Ls = 2..L_max`` that :func:`iterate_delensing` passes, this grid is
+    every L, i.e. ~L_max per-L Wigner sweeps per estimator.
+
+    ``n_L_sample=n`` (the sampled grid): every L below 20 (the reionization
+    bump end of the range, where N_0 changes fastest) plus ``n`` log-spaced
+    samples from 20 to ``L_max``, with the requested ``Ls`` *not* unioned in;
+    ``N_0^{-1}`` is log-interpolated onto them. This is the same construction
+    the lensing kernel has always used (:func:`lensing_kernel`); see
+    ``scripts/n0_validation/l_sampling_convergence.py`` for the value and
+    derivative convergence that sets the production default.
     """
     L_min = max(2, int(Ls_np.min()))
     L_max = int(Ls_np.max())
-    n_sample = max(50, L_max // 20)
+    if n_L_sample is None:
+        n_sample = max(50, L_max // 20)
+        return np.unique(np.concatenate([
+            np.arange(L_min, min(20, L_max + 1)),
+            np.geomspace(max(20, L_min), L_max, n_sample).astype(int),
+            np.asarray(Ls_np, dtype=int),
+        ]).clip(L_min, L_max).astype(int))
+    n = int(n_L_sample)
+    if n < 2:
+        raise ValueError(f"n_L_sample must be >= 2 (or None); got {n_L_sample!r}")
     return np.unique(np.concatenate([
         np.arange(L_min, min(20, L_max + 1)),
-        np.geomspace(max(20, L_min), L_max, n_sample).astype(int),
-        np.asarray(Ls_np, dtype=int),
+        np.rint(np.geomspace(max(20, L_min), L_max, n)).astype(int),
+        np.array([L_min, L_max]),
     ]).clip(L_min, L_max).astype(int))
 
 
@@ -925,7 +952,8 @@ def _per_L_tb(L_in, *, l_E_arr, l1_weight, cl_bb_tot):
     return np.sum(l1_weight * l2_sum) / (2 * L + 1)
 
 
-def _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max):
+def _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max,
+                           n_L_sample=None):
     """Full-sky N_0^{TB}: same parity-odd coupling as EB, but C^{TE}/C^{TT} weights."""
     cl_tt_tot = np.asarray(spectra.cl_tt_len + nl_tt)
     cl_bb_tot = np.asarray(spectra.cl_bb_len + nl_bb)
@@ -933,7 +961,7 @@ def _compute_n0_tb_fullsky(Ls, spectra, nl_tt, nl_bb, l_min, l_max):
 
     Ls_np = np.asarray(Ls)
     l_E_arr = np.arange(l_min, l_max + 1, dtype=float)
-    L_samples = _fullsky_L_samples(Ls_np)
+    L_samples = _fullsky_L_samples(Ls_np, n_L_sample)
 
     # L-independent weights
     te_unl_sq = cl_te_unl[l_min:l_max + 1] ** 2
@@ -981,14 +1009,14 @@ def _per_L_tt(L_in, *, l1_arr, l1_ll1, tt_l1, inv_tt_l1, cl_tt_unl,
     return np.sum(integrand) / (2 * L + 1)
 
 
-def _compute_n0_tt_fullsky(Ls, spectra, nl_tt, l_min, l_max):
+def _compute_n0_tt_fullsky(Ls, spectra, nl_tt, l_min, l_max, n_L_sample=None):
     """Full-sky N_0^{TT} using vectorized (l1 l2 L; 0 0 0)."""
     cl_tt_tot = np.asarray(spectra.cl_tt_len + nl_tt)
     cl_tt_unl = np.asarray(spectra.cl_tt_unl)
 
     Ls_np = np.asarray(Ls)
     l1_arr = np.arange(l_min, l_max + 1, dtype=int)
-    L_samples = _fullsky_L_samples(Ls_np)
+    L_samples = _fullsky_L_samples(Ls_np, n_L_sample)
 
     l1_ll1 = l1_arr * (l1_arr + 1)
     tt_l1 = cl_tt_unl[l1_arr]
@@ -1041,7 +1069,7 @@ def _per_L_ee(L_in, *, l1_arr, l1_ll1, ee_l1, inv_ee_l1, cl_ee_unl,
     return np.sum(integrand) / (2 * L + 1)
 
 
-def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
+def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max, n_L_sample=None):
     """Full-sky N_0^{EE} using parity-even spin-2 coupling.
 
     Implements Okamoto & Hu 2003 (astro-ph/0301031) Eq. 14 for the EE
@@ -1063,7 +1091,7 @@ def _compute_n0_ee_fullsky(Ls, spectra, nl_ee, l_min, l_max):
 
     Ls_np = np.asarray(Ls)
     l1_arr = np.arange(l_min, l_max + 1, dtype=float)
-    L_samples = _fullsky_L_samples(Ls_np)
+    L_samples = _fullsky_L_samples(Ls_np, n_L_sample)
 
     l1_ll1 = l1_arr * (l1_arr + 1)
     ee_l1 = cl_ee_unl[l_min:l_max + 1]
@@ -1168,7 +1196,7 @@ def _per_L_te(L_in, *, l1_arr, l1_ll1, te_l1, tt_l1, te_tot_l1, ee_l1,
     return np.sum(f_total ** 2 * inv_denom) / (2 * L + 1)
 
 def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
-                           te_filter='ho02_exact'):
+                           te_filter='ho02_exact', n_L_sample=None):
     """Full-sky N_0^{TE} using OkaHu Table I spin-mixed coupling.
 
     Implements the spin-mixed response per Okamoto & Hu 2003 Table I:
@@ -1240,7 +1268,7 @@ def _compute_n0_te_fullsky(Ls, spectra, nl_tt, nl_ee, l_min, l_max,
 
     Ls_np = np.asarray(Ls)
     l1_arr = np.arange(l_min, l_max + 1, dtype=int)
-    L_samples = _fullsky_L_samples(Ls_np)
+    L_samples = _fullsky_L_samples(Ls_np, n_L_sample)
 
     l1_ll1 = l1_arr * (l1_arr + 1)
     te_l1 = cl_te_unl[l1_arr]
@@ -1501,7 +1529,7 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
         # Differentiable jnp full-sky residual (issue #45 Stage 3).
         from augr.delensing_fullsky_jax import residual_cl_bb_fullsky_jax
         return residual_cl_bb_fullsky_jax(
-            ls, Ls, spectra, n0_mv, l_min, l_max, nl_ee=nl_ee)
+            ls, Ls, spectra, n0_mv, l_min, l_max, nl_ee=nl_ee, remat=remat)
     if backend not in ("numpy", "jax"):
         raise ValueError(f"backend must be 'numpy' or 'jax'; got {backend!r}")
 
@@ -1567,8 +1595,9 @@ def _delens_core(spectra: LensingSpectra,
                  n_phi: int,
                  fullsky: bool,
                  backend: str = "numpy",
-                 remat: bool = True) -> tuple[jnp.ndarray, jnp.ndarray,
-                                                  jnp.ndarray, jnp.ndarray]:
+                 remat: bool = True,
+                 n_L_sample: int | None = None) -> tuple[jnp.ndarray, jnp.ndarray,
+                                                             jnp.ndarray, jnp.ndarray]:
     """Pure iterative-delensing core -- no host-side casts or I/O.
 
     Runs the Smith+ 2012 self-consistent QE-delensing iteration and returns
@@ -1607,7 +1636,8 @@ def _delens_core(spectra: LensingSpectra,
         # MV N_0 with the current BB in the EB/TB filters.
         n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb_eff,
                            l_min_qe, l_max_qe, n_phi, fullsky=fullsky,
-                           backend=backend, remat=remat)
+                           backend=backend, remat=remat,
+                           n_L_sample=n_L_sample)
 
         # Residual BB (exact Smith+ Eq. 12 with the W_EE Wiener filter).
         cl_bb_res = residual_cl_bb(ls, Ls, spectra, n0,
@@ -1646,7 +1676,8 @@ def delens_residual_bb(spectra: LensingSpectra,
                        n_phi: int = 128,
                        n_iter: int = 5,
                        *,
-                       remat: bool = True) -> jnp.ndarray:
+                       remat: bool = True,
+                       n_L_sample: int | None = None) -> jnp.ndarray:
     """Differentiable residual lensing BB from iterative flat-sky QE delensing.
 
     Flat-sky, pure-jnp entry point for the residual C_l^{BB} the design
@@ -1668,11 +1699,13 @@ def delens_residual_bb(spectra: LensingSpectra,
     """
     if ls is None:
         ls = jnp.arange(2, 301, dtype=float)
-    Ls = jnp.arange(2, L_max + 1, dtype=float)
+    # numpy on purpose: the full-sky drivers size their L-sample grid from
+    # it at trace time, so it must stay concrete under an outer jax.jit.
+    Ls = np.arange(2, L_max + 1, dtype=float)
     cl_bb_res, _n0, _a, _hist = _delens_core(
         spectra, nl_tt, nl_ee, nl_bb, ls, Ls,
         n_iter=n_iter, l_min_qe=l_min_qe, l_max_qe=l_max_qe,
-        n_phi=n_phi, fullsky=False, remat=remat)
+        n_phi=n_phi, fullsky=False, remat=remat, n_L_sample=n_L_sample)
     return cl_bb_res
 
 
@@ -1689,7 +1722,8 @@ def iterate_delensing(spectra: LensingSpectra,
                       verbose: bool = False,
                       fullsky: bool = False,
                       backend: str = "numpy",
-                      remat: bool = True) -> DelensedSpectra:
+                      remat: bool = True,
+                      n_L_sample: int | None = None) -> DelensedSpectra:
     """Iterative QE delensing: compute residual lensing BB self-consistently.
 
     The key insight (Smith et al. 2012 §3.1): lensed B-mode power acts as
@@ -1734,6 +1768,13 @@ def iterate_delensing(spectra: LensingSpectra,
                     whole full-sky solve is jax.jit / jax.grad-traceable
                     in the noise spectra (issue #45 Stage 3). The flat-sky
                     path is already jnp regardless of backend.
+        n_L_sample: Full-sky only. ``None`` evaluates the five N_0
+                    estimators at every requested L (exact; ~L_max Wigner
+                    sweeps per estimator). An int evaluates them at every
+                    L < 20 plus that many log-spaced samples and
+                    log-interpolates ``N_0^{-1}`` -- the construction the
+                    lensing kernel already uses. See
+                    :func:`_fullsky_L_samples`.
 
     Returns:
         DelensedSpectra with residual BB, final N_0, and effective A_lens.
@@ -1741,12 +1782,15 @@ def iterate_delensing(spectra: LensingSpectra,
     if ls is None:
         ls = jnp.arange(2, 301, dtype=float)
 
-    Ls = jnp.arange(2, L_max + 1, dtype=float)
+    # numpy on purpose: the full-sky drivers size their L-sample grid from
+    # it at trace time, so it must stay concrete under an outer jax.jit.
+    Ls = np.arange(2, L_max + 1, dtype=float)
 
     cl_bb_res, n0, A_lens_eff, a_lens_hist = _delens_core(
         spectra, nl_tt, nl_ee, nl_bb, ls, Ls,
         n_iter=n_iter, l_min_qe=l_min_qe, l_max_qe=l_max_qe,
-        n_phi=n_phi, fullsky=fullsky, backend=backend, remat=remat)
+        n_phi=n_phi, fullsky=fullsky, backend=backend, remat=remat,
+        n_L_sample=n_L_sample)
 
     if verbose:
         for i in range(n_iter):

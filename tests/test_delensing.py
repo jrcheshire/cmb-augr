@@ -834,7 +834,7 @@ TOL_FULLSKY_TT_TAIL = 1e-3   # high-L (l > 2000) where both feel boundary trunc
 # stops at L=1800 to avoid the C_TE zero-crossings near l~1850 where
 # the response amplitude vanishes and any structural residual blows
 # up relative to plancklens.
-TOL_FULLSKY_TE_BULK = 6e-2
+TOL_FULLSKY_TE_BULK = 3e-2   # measured 2.35e-2 post-#48 (was ~5% with the truncated-grid TE bug)
 L_BULK_TE = (10, 1800)
 
 L_BULK = (10, 2000)
@@ -1289,3 +1289,68 @@ class TestRematIsNumericallyTransparent:
         r_b = residual_cl_bb(ls, Ls, spectra, mv_b, nl_ee=noise["ee"],
                              remat=False, **self._KW)
         np.testing.assert_array_equal(np.asarray(r_a), np.asarray(r_b))
+
+
+# -----------------------------------------------------------------------
+# Full-sky N_0 L-sample grid (issue #48 follow-up: sparse-L sampling knob)
+# -----------------------------------------------------------------------
+
+class TestFullSkyLSamples:
+    """``_fullsky_L_samples`` -- the exact (None) grid and the sampled grid."""
+
+    def test_none_is_the_dense_union_grid(self):
+        """``n_L_sample=None`` reproduces the pre-#48 grid: every requested L is in it."""
+        from augr.delensing import _fullsky_L_samples
+        Ls = np.arange(2, 1501)
+        grid = _fullsky_L_samples(Ls)
+        assert grid.shape == Ls.shape and np.array_equal(grid, Ls)
+        # sparse request: internal log grid fills in, requested points kept
+        Ls = np.array([2, 7, 50, 400, 1500])
+        grid = _fullsky_L_samples(Ls, None)
+        assert set(Ls).issubset(set(grid.tolist()))
+        assert len(grid) >= 50 and grid[0] == 2 and grid[-1] == 1500
+        assert np.all(np.diff(grid) > 0)
+
+    @pytest.mark.parametrize("n", [25, 75, 200])
+    def test_sampled_grid_shape(self, n):
+        """Every L < 20, plus n log-spaced samples, plus both ends; requested Ls not unioned."""
+        from augr.delensing import _fullsky_L_samples
+        Ls = np.arange(2, 1501)
+        grid = _fullsky_L_samples(Ls, n)
+        assert grid[0] == 2 and grid[-1] == 1500
+        assert np.all(np.diff(grid) > 0)
+        assert np.array_equal(grid[grid < 20], np.arange(2, 20))
+        # n log-spaced points from 20 to 1500, minus collisions after rounding
+        # (dense at the low end: n=200 loses 12 of them)
+        assert 18 + n // 2 <= len(grid) <= 18 + n
+        assert len(grid) < len(Ls) // 5
+
+    def test_sampled_grid_rejects_degenerate_n(self):
+        from augr.delensing import _fullsky_L_samples
+        with pytest.raises(ValueError):
+            _fullsky_L_samples(np.arange(2, 100), 1)
+
+    def test_sampled_n0_matches_dense_small_lmax(self):
+        """Sampled-grid N_0^MV (jax) vs the dense grid at l_max=250.
+
+        Interp error of ``N_0^{-1}`` in log-L; measured at n=50 on this
+        configuration: 1.95e-3 max (at L=32), 5.8e-4 median over L=2..150
+        (n=25: 5.3e-3 / 2.6e-3; n=100: 6.8e-4 / 0). Gate 5e-3 max.
+        The production default is set by the convergence study in
+        ``scripts/n0_validation/l_sampling_convergence.py``, not by this test.
+        """
+        from augr.delensing import compute_n0_mv, load_lensing_spectra
+        spectra = load_lensing_spectra()
+        n = len(spectra.cl_ee_len)
+        nt, ne, nb = (jnp.full(n, 1e-6), jnp.full(n, 2e-6), jnp.full(n, 2e-6))
+        Ls = jnp.arange(2, 151, dtype=float)
+        dense = np.asarray(compute_n0_mv(Ls, spectra, nt, ne, nb, 2, 250,
+                                         fullsky=True, backend="jax"))
+        sampled = np.asarray(compute_n0_mv(Ls, spectra, nt, ne, nb, 2, 250,
+                                           fullsky=True, backend="jax",
+                                           n_L_sample=50))
+        rel = np.abs(sampled / dense - 1.0)
+        assert np.all(np.isfinite(rel))
+        assert rel.max() < 5e-3, rel.max()
+        # below L=20 the sampled grid is dense: exact by construction
+        np.testing.assert_allclose(sampled[:18], dense[:18], rtol=1e-12)
