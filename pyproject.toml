@@ -144,8 +144,9 @@ cmb-augr = { path = ".", editable = true }
 # on jaxht>=0.2.0's looped azimuth-FFT mode (the driver sets it; --fft-mode) -- unrolled
 # per-ring kernels made the graph multi-GB (~42 min compile / 12 GB measured on Grace).
 # The aarch64-hard deps (camb, namaster, cmbroom, pywigxjpf) are not needed by the map-based
-# forecast / active-subspace driver, so they stay off. Use it with
-# `pixi run -e cpu python scripts/active_subspace_hl_eig.py --backend ducc --workers N ...`.
+# forecast / active-subspace driver, so they stay off. Point it at a study driver living
+# outside this repo with
+# `pixi run --manifest-path <cmb-augr>/pyproject.toml -e cpu python <driver.py> --backend ducc --workers N ...`.
 [tool.pixi.feature.cpu]
 platforms = ["linux-aarch64"]
 
