@@ -1375,3 +1375,142 @@ class TestFullSkyLSamples:
         assert rel.max() < 5e-3, rel.max()
         # below L=20 the sampled grid is dense: exact by construction
         np.testing.assert_allclose(sampled[:18], dense[:18], rtol=1e-12)
+
+
+class TestMapBatching:
+    """``_map``'s ``l_batch`` knob: exact on elementwise bodies, and demonstrably live.
+
+    Exactness is asserted rather than measured here because these toy bodies are
+    elementwise in the mapped axis -- ``vmap`` cannot reassociate anything. The
+    real estimators do carry a trailing reduction, and their agreement is gated
+    on a measured tolerance in ``TestFullSkyBatchAgreement``.
+    """
+
+    @staticmethod
+    def _bodies():
+        """(name, body, per-element output shape) -- scalar, vector, matrix."""
+        return [
+            ("scalar", lambda x: jnp.sin(x) * x + 1.0, ()),
+            ("vector", lambda x: x * jnp.arange(4.0) + jnp.cos(x), (4,)),
+            ("matrix", lambda x: jnp.arange(6.0).reshape(2, 3) * x, (2, 3)),
+        ]
+
+    @pytest.mark.parametrize("remat", [False, True])
+    def test_batched_equals_unbatched(self, remat):
+        """Every (n, l_batch) reproduces the sequential map bit-for-bit.
+
+        n and l_batch are looped rather than parametrized: 5 x 5 x 2 ids for one
+        elementwise identity is noise in a 1200-test suite.
+        """
+        from augr.delensing_fullsky_jax import _map
+        for n in (1, 5, 7, 16, 17):
+            xs = jnp.arange(2.0, 2.0 + n)
+            for name, body, shape in self._bodies():
+                ref = _map(body, xs, remat=remat)
+                for l_batch in (1, 2, 4, 16, 32):
+                    out = _map(body, xs, remat=remat, l_batch=l_batch)
+                    tag = f"{name} n={n} B={l_batch}"
+                    assert out.shape == (n, *shape), tag
+                    np.testing.assert_array_equal(np.asarray(out), np.asarray(ref),
+                                                  err_msg=tag)
+
+    def test_remat_is_transparent_to_batching(self):
+        """remat changes the tape, never the value -- at l_batch > 1 too."""
+        from augr.delensing_fullsky_jax import _map
+        xs = jnp.arange(2.0, 13.0)
+        body = self._bodies()[0][1]
+        for l_batch in (1, 4):
+            a = _map(body, xs, remat=False, l_batch=l_batch)
+            b = _map(body, xs, remat=True, l_batch=l_batch)
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_gradient_matches_unbatched(self):
+        """Reverse mode through the batched map agrees with the sequential one."""
+        from augr.delensing_fullsky_jax import _map
+        xs = jnp.arange(2.0, 13.0)
+
+        def total(scale, l_batch):
+            out = _map(lambda x: jnp.sin(x * scale) ** 2, xs,
+                       remat=True, l_batch=l_batch)
+            return jnp.sum(out)
+
+        g1 = jax.grad(lambda s: total(s, 1))(0.7)
+        g4 = jax.grad(lambda s: total(s, 4))(0.7)
+        np.testing.assert_allclose(float(g4), float(g1), rtol=1e-13, atol=0.0)
+
+    @pytest.mark.parametrize("bad", [0, -1, 1.0, True, "4", None])
+    def test_rejects_bad_l_batch(self, bad):
+        from augr.delensing_fullsky_jax import _map
+        with pytest.raises(ValueError):
+            _map(lambda x: x, jnp.arange(4.0), remat=False, l_batch=bad)
+
+    @staticmethod
+    def _scan_lengths(jaxpr):
+        """Lengths of every ``scan`` eqn in a jaxpr, innermost calls included."""
+        lengths = []
+
+        def walk(jx):
+            for eqn in jx.eqns:
+                if eqn.primitive.name == "scan":
+                    lengths.append(eqn.params["length"])
+                for v in eqn.params.values():
+                    for sub in (v if isinstance(v, (list, tuple)) else (v,)):
+                        inner = getattr(sub, "jaxpr", None)
+                        if inner is not None:
+                            walk(getattr(inner, "jaxpr", inner))
+
+        walk(jaxpr.jaxpr)
+        return lengths
+
+    @pytest.mark.parametrize("l_batch,expected", [(1, 17), (2, 9), (4, 5), (16, 2)])
+    def test_knob_is_live_in_the_jaxpr(self, l_batch, expected):
+        """The sequential axis actually shortens: scan length == ceil(n_pad / l_batch).
+
+        A dead knob and a converged answer look identical, so the trace is
+        checked directly rather than inferred from the values agreeing.
+        """
+        from augr.delensing_fullsky_jax import _map
+        xs = jnp.arange(2.0, 19.0)          # n = 17
+        jaxpr = jax.make_jaxpr(
+            lambda x: _map(lambda v: jnp.sin(v) * v, x, remat=False, l_batch=l_batch)
+        )(xs)
+        assert expected in self._scan_lengths(jaxpr), (
+            f"l_batch={l_batch}: scan lengths {self._scan_lengths(jaxpr)}")
+
+    def test_remat_appears_inside_the_batched_scan(self):
+        """``remat=True`` still checkpoints when the step is a vmapped batch."""
+        from augr.delensing_fullsky_jax import _map
+        xs = jnp.arange(2.0, 19.0)
+        txt = str(jax.make_jaxpr(
+            lambda x: _map(lambda v: jnp.sin(v) * v, x, remat=True, l_batch=4)
+        )(xs))
+        assert "remat" in txt or "checkpoint" in txt, txt[:400]
+
+    def test_single_device_single_batch_is_the_old_jaxpr(self):
+        """The (l_batch=1, one device) path is the pre-batching trace, unchanged."""
+        from augr.delensing_fullsky_jax import _map
+        xs = jnp.arange(2.0, 19.0)
+        body = self._bodies()[0][1]
+        from jax import lax
+        new = str(jax.make_jaxpr(lambda x: _map(body, x, remat=True))(xs))
+        old = str(jax.make_jaxpr(
+            lambda x: lax.map(jax.checkpoint(body, prevent_cse=False), x))(xs))
+        assert new == old
+
+    def test_pad_rows_repeats_the_largest_L(self):
+        from augr.delensing_fullsky_jax import _pad_rows
+        xs = jnp.arange(2.0, 7.0)                      # n = 5
+        assert _pad_rows(xs, 1).shape == (5,)
+        assert np.asarray(_pad_rows(xs, 5)).tolist() == [2, 3, 4, 5, 6]
+        padded = np.asarray(_pad_rows(xs, 4))
+        assert padded.tolist() == [2, 3, 4, 5, 6, 6, 6, 6]
+
+    def test_shard_devices_defaults_to_one_here(self, monkeypatch):
+        """Single-device session: no sharding, and the opt-out is honoured."""
+        from augr.delensing_fullsky_jax import _NO_SHARD_ENV, _shard_devices
+        monkeypatch.delenv(_NO_SHARD_ENV, raising=False)
+        assert _shard_devices() == jax.device_count()
+        monkeypatch.setenv(_NO_SHARD_ENV, "1")
+        assert _shard_devices() == 1
+        monkeypatch.setenv(_NO_SHARD_ENV, "0")
+        assert _shard_devices() == jax.device_count()

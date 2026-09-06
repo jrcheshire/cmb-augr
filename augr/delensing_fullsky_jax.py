@@ -24,6 +24,9 @@ only the backend changes.
 
 from __future__ import annotations
 
+import functools
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -68,8 +71,48 @@ def _even_mask(l_row: jnp.ndarray, l_col: jnp.ndarray, L_f) -> jnp.ndarray:
     return (parity == 0).astype(float)
 
 
-def _map(body, xs, *, remat: bool):
-    """``lax.map`` over ``body``, optionally gradient-checkpointed.
+_NO_SHARD_ENV = "AUGR_DELENS_NO_SHARD"
+
+
+def _shard_devices() -> int:
+    """Number of CPU devices the per-L map should shard over (1 = no sharding).
+
+    Trace-time decision, baked into every compiled executable: JAX reads
+    ``JAX_NUM_CPU_DEVICES`` once at import and refuses it after backend init,
+    so a process is single- or multi-device for its whole life. Sharding is
+    automatic when a launcher has asked for several CPU devices; set
+    ``AUGR_DELENS_NO_SHARD=1`` to opt out, and note that non-CPU backends are
+    left alone (one GPU already fans out inside the kernel).
+    """
+    if os.environ.get(_NO_SHARD_ENV, "") not in ("", "0"):
+        return 1
+    if jax.default_backend() != "cpu":
+        return 1
+    return int(jax.device_count())
+
+
+@functools.lru_cache(maxsize=4)
+def _l_mesh(n_dev: int):
+    """Cached 1-D device mesh over the L axis (mesh construction is not free)."""
+    return jax.make_mesh((n_dev,), ("L",))
+
+
+def _pad_rows(xs: jnp.ndarray, multiple: int) -> jnp.ndarray:
+    """Repeat the last row of ``xs`` up to a length divisible by ``multiple``.
+
+    The last row is the largest L sample, so a padded slot costs what the most
+    expensive real slot costs -- padding is never free, and callers print
+    ``n -> n_pad`` so it is not mistaken for parallel speedup.
+    """
+    n = xs.shape[0]
+    rem = (-n) % multiple
+    if rem == 0:
+        return xs
+    return jnp.concatenate([xs, jnp.repeat(xs[-1:], rem, axis=0)], axis=0)
+
+
+def _map(body, xs, *, remat: bool, l_batch: int = 1):
+    """``lax.map`` over ``body``, optionally gradient-checkpointed and batched.
 
     Sibling of :func:`augr.delensing._scan` for the full-sky per-L bodies. Each
     body builds a handful of ``(n_l1, n_l2)`` tables (Wigner symbol, geometric
@@ -80,10 +123,44 @@ def _map(body, xs, *, remat: bool):
     Forward values are unaffected; the gradient costs ~2x in runtime. No
     ``policy=``: every candidate intermediate is the same full table, so
     saving any one of them re-introduces the whole term.
+
+    ``l_batch > 1`` vmaps that many L values into each sequential step, and
+    several CPU devices (see :func:`_shard_devices`) split the L grid with
+    ``shard_map``; both exist because a plain sequential map of modest kernels
+    leaves most of a many-core node idle. ``l_batch=1`` on one device is an
+    early return to exactly today's jaxpr, hence bit-identical. ``l_batch > 1``
+    reassociates the trailing reduction inside each body, so its agreement with
+    ``l_batch=1`` is measured, not assumed.
     """
+    if isinstance(l_batch, bool) or not isinstance(l_batch, int) or l_batch < 1:
+        raise ValueError(f"l_batch must be a Python int >= 1, got {l_batch!r}")
+
+    n = xs.shape[0]
+    n_dev = _shard_devices()
+
+    if l_batch == 1 and n_dev == 1:
+        if remat:
+            body = jax.checkpoint(body, prevent_cse=False)
+        return lax.map(body, xs)
+
+    step = body if l_batch == 1 else jax.vmap(body)
     if remat:
-        body = jax.checkpoint(body, prevent_cse=False)
-    return lax.map(body, xs)
+        step = jax.checkpoint(step, prevent_cse=False)
+
+    def local_map(x):
+        """Map over one device's slice; its length is a multiple of l_batch."""
+        if l_batch == 1:
+            return lax.map(step, x)
+        out = lax.map(step, x.reshape((-1, l_batch, *x.shape[1:])))
+        return out.reshape((-1, *out.shape[2:]))
+
+    if n_dev == 1:
+        out = local_map(_pad_rows(xs, l_batch))
+    else:
+        sharded = jax.shard_map(local_map, mesh=_l_mesh(n_dev),
+                                in_specs=jax.P("L"), out_specs=jax.P("L"))
+        out = sharded(_pad_rows(xs, l_batch * n_dev))
+    return out[:n]
 
 
 def _interp_n0(n0_inv_samples: jnp.ndarray, L_samples: np.ndarray,
