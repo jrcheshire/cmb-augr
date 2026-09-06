@@ -22,6 +22,16 @@ Rows (one machine, jit-warm, median of ``--repeat``):
   4. ``pseudo_cl_jax.coupling_matrices`` (MASTER M+, M-).
   5. ``DelensCoupling`` build + design gradient, flat-sky vs full-sky sampled.
 
+``--sweep`` runs the L-batching / device-sharding grid: one CHILD PROCESS per
+``(l_batch, devices)`` pair, because ``JAX_NUM_CPU_DEVICES`` is read once at
+import and the sharding decision is baked in at trace time -- never toggle
+either knob inside one process. Children run ``--closed-only`` against the
+``(1,1)`` child's values, and every row carries ``n -> n_pad``: padding repeats
+the largest L sample, so ``(16,16)`` at 125 samples does 256 samples' work and
+cannot win on wall time unless per-L efficiency more than doubles. ``eff``
+over-counts once N > 1 (the replicated outer work is charged to every device),
+so **wall time decides**, not eff.
+
 Harness rules (each one was violated by the first version of this script and
 produced a table that measured nothing -- see the commit message):
 
@@ -39,13 +49,17 @@ produced a table that measured nothing -- see the commit message):
 Usage:
     pixi run python scripts/bench_wigner_closed.py [--l-max 1500 3000]
         [--repeat 3] [--dense] [--numpy] [--skip 1 2 3 4 5]
+    pixi run python scripts/bench_wigner_closed.py --sweep --l-max 1500 3000
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
+import resource
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -60,9 +74,68 @@ from augr.config import pico_like
 from augr.delensing import default_n_L_sample, iterate_delensing, load_lensing_spectra
 from augr.instrument import combined_noise_nl
 
+#: Parsed CLI, set once in ``main``; the timing helpers read the knobs off it.
+ARGS = argparse.Namespace(l_batch=1, closed_only=False, agree_tol=1e-9)
+
+#: name -> flat value array, written by ``--values-out`` and read as the
+#: cross-process agreement baseline by ``--baseline-values``.
+_VALUES: dict[str, np.ndarray] = {}
+_BASELINE: dict[str, np.ndarray] = {}
+
+
+def _bn_pair(text):
+    """CLI \"B,N\" -> (l_batch, devices)."""
+    b, n = text.split(",")
+    return int(b), int(n)
+
 
 def _print(*a):
     print(*a, flush=True)
+
+
+def _result(key, row, **extra):
+    """Machine-readable row for the sweep parent to collect."""
+    payload = dict(key=key, wall=row.wall, eff=row.eff, **extra)
+    print("#RESULT " + json.dumps(payload), flush=True)
+
+
+def _peak_rss_gb():
+    """Peak RSS of THIS process. RUSAGE_CHILDREN is a max over reaped
+    children, not per child, so each child must report its own."""
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return rss / 1e9 if sys.platform == "darwin" else rss / 1e6   # bytes vs KB
+
+
+def _flat(value):
+    leaves = [np.asarray(x, dtype=float).ravel() for x in jax.tree.leaves(value)]
+    return np.concatenate(leaves) if leaves else np.zeros(0)
+
+
+def _agree_with_baseline(name, value):
+    """Relative departure from the ``(1,1)`` child's value, or nan if unknown."""
+    got = _flat(value)
+    _VALUES[name] = got
+    want = _BASELINE.get(name)
+    if want is None or want.shape != got.shape:
+        return float("nan")
+    finite = np.isfinite(got) & np.isfinite(want)
+    scale = np.maximum(np.abs(got[finite]), np.abs(want[finite]))
+    rel = np.abs(got[finite] - want[finite]) / np.where(scale > 0, scale, 1.0)
+    return float(rel.max()) if rel.size else 0.0
+
+
+def _agree_tag(worst):
+    if not np.isfinite(worst):
+        return "agree    n/a"
+    flag = "  MISMATCH" if worst > ARGS.agree_tol else ""
+    return f"agree {worst:.0e}{flag}"
+
+
+def _pad_note(n, l_batch, n_dev):
+    """``n -> n_pad`` for an L grid of length n under (l_batch, devices)."""
+    m = l_batch * n_dev
+    n_pad = -(-n // m) * m
+    return f"{n}->{n_pad}"
 
 
 def _now():
@@ -207,15 +280,28 @@ def _timed_variant(make_fn, impl, repeat):
     return row, value
 
 
-def _pair(name, make_fn, repeat):
-    """SG -> closed pair on one fresh callable per variant; values must agree."""
+def _pair(name, make_fn, repeat, *, pad=""):
+    """SG -> closed pair on one fresh callable per variant; values must agree.
+
+    Under ``--closed-only`` the SG variant is skipped entirely (its ``lax.scan``
+    under a ``vmap`` batch is not a quantity anyone would run) and the closed
+    row is checked against the ``(1,1)`` baseline values instead.
+    """
+    if ARGS.closed_only:
+        t_new, v_new = _timed_variant(make_fn, "closed", repeat)
+        worst = _agree_with_baseline(name, v_new)
+        _print(f"    {name:7s} {t_new:>26}  {pad:>10}  {_agree_tag(worst)}   [{_now()}]")
+        _result(name, t_new, pad=pad, agree=worst)
+        return None, t_new
     _SG_EXTENDED[0] = 0
     t_sg, v_sg = _timed_variant(make_fn, "sg", repeat)
     ext = "  (SG grid extended)" if _SG_EXTENDED[0] else ""
     t_new, v_new = _timed_variant(make_fn, "closed", repeat)
     worst = _check_agree(name, v_sg, v_new)
+    _agree_with_baseline(name, v_new)
     _print(f"    {name:7s} {t_sg:>26} -> {t_new:>26}   ({t_sg.wall / t_new.wall:4.1f}x)"
            f"  agree {worst:.0e}{ext}   [{_now()}]")
+    _result(name, t_new, pad=pad, agree=worst, sg_wall=t_sg.wall)
     return t_sg, t_new
 
 
@@ -248,23 +334,29 @@ def bench_tables(l_max, repeat):
 
 def bench_estimators(l_max, repeat, spec, nl, n_L_sample):
     import augr.delensing_fullsky_jax as dj
+    from augr.delensing import _fullsky_L_samples
     nl_tt, nl_ee, nl_bb = nl
     Ls = np.arange(2, l_max + 1, dtype=float)
     ls = np.arange(2, 301, dtype=float)
-    kw = dict(n_L_sample=n_L_sample)
+    kw = dict(n_L_sample=n_L_sample, l_batch=ARGS.l_batch)
     grid = "exact every-L grid" if n_L_sample is None else f"sampled grid, n_L_sample={n_L_sample}"
+    pad = _pad_note(len(_fullsky_L_samples(Ls, n_L_sample)), ARGS.l_batch, _devices())
     fns = {
         "N0 TT": lambda: dj.compute_n0_tt_fullsky_jax(Ls, spec, nl_tt, 2, l_max, **kw),
         "N0 EE": lambda: dj.compute_n0_ee_fullsky_jax(Ls, spec, nl_ee, 2, l_max, **kw),
         "N0 TE": lambda: dj.compute_n0_te_fullsky_jax(Ls, spec, nl_tt, nl_ee, 2, l_max, **kw),
         "N0 EB": lambda: dj.compute_n0_eb_fullsky_jax(Ls, spec, nl_ee, nl_bb, 2, l_max, **kw),
         "N0 TB": lambda: dj.compute_n0_tb_fullsky_jax(Ls, spec, nl_tt, nl_bb, 2, l_max, **kw),
-        "kernel": lambda: dj.lensing_kernel_fullsky_jax(ls, Ls, spec, 2, l_max),
+        "kernel": lambda: dj.lensing_kernel_fullsky_jax(ls, Ls, spec, 2, l_max,
+                                                       l_batch=ARGS.l_batch),
     }
-    _print(f"\n[2] full-sky estimators, l_max_qe={l_max}, {grid}: SG -> closed")
+    if ARGS.closed_only:
+        fns = {k: v for k, v in fns.items() if k in ARGS.rows}
+    _print(f"\n[2] full-sky estimators, l_max_qe={l_max}, {grid}, "
+           f"l_batch={ARGS.l_batch} devices={_devices()} n_pad {pad}")
     for name, f in fns.items():
         # jax.jit of a fresh lambda per variant; f itself is re-traced by jit
-        _pair(name, lambda f=f: jax.jit(lambda: f()), repeat)
+        _pair(f"[2]{name}@{l_max}", lambda f=f: jax.jit(lambda: f()), repeat, pad=pad)
 
 
 # ---------------------------------------------------------------------------
@@ -278,13 +370,23 @@ def bench_iterate(l_max, spec, nl, n_L_sample, *, dense, numpy_backend):
 
     def run(backend, n_L):
         return lambda: iterate_delensing(spec, nl_tt, nl_ee, nl_bb, backend=backend,
-                                         n_L_sample=n_L, **kw).cl_bb_res
+                                         n_L_sample=n_L, l_batch=ARGS.l_batch,
+                                         **kw).cl_bb_res
+
+    if ARGS.closed_only:
+        t, v = _timed_variant(lambda: run("jax", n_L_sample), "closed", 1)
+        worst = _agree_with_baseline("[3]iterate", v)
+        _print(f"    jax, n_L_sample={n_L_sample:<4d} l_batch={ARGS.l_batch:<4d}"
+               f"{t:>26}  {_agree_tag(worst)}   [{_now()}]")
+        _result("[3]iterate", t, agree=worst)
+        return
 
     # Eager lax.map callers re-trace per call, so one call per row is honest.
     t, v_sg = _timed_variant(lambda: run("jax", n_L_sample), "sg", 1)
     _print(f"    jax, n_L_sample={n_L_sample:<4d} SG tables (pre-#48)   {t:>26}   [{_now()}]")
     t, v_new = _timed_variant(lambda: run("jax", n_L_sample), "closed", 1)
     worst = _check_agree("iterate_delensing", v_sg, v_new)
+    _agree_with_baseline("[3]iterate", v_new)
     _print(f"    jax, n_L_sample={n_L_sample:<4d} closed form           {t:>26}"
            f"  agree {worst:.0e}   [{_now()}]")
     if dense:
@@ -314,7 +416,7 @@ def bench_master(repeat):
         def make(w=w_ell, lmax=lmax):
             f = jax.jit(lambda w: coupling_matrices(w, lmax=lmax))
             return lambda: f(w)
-        _pair(f"lmax={lmax:4d}", make, repeat)
+        _pair(f"[4]lmax={lmax}", make, repeat)
 
 
 # ---------------------------------------------------------------------------
@@ -322,17 +424,24 @@ def bench_master(repeat):
 # ---------------------------------------------------------------------------
 
 def bench_coupling(spec, n_L_sample, l_max_qes):
+    """The production quantity: one delensing solve, then the design gradient."""
+    from augr.delensing import _fullsky_L_samples
     from augr.optimize import DelensCoupling
     d = dict(n_det=jnp.asarray((200.0, 400.0, 200.0)), net=jnp.asarray((60.0, 50.0, 80.0)),
              beam=jnp.asarray((40.0, 30.0, 20.0)), eta=jnp.asarray((0.5, 0.5, 0.5)),
              mission_years=4.0, f_sky=0.6)
-    _print("\n[5] DelensCoupling (3-band design): build + jit'd design gradient")
+    _print("\n[5] DelensCoupling (3-band design): build + jit'd design gradient"
+           f"  l_batch={ARGS.l_batch} devices={_devices()}")
+    # flat-sky ignores l_batch and sharding entirely -- it is the serial
+    # baseline, so the sweep children only pay for it once, at (1, 1).
+    arms = [(True, n_L_sample)] if ARGS.closed_only else [(False, None), (True, n_L_sample)]
     for l_max_qe in l_max_qes:
-        for fullsky, nL in ((False, None), (True, n_L_sample)):
+        for fullsky, nL in arms:
+            lb = ARGS.l_batch if fullsky else 1
             jax.clear_caches()
             c0, w0 = time.process_time(), time.perf_counter()
             c = DelensCoupling.build(lensing_spectra=spec, l_max_qe=l_max_qe, n_iter=2,
-                                     fullsky=fullsky, n_L_sample=nL, **d)
+                                     fullsky=fullsky, n_L_sample=nL, l_batch=lb, **d)
             jax.block_until_ready(c.cl_bb_res0)
             tb = Row(time.perf_counter() - w0, time.process_time() - c0)
 
@@ -340,9 +449,15 @@ def bench_coupling(spec, n_L_sample, l_max_qes):
                 return jnp.sum(c.residual(d["n_det"], d["net"], d["beam"] * jnp.exp(s),
                                           d["eta"], d["mission_years"], d["f_sky"]))
             g = jax.jit(jax.grad(total))
-            tg, _ = _time(lambda g=g: g(jnp.asarray(0.0)), 1)
+            tg, gval = _time(lambda g=g: g(jnp.asarray(0.0)), 1)
             tag = f"full-sky n_L={nL}" if fullsky else "flat-sky"
-            _print(f"    l_max_qe={l_max_qe}  {tag:18s} build {tb:>26}   grad {tg:>26}   [{_now()}]")
+            pad = (_pad_note(len(_fullsky_L_samples(np.arange(2, l_max_qe + 1), nL)),
+                             lb, _devices()) if fullsky else "-")
+            worst = _agree_with_baseline(f"[5]grad@{l_max_qe}:{tag}", gval)
+            _print(f"    l_max_qe={l_max_qe}  {tag:18s} build {tb:>26}   grad {tg:>26}"
+                   f"  {pad:>10}  {_agree_tag(worst)}   [{_now()}]")
+            _result(f"[5]grad@{l_max_qe}:{tag}", tg, pad=pad, agree=worst,
+                    build_wall=tb.wall)
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +470,105 @@ def _env_banner():
     _print(f"cpu_count {os.cpu_count()}  schedulable {aff}  jax devices {jax.device_count()}  "
            f"os threads at start {_threads()}")
     _print("env " + "  ".join(f"{k}={v}" for k, v in env.items() if v is not None))
-    _print("columns: wall (eff = process CPU time / wall, i.e. cores kept busy)")
+    import augr.delensing_fullsky_jax as dj
+    _print(f"l_batch {ARGS.l_batch}  _shard_devices() {dj._shard_devices()}  "
+           f"{dj._NO_SHARD_ENV}={os.environ.get(dj._NO_SHARD_ENV, '')!r}")
+    _print("columns: wall (eff = process CPU time / wall, i.e. cores kept busy). "
+           "eff over-counts at devices > 1: wall decides.")
+
+
+def _devices():
+    """Devices the per-L map will actually shard over in THIS process."""
+    import augr.delensing_fullsky_jax as dj
+    return dj._shard_devices()
+
+
+#: (l_batch, devices) pairs. (16,16) pads 125 -> 256 L at l_max_qe=1500, so it
+#: is carried at 1500 only and labelled by its n_pad; it cannot win on wall
+#: time unless per-L efficiency more than doubles.
+_SWEEP_GRID = [(1, 1), (4, 1), (16, 1), (1, 4), (1, 16), (4, 4), (16, 16)]
+
+
+def _child_cmd(args, l_batch, devices, *, values_out=None, baseline=None):
+    cmd = [sys.executable, os.path.abspath(__file__),
+           "--l-max", *[str(x) for x in args.l_max],
+           "--repeat", str(args.repeat),
+           "--l-batch", str(l_batch),
+           "--rows", *args.rows,
+           "--agree-tol", repr(args.agree_tol),
+           "--no-lmax-cap",
+           # [1] and [4] do not touch the per-L map; the caller's own --skip
+           # rides along so a smoke can drop [3] as well.
+           "--skip", *sorted({"1", "4"} | set(args.skip))]
+    if devices > 1:
+        cmd += ["--devices", str(devices)]
+    if values_out:
+        cmd += ["--values-out", values_out]
+    else:
+        cmd += ["--closed-only"]
+    if baseline:
+        cmd += ["--baseline-values", baseline]
+    return cmd
+
+
+def _sweep(args):
+    """One fresh child per (l_batch, devices): both knobs are import/trace time."""
+    grid = args.sweep_grid or _SWEEP_GRID
+    baseline = os.path.abspath(args.sweep_baseline)
+    rows = []
+    _print(f"\n=== sweep {grid} at l_max {args.l_max}; baseline values -> {baseline}")
+    for l_batch, devices in grid:
+        if l_batch * devices >= 256 and max(args.l_max) > 1500:
+            _print(f"\n--- skip (B={l_batch}, N={devices}) above l_max 1500: "
+                   "padding would dominate")
+            continue
+        first = (l_batch, devices) == (1, 1)
+        cmd = _child_cmd(args, l_batch, devices,
+                         values_out=baseline if first else None,
+                         baseline=None if first else baseline)
+        _print(f"\n--- child B={l_batch} N={devices}: {' '.join(cmd[1:])}   [{_now()}]")
+        env = dict(os.environ)
+        env.pop("AUGR_DELENS_NO_SHARD", None)
+        proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
+        mine, peak = [], float("nan")
+        for line in proc.stdout.splitlines():
+            if line.startswith("#RESULT "):
+                r = json.loads(line[len("#RESULT "):])
+                if r["key"] == "peak_rss":
+                    peak = r["peak_rss_gb"]
+                    continue
+                r.update(l_batch=l_batch, devices=devices)
+                mine.append(r)
+            else:
+                _print("    | " + line)
+        for r in mine:                       # the child's own RSS, not RUSAGE_CHILDREN
+            r["peak_rss_gb"] = peak
+        rows.extend(mine)
+        if proc.returncode != 0:
+            _print(f"    FAILED rc={proc.returncode}")
+            _print("    stderr: " + proc.stderr[-2000:])
+    _print("\n=== sweep table (wall seconds; eff over-counts at N>1, so wall decides)")
+    _print("    agree: (1,1) rows are SG vs closed form; every other row is that "
+           "row's value vs the (1,1) baseline")
+    _print(f"    {'key':28s} {'B':>3s} {'N':>3s} {'n->n_pad':>12s} "
+           f"{'wall':>10s} {'eff':>7s} {'peakRSS':>9s} {'agree':>10s}")
+    for r in rows:
+        _print(f"    {r['key']:28s} {r['l_batch']:3d} {r['devices']:3d} "
+               f"{r.get('pad', '-'):>12s} {r['wall']:10.3f} {r['eff']:7.1f} "
+               f"{r.get('peak_rss_gb', float('nan')):8.2f}G "
+               f"{r.get('agree', float('nan')):10.1e}")
+    _print(f"\nsweep done {_now()}")
+
+
+def _relaunch_with_devices(args):
+    """Re-exec self with JAX_NUM_CPU_DEVICES set; JAX refuses it post-init."""
+    env = dict(os.environ)
+    env["JAX_NUM_CPU_DEVICES"] = str(args.devices)
+    if args.no_shard:
+        env["AUGR_DELENS_NO_SHARD"] = "1"
+    env["_AUGR_BENCH_CHILD"] = "1"
+    cmd = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
+    return subprocess.run(cmd, env=env).returncode
 
 
 def main():
@@ -369,7 +582,51 @@ def main():
                          "[3]: add the exact-grid row. Serial SG rows, ~13x the sweeps.")
     ap.add_argument("--numpy", action="store_true", help="[3]: add the numpy ProcessPool backend row")
     ap.add_argument("--skip", nargs="*", default=[], choices=["1", "2", "3", "4", "5"])
+    ap.add_argument("--l-batch", type=int, default=1,
+                    help="L values vmapped into each step of the full-sky per-L map")
+    ap.add_argument("--devices", type=int, default=1,
+                    help="CPU devices to shard the L grid over; re-execs self with "
+                         "JAX_NUM_CPU_DEVICES (JAX reads it once, at import)")
+    ap.add_argument("--no-shard", action="store_true",
+                    help="with --devices: set AUGR_DELENS_NO_SHARD=1 in the child "
+                         "(the opt-out control -- same device count, no shard_map)")
+    ap.add_argument("--closed-only", action="store_true",
+                    help="skip the Schulten-Gordon variants and check values against "
+                         "--baseline-values instead (SG under a vmap batch is not a "
+                         "quantity anyone runs)")
+    ap.add_argument("--rows", nargs="*", default=["N0 TT", "N0 EB", "kernel"],
+                    help="[2] rows to keep under --closed-only")
+    ap.add_argument("--values-out", help="write this run's values as the sweep baseline")
+    ap.add_argument("--baseline-values", help="npz of (1,1) values to check against")
+    ap.add_argument("--agree-tol", type=float, default=4e-13,
+                    help="flag a row MISMATCH above this relative departure from the "
+                         "baseline; default = the measured l_batch gradient gate")
+    ap.add_argument("--no-lmax-cap", action="store_true",
+                    help="[5]: keep the full l_max list instead of capping at 1600, so "
+                         "the 3000 gradient row exists")
+    ap.add_argument("--sweep", action="store_true",
+                    help="run the (l_batch, devices) grid, one child process each")
+    ap.add_argument("--sweep-grid", type=_bn_pair, nargs="*", default=None,
+                    help='pairs like "1,1 4,2"; default is the full grid')
+    ap.add_argument("--sweep-baseline", default="bench_sweep_baseline.npz")
     args = ap.parse_args()
+
+    global ARGS
+    ARGS = args
+    if args.sweep:
+        return _sweep(args)
+    if args.devices > 1 and not os.environ.get("_AUGR_BENCH_CHILD"):
+        return sys.exit(_relaunch_with_devices(args))
+    if args.devices > 1:
+        if jax.device_count() != args.devices:
+            raise RuntimeError(f"sharding not engaged: jax.device_count() "
+                               f"{jax.device_count()} != --devices {args.devices}")
+        want = 1 if args.no_shard else args.devices
+        if _devices() != want:
+            raise RuntimeError(f"sharding not engaged: _shard_devices() {_devices()} "
+                               f"!= {want}")
+    if args.baseline_values:
+        _BASELINE.update(dict(np.load(args.baseline_values)))
 
     _env_banner()
     spec = load_lensing_spectra()
@@ -390,8 +647,16 @@ def main():
     if "4" not in args.skip:
         bench_master(args.repeat)
     if "5" not in args.skip:
+        cap = (lambda lm: lm) if args.no_lmax_cap else (lambda lm: min(lm, 1600))
         bench_coupling(spec, n_L_for(min(args.l_max)),
-                       sorted({min(lm, 1600) for lm in args.l_max} | {800}))
+                       sorted({cap(lm) for lm in args.l_max} | {800}))
+    if args.values_out:
+        np.savez(args.values_out, **_VALUES)
+        _print(f"\nbaseline values -> {args.values_out} ({len(_VALUES)} keys)")
+    _print(f"peak RSS {_peak_rss_gb():.2f} GB")
+    print("#RESULT " + json.dumps(dict(key="peak_rss", wall=float("nan"),
+                                       eff=float("nan"),
+                                       peak_rss_gb=_peak_rss_gb())), flush=True)
     _print(f"\ndone {_now()}")
 
 
