@@ -389,6 +389,9 @@ def bench_iterate(l_max, spec, nl, n_L_sample, *, dense, numpy_backend):
     _agree_with_baseline("[3]iterate", v_new)
     _print(f"    jax, n_L_sample={n_L_sample:<4d} closed form           {t:>26}"
            f"  agree {worst:.0e}   [{_now()}]")
+    # The (1,1) child is the only one that takes this branch, and without this
+    # the sweep table has no baseline row for [3] to compare the others against.
+    _result("[3]iterate", t, agree=worst, sg_wall=None)
     if dense:
         t, _ = _timed_variant(lambda: run("jax", None), "closed", 1)
         _print(f"    jax, exact every-L grid, closed form      {t:>26}   [{_now()}]")
