@@ -753,8 +753,16 @@ def test_design_forward_defaults_to_fullsky_sampled():
     assert inspect.signature(make_optimization_context).parameters["delens_fullsky"].default is True
     fields = {f.name: f.default for f in dataclasses.fields(DelensCoupling)}
     assert fields["fullsky"] is True and fields["n_L_sample"] == "auto"
+    assert fields["l_batch"] == 1
     fields = {f.name: f.default for f in dataclasses.fields(OptimizationContext)}
     assert fields["delens_fullsky"] is True and fields["delens_n_L_sample"] == "auto"
+    assert fields["delens_l_batch"] == 1
+    # l_batch defaults to the sequential map at every entry until a measured
+    # table says otherwise (the flip is a deliberate, documented decision).
+    assert inspect.signature(delens_residual_bb).parameters["l_batch"].default == 1
+    assert inspect.signature(_delens_from_combined_bb).parameters["l_batch"].default == 1
+    assert inspect.signature(DelensCoupling.build).parameters["l_batch"].default == 1
+    assert inspect.signature(make_optimization_context).parameters["delens_l_batch"].default == 1
 
 
 @pytest.mark.slow
@@ -796,6 +804,13 @@ def test_delens_coupling_fullsky_flags_reach_both_solves(_coupling_design):
     np.testing.assert_array_equal(np.asarray(c_full.cl_bb_res0), np.asarray(c_off.cl_bb_res0))
     np.testing.assert_array_equal(np.asarray(c_full.residual(*args)),
                                   np.asarray(c_off.residual(*args)))
+    # l_batch likewise reaches both solves, and is recorded on the dataclass
+    c_b = DelensCoupling.build(**kw, **d, fullsky=True, n_L_sample=50, l_batch=4)
+    assert c_b.l_batch == 4
+    np.testing.assert_array_equal(np.asarray(c_b.cl_bb_res0),
+                                  np.asarray(c_full.cl_bb_res0))
+    np.testing.assert_array_equal(np.asarray(c_b.residual(*args)),
+                                  np.asarray(c_full.residual(*args)))
 
 
 @pytest.mark.slow
@@ -872,3 +887,79 @@ def test_make_optimization_context_delens_fullsky(_coupling_design):
     assert np.isfinite(s_full) and s_full > 0
     # same design, same physics up to the flat/full geometry: same order of magnitude
     assert 0.5 < s_full / s_flat < 2.0, (s_full, s_flat)
+
+
+class TestDelensLBatchReachesEverySolve:
+    """``l_batch`` is observed at the ``_map`` call, not inferred from the answer.
+
+    Values are bit-identical at every measured shape (see
+    ``tests/test_delensing.py::TestFullSkyBatchAgreement``), so a half-threaded
+    knob cannot be caught by comparing outputs -- the reference solve would just
+    stay sequential and still be right. These tests mock ``_map`` and read what
+    each call actually saw. Fast: a toy QE (l_max_qe=40, n_iter=1, n_L_sample=5).
+    """
+
+    QE: ClassVar[dict] = dict(l_max_qe=40, n_iter=1, n_L_sample=5)
+
+    @staticmethod
+    def _watch():
+        """Patch ``_map`` with a wrapper recording every ``l_batch`` it is given."""
+        from unittest import mock
+
+        import augr.delensing_fullsky_jax as dj
+        seen = []
+        real = dj._map
+
+        def spy(body, xs, *, remat, l_batch=1):
+            seen.append(l_batch)
+            return real(body, xs, remat=remat, l_batch=l_batch)
+
+        return seen, mock.patch.object(dj, "_map", spy)
+
+    def test_build_and_residual_both_see_it(self, _coupling_design):
+        d = _coupling_design
+        args = (d["n_det"], d["net"], d["beam"], d["eta"],
+                d["mission_years"], d["f_sky"])
+        seen, patch = self._watch()
+        with patch:
+            c = DelensCoupling.build(
+                lensing_spectra=load_lensing_spectra(),
+                ls=jnp.arange(2, 12, dtype=float), fullsky=True,
+                l_batch=4, **self.QE, **d)
+            n_build = len(seen)
+            c.residual(*args)
+        assert n_build > 0 and len(seen) > n_build, seen
+        assert set(seen) == {4}, seen
+        assert c.l_batch == 4
+
+        # and the recorded value is what residual() uses, not build()'s argument
+        seen2, patch2 = self._watch()
+        with patch2:
+            dataclasses.replace(c, l_batch=1).residual(*args)
+        assert set(seen2) == {1}, seen2
+
+    def test_context_forwards_to_the_design_forward(self, _coupling_design):
+        """``make_optimization_context(delens_l_batch=)`` reaches sigma_r_from_channels."""
+        inst = simple_probe()
+        seen, patch = self._watch()
+        with patch:
+            ctx = make_optimization_context(
+                instrument=inst,
+                foreground_model=GaussianForegroundModel(),
+                cmb_spectra=CMBSpectra(),
+                fiducial_params=dict(FIDUCIAL_BK15),
+                fixed_params=["T_dust", "Delta_dust"],
+                delens="recompute", lensing_spectra=load_lensing_spectra(),
+                delens_ls=jnp.arange(2, 31, dtype=float),
+                delens_l_max_qe=self.QE["l_max_qe"],
+                delens_n_iter=self.QE["n_iter"],
+                delens_n_L_sample=self.QE["n_L_sample"],
+                delens_l_batch=4, delens_fullsky=True,
+                ell_min=2, ell_max=30, delta_ell=10)
+            n_ctx = len(seen)
+            sigma_r_from_channels(ctx.n_det, ctx.net, ctx.beam, ctx.eta, ctx,
+                                  mission_years=inst.mission_duration_years,
+                                  f_sky=inst.f_sky)
+        assert ctx.delens_l_batch == 4
+        assert n_ctx > 0 and len(seen) > n_ctx, seen
+        assert set(seen) == {4}, seen

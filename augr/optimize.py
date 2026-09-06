@@ -116,7 +116,8 @@ def _delens_from_combined_bb(spectra: LensingSpectra,
                              n_iter: int,
                              remat: bool = True,
                              fullsky: bool = True,
-                             n_L_sample: int | str | None = AUTO_N_L_SAMPLE) -> jnp.ndarray:
+                             n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
+                             l_batch: int = 1) -> jnp.ndarray:
     """Residual lensing BB from the single combined polarization noise.
 
     In the design forward the inverse-variance-combined noise obeys the
@@ -129,7 +130,8 @@ def _delens_from_combined_bb(spectra: LensingSpectra,
     return delens_residual_bb(
         spectra, nl_bb / 2.0, nl_bb, nl_bb,
         ls=ls, L_max=l_max_qe, l_max_qe=l_max_qe, n_iter=n_iter,
-        remat=remat, fullsky=fullsky, n_L_sample=n_L_sample)
+        remat=remat, fullsky=fullsky, n_L_sample=n_L_sample,
+        l_batch=l_batch)
 
 
 @dataclass(frozen=True)
@@ -182,14 +184,18 @@ class DelensCoupling:
     #: O(l_max_qe**2) tape -- i.e. it would pass for the wrong reason.
     fullsky: bool = True       # full-sky Wigner-3j QE (JAX backend); False = flat-sky
     n_L_sample: int | str | None = AUTO_N_L_SAMPLE  # full-sky N_0 L grid; None = every L
+    l_batch: int = 1           # full-sky only: L values vmapped per map step
     #: Full-sky sampled is the default (2026-09-06): it is the exact geometry at
     #: the low L that set sigma(r), and it is the parallel path -- on a 144-core
     #: node the flat-sky gradient at l_max_qe=1500 held 4 cores for 175 s where
     #: full-sky sampled held 27 for 14 s (scripts/bench_wigner_closed.py, Vista
     #: job 972604). Flat-sky's ``_scan`` over l1 is serial by construction.
-    #: ``fullsky`` / ``n_L_sample`` likewise enter BOTH solves: the reference
-    #: residual and the per-design one must be the same approximation, or the
-    #: "reproduces cl_bb_res0 at the reference" contract breaks silently.
+    #: ``fullsky`` / ``n_L_sample`` / ``l_batch`` likewise enter BOTH solves: the
+    #: reference residual and the per-design one must be the same approximation,
+    #: or the "reproduces cl_bb_res0 at the reference" contract breaks silently.
+    #: ``l_batch`` is a performance knob whose values are bit-identical today,
+    #: but it is pinned on both sides anyway -- an XLA version that reassociates
+    #: the batched reduction would otherwise open a seam between them.
 
     @classmethod
     def build(
@@ -208,6 +214,7 @@ class DelensCoupling:
         remat: bool = True,
         fullsky: bool = True,
         n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
+        l_batch: int = 1,
     ) -> DelensCoupling:
         """Precompute the coupling at a reference design (one delensing solve).
 
@@ -232,7 +239,7 @@ class DelensCoupling:
             ells, mission_years, f_sky)
         cl_res0 = _delens_from_combined_bb(
             lensing_spectra, nl_bb0, ls_arr, l_max_qe, n_iter, remat,
-            fullsky=fullsky, n_L_sample=n_L_sample)
+            fullsky=fullsky, n_L_sample=n_L_sample, l_batch=l_batch)
         return cls(
             spectra=lensing_spectra,
             ls=ls_arr,
@@ -245,6 +252,7 @@ class DelensCoupling:
             fullsky=bool(fullsky),
             n_L_sample=(n_L_sample if n_L_sample is None or isinstance(n_L_sample, str)
                         else int(n_L_sample)),
+            l_batch=int(l_batch),
         )
 
     def residual(self, n_det, net, beam, eta, mission_years, f_sky):
@@ -259,7 +267,8 @@ class DelensCoupling:
             self.ells, mission_years, f_sky)
         return _delens_from_combined_bb(
             self.spectra, nl_bb, self.ls, self.l_max_qe, self.n_iter,
-            self.remat, fullsky=self.fullsky, n_L_sample=self.n_L_sample)
+            self.remat, fullsky=self.fullsky, n_L_sample=self.n_L_sample,
+            l_batch=self.l_batch)
 
 
 @dataclass(frozen=True)
@@ -315,6 +324,7 @@ class OptimizationContext:
     delens_remat: bool = True                     # checkpoint the QE scans (see delensing._scan)
     delens_fullsky: bool = True                   # full-sky Wigner-3j QE (JAX); False = flat-sky
     delens_n_L_sample: int | str | None = AUTO_N_L_SAMPLE  # full-sky N_0 L grid; None = every L
+    delens_l_batch: int = 1                       # full-sky only: L values vmapped per map step
 
 
 def make_optimization_context(
@@ -333,6 +343,7 @@ def make_optimization_context(
     delens_remat: bool = True,
     delens_fullsky: bool = True,
     delens_n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
+    delens_l_batch: int = 1,
     **signal_kwargs,
 ) -> OptimizationContext:
     """One-time setup for differentiable sigma(r) optimization.
@@ -374,6 +385,11 @@ def make_optimization_context(
         delens_n_L_sample: full-sky only; N_0 L-sample grid (``"auto"`` =
                          ``delensing.default_n_L_sample``, ``None`` = every L,
                          see ``delensing._fullsky_L_samples``).
+        delens_l_batch:  full-sky only; L values vmapped into each step of
+                         the per-L map (default 1 = today's sequential map).
+                         A wall-clock knob for many-core nodes; values are
+                         bit-identical and the gradient agrees to ~4e-15.
+                         Trace-time constant, like ``delens_remat``.
         **signal_kwargs: Passed to SignalModel (ell_min, ell_max, delta_ell,
                          ell_per_bin_below, delensed_bb, etc.)
 
@@ -422,7 +438,8 @@ def make_optimization_context(
         delens_cl_bb_res0 = _delens_from_combined_bb(
             lensing_spectra, delens_nl_bb0, delens_ls_arr,
             delens_l_max_qe, delens_n_iter, delens_remat,
-            fullsky=delens_fullsky, n_L_sample=delens_n_L_sample)
+            fullsky=delens_fullsky, n_L_sample=delens_n_L_sample,
+            l_batch=delens_l_batch)
         if delens == "linearized":
             # J = d(cl_bb_res)/d(nl_bb) at the reference (reverse-mode: output
             # dim n_ls << input dim n_ells). This precompute costs O(n_ls)
@@ -432,7 +449,8 @@ def make_optimization_context(
                     lensing_spectra, nlbb, delens_ls_arr,
                     delens_l_max_qe, delens_n_iter,
                     delens_remat, fullsky=delens_fullsky,
-                    n_L_sample=delens_n_L_sample))(delens_nl_bb0)
+                    n_L_sample=delens_n_L_sample,
+                    l_batch=delens_l_batch))(delens_nl_bb0)
         # Put the SignalModel in delensed mode at the reference residual.
         signal_kwargs = dict(signal_kwargs)
         signal_kwargs["delensed_bb"] = delens_cl_bb_res0
@@ -489,6 +507,7 @@ def make_optimization_context(
         delens_remat=delens_remat,
         delens_fullsky=delens_fullsky,
         delens_n_L_sample=delens_n_L_sample,
+        delens_l_batch=delens_l_batch,
         delens_n_iter=delens_n_iter,
         delens_cl_bb_res0=delens_cl_bb_res0,
         delens_nl_bb0=delens_nl_bb0,
@@ -578,7 +597,8 @@ def sigma_r_from_channels(
             cl_res = _delens_from_combined_bb(
                 ctx.lensing_spectra, nl_bb_del, ctx.delens_ls,
                 ctx.delens_l_max_qe, ctx.delens_n_iter, ctx.delens_remat,
-                fullsky=ctx.delens_fullsky, n_L_sample=ctx.delens_n_L_sample)
+                fullsky=ctx.delens_fullsky, n_L_sample=ctx.delens_n_L_sample,
+                l_batch=ctx.delens_l_batch)
         else:  # 'linearized': cl_bb_res0 + J (nl_bb - nl_bb0)
             cl_res = ctx.delens_cl_bb_res0 + ctx.delens_jac @ (
                 nl_bb_del - ctx.delens_nl_bb0)

@@ -699,7 +699,8 @@ def compute_n0_mv(Ls: jnp.ndarray,
                   max_workers: int | None = None,
                   backend: str = "numpy",
                   remat: bool = True,
-                  n_L_sample: int | None = None) -> jnp.ndarray:
+                  n_L_sample: int | None = None,
+                  l_batch: int = 1) -> jnp.ndarray:
     """Minimum-variance combination of all five QE estimators.
 
     1/N_0^{MV}(L) = Σ_α 1/N_0^α(L)    (HO02 Eq. 22)
@@ -726,7 +727,7 @@ def compute_n0_mv(Ls: jnp.ndarray,
         from augr.delensing_fullsky_jax import compute_n0_mv_fullsky_jax
         return compute_n0_mv_fullsky_jax(
             Ls, spectra, nl_tt, nl_ee, nl_bb, l_min, l_max,
-            n_L_sample=n_L_sample, remat=remat)
+            n_L_sample=n_L_sample, l_batch=l_batch, remat=remat)
     if backend not in ("numpy", "jax"):
         raise ValueError(f"backend must be 'numpy' or 'jax'; got {backend!r}")
 
@@ -1533,7 +1534,8 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
                    *,
                    nl_ee: jnp.ndarray | None = None,
                    backend: str = "numpy",
-                   remat: bool = True) -> jnp.ndarray:
+                   remat: bool = True,
+                   l_batch: int = 1) -> jnp.ndarray:
     """Residual lensing BB after QE delensing (Smith et al. 2012, Eq. 12).
 
     The full Smith+ 2012 formula is
@@ -1568,7 +1570,8 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
         # Differentiable jnp full-sky residual (issue #45 Stage 3).
         from augr.delensing_fullsky_jax import residual_cl_bb_fullsky_jax
         return residual_cl_bb_fullsky_jax(
-            ls, Ls, spectra, n0_mv, l_min, l_max, nl_ee=nl_ee, remat=remat)
+            ls, Ls, spectra, n0_mv, l_min, l_max, nl_ee=nl_ee,
+            l_batch=l_batch, remat=remat)
     if backend not in ("numpy", "jax"):
         raise ValueError(f"backend must be 'numpy' or 'jax'; got {backend!r}")
 
@@ -1635,7 +1638,8 @@ def _delens_core(spectra: LensingSpectra,
                  fullsky: bool,
                  backend: str = "numpy",
                  remat: bool = True,
-                 n_L_sample: int | str | None = AUTO_N_L_SAMPLE
+                 n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
+                 l_batch: int = 1
                  ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Pure iterative-delensing core -- no host-side casts or I/O.
 
@@ -1676,13 +1680,14 @@ def _delens_core(spectra: LensingSpectra,
         n0 = compute_n0_mv(Ls, spectra, nl_tt, nl_ee, nl_bb_eff,
                            l_min_qe, l_max_qe, n_phi, fullsky=fullsky,
                            backend=backend, remat=remat,
-                           n_L_sample=n_L_sample)
+                           n_L_sample=n_L_sample, l_batch=l_batch)
 
         # Residual BB (exact Smith+ Eq. 12 with the W_EE Wiener filter).
         cl_bb_res = residual_cl_bb(ls, Ls, spectra, n0,
                                    l_min_qe, l_max_qe, n_phi,
                                    fullsky=fullsky, nl_ee=nl_ee,
-                                   backend=backend, remat=remat)
+                                   backend=backend, remat=remat,
+                                   l_batch=l_batch)
 
         # Interpolate the residual onto the full ell grid for the next
         # iteration's filters.  Outside the QE ls range we fall back to the
@@ -1717,6 +1722,7 @@ def delens_residual_bb(spectra: LensingSpectra,
                        *,
                        remat: bool = True,
                        n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
+                       l_batch: int = 1,
                        fullsky: bool = True) -> jnp.ndarray:
     """Differentiable residual lensing BB from iterative QE delensing.
 
@@ -1747,6 +1753,9 @@ def delens_residual_bb(spectra: LensingSpectra,
 
     ``remat`` is read at trace time, so it must be a Python ``bool``, not a
     traced value -- do not pass it through ``jax.jit``'s traced arguments.
+    The same applies to ``l_batch`` (full-sky only), which vmaps that many
+    L values into each step of the per-L map -- a wall-clock knob for
+    many-core nodes, forward bit-identical at every measured shape.
     """
     if ls is None:
         ls = jnp.arange(2, 301, dtype=float)
@@ -1757,7 +1766,7 @@ def delens_residual_bb(spectra: LensingSpectra,
         spectra, nl_tt, nl_ee, nl_bb, ls, Ls,
         n_iter=n_iter, l_min_qe=l_min_qe, l_max_qe=l_max_qe,
         n_phi=n_phi, fullsky=fullsky, backend="jax", remat=remat,
-        n_L_sample=n_L_sample)
+        n_L_sample=n_L_sample, l_batch=l_batch)
     return cl_bb_res
 
 
@@ -1775,7 +1784,8 @@ def iterate_delensing(spectra: LensingSpectra,
                       fullsky: bool = False,
                       backend: str = "numpy",
                       remat: bool = True,
-                      n_L_sample: int | str | None = AUTO_N_L_SAMPLE) -> DelensedSpectra:
+                      n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
+                      l_batch: int = 1) -> DelensedSpectra:
     """Iterative QE delensing: compute residual lensing BB self-consistently.
 
     The key insight (Smith et al. 2012 §3.1): lensed B-mode power acts as
@@ -1828,6 +1838,10 @@ def iterate_delensing(spectra: LensingSpectra,
                     ``None`` evaluates at every requested L (exact; ~L_max
                     Wigner sweeps per estimator, the pre-#48 behaviour).
                     See :func:`_fullsky_L_samples`.
+        l_batch:    Full-sky JAX backend only (ignored by the flat-sky and
+                    numpy paths). Number of L values vmapped into each
+                    step of the per-L map; trace-time constant, like
+                    ``remat``. See :func:`augr.delensing_fullsky_jax._map`.
 
     Returns:
         DelensedSpectra with residual BB, final N_0, and effective A_lens.
@@ -1843,7 +1857,7 @@ def iterate_delensing(spectra: LensingSpectra,
         spectra, nl_tt, nl_ee, nl_bb, ls, Ls,
         n_iter=n_iter, l_min_qe=l_min_qe, l_max_qe=l_max_qe,
         n_phi=n_phi, fullsky=fullsky, backend=backend, remat=remat,
-        n_L_sample=n_L_sample)
+        n_L_sample=n_L_sample, l_batch=l_batch)
 
     if verbose:
         for i in range(n_iter):
