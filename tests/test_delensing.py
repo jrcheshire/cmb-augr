@@ -1514,3 +1514,91 @@ class TestMapBatching:
         assert _shard_devices() == 1
         monkeypatch.setenv(_NO_SHARD_ENV, "0")
         assert _shard_devices() == jax.device_count()
+
+
+class TestFullSkyBatchAgreement:
+    """``l_batch`` on the real estimators: values exact, gradients to a measured gate.
+
+    Unlike the toy bodies in :class:`TestMapBatching`, these bodies end in a
+    matvec and a sum, so ``vmap`` is *entitled* to reassociate. Measured on
+    {tt,ee,te,eb,tb,mv,kernel,residual} x B in {2,4,16} x l_max in {150,250}
+    x noise scaled 1x and 100x (scratch script, 2026-09-06): every value is
+    bit-identical (XLA maps the row reduction rather than fusing across the
+    batch) and the worst gradient departure is 3.9e-15 relative, in the
+    cotangent accumulation over L. Values are therefore asserted equal --
+    an XLA upgrade could legitimately break that, and the fix is to widen
+    this to the gradient's gate, not to widen it silently -- and the
+    gradient is gated at 4e-13, 100x the worst measurement.
+    """
+
+    L_MAX: ClassVar[int] = 150
+    N_L_SAMPLE: ClassVar[int] = 50
+    GRAD_RTOL: ClassVar[float] = 4e-13
+
+    @pytest.mark.parametrize("l_batch", [4, 16])
+    def test_estimators_and_kernel_are_exact(self, spectra, noise, l_batch):
+        import augr.delensing_fullsky_jax as dj
+        nt, ne, nb = noise["tt"], noise["ee"], noise["bb"]
+        Ls = jnp.arange(2, 101, dtype=float)
+        ls = jnp.arange(2, 61, dtype=float)
+        lmin, lmax = 2, self.L_MAX
+        kw = dict(n_L_sample=self.N_L_SAMPLE, remat=True)
+
+        cases = {
+            "tt": lambda B: dj.compute_n0_tt_fullsky_jax(Ls, spectra, nt, lmin, lmax, l_batch=B, **kw),
+            "ee": lambda B: dj.compute_n0_ee_fullsky_jax(Ls, spectra, ne, lmin, lmax, l_batch=B, **kw),
+            "te": lambda B: dj.compute_n0_te_fullsky_jax(Ls, spectra, nt, ne, lmin, lmax, l_batch=B, **kw),
+            "eb": lambda B: dj.compute_n0_eb_fullsky_jax(Ls, spectra, ne, nb, lmin, lmax, l_batch=B, **kw),
+            "tb": lambda B: dj.compute_n0_tb_fullsky_jax(Ls, spectra, nt, nb, lmin, lmax, l_batch=B, **kw),
+            "mv": lambda B: dj.compute_n0_mv_fullsky_jax(Ls, spectra, nt, ne, nb, lmin, lmax, l_batch=B, **kw),
+            "kernel": lambda B: dj.lensing_kernel_fullsky_jax(ls, Ls, spectra, lmin, lmax,
+                                                             l_batch=B, remat=True),
+        }
+        for name, fn in cases.items():
+            ref, out = np.asarray(fn(1)), np.asarray(fn(l_batch))
+            assert np.all(np.isfinite(ref)), name
+            np.testing.assert_array_equal(out, ref, err_msg=name)
+
+    @pytest.mark.parametrize("l_batch", [4, 16])
+    def test_residual_gradient_matches_unbatched(self, spectra, noise, l_batch):
+        """d/d nl_bb of the residual BB sum -- the production reverse-mode shape."""
+        import augr.delensing_fullsky_jax as dj
+        nt, ne = noise["tt"], noise["ee"]
+        Ls = jnp.arange(2, 101, dtype=float)
+        ls = jnp.arange(2, 61, dtype=float)
+        lmin, lmax = 2, self.L_MAX
+
+        def total(nl_bb, B):
+            n0 = dj.compute_n0_mv_fullsky_jax(Ls, spectra, nt, ne, nl_bb, lmin, lmax,
+                                              n_L_sample=self.N_L_SAMPLE, l_batch=B,
+                                              remat=True)
+            res = dj.residual_cl_bb_fullsky_jax(ls, Ls, spectra, n0, lmin, lmax,
+                                                nl_ee=ne, l_batch=B, remat=True)
+            return jnp.sum(res)
+
+        g1 = np.asarray(jax.grad(lambda x: total(x, 1))(noise["bb"]))
+        gB = np.asarray(jax.grad(lambda x: total(x, l_batch))(noise["bb"]))
+        assert np.all(np.isfinite(g1)) and np.any(g1 != 0.0)
+        np.testing.assert_allclose(gB, g1, rtol=self.GRAD_RTOL, atol=0.0)
+
+    def test_l_batch_reaches_both_kernel_calls_in_the_residual(self, spectra, noise):
+        """``residual_cl_bb_fullsky_jax`` forwards l_batch to K *and* K_wee.
+
+        The W_EE-weighted kernel is a second call with its own default, so a
+        half-threaded knob would leave the expensive one sequential and still
+        return the right answer.
+        """
+        from unittest import mock
+
+        import augr.delensing_fullsky_jax as dj
+        Ls = jnp.arange(2, 41, dtype=float)
+        ls = jnp.arange(2, 31, dtype=float)
+        n0 = jnp.full(Ls.shape, 1e-8)
+        seen = []
+        real = dj.lensing_kernel_fullsky_jax
+        with mock.patch.object(dj, "lensing_kernel_fullsky_jax",
+                               side_effect=lambda *a, **k: (seen.append(k.get("l_batch")),
+                                                            real(*a, **k))[1]):
+            dj.residual_cl_bb_fullsky_jax(ls, Ls, spectra, n0, 2, 60,
+                                          nl_ee=noise["ee"], l_batch=4, remat=True)
+        assert seen == [4, 4], seen
