@@ -96,8 +96,19 @@ def _shard_devices() -> int:
 
 @functools.lru_cache(maxsize=4)
 def _l_mesh(n_dev: int):
-    """Cached 1-D device mesh over the L axis (mesh construction is not free)."""
-    return jax.make_mesh((n_dev,), ("L",))
+    """Cached 1-D device mesh over the L axis (mesh construction is not free).
+
+    ``AxisType.Auto``, not the ``jax.make_mesh`` default of ``Explicit``: the
+    per-L bodies close over ell-length vectors and (under an outer ``grad``)
+    over tracers, and on an explicit-sharding mesh those unsharded closures
+    raise "Length of device assignment 1 is not equal to the size of the mesh"
+    unless every caller wraps itself in an ambient mesh context. Auto leaves
+    the placement to the SPMD partitioner, which is what a library that is
+    called from inside other people's ``jit`` needs. Measured on 2 CPU
+    devices: forward and gradient both correct, eager and jitted.
+    """
+    return jax.make_mesh((n_dev,), ("L",),
+                         axis_types=(jax.sharding.AxisType.Auto,))
 
 
 def _pad_rows(xs: jnp.ndarray, multiple: int) -> jnp.ndarray:
@@ -114,8 +125,8 @@ def _pad_rows(xs: jnp.ndarray, multiple: int) -> jnp.ndarray:
     return jnp.concatenate([xs, jnp.repeat(xs[-1:], rem, axis=0)], axis=0)
 
 
-def _map(body, xs, *, remat: bool, l_batch: int = 1):
-    """``lax.map`` over ``body``, optionally gradient-checkpointed and batched.
+def _map(body, xs, *, remat: bool, l_batch: int = 1, consts: tuple = ()):
+    """``lax.map`` over ``body(L, *consts)``, optionally checkpointed and batched.
 
     Sibling of :func:`augr.delensing._scan` for the full-sky per-L bodies. Each
     body builds a handful of ``(n_l1, n_l2)`` tables (Wigner symbol, geometric
@@ -134,6 +145,21 @@ def _map(body, xs, *, remat: bool, l_batch: int = 1):
     early return to exactly today's jaxpr, hence bit-identical. ``l_batch > 1``
     reassociates the trailing reduction inside each body, so its agreement with
     ``l_batch=1`` is measured, not assumed.
+
+    ``consts`` exists because of a JAX rule the sharding branch cannot dodge: a
+    value whose aval carries a mesh sharding -- which is what anything produced
+    by an earlier ``shard_map`` carries -- may not be *closed over* by a later
+    ``shard_map`` body, only passed in through ``in_specs``. Closing one over
+    raises "Context mesh ... Manual ... should match the mesh of sharding ...
+    Auto". The delensing iteration hits this exactly: iteration 2's N_0 bodies
+    depend on iteration 1's residual. So every body input derived from the
+    caller's *noise spectra* is hoisted here and passed replicated; arrays that
+    are pure functions of the fiducial spectra or of the ell grids carry no mesh
+    sharding and stay closed over. Measured on 4 CPU devices: hoisting works in
+    eager, jit, grad and jit(grad) alike, where closing over fails in all but
+    plain jit (``pmap`` fails identically -- this is not a ``shard_map`` quirk).
+    Adding a noise-derived closure to a body without hoisting it is a loud error
+    under sharding, not a silent wrong answer.
     """
     if isinstance(l_batch, bool) or not isinstance(l_batch, int) or l_batch < 1:
         raise ValueError(f"l_batch must be a Python int >= 1, got {l_batch!r}")
@@ -142,27 +168,33 @@ def _map(body, xs, *, remat: bool, l_batch: int = 1):
     n_dev = _shard_devices()
 
     if l_batch == 1 and n_dev == 1:
+        def plain(v):
+            return body(v, *consts)
+        step = body if not consts else plain
         if remat:
-            body = jax.checkpoint(body, prevent_cse=False)
-        return lax.map(body, xs)
+            step = jax.checkpoint(step, prevent_cse=False)
+        return lax.map(step, xs)
 
-    step = body if l_batch == 1 else jax.vmap(body)
-    if remat:
-        step = jax.checkpoint(step, prevent_cse=False)
-
-    def local_map(x):
+    def local_map(x, *cs):
         """Map over one device's slice; its length is a multiple of l_batch."""
+        def step(v):
+            return body(v, *cs)
+        if l_batch > 1:
+            step = jax.vmap(step)
+        if remat:
+            step = jax.checkpoint(step, prevent_cse=False)
         if l_batch == 1:
             return lax.map(step, x)
         out = lax.map(step, x.reshape((-1, l_batch, *x.shape[1:])))
         return out.reshape((-1, *out.shape[2:]))
 
     if n_dev == 1:
-        out = local_map(_pad_rows(xs, l_batch))
+        out = local_map(_pad_rows(xs, l_batch), *consts)
     else:
         sharded = jax.shard_map(local_map, mesh=_l_mesh(n_dev),
-                                in_specs=jax.P("L"), out_specs=jax.P("L"))
-        out = sharded(_pad_rows(xs, l_batch * n_dev))
+                                in_specs=(jax.P("L"), *((jax.P(),) * len(consts))),
+                                out_specs=jax.P("L"))
+        out = sharded(_pad_rows(xs, l_batch * n_dev), *consts)
     return out[:n]
 
 
@@ -207,7 +239,7 @@ def compute_n0_eb_fullsky_jax(Ls, spectra: LensingSpectra,
     l_B_ll = l_B_grid * (l_B_grid + 1)
     inv_bb = _inv_spectrum_jax(cl_bb_tot, l_B_grid)
 
-    def body(L_f):
+    def body(L_f, weight, inv_b):
         w3j = spin2_body(L_f, l_E_arr, -2, 0, 2, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
         geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
@@ -215,11 +247,11 @@ def compute_n0_eb_fullsky_jax(Ls, spectra: LensingSpectra,
                       * (2 * L_f + 1) / (16.0 * _PI))
         odd_L = _odd_mask(l_E_arr, l_B_grid, L_f)
         f_eb_sq = (pf * w3j * geom) ** 2 * odd_L
-        l_B_sum = f_eb_sq @ inv_bb
-        return jnp.sum(l_E_weight * l_B_sum) / (2 * L_f + 1.0)
+        l_B_sum = f_eb_sq @ inv_b
+        return jnp.sum(weight * l_B_sum) / (2 * L_f + 1.0)
 
     n0_inv = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
-                  l_batch=l_batch)
+                  l_batch=l_batch, consts=(l_E_weight, inv_bb))
     return _interp_n0(n0_inv, L_samples, Ls_np)
 
 
@@ -253,7 +285,7 @@ def compute_n0_tb_fullsky_jax(Ls, spectra: LensingSpectra,
     l_B_ll = l_B_grid * (l_B_grid + 1)
     inv_bb = _inv_spectrum_jax(cl_bb_tot, l_B_grid)
 
-    def body(L_f):
+    def body(L_f, weight, inv_b):
         w3j = spin2_body(L_f, l_E_arr, -2, 0, 2, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
         geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
@@ -261,11 +293,11 @@ def compute_n0_tb_fullsky_jax(Ls, spectra: LensingSpectra,
                       * (2 * L_f + 1) / (16.0 * _PI))
         odd_L = _odd_mask(l_E_arr, l_B_grid, L_f)
         f_odd_sq = (pf * w3j * geom) ** 2 * odd_L
-        l2_sum = f_odd_sq @ inv_bb
-        return jnp.sum(l1_weight * l2_sum) / (2 * L_f + 1.0)
+        l2_sum = f_odd_sq @ inv_b
+        return jnp.sum(weight * l2_sum) / (2 * L_f + 1.0)
 
     n0_inv = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
-                  l_batch=l_batch)
+                  l_batch=l_batch, consts=(l1_weight, inv_bb))
     return _interp_n0(n0_inv, L_samples, Ls_np)
 
 
@@ -297,7 +329,7 @@ def compute_n0_tt_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt,
     tt_l2 = _gather_spectrum_jax(cl_tt_unl, l2_grid)
     inv_tt_l2 = _inv_spectrum_jax(cl_tt_tot, l2_grid)
 
-    def body(L_f):
+    def body(L_f, inv1, inv2):
         w000 = spin0_body(L_f, l1_arr, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
         alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
@@ -306,11 +338,11 @@ def compute_n0_tt_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt,
                       * (2 * L_f + 1) / (4.0 * _PI))
         f_sq = (tt_l1[:, None] * alpha1 + tt_l2[None, :] * alpha2) ** 2 \
             * pf ** 2 * w000 ** 2
-        integrand = f_sq * inv_tt_l1[:, None] * inv_tt_l2[None, :] / 2.0
+        integrand = f_sq * inv1[:, None] * inv2[None, :] / 2.0
         return jnp.sum(integrand) / (2 * L_f + 1.0)
 
     n0_inv = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
-                  l_batch=l_batch)
+                  l_batch=l_batch, consts=(inv_tt_l1, inv_tt_l2))
     return _interp_n0(n0_inv, L_samples, Ls_np)
 
 
@@ -343,7 +375,7 @@ def compute_n0_ee_fullsky_jax(Ls, spectra: LensingSpectra, nl_ee,
     ee_at_l2 = _gather_spectrum_jax(cl_ee_unl, l2_grid, l_min_valid=l_min)
     inv_ee_l2 = _inv_spectrum_jax(cl_ee_tot, l2_grid)
 
-    def body(L_f):
+    def body(L_f, inv1, inv2):
         w3j = spin2_body(L_f, l1_arr, -2, 0, 2, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
         alpha1 = L_LL + l1_ll1[:, None] - l2_ll2[None, :]
@@ -353,11 +385,11 @@ def compute_n0_ee_fullsky_jax(Ls, spectra: LensingSpectra, nl_ee,
         even_L = _even_mask(l1_arr, l2_grid, L_f)
         f_sq = (ee_l1[:, None] * alpha1 + ee_at_l2[None, :] * alpha2) ** 2 \
             * pf ** 2 * w3j ** 2 * even_L
-        integrand = f_sq * inv_ee_l1[:, None] * inv_ee_l2[None, :] / 2.0
+        integrand = f_sq * inv1[:, None] * inv2[None, :] / 2.0
         return jnp.sum(integrand) / (2 * L_f + 1.0)
 
     n0_inv = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
-                  l_batch=l_batch)
+                  l_batch=l_batch, consts=(inv_ee_l1, inv_ee_l2))
     return _interp_n0(n0_inv, L_samples, Ls_np)
 
 
@@ -406,7 +438,7 @@ def compute_n0_te_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt, nl_ee,
     ee_l1 = cl_ee_tot[l_min:l_max + 1]
     tt_l2 = _gather_spectrum_jax(cl_tt_tot, l2_grid)
 
-    def body(L_f):
+    def body(L_f, tt1, ee1, ee2, tt2):
         w000 = spin0_body(L_f, l1_arr, l2_min, l2_max)
         w2F = spin2_body(L_f, l1_arr, -2, 0, 2, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
@@ -426,26 +458,26 @@ def compute_n0_te_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt, nl_ee,
             f_swap = (te_l2[None, :] * alpha2 * pf * w2F * even_L
                       + te_l1[:, None] * alpha1 * pf * w000)
             cross = te_tot_l1[:, None] * te_tot_l2[None, :]
-            num = ee_l1[:, None] * tt_l2[None, :] * f_total - cross * f_swap
-            denom = (tt_l1[:, None] * ee_l2[None, :]
-                     * ee_l1[:, None] * tt_l2[None, :] - cross ** 2)
+            num = ee1[:, None] * tt2[None, :] * f_total - cross * f_swap
+            denom = (tt1[:, None] * ee2[None, :]
+                     * ee1[:, None] * tt2[None, :] - cross ** 2)
             # Non-negative by Cauchy-Schwarz (C_TE(l)^2 <= C_TT(l) C_EE(l)).
             weight = jnp.where(denom > 0,
                                num / jnp.where(denom > 0, denom, 1.0), 0.0)
             return jnp.sum(f_total * weight) / (2 * L_f + 1.0)
         if te_filter == "ho02_diag_approx":
-            denom = (tt_l1[:, None] * ee_l2[None, :]
+            denom = (tt1[:, None] * ee2[None, :]
                      + te_tot_l1[:, None] * te_tot_l2[None, :])
             inv_denom = jnp.where(jnp.abs(denom) > 0,
                                   1.0 / jnp.where(jnp.abs(denom) > 0, denom, 1.0), 0.0)
         else:  # 'strict_diagonal'
-            denom = tt_l1[:, None] * ee_l2[None, :]
+            denom = tt1[:, None] * ee2[None, :]
             inv_denom = jnp.where(denom > 0,
                                   1.0 / jnp.where(denom > 0, denom, 1.0), 0.0)
         return jnp.sum(f_total ** 2 * inv_denom) / (2 * L_f + 1.0)
 
     n0_inv = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
-                  l_batch=l_batch)
+                  l_batch=l_batch, consts=(tt_l1, ee_l1, ee_l2, tt_l2))
     return _interp_n0(n0_inv, L_samples, Ls_np, use_abs=True)
 
 
@@ -490,7 +522,7 @@ def lensing_kernel_fullsky_jax(ls, Ls, spectra: LensingSpectra,
     ls_idx = jnp.asarray(np.asarray(ls_np, dtype=int) - l2_min)   # into l_B_grid
     ls_f = jnp.asarray(np.asarray(ls_np), dtype=float)
 
-    def body(L_f):
+    def body(L_f, ee_w):
         w3j = spin2_body(L_f, l_E_arr, -2, 0, 2, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
         geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
@@ -500,11 +532,11 @@ def lensing_kernel_fullsky_jax(ls, Ls, spectra: LensingSpectra,
         f_eb_sq = (pf * w3j * geom) ** 2 * odd_L        # (n_lE, n_l2)
         # K_col[i_l] = sum_lE ee * f_eb_sq[:, col(ls[i_l])] / (2 ls + 1)
         cols = f_eb_sq[:, ls_idx]                       # (n_lE, n_l)
-        K_col = jnp.sum(ee[:, None] * cols, axis=0) / (2.0 * ls_f + 1.0)
+        K_col = jnp.sum(ee_w[:, None] * cols, axis=0) / (2.0 * ls_f + 1.0)
         return jnp.where(L_f >= 2.0, K_col, 0.0)        # (n_l,)
 
     K_samples = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
-                     l_batch=l_batch)                      # (n_Lsamp, n_l)
+                     l_batch=l_batch, consts=(ee,))         # (n_Lsamp, n_l)
     # Per-l log-interp onto Ls.
     log_K = jnp.log(jnp.maximum(K_samples.T, 1e-300))   # (n_l, n_Lsamp)
     Ls_f = jnp.asarray(np.asarray(Ls_np), dtype=float)

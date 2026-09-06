@@ -910,9 +910,9 @@ class TestDelensLBatchReachesEverySolve:
         seen = []
         real = dj._map
 
-        def spy(body, xs, *, remat, l_batch=1):
+        def spy(body, xs, *, remat, l_batch=1, consts=()):
             seen.append(l_batch)
-            return real(body, xs, remat=remat, l_batch=l_batch)
+            return real(body, xs, remat=remat, l_batch=l_batch, consts=consts)
 
         return seen, mock.patch.object(dj, "_map", spy)
 

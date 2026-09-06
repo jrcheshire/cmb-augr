@@ -1,5 +1,6 @@
 """Tests for delensing.py — QE lensing reconstruction and residual BB."""
 
+import os
 from pathlib import Path
 from typing import ClassVar
 
@@ -1602,3 +1603,121 @@ class TestFullSkyBatchAgreement:
             dj.residual_cl_bb_fullsky_jax(ls, Ls, spectra, n0, 2, 60,
                                           nl_ee=noise["ee"], l_batch=4, remat=True)
         assert seen == [4, 4], seen
+
+
+class TestFullSkyDeviceSharding:
+    """``_map`` splits the L grid over several CPU devices, in a child process.
+
+    ``JAX_NUM_CPU_DEVICES`` is read once at backend init and refused after, so
+    a multi-device trace cannot be produced in this process -- every arm runs
+    in a child.
+
+    The gradient is the arm that matters. The bodies consume ell-length vectors
+    that are functions of the caller's noise spectra, and under an outer
+    ``grad`` those arrive as tracers whose avals carry the mesh sharding; JAX
+    forbids closing such a value over inside a later ``shard_map`` body, which
+    is why ``_map`` hoists them through ``consts``. The delensing *iteration* is
+    where that bites -- iteration 2 consumes iteration 1's residual -- and a
+    single estimator call would pass either way. Sharded gradient compilation
+    costs ~27 s at any shape (measured), so the iteration comparison is slow-
+    tier and the fast tier keeps a forward-only smoke.
+    """
+
+    CHILD: ClassVar[str] = r'''
+import os, sys
+import numpy as np, jax, jax.numpy as jnp
+n_dev = int(os.environ["JAX_NUM_CPU_DEVICES"])
+assert jax.device_count() == n_dev, (jax.device_count(), n_dev)
+import augr.delensing_fullsky_jax as dj
+from augr.delensing import _delens_core, load_lensing_spectra
+expect = 1 if os.environ.get("AUGR_DELENS_NO_SHARD") else n_dev
+assert dj._shard_devices() == expect, (dj._shard_devices(), expect)
+want_grad = os.environ["AUGR_TEST_GRAD"] == "1"
+
+spectra = load_lensing_spectra()
+n = len(spectra.cl_ee_len)
+nt, ne = jnp.full(n, 1e-6), jnp.full(n, 2e-6)
+ls = jnp.arange(2, 13, dtype=float)
+Ls = jnp.arange(2, 25, dtype=float)
+
+def f(nl_bb):
+    cl, _n0, _a, _h = _delens_core(
+        spectra, nt, ne, nl_bb, ls, Ls, n_iter=2, l_min_qe=2, l_max_qe=40,
+        n_phi=32, fullsky=True, backend="jax", n_L_sample=6)
+    return jnp.sum(cl)
+
+nb = jnp.full(n, 2e-6)
+txt = str(jax.make_jaxpr(f)(nb))
+val = np.asarray(f(nb))
+grad = np.asarray(jax.grad(f)(nb)) if want_grad else np.zeros(1)
+np.savez(sys.argv[1], val=val, grad=grad,
+         sharded=np.array(int("shard_map" in txt)))
+'''
+
+    @staticmethod
+    def _reference():
+        """This process's single-device value and gradient for the same solve."""
+        from augr.delensing import _delens_core, load_lensing_spectra
+        spectra = load_lensing_spectra()
+        n = len(spectra.cl_ee_len)
+        nt, ne = jnp.full(n, 1e-6), jnp.full(n, 2e-6)
+        nb = jnp.full(n, 2e-6)
+        ls = jnp.arange(2, 13, dtype=float)
+        Ls = jnp.arange(2, 25, dtype=float)
+
+        def f(nl_bb):
+            cl, _n0, _a, _h = _delens_core(
+                spectra, nt, ne, nl_bb, ls, Ls, n_iter=2, l_min_qe=2, l_max_qe=40,
+                n_phi=32, fullsky=True, backend="jax", n_L_sample=6)
+            return jnp.sum(cl)
+
+        return f, nb
+
+    def _child(self, tmp_path, tag, *, grad, opt_out=False, devices=2):
+        import subprocess
+        import sys
+
+        script = tmp_path / "child.py"
+        script.write_text(self.CHILD)
+        npz = tmp_path / f"{tag}.npz"
+        env = {k: v for k, v in os.environ.items() if k != "AUGR_DELENS_NO_SHARD"}
+        env.update(JAX_NUM_CPU_DEVICES=str(devices),
+                   AUGR_TEST_GRAD="1" if grad else "0")
+        if opt_out:
+            env["AUGR_DELENS_NO_SHARD"] = "1"
+        proc = subprocess.run([sys.executable, str(script), str(npz)],
+                              capture_output=True, text=True, timeout=600, env=env)
+        assert proc.returncode == 0, proc.stderr[-3000:]
+        return np.load(npz)
+
+    def test_sharded_forward_matches_and_is_actually_sharded(self, tmp_path):
+        """Fast smoke: 2 devices, forward only -- the value and a live shard_map."""
+        f, nb = self._reference()
+        out = self._child(tmp_path, "fwd", grad=False)
+        assert out["sharded"] == 1, "shard_map missing from the sharded jaxpr"
+        np.testing.assert_allclose(out["val"], np.asarray(f(nb)),
+                                   rtol=4e-13, atol=0.0)
+
+    @pytest.mark.slow
+    def test_sharded_gradient_matches_and_opt_out_is_exact(self, tmp_path):
+        """The reverse-mode arm, plus AUGR_DELENS_NO_SHARD as the single-device path.
+
+        Two child processes; the sharded gradient's compile dominates (~27 s).
+        """
+        f, nb = self._reference()
+        ref_val = np.asarray(f(nb))
+        ref_grad = np.asarray(jax.grad(f)(nb))
+        assert np.all(np.isfinite(ref_grad)) and np.any(ref_grad != 0.0)
+
+        sharded = self._child(tmp_path, "sharded", grad=True)
+        optout = self._child(tmp_path, "optout", grad=True, opt_out=True)
+
+        assert sharded["sharded"] == 1
+        assert optout["sharded"] == 0, "opt-out still produced a shard_map"
+        # opt-out is literally the single-device path: exact.
+        np.testing.assert_array_equal(optout["val"], ref_val)
+        np.testing.assert_array_equal(optout["grad"], ref_grad)
+        # sharded: the L axis is split, so reductions assemble in a different
+        # order; measured 0 on this shape, gated at the l_batch tolerance.
+        np.testing.assert_allclose(sharded["val"], ref_val, rtol=4e-13, atol=0.0)
+        np.testing.assert_allclose(sharded["grad"], ref_grad, rtol=4e-13, atol=0.0)
