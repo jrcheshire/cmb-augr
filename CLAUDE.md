@@ -210,6 +210,24 @@ Knowing how the modules chain together matters more than any one file:
    On the 3-band fixture the full-sky residual is 1.1-1.4% below flat-sky
    and its `jax.grad` matches finite differences to 1e-8.
 
+   **Run the full-sky path on 4 CPU devices** (`JAX_NUM_CPU_DEVICES=4`
+   in the environment *before* Python starts -- JAX reads it once, at
+   import, and refuses it afterwards). `delensing_fullsky_jax._map`
+   then shards the per-L grid across them automatically;
+   `AUGR_DELENS_NO_SHARD=1` opts out. Measured on Vista gg (144 cores,
+   job 974631): the full-sky design gradient at l_max_qe=3000 goes
+   52.1 s -> 16.9 s (28 -> 99 effective cores) and at 1500 14.1 s ->
+   4.1 s, values agreeing to 1.7e-16. 16 devices buys a further ~12%
+   for 3.7x the memory (94 GB vs 25 GB); 4 is the recommended point.
+   Two caveats: `iterate_delensing` does **not** benefit (7.0 s at 1
+   device, 7.1 at 4, 8.5 at 16 -- it runs five estimators in sequence
+   that already fan out), and any **outer** multiprocessing caller must
+   divide the device count the way `process_pool` already divides
+   `AUGR_DELENS_WORKERS`, or the two levels oversubscribe. The
+   `l_batch` knob on the same map is a **measured negative** and stays
+   at 1: at l_max_qe=3000 it costs 53.8 s at 4 and 73.8 s at 16,
+   against 52.1 s sequential, for 2.5-7x the memory.
+
    **N₀ validation status (2026-05-07).** Validated against `plancklens`
    at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:
    - **TT flat-sky**: machine-precision against the constant-Cℓ closed

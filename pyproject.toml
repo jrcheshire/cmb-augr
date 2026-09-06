@@ -172,8 +172,13 @@ gpu = { features = ["gpu"], no-default-feature = true }
 cpu = { features = ["cpu"], no-default-feature = true }
 
 [tool.pixi.tasks]
-test = { cmd = "pytest tests/ -m 'not slow' -n auto --maxprocesses=8 --timeout=180 --timeout-method=thread --max-worker-restart=0 -ra", env = { AUGR_DELENS_WORKERS = "1", AUGR_SHT_NTHREADS = "1", OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1" } }
-test-slow = "pytest tests/ -v -m slow"
+# JAX_NUM_CPU_DEVICES is pinned to 1 so an ambient export cannot silently
+# shard the full-sky per-L map under the suite: the sharding tests compute
+# their single-device reference in-process, and a multi-device parent would
+# make that "reference" sharded too. The tests that need several devices
+# spawn their own children with an explicit override.
+test = { cmd = "pytest tests/ -m 'not slow' -n auto --maxprocesses=8 --timeout=180 --timeout-method=thread --max-worker-restart=0 -ra", env = { AUGR_DELENS_WORKERS = "1", AUGR_SHT_NTHREADS = "1", OMP_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1", MKL_NUM_THREADS = "1", JAX_NUM_CPU_DEVICES = "1" } }
+test-slow = { cmd = "pytest tests/ -v -m slow", env = { JAX_NUM_CPU_DEVICES = "1" } }
 test-all = { depends-on = ["test", "test-slow"] }
 validate-pico = "python scripts/validate_pico.py"
 validate-bk = "python scripts/validate_bk.py"
