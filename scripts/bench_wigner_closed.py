@@ -489,9 +489,9 @@ def _devices():
 _SWEEP_GRID = [(1, 1), (4, 1), (16, 1), (1, 4), (1, 16), (4, 4), (16, 16)]
 
 
-def _child_cmd(args, l_batch, devices, *, values_out=None, baseline=None):
+def _child_cmd(args, l_batch, devices, l_maxes, *, values_out=None, baseline=None):
     cmd = [sys.executable, os.path.abspath(__file__),
-           "--l-max", *[str(x) for x in args.l_max],
+           "--l-max", *[str(x) for x in l_maxes],
            "--repeat", str(args.repeat),
            "--l-batch", str(l_batch),
            "--rows", *args.rows,
@@ -518,15 +518,22 @@ def _sweep(args):
     rows = []
     _print(f"\n=== sweep {grid} at l_max {args.l_max}; baseline values -> {baseline}")
     for l_batch, devices in grid:
-        if l_batch * devices >= 256 and max(args.l_max) > 1500:
-            _print(f"\n--- skip (B={l_batch}, N={devices}) above l_max 1500: "
-                   "padding would dominate")
-            continue
+        # A point that pads 125 L samples to 256 doubles the work; it is worth
+        # one row at the smaller l_max to see whether per-L efficiency more
+        # than doubles, and is not worth the wall time above that.
+        l_maxes = args.l_max
+        if l_batch * devices >= 256:
+            l_maxes = [lm for lm in args.l_max if lm <= 1500]
+            if not l_maxes:
+                _print(f"\n--- skip (B={l_batch}, N={devices}): no l_max <= 1500 "
+                       "in this run, and padding would dominate above it")
+                continue
         first = (l_batch, devices) == (1, 1)
-        cmd = _child_cmd(args, l_batch, devices,
+        cmd = _child_cmd(args, l_batch, devices, l_maxes,
                          values_out=baseline if first else None,
                          baseline=None if first else baseline)
-        _print(f"\n--- child B={l_batch} N={devices}: {' '.join(cmd[1:])}   [{_now()}]")
+        _print(f"\n--- child B={l_batch} N={devices} l_max {l_maxes}: "
+               f"{' '.join(cmd[1:])}   [{_now()}]")
         env = dict(os.environ)
         env.pop("AUGR_DELENS_NO_SHARD", None)
         proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
