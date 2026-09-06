@@ -1717,7 +1717,7 @@ def delens_residual_bb(spectra: LensingSpectra,
                        *,
                        remat: bool = True,
                        n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
-                       fullsky: bool = False) -> jnp.ndarray:
+                       fullsky: bool = True) -> jnp.ndarray:
     """Differentiable residual lensing BB from iterative QE delensing.
 
     Pure-jnp entry point for the residual C_l^{BB} the design forward needs:
@@ -1727,11 +1727,16 @@ def delens_residual_bb(spectra: LensingSpectra,
     .cl_bb_res`` without the host-side dataclass packaging.  Returns
     C_l^{BB,res} at ls.
 
-    ``fullsky=False`` (default) is the flat-sky Gauss-Legendre QE;
-    ``fullsky=True`` runs the full-sky Wigner-3j drivers on the JAX backend
-    (closed-form tables since issue #48, gradient-checkpointed per L when
-    ``remat``), with ``n_L_sample`` selecting the N_0 L-sample grid (see
-    :func:`_fullsky_L_samples`).
+    ``fullsky=True`` (default since 2026-09-06) runs the full-sky Wigner-3j
+    drivers on the JAX backend (closed-form tables since issue #48,
+    gradient-checkpointed per L when ``remat``), with ``n_L_sample``
+    selecting the N_0 L-sample grid (see :func:`_fullsky_L_samples`);
+    ``fullsky=False`` is the flat-sky Gauss-Legendre QE. The full-sky path is
+    both the exact geometry at low L and the parallel one: its per-L bodies
+    are fused kernels, whereas the flat-sky ``_scan`` over l1 is serial
+    (4 cores on a 144-core node vs 27, 12x the wall time at l_max_qe=1500;
+    ``scripts/bench_wigner_closed.py``). Note :func:`iterate_delensing`
+    keeps its own flat-sky / numpy defaults.
 
     ``remat`` (default True) gradient-checkpoints the QE scan bodies, which is
     what keeps a ``jax.grad`` through this function from allocating

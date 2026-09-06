@@ -289,8 +289,12 @@ class TestIterativeDelensing:
 
 # Light delensing config (mirrors test_result_shape) so the differentiable
 # tests below stay in the fast gate.
+# fullsky=False pins these tests to the flat-sky Gauss-Legendre path they
+# characterize (the design forward defaults to full-sky sampled since
+# 2026-09-06; iterate_delensing's own default is still flat-sky, and
+# test_matches_iterate compares the two entry points bit-for-bit).
 _DIFF_KW = dict(ls=jnp.arange(2, 201, dtype=float),
-                L_max=500, l_max_qe=500, n_phi=32, n_iter=2)
+                L_max=500, l_max_qe=500, n_phi=32, n_iter=2, fullsky=False)
 
 
 class TestDifferentiableDelensing:
@@ -1160,7 +1164,9 @@ class TestFullSkyJaxBackend:
 # -----------------------------------------------------------------------
 
 #: Small enough to stay inside the fast gate's --timeout=180.
-_REMAT_KW = dict(ls=jnp.arange(2, 30, dtype=float), n_phi=32, n_iter=2)
+# Flat-sky explicitly: these tests measure the l1-scan tape's L^2 growth and
+# its remat cure; the full-sky path's remat'd per-L map has its own gates.
+_REMAT_KW = dict(ls=jnp.arange(2, 30, dtype=float), n_phi=32, n_iter=2, fullsky=False)
 
 
 def _grad_temp_bytes(spectra, nl, l_max_qe, remat):

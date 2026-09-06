@@ -737,6 +737,26 @@ class TestCombinedWhiteNoiseOverflow:
 # --- DelensCoupling: full-sky Wigner-3j QE in the design forward (issue #48) ----
 
 
+def test_design_forward_defaults_to_fullsky_sampled():
+    """Full-sky sampled is the design-forward default (2026-09-06), at every entry.
+
+    No compute: reads the signature / dataclass defaults. Flipping any one of
+    them back silently would put that entry on the serial flat-sky scan.
+    """
+    import inspect
+
+    from augr.delensing import delens_residual_bb
+    from augr.optimize import OptimizationContext, _delens_from_combined_bb
+    assert inspect.signature(delens_residual_bb).parameters["fullsky"].default is True
+    assert inspect.signature(_delens_from_combined_bb).parameters["fullsky"].default is True
+    assert inspect.signature(DelensCoupling.build).parameters["fullsky"].default is True
+    assert inspect.signature(make_optimization_context).parameters["delens_fullsky"].default is True
+    fields = {f.name: f.default for f in dataclasses.fields(DelensCoupling)}
+    assert fields["fullsky"] is True and fields["n_L_sample"] == "auto"
+    fields = {f.name: f.default for f in dataclasses.fields(OptimizationContext)}
+    assert fields["delens_fullsky"] is True and fields["delens_n_L_sample"] == "auto"
+
+
 @pytest.mark.slow
 def test_delens_coupling_fullsky_reference_is_exact(_coupling_design):
     """residual() reproduces cl_bb_res0 at the reference on the full-sky path too."""
@@ -839,7 +859,8 @@ def test_make_optimization_context_delens_fullsky(_coupling_design):
                   ell_max=30)
     ctx_full = make_optimization_context(**common, delens="recompute",
                                          delens_fullsky=True, delens_n_L_sample=50)
-    ctx_flat = make_optimization_context(**common, delens="recompute")
+    ctx_flat = make_optimization_context(**common, delens="recompute",
+                                         delens_fullsky=False)
     assert ctx_full.delens_fullsky is True and ctx_full.delens_n_L_sample == 50
     assert ctx_flat.delens_fullsky is False and ctx_flat.delens_n_L_sample == "auto"
     assert not np.array_equal(np.asarray(ctx_full.delens_cl_bb_res0),

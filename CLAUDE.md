@@ -199,13 +199,16 @@ Knowing how the modules chain together matters more than any one file:
    backend='jax')` matches the numpy solve to 1e-6 and is grad-finite,
    with the remat'd tape 53 GB -> 324 MB at l_max_qe=800.
    `backend='numpy'` (default for `iterate_delensing`) keeps the
-   ProcessPool path as the reference. **The design forward can now run
-   full-sky**: `delens_residual_bb(fullsky=True)`,
-   `DelensCoupling.build(fullsky=True)`,
-   `make_optimization_context(delens_fullsky=True)`; default stays
-   flat-sky (byte-identical when off). On the 3-band fixture the
-   full-sky residual is 1.1-1.4% below flat-sky and its `jax.grad`
-   matches finite differences to 1e-8.
+   ProcessPool path as the reference. **The design forward runs
+   full-sky sampled by default (2026-09-06)**: `delens_residual_bb`,
+   `DelensCoupling.build`, `make_optimization_context(delens=...)`;
+   pass `fullsky=False` / `delens_fullsky=False` for flat-sky. The flip
+   was measured, not argued: on Vista gg (144 cores, job 972604,
+   `scripts/bench_wigner_closed.py`) the flat-sky design gradient at
+   l_max_qe=1500 took 175 s at 4.0 effective cores (its `_scan` over l1
+   is serial by construction) while full-sky sampled took 14.4 s at 27.
+   On the 3-band fixture the full-sky residual is 1.1-1.4% below flat-sky
+   and its `jax.grad` matches finite differences to 1e-8.
 
    **N₀ validation status (2026-05-07).** Validated against `plancklens`
    at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:
@@ -349,8 +352,9 @@ Knowing how the modules chain together matters more than any one file:
    linearly per eval (near-free, first-order). Default `delens=None` is
    byte-identical. The context is built in delensed mode at a reference
    solve, so recompute at the reference design reproduces the frozen
-   residual exactly. **Full-sky delensing (`fullsky=True`) is still numpy
-   (Stage 3); the forward uses the flat-sky path.**
+   residual exactly. **The forward runs the full-sky sampled QE by default
+   since 2026-09-06 (JAX backend, item 5); `delens_fullsky=False` selects
+   the flat-sky path.**
 
 7. **`multipatch.py` + `sky_patches.py`.** `MultiPatchFisher` runs
    independent per-patch Fishers with shared spectral indices and

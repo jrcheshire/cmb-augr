@@ -115,7 +115,7 @@ def _delens_from_combined_bb(spectra: LensingSpectra,
                              l_max_qe: int,
                              n_iter: int,
                              remat: bool = True,
-                             fullsky: bool = False,
+                             fullsky: bool = True,
                              n_L_sample: int | str | None = AUTO_N_L_SAMPLE) -> jnp.ndarray:
     """Residual lensing BB from the single combined polarization noise.
 
@@ -180,8 +180,13 @@ class DelensCoupling:
     #: Setting it on only one of them still passes every value test (remat is
     #: forward-transparent) while silently leaving the other path on the
     #: O(l_max_qe**2) tape -- i.e. it would pass for the wrong reason.
-    fullsky: bool = False      # full-sky Wigner-3j QE (JAX backend) instead of flat-sky
+    fullsky: bool = True       # full-sky Wigner-3j QE (JAX backend); False = flat-sky
     n_L_sample: int | str | None = AUTO_N_L_SAMPLE  # full-sky N_0 L grid; None = every L
+    #: Full-sky sampled is the default (2026-09-06): it is the exact geometry at
+    #: the low L that set sigma(r), and it is the parallel path -- on a 144-core
+    #: node the flat-sky gradient at l_max_qe=1500 held 4 cores for 175 s where
+    #: full-sky sampled held 27 for 14 s (scripts/bench_wigner_closed.py, Vista
+    #: job 972604). Flat-sky's ``_scan`` over l1 is serial by construction.
     #: ``fullsky`` / ``n_L_sample`` likewise enter BOTH solves: the reference
     #: residual and the per-design one must be the same approximation, or the
     #: "reproduces cl_bb_res0 at the reference" contract breaks silently.
@@ -201,15 +206,16 @@ class DelensCoupling:
         n_iter: int = 5,
         ls: jnp.ndarray | None = None,
         remat: bool = True,
-        fullsky: bool = False,
+        fullsky: bool = True,
         n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
     ) -> DelensCoupling:
         """Precompute the coupling at a reference design (one delensing solve).
 
-        ``fullsky=True`` runs the full-sky Wigner-3j QE (JAX backend, remat per L)
-        instead of the flat-sky Gauss-Legendre one; ``n_L_sample`` picks its N_0
-        L-sample grid (``None`` = every L; see
-        :func:`augr.delensing._fullsky_L_samples`).
+        ``fullsky=True`` (default) runs the full-sky Wigner-3j QE (JAX backend,
+        remat per L) on the sampled N_0 L grid ``n_L_sample`` (``"auto"`` =
+        :func:`augr.delensing.default_n_L_sample`, ``None`` = every L; see
+        :func:`augr.delensing._fullsky_L_samples`); ``fullsky=False`` is the
+        flat-sky Gauss-Legendre QE.
 
         ``n_det`` / ``net`` / ``beam`` / ``eta`` are the reference design's
         per-channel arrays (the same ones :func:`design_to_channels` produces), and
@@ -307,7 +313,7 @@ class OptimizationContext:
     delens_nl_bb0: jnp.ndarray | None = None      # reference combined nl_bb (on delens_ells)
     delens_jac: jnp.ndarray | None = None         # d(cl_bb_res)/d(nl_bb), linearized mode
     delens_remat: bool = True                     # checkpoint the QE scans (see delensing._scan)
-    delens_fullsky: bool = False                  # full-sky Wigner-3j QE (JAX) instead of flat-sky
+    delens_fullsky: bool = True                   # full-sky Wigner-3j QE (JAX); False = flat-sky
     delens_n_L_sample: int | str | None = AUTO_N_L_SAMPLE  # full-sky N_0 L grid; None = every L
 
 
@@ -325,7 +331,7 @@ def make_optimization_context(
     delens_n_iter: int = 5,
     delens_ls: jnp.ndarray | None = None,
     delens_remat: bool = True,
-    delens_fullsky: bool = False,
+    delens_fullsky: bool = True,
     delens_n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
     **signal_kwargs,
 ) -> OptimizationContext:
@@ -360,8 +366,11 @@ def make_optimization_context(
                          (~90 GB at l_max_qe=1000). Forward-transparent.
         delens_ls:       ell grid for the residual (delens only; default
                          2..300, must span the SignalModel [ell_min, ell_max]).
-        delens_fullsky:  run the full-sky Wigner-3j QE (JAX backend, remat
-                         per L) instead of the flat-sky Gauss-Legendre one.
+        delens_fullsky:  True (default): the full-sky Wigner-3j QE (JAX
+                         backend, remat per L) on the sampled N_0 grid -- the
+                         exact low-L geometry and the parallel path (see
+                         ``DelensCoupling``). False: the flat-sky
+                         Gauss-Legendre QE, whose l1 scan is serial.
         delens_n_L_sample: full-sky only; N_0 L-sample grid (``"auto"`` =
                          ``delensing.default_n_L_sample``, ``None`` = every L,
                          see ``delensing._fullsky_L_samples``).
