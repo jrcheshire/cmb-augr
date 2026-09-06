@@ -43,5 +43,12 @@ echo "finished  $(date -Is)"
 # Peak RSS of the whole job step. sacct's MaxRSS is polled and under-reports;
 # the cgroup counter is not.
 for f in /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory/memory.max_usage_in_bytes; do
-    [ -r "$f" ] && echo "cgroup peak $(awk '{printf "%.2f GB\n", $1/1e9}' "$f")" && break
+    if [ -r "$f" ]; then
+        echo "cgroup peak $(awk '{printf "%.2f GB\n", $1/1e9}' "$f")"
+        break
+    fi
 done
+# Neither counter exists on every site, and under `set -e` a failing final
+# test would fail the whole job after the table is already printed -- which
+# is exactly how job 974622 exited 1 on a clean sweep.
+exit 0
