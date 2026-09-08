@@ -809,37 +809,28 @@ class TestSignalModelIntegration:
 # -----------------------------------------------------------------------
 # Cross-validation against plancklens (LiteBIRD-PTEP fiducial)
 #
-# Reference NPZ produced by scripts/n0_validation/run_plancklens.py;
-# regen recipe in scripts/n0_validation/README.md. The lightweight test
-# here just compares augr's compute_n0_* on the *same* nl_*/cl_* arrays
-# against the saved reference. Tolerances reflect the conventions both
-# codes use: response = unlensed C_l, filter = lensed + noise, MV =
-# diagonal 1/Sum 1/N_0_alpha.
+# Reference NPZ from scripts/n0_validation/run_plancklens.py; regen recipe in
+# scripts/n0_validation/README.md. Compares augr's compute_n0_* on the *same*
+# nl_*/cl_* arrays against the saved reference. Shared conventions: response =
+# unlensed C_l, filter = lensed + noise, MV = diagonal 1/Sum 1/N_0_alpha.
 # -----------------------------------------------------------------------
 
-# Tolerances for the augr full-sky vs plancklens TT comparison.
-# Locked in 2026-05-06 after the controlled-input test + regen with
-# correct lmin filter (see scripts/n0_validation/README.md "RESOLVED"
-# section). On the LiteBIRD-PTEP fiducial config the agreement is
-# ~1e-6 in the bulk and ~1e-4 at L > 2000 (where both codes feel the
-# l1+l2 boundary truncation). 1e-3 is a safe headroom that catches
-# regressions while not being noisy.
+# Measured agreement on the LiteBIRD-PTEP fiducial is ~1e-6 in the bulk and
+# ~1e-4 at L > 2000, where both codes feel the l1+l2 boundary truncation; 1e-3
+# is headroom that catches regressions without being noisy.
 #
-# Only TT is tested here. plancklens 'p_p' / 'p' include inter-
-# estimator cross-correlations (joint GMV); augr's MV is diagonal
-# (HO02 Eq. 22). The diagonal-vs-joint difference is real physics, not
-# a bug, and varies with the relative weight of estimators -- not
-# something to lock into a tolerance test.
+# Only TT is compared: plancklens 'p_p' / 'p' include inter-estimator
+# cross-correlations (joint GMV) where augr's MV is diagonal (HO02 Eq. 22).
+# That difference is real physics and varies with estimator weights, so it is
+# not something to lock into a tolerance test.
 N0_REF_PATH = Path(__file__).resolve().parents[1] / "data" / "n0_reference_litebird.npz"
 TOL_FULLSKY_TT_BULK = 1e-3   # bulk-L window
 TOL_FULLSKY_TT_TAIL = 1e-3   # high-L (l > 2000) where both feel boundary trunc
 
-# TE has a structural ~5% bulk-L residual not shared with the other 4
-# estimators; see TestN0TEAgainstPlancklens for diagnosis. Bulk-L band
-# stops at L=1800 to avoid the C_TE zero-crossings near l~1850 where
-# the response amplitude vanishes and any structural residual blows
-# up relative to plancklens.
-TOL_FULLSKY_TE_BULK = 3e-2   # measured 2.35e-2 post-#48 (was ~5% with the truncated-grid TE bug)
+# TE carries a structural ~5% bulk-L residual the other four estimators do not;
+# see TestN0TEAgainstPlancklens. The band stops at L=1800 to avoid the C_TE
+# zero-crossings near l~1850.
+TOL_FULLSKY_TE_BULK = 3e-2   # measured 2.35e-2
 L_BULK_TE = (10, 1800)
 
 L_BULK = (10, 2000)
@@ -998,44 +989,19 @@ class TestN0EBAgainstPlancklens:
 class TestN0TEAgainstPlancklens:
     """Augr full-sky TE N_0 vs plancklens 'p_te' (symmetrized).
 
-    Locked at ``TOL_FULLSKY_TE_BULK`` (6e-2) in ``L_BULK_TE`` (10..1800),
-    a deliberately looser gate than the <1e-3 bulk-L lock-in for TT / EE
-    / EB / TB. The looseness is structural, not a tolerance kludge:
+    Locked at ``TOL_FULLSKY_TE_BULK`` (6e-2) in ``L_BULK_TE`` (10..1800), looser
+    than the <1e-3 lock-in for TT / EE / EB / TB. The looseness is structural:
 
-    * **Production filter mismatch**: augr's ``compute_n0_te`` defaults
-      to HO02 Eq. 13's diagonal-approximation filter
-      ``1/(C_TT*C_EE + C_TE^2)``. Plancklens forces ``fal['te']=0``,
-      giving the strict-diagonal filter ``1/(C_TT*C_EE)``. This test
-      calls with ``te_filter='strict_diagonal'`` to align the filters
-      exactly; that part is apples-to-apples.
-    * **Symmetrization residual** (the structural ~5%): plancklens
-      ``p_te`` is the symmetric estimator ``g_pte + g_pet``, whose
-      variance is ``Var(pte) + Var(pet) + 2 Cov(pte, pet)``. Augr's
-      ``_compute_n0_te_fullsky`` implements OkaHu 2003 Table I's
-      single-projection response (E-leg spin-2, T-leg spin-0), which
-      reproduces ``Var(pte)`` only -- it does NOT capture the
-      ``Cov(pte, pet)`` cross-Wick contraction. With ``fal['te']=0``
-      the cross term is non-zero because ``cls_ivfs[te] = cl_te /
-      (C_TT_total * C_EE_total)`` is non-zero, and contributes a few
-      percent at all L. Closing it requires porting plancklens's
-      ``nhl._get_nhl`` cross-Wick logic to harmonic space (the
-      already-validated ``augr/_qe.py`` is the leg-construction
-      reference) -- deferred; out of scope for this test.
-    * **C_TE zero-crossings at L~1850**: the response amplitude
-      vanishes there, so any residual structural percent-level error
-      blows up to 10-20% in relative terms. The bulk-L band stops at
-      L=1800 to keep the test informative about the structural floor
-      rather than dominated by these localized blow-ups.
+    * Filters are aligned exactly -- the test passes
+      ``te_filter='strict_diagonal'`` to match plancklens's ``fal['te']=0``.
+    * ~5% symmetrization residual: plancklens ``p_te`` is ``g_pte + g_pet``, whose
+      variance carries a ``2 Cov(pte, pet)`` cross-Wick term that augr's
+      single-projection OkaHu Table I response does not reproduce.
+    * The band stops at L=1800 because the C_TE zero-crossings near L~1850 make
+      the relative error blow up to 10-20% where the response amplitude vanishes.
 
-    Per ``compute_n0_te``'s own docstring, TE contributes ~1-2% to
-    ``N_0^MV`` at space-experiment noise levels, so the 5% TE residual
-    propagates as <0.1% on N_0^MV and <1% on A_L for realistic delensing
-    efficiencies -- well below decision-relevance for sigma(r) forecasts.
-    Full-sky is production-grade for space-mission applications (where
-    the reionization bump dominates the sigma(r) constraint and the
-    (L+1)^2 / L^2 flat-vs-full geometric correction matters at low L);
-    flat-sky remains the ``iterate_delensing`` default for runtime
-    (~5x faster) but is no longer the math/physics preference.
+    TE contributes ~1-2% to ``N_0^MV`` at space-experiment noise levels, so this
+    propagates as <0.1% on N_0^MV and <1% on A_L.
     """
 
     def test_te_max_rel_err_in_bulk(self):
@@ -1184,18 +1150,13 @@ class TestRematMemory:
     """``remat=True`` is what stands between the design gradient and an OOM.
 
     ``optimize._delens_from_combined_bb`` ties ``L_max`` to ``l_max_qe``, so the
-    reverse-mode tape over the five N_0 scans grows as ``l_max_qe**2 * n_phi``.
-    Measured on antares: 91.5 GB peak RSS at ``l_max_qe=1000`` and a 217 GB
-    single allocation at 1500, against a 124 GB node.
+    reverse-mode tape over the five N_0 scans grows as ``l_max_qe**2 * n_phi`` --
+    measured 91.5 GB peak RSS at ``l_max_qe=1000`` against a 124 GB node.
 
-    Gated on ``memory_analysis().temp_size_in_bytes`` -- XLA's buffer
-    assignment, which is deterministic for a given HLO -- rather than sampled
-    RSS, which depends on the allocator, the machine, and whatever else the
-    process did, and is meaningless under the ``-n auto`` parallel gate.
-
-    NOT ``peak_memory_in_bytes``: that field read 0.00 MB on a case whose temp
-    was 655 MB, i.e. it does not track the tape at all.
-
+    Gated on ``memory_analysis().temp_size_in_bytes`` (XLA buffer assignment,
+    deterministic for a given HLO), not sampled RSS, which depends on the allocator
+    and the machine and is meaningless under a parallel gate. NOT
+    ``peak_memory_in_bytes``: it read 0.00 MB on a case whose temp was 655 MB.
     Ratios, not absolute byte counts -- absolutes are not portable across XLA
     versions or backends.
     """

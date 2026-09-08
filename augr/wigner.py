@@ -302,12 +302,11 @@ def wigner3j_vectorized(j2: int, l1_array: np.ndarray,
     momentum (here l2), with l1 and j2 fixed per recursion step.
     All l1 values are processed in parallel (vectorized backward sweep).
 
-    The numpy spin-2 table deliberately stays on this recursion: the
-    closed-form ``augr.wigner_closed.spin2_table(xp=np)`` is exact but
-    memory-bound as numpy elementwise work over the full ``(n_l1, n_l2)``
-    table (measured 0.37 s vs 0.066 s here at l_max=1500), whereas the JAX
-    core (``wigner_jax.spin2_body``) fuses it into one kernel and wins. The
-    numpy closed form is still the cross-backend reference in the tests.
+    The numpy spin-2 table stays on this recursion: the closed form
+    ``augr.wigner_closed.spin2_table(xp=np)`` is exact but memory-bound in
+    numpy over the full ``(n_l1, n_l2)`` table, where the JAX core
+    ``wigner_jax.spin2_body`` fuses it into one kernel and wins. The numpy
+    closed form remains the cross-backend reference in the tests.
 
     Because the sum-rule normalization runs over the supplied grid, the grid
     must cover every row's full triangle ``[|l1-j2|, l1+j2]`` (clipped by

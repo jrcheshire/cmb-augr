@@ -1,28 +1,20 @@
-"""
-delensing_fullsky_jax.py -- pure-jnp full-sky QE N_0 and lensing kernel.
+"""delensing_fullsky_jax.py -- pure-jnp full-sky QE N_0 and lensing kernel.
 
-Differentiable (jax.jit / jax.grad) counterparts of the numpy full-sky
-drivers in ``delensing.py`` (issue #45 Stage 3). Each per-L body is
-``jnp`` throughout and uses the traced-L Wigner cores in ``wigner_jax``
-(``spin2_body`` / ``spin0_body`` -- closed-form lookup tables since issue
-#48, one fused kernel per L instead of an l2-length recursion); the per-L
-sweep is a ``lax.map`` over the static ``_fullsky_L_samples`` grid
-(sequential -> one Wigner table live at a time), replacing the numpy
-ProcessPool. ``l_batch`` (trace-time constant, like ``remat``; full-sky
-JAX backend only, ignored by the flat-sky and numpy paths) vmaps that many
-L values into each step, and several CPU devices shard the grid
-automatically -- see :func:`_map`. The log-interp onto the requested Ls is a differentiable
-``jnp.interp``.
+Differentiable (jax.jit / jax.grad) counterparts of the numpy full-sky drivers
+in ``delensing.py``. Each per-L body is ``jnp`` throughout and uses the traced-L
+Wigner cores in ``wigner_jax`` (``spin2_body`` / ``spin0_body``); the per-L
+sweep is a ``lax.map`` over the static ``_fullsky_L_samples`` grid, optionally
+batched and device-sharded (see :func:`_map`). The log-interp onto the
+requested Ls is a differentiable ``jnp.interp``.
 
 Shape contract: ``L`` is traced inside ``lax.map``; the l2 grid bounds are
-static (a *global* l2_max = l_max + max(L_sample) for the spin-2 estimators,
-so the (n_l1, n_l2) table shape is uniform across L -- extra columns fall
-outside the per-L triangle and are zeroed by the Wigner mask). Validated
-bit-for-bit against the numpy drivers in ``tests/test_delensing.py``.
+static (a *global* l2_max = l_max + max(L_sample) for the spin-2 estimators, so
+the (n_l1, n_l2) table shape is uniform across L -- extra columns fall outside
+the per-L triangle and are zeroed by the Wigner mask).
 
 Math (couplings, parity masks, filters, weights) is identical to the numpy
-per-L workers ``_per_L_{eb,tb,tt,ee,te}`` and ``_per_L_lensing_kernel``;
-only the backend changes.
+per-L workers ``_per_L_{eb,tb,tt,ee,te}`` and ``_per_L_lensing_kernel``; only
+the backend changes.
 """
 
 from __future__ import annotations
@@ -78,14 +70,11 @@ _NO_SHARD_ENV = "AUGR_DELENS_NO_SHARD"
 
 
 def _shard_devices() -> int:
-    """Number of CPU devices the per-L map should shard over (1 = no sharding).
+    """Number of CPU devices the per-L map shards over (1 = no sharding).
 
-    Trace-time decision, baked into every compiled executable: JAX reads
-    ``JAX_NUM_CPU_DEVICES`` once at import and refuses it after backend init,
-    so a process is single- or multi-device for its whole life. Sharding is
-    automatic when a launcher has asked for several CPU devices; set
-    ``AUGR_DELENS_NO_SHARD=1`` to opt out, and note that non-CPU backends are
-    left alone (one GPU already fans out inside the kernel).
+    Read from ``JAX_NUM_CPU_DEVICES``, which JAX fixes at import, so the value is
+    constant for the life of the process and is baked in at trace time.
+    ``AUGR_DELENS_NO_SHARD=1`` forces 1; non-CPU backends are left alone.
     """
     if os.environ.get(_NO_SHARD_ENV, "") not in ("", "0"):
         return 1
@@ -96,16 +85,11 @@ def _shard_devices() -> int:
 
 @functools.lru_cache(maxsize=4)
 def _l_mesh(n_dev: int):
-    """Cached 1-D device mesh over the L axis (mesh construction is not free).
+    """Cached 1-D device mesh over the L axis.
 
-    ``AxisType.Auto``, not the ``jax.make_mesh`` default of ``Explicit``: the
-    per-L bodies close over ell-length vectors and (under an outer ``grad``)
-    over tracers, and on an explicit-sharding mesh those unsharded closures
-    raise "Length of device assignment 1 is not equal to the size of the mesh"
-    unless every caller wraps itself in an ambient mesh context. Auto leaves
-    the placement to the SPMD partitioner, which is what a library that is
-    called from inside other people's ``jit`` needs. Measured on 2 CPU
-    devices: forward and gradient both correct, eager and jitted.
+    ``AxisType.Auto``, not ``make_mesh``'s ``Explicit`` default: the per-L bodies
+    close over unsharded ell-length vectors, which an explicit mesh rejects unless
+    every caller supplies an ambient mesh context.
     """
     return jax.make_mesh((n_dev,), ("L",),
                          axis_types=(jax.sharding.AxisType.Auto,))
@@ -114,9 +98,7 @@ def _l_mesh(n_dev: int):
 def _pad_rows(xs: jnp.ndarray, multiple: int) -> jnp.ndarray:
     """Repeat the last row of ``xs`` up to a length divisible by ``multiple``.
 
-    The last row is the largest L sample, so a padded slot costs what the most
-    expensive real slot costs -- padding is never free, and callers print
-    ``n -> n_pad`` so it is not mistaken for parallel speedup.
+    A padded slot costs a full slot, so callers report ``n -> n_pad``.
     """
     n = xs.shape[0]
     rem = (-n) % multiple
@@ -128,38 +110,25 @@ def _pad_rows(xs: jnp.ndarray, multiple: int) -> jnp.ndarray:
 def _map(body, xs, *, remat: bool, l_batch: int = 1, consts: tuple = ()):
     """``lax.map`` over ``body(L, *consts)``, optionally checkpointed and batched.
 
-    Sibling of :func:`augr.delensing._scan` for the full-sky per-L bodies. Each
-    body builds a handful of ``(n_l1, n_l2)`` tables (Wigner symbol, geometric
-    prefactor, parity mask, coupling) that reverse mode would otherwise keep
-    for every L sample -- ~n_L * n_l1 * n_l2 * 8 B per retained table, i.e.
-    tens of GB at l_max_qe ~ 1000 on the dense L grid. ``remat=True`` stores
-    only the per-L inputs and recomputes the body on the backward pass.
-    Forward values are unaffected; the gradient costs ~2x in runtime. No
-    ``policy=``: every candidate intermediate is the same full table, so
-    saving any one of them re-introduces the whole term.
+    Sibling of :func:`augr.delensing._scan` for the full-sky per-L bodies.
 
-    ``l_batch > 1`` vmaps that many L values into each sequential step, and
-    several CPU devices (see :func:`_shard_devices`) split the L grid with
-    ``shard_map``; both exist because a plain sequential map of modest kernels
-    leaves most of a many-core node idle. ``l_batch=1`` on one device is an
-    early return to exactly today's jaxpr, hence bit-identical. ``l_batch > 1``
-    reassociates the trailing reduction inside each body, so its agreement with
-    ``l_batch=1`` is measured, not assumed.
+    ``remat=True`` stores only the per-L inputs and recomputes the body on the
+    backward pass; each body builds several ``(n_l1, n_l2)`` tables that reverse
+    mode would otherwise retain for every L sample (tens of GB at l_max_qe ~ 1000).
+    No ``policy=``: every candidate intermediate is the same full table.
 
-    ``consts`` exists because of a JAX rule the sharding branch cannot dodge: a
-    value whose aval carries a mesh sharding -- which is what anything produced
-    by an earlier ``shard_map`` carries -- may not be *closed over* by a later
-    ``shard_map`` body, only passed in through ``in_specs``. Closing one over
-    raises "Context mesh ... Manual ... should match the mesh of sharding ...
-    Auto". The delensing iteration hits this exactly: iteration 2's N_0 bodies
-    depend on iteration 1's residual. So every body input derived from the
-    caller's *noise spectra* is hoisted here and passed replicated; arrays that
-    are pure functions of the fiducial spectra or of the ell grids carry no mesh
-    sharding and stay closed over. Measured on 4 CPU devices: hoisting works in
-    eager, jit, grad and jit(grad) alike, where closing over fails in all but
-    plain jit (``pmap`` fails identically -- this is not a ``shard_map`` quirk).
-    Adding a noise-derived closure to a body without hoisting it is a loud error
-    under sharding, not a silent wrong answer.
+    ``l_batch > 1`` vmaps that many L values into each sequential step; it
+    reassociates the trailing reduction, so agreement with ``l_batch=1`` is
+    measured rather than exact. ``_shard_devices() > 1`` splits the grid across CPU
+    devices with ``shard_map``. ``l_batch=1`` on one device is an early return to a
+    plain ``lax.map``, hence bit-identical.
+
+    Caller contract: any body input derived from the caller's *noise* spectra must
+    be passed through ``consts``, not closed over. Values carrying a mesh sharding
+    -- anything produced by an earlier ``shard_map``, e.g. the previous delensing
+    iteration's residual -- may not be closed over by a later ``shard_map`` body.
+    Arrays that are pure functions of the fiducial spectra or the ell grids carry
+    no sharding and may close over.
     """
     if isinstance(l_batch, bool) or not isinstance(l_batch, int) or l_batch < 1:
         raise ValueError(f"l_batch must be a Python int >= 1, got {l_batch!r}")

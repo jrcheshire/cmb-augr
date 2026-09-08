@@ -1,50 +1,41 @@
-"""
-bench_wigner_closed.py -- before/after timings for the issue #48 Wigner-3j work.
+"""bench_wigner_closed.py -- before/after timings for the closed-form Wigner-3j work.
 
-Every row reports wall time, process CPU time summed over all threads, and
-their ratio ``eff`` (the number of cores the row effectively kept busy). A
-row with ``eff`` ~ 1 on a many-core node is serial by construction, not
-"unlucky"; the Schulten-Gordon recursion (a ``lax.scan`` over l2 with a
-vector of ``n_l1`` elements per step) is the known example.
+Every row reports wall time, process CPU time summed over all threads, and their
+ratio ``eff`` (cores the row effectively kept busy). ``eff`` counts thread-pool
+spin-waiting and over-counts once devices > 1, since the replicated outer work
+is charged to every device -- **wall time decides**.
 
 Rows (one machine, jit-warm, median of ``--repeat``):
 
-  1. per-L tables: ``spin2_body`` closed form vs the retained Schulten-Gordon
-     scan ``_spin2_body_sg``; ``spin0_body`` g-table vs ``_spin0_body_gammaln``.
+  1. per-L tables: ``spin2_body`` closed form vs the Schulten-Gordon scan
+     ``_spin2_body_sg``; ``spin0_body`` g-table vs ``_spin0_body_gammaln``.
   2. full estimators: ``compute_n0_{tt,ee,te,eb,tb}_fullsky_jax`` and the
      lensing kernel, SG vs closed form, on the production sampled L grid
-     (``--dense`` for the exact every-L grid: ~13x the sweeps at
-     l_max_qe=1500, and the SG rows there are serial -- that is the shape
-     that ran for two hours on a 144-core node).
+     (``--dense`` for the exact every-L grid).
   3. ``iterate_delensing(fullsky=True)`` end to end, JAX backend, SG vs closed
      on the sampled grid, plus the exact grid and the numpy ProcessPool backend
      on request.
   4. ``pseudo_cl_jax.coupling_matrices`` (MASTER M+, M-).
   5. ``DelensCoupling`` build + design gradient, flat-sky vs full-sky sampled.
 
-``--sweep`` runs the L-batching / device-sharding grid: one CHILD PROCESS per
-``(l_batch, devices)`` pair, because ``JAX_NUM_CPU_DEVICES`` is read once at
-import and the sharding decision is baked in at trace time -- never toggle
-either knob inside one process. Children run ``--closed-only`` against the
-``(1,1)`` child's values, and every row carries ``n -> n_pad``: padding repeats
-the largest L sample, so ``(16,16)`` at 125 samples does 256 samples' work and
-cannot win on wall time unless per-L efficiency more than doubles. ``eff``
-over-counts once N > 1 (the replicated outer work is charged to every device),
-so **wall time decides**, not eff.
+``--sweep`` runs the L-batching / device-sharding grid with one CHILD PROCESS
+per ``(l_batch, devices)`` pair: ``JAX_NUM_CPU_DEVICES`` is read once at import
+and the sharding decision is baked in at trace time, so neither knob may be
+toggled inside one process. Children run ``--closed-only`` against the ``(1,1)``
+child's values, and every row carries ``n -> n_pad`` -- padding repeats the
+largest L sample, so a padded configuration does the padded count's work.
 
-Harness rules (each one was violated by the first version of this script and
-produced a table that measured nothing -- see the commit message):
+Harness rules, each of which a benchmark here must keep:
 
-  * The swept quantity (``L``) is a traced jit ARGUMENT. A Python scalar
-    closed over by ``jax.jit(lambda: ...)`` is constant-folded and the timed
-    call is a memcpy of a precomputed table.
-  * Each variant is a fresh function object and ``jax.clear_caches()`` runs
-    between variants: ``jax.jit`` caches executables by the function object,
-    so timing one ``f`` under a monkeypatch and again without it re-runs the
-    first executable (every row reads 1.0x).
+  * The swept quantity (``L``) is a traced jit ARGUMENT. A Python scalar closed
+    over by ``jax.jit(lambda: ...)`` is constant-folded and the timed call is a
+    memcpy of a precomputed table.
+  * Each variant is a fresh function object with ``jax.clear_caches()`` between
+    variants: ``jax.jit`` caches executables by function object, so timing one
+    ``f`` under a monkeypatch and again without it re-runs the first executable.
   * The implementation swap is verified live: the patched-in Wigner core is a
     counting wrapper and the row asserts it was invoked during tracing.
-  * Every print is flushed, so a killed or cancelled job leaves its rows.
+  * Every print is flushed, so a killed job leaves its rows.
 
 Usage:
     pixi run python scripts/bench_wigner_closed.py [--l-max 1500 3000]

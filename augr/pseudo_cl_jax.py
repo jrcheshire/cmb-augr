@@ -34,12 +34,8 @@ would double-count.
 
 **The l3 grid runs to ``2 * lmax``, not to ``lmax_mask``.** The sum over l3
 is physically supported out to ``l1 + l2 = 2 lmax``; ``W_l`` is zero-padded
-above ``lmax_mask`` rather than the grid being cut there. (Historically this
-was also required by the Schulten-Gordon table's sum-rule normalization,
-which renormalized clipped rows against a partial sum -- 73-162% error; the
-closed-form table :func:`augr.wigner_jax.spin2_body` now uses has no such
-dependence, but the support argument stands.) The extra columns cost 0.6 MB
-at lmax=192.
+above ``lmax_mask`` rather than the grid being cut there. The extra columns
+cost 0.6 MB at lmax=192.
 """
 
 from __future__ import annotations

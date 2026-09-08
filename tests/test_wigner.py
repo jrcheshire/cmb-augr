@@ -1,19 +1,11 @@
 """Tests for augr.wigner Wigner-3j primitives.
 
-Locks in the Schulten-Gordon recursion against sympy. The
-``_sg_b`` sign-on-m_3 bug surfaced by n0_validation work
-(2026-05-06) is the motivating regression: previously,
-``wigner3j_recurse`` and the vectorized variant produced wrong
-values for any (m_1, m_2) with m_3 = -(m_1+m_2) != 0, because
-``_sg_b`` had the wrong sign on the m_3 term.
-
-Sympy's ``wigner_3j`` is the truth here. We test:
-  - the closed-form ``wigner3j_000`` path (m1=m2=m3=0).
-  - the recursion path ``wigner3j_recurse`` for small n with
-    m_3 != 0 (the corner case that failed silently).
-  - the vectorized table path ``wigner3j_vectorized`` for several
-    (m_1, m_2) signatures including the production case
-    (m_1=-2, m_2=0).
+Sympy's ``wigner_3j`` is the truth here. Covers:
+  - the closed-form ``wigner3j_000`` path (m1=m2=m3=0);
+  - the recursion ``wigner3j_recurse`` for small n with m_3 != 0, where a sign
+    error on the ``_sg_b`` m_3 term once failed silently;
+  - the vectorized table ``wigner3j_vectorized`` for several (m_1, m_2)
+    signatures including the production (m_1=-2, m_2=0).
 """
 
 from __future__ import annotations
@@ -312,20 +304,14 @@ def test_spin2_body_is_truncation_independent(m1, m2, m3):
 def test_spin2_body_gradient_is_finite(m1, m2, m3):
     """Reverse mode through the recursion must not produce NaN.
 
-    ``_sg_a_jax``'s ``sqrt(maximum(arg, 0))`` was correct in value but
-    NaN-poisoned in reverse mode: d/dx sqrt(x) is infinite at x=0 and the
-    clamped branch contributes a zero, so the cotangent is inf * 0. It now uses
-    the double-where idiom, substituting the argument before the sqrt.
+    ``_sg_a_jax`` uses the double-where idiom, substituting the argument before the
+    sqrt: ``sqrt(maximum(arg, 0))`` is correct in value but NaN-poisons the reverse
+    pass, since d/dx sqrt(x) is infinite at x=0 and the clamped branch contributes a
+    zero, giving inf * 0.
 
-    (The normalization has the same latent pattern but is unreachable -- see the
-    note at that line. Mutating it back fails no test; mutating _sg_a_jax fails
-    two, which is why only the reachable one was changed.)
-
-    Nothing in augr differentiates with respect to a multipole index, so this
-    guards a property rather than a caller. It is worth guarding anyway: a NaN
-    in the reverse pass of a module whose entire purpose is differentiability is
-    a footgun for the next caller, and the fix leaves the forward pass bitwise
-    unchanged.
+    Nothing in augr differentiates with respect to a multipole index, so this guards
+    a property rather than a caller -- worth keeping in a module whose purpose is
+    differentiability.
     """
     l1 = jnp.arange(0, 6, dtype=float)
     g = jax.grad(jax.jit(lambda j2: spin2_body(j2, l1, m1, m2, m3, 0, 8).sum()))
