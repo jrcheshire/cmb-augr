@@ -39,7 +39,7 @@ import jax
 import jax.numpy as jnp
 
 from augr.covariance import bandpower_covariance_blocks_from_noise
-from augr.delensing import LensingSpectra, delens_residual_bb
+from augr.delensing import AUTO_N_L_SAMPLE, LensingSpectra, delens_residual_bb
 from augr.fisher import _fisher_from_blocks, _fisher_from_full
 from augr.instrument import (
     Instrument,
@@ -55,10 +55,7 @@ from augr.telescope import (
     photon_noise_net_jax,
 )
 
-# Backward-compat alias: the optimize and FisherForecast paths share the
-# same primitive (jnp.linalg.solve per bin). Kept as a name in case any
-# downstream code imports it; new code should use _fisher_from_blocks
-# directly.
+# Backward-compat alias; new code should use _fisher_from_blocks directly.
 _fisher_from_blocks_solve = _fisher_from_blocks
 
 
@@ -71,31 +68,18 @@ def _combined_white_nl_bb(n_det: jnp.ndarray,
                           f_sky: float) -> jnp.ndarray:
     """Inverse-variance-combined *white* polarization noise N_l^BB.
 
-    White (no 1/f) by design: the QE lensing reconstruction is dominated by
-    the E/B lensing peak (l ~ 500-2000) where 1/f is negligible, and using
-    white noise keeps the context-build reference solve consistent with the
-    per-design eval regardless of the covariance-side ``knee_ell``. Same
-    channel parameters that feed the covariance noise, so it tracks the
-    design differentiably.
+    White (no 1/f) by design: the QE reconstruction is dominated by the E/B lensing
+    peak (l ~ 500-2000) where 1/f is negligible, and it keeps the context-build
+    reference solve consistent with the per-design eval regardless of the
+    covariance-side ``knee_ell``.
 
-    ``net`` / ``beam`` / ``eta`` may each be a scalar, which is broadcast across
-    the channels ``n_det`` defines. ``eta`` in particular reaches here as
-    :func:`augr.eig.design_objective`'s ``eta_total``, whose documented default
-    at the physical entry point (:func:`augr.eig.physical_design_objective`) is
-    the scalar ``0.5`` -- indexing that per channel raised ``IndexError: array is
-    0-dimensional``, so ``delens=`` was unusable from the physical entry point
-    even though the channel-level one worked.
+    ``net`` / ``beam`` / ``eta`` may each be a scalar, broadcast across the channels
+    ``n_det`` defines.
 
-    **The per-channel inverse weight is accumulated as ``b_l**2 / w_inv``, never
-    as ``1 / (w_inv / b_l**2)``.** The two are algebraically identical and agree
-    to fp64 round-off, but the second overflows: on the delensing noise grid
-    (``ell`` to 5000) a large-beam channel's ``b_l**2`` decays past what fp64
-    holds, so ``noise_nl_continuous``'s ``w_inv / b_l**2`` reaches ``+inf``. The
-    *value* survives -- ``1 / inf`` is 0, i.e. the channel correctly drops out of
-    the combine where its beam has killed all signal -- but the backward pass
-    multiplies ``d(1/nl)/d(nl) = -1/nl**2 -> -0`` by ``d(nl)/d(beam) -> inf`` and
-    ``0 * inf`` is **NaN**. Accumulating the reciprocal directly keeps the
-    underflowed channel at a clean zero contribution with a zero derivative.
+    Accumulate the per-channel inverse weight as ``b_l**2 / w_inv``, never as
+    ``1 / (w_inv / b_l**2)``: the latter overflows to ``+inf`` for a large-beam
+    channel on the delensing ell grid, and while the value is still correct the
+    backward pass then evaluates ``0 * inf`` -> NaN.
     """
     n_chan = n_det.shape[0]
     net, beam, eta = (jnp.broadcast_to(jnp.asarray(x, dtype=float), (n_chan,))
@@ -114,55 +98,39 @@ def _delens_from_combined_bb(spectra: LensingSpectra,
                              ls: jnp.ndarray,
                              l_max_qe: int,
                              n_iter: int,
-                             remat: bool = True) -> jnp.ndarray:
+                             remat: bool = True,
+                             fullsky: bool = True,
+                             n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
+                             l_batch: int = 1) -> jnp.ndarray:
     """Residual lensing BB from the single combined polarization noise.
 
     In the design forward the inverse-variance-combined noise obeys the
     pol/temperature relation ``nl_ee = nl_bb`` and ``nl_tt = nl_bb / 2``, so
     the iterative-QE residual is a function of ``nl_bb`` alone. ``nl_bb`` is
     indexed on ``spectra.ells`` (the LensingSpectra grid).  Differentiable
-    (flat-sky ``delens_residual_bb``), so this composes into ``jax.grad``.
+    (``delens_residual_bb``, flat-sky or full-sky), so this composes into
+    ``jax.grad``.
     """
     return delens_residual_bb(
         spectra, nl_bb / 2.0, nl_bb, nl_bb,
         ls=ls, L_max=l_max_qe, l_max_qe=l_max_qe, n_iter=n_iter,
-        remat=remat)
+        remat=remat, fullsky=fullsky, n_L_sample=n_L_sample,
+        l_batch=l_batch)
 
 
 @dataclass(frozen=True)
 class DelensCoupling:
-    """Design-dependent residual lensing ``C_ell^BB`` for the **map-based** forward.
-
-    :func:`make_optimization_context` (``delens=...``) couples delensing into the
-    *analytic* forward, where the design's channels live on the context's own
-    instrument. The map-based / EIG forward cannot use that: its
-    ``OptimizationContext`` is built on the single-channel
-    :func:`augr.config.cleaned_map_instrument` placeholder, whose dummy NET says
-    nothing about how well the real design reconstructs lensing. This object carries
-    the same coupling keyed on the *real* design knobs instead, and is the piece
-    :func:`augr.eig.design_objective` threads into the Monte-Carlo sims.
+    """Design-dependent residual lensing BB from an iterative-QE solve.
 
     Build it with :meth:`build` at a reference design; call :meth:`residual` per
-    design. The residual is recomputed by a full iterative-QE solve at each
-    evaluation, so its **value** is exact at every design, not an expansion about the
-    reference.
+    design. The residual is a full solve at each evaluation, so its value is exact
+    at every design, not an expansion about the reference. For the cheaper
+    first-order alternative see ``make_optimization_context(delens='linearized')``.
 
-    **No linearized mode, deliberately.** ``make_optimization_context`` offers
-    ``delens='linearized'`` (a Jacobian precomputed once, ``C_res0 + J dN``), which
-    would be far cheaper here. It is not offered because it was measured to fail:
-    at a 3-band reference design, a **5% change in detector count** sent the
-    linearized residual to ``-0.083 x C_lens`` against a true ``0.467`` (118% error,
-    and negative). The cause is upstream of this class -- ``delens_residual_bb`` has
-    a jump discontinuity in the noise at isolated multipoles (measured at
-    ``ell = 30``: perturbing ``N_ell`` there by any amount of either sign, from 1e-4
-    to 1e-1 relative, shifts the output by a constant ``+4.5e-10``), so autodiff
-    reports a ~6-orders-too-large slope at that coordinate and the Jacobian
-    contraction is dominated by it. Everywhere else AD and finite differences agree
-    to 5 digits.
-
-    **The same discontinuity limits the design gradient through delensing**, in this
-    class and in the analytic ``delens=`` path alike: the *value* is trustworthy,
-    ``jax.grad`` through the QE solve is not, until the upstream jump is fixed.
+    ``jax.grad`` through the solve agrees with finite differences on both backends
+    (verified along a single-multipole noise direction and against a global noise
+    rescale; the AD-vs-FD gates in ``tests/test_optimize.py`` cover the design
+    directions).
     """
 
     spectra: LensingSpectra
@@ -173,10 +141,17 @@ class DelensCoupling:
     nl_bb0: jnp.ndarray        # reference combined white nl_bb (on ells)
     cl_bb_res0: jnp.ndarray    # reference residual (on ls)
     remat: bool = True         # gradient-checkpoint the QE scans
-    #: ``remat`` must be read by BOTH :meth:`build` and :meth:`residual`.
-    #: Setting it on only one of them still passes every value test (remat is
-    #: forward-transparent) while silently leaving the other path on the
-    #: O(l_max_qe**2) tape -- i.e. it would pass for the wrong reason.
+    #: ``remat`` must be read by BOTH :meth:`build` and :meth:`residual`; it is
+    #: forward-transparent, so setting it on one side only passes every value
+    #: test while leaving the other on the O(l_max_qe**2) tape.
+    fullsky: bool = True       # full-sky Wigner-3j QE (JAX backend); False = flat-sky
+    n_L_sample: int | str | None = AUTO_N_L_SAMPLE  # full-sky N_0 L grid; None = every L
+    l_batch: int = 1           # full-sky only: L values vmapped per map step
+    #: ``fullsky`` / ``n_L_sample`` / ``l_batch`` must enter BOTH solves: the
+    #: reference residual and the per-design one have to be the same
+    #: approximation, or the "reproduces cl_bb_res0 at the reference" contract
+    #: breaks silently. This includes ``l_batch``, whose values are bit-identical
+    #: today but need not stay so across XLA versions.
 
     @classmethod
     def build(
@@ -193,16 +168,21 @@ class DelensCoupling:
         n_iter: int = 5,
         ls: jnp.ndarray | None = None,
         remat: bool = True,
+        fullsky: bool = True,
+        n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
+        l_batch: int = 1,
     ) -> DelensCoupling:
         """Precompute the coupling at a reference design (one delensing solve).
 
-        ``n_det`` / ``net`` / ``beam`` / ``eta`` are the reference design's
-        per-channel arrays (the same ones :func:`design_to_channels` produces), and
-        ``f_sky`` / ``mission_years`` set the noise normalization. :attr:`cl_bb_res0`
-        is the residual there -- the value to hand the forecast's ``SignalModel`` as
-        ``delensed_bb``, so the model half of the coupling matches the sims at the
-        reference (the frozen-Jacobian convention :func:`sigma_r_from_channels`
-        already uses analytically).
+        ``fullsky=True`` (default) runs the full-sky Wigner-3j QE on the sampled N_0 L
+        grid ``n_L_sample`` (``"auto"`` = :func:`augr.delensing.default_n_L_sample`,
+        ``None`` = every L); ``fullsky=False`` is the flat-sky Gauss-Legendre QE.
+
+        ``n_det`` / ``net`` / ``beam`` / ``eta`` are the reference design's per-channel
+        arrays (as :func:`design_to_channels` produces); ``f_sky`` / ``mission_years``
+        set the noise normalization. :attr:`cl_bb_res0` is the residual there -- hand it
+        to the forecast's ``SignalModel`` as ``delensed_bb`` so the model half of the
+        coupling matches the sims at the reference.
         """
         ells = lensing_spectra.ells
         ls_arr = jnp.arange(2, 301, dtype=float) if ls is None else jnp.asarray(ls)
@@ -210,7 +190,8 @@ class DelensCoupling:
             jnp.asarray(n_det), jnp.asarray(net), jnp.asarray(beam), jnp.asarray(eta),
             ells, mission_years, f_sky)
         cl_res0 = _delens_from_combined_bb(
-            lensing_spectra, nl_bb0, ls_arr, l_max_qe, n_iter, remat)
+            lensing_spectra, nl_bb0, ls_arr, l_max_qe, n_iter, remat,
+            fullsky=fullsky, n_L_sample=n_L_sample, l_batch=l_batch)
         return cls(
             spectra=lensing_spectra,
             ls=ls_arr,
@@ -220,21 +201,25 @@ class DelensCoupling:
             nl_bb0=nl_bb0,
             cl_bb_res0=cl_res0,
             remat=bool(remat),
+            fullsky=bool(fullsky),
+            n_L_sample=(n_L_sample if n_L_sample is None or isinstance(n_L_sample, str)
+                        else int(n_L_sample)),
+            l_batch=int(l_batch),
         )
 
     def residual(self, n_det, net, beam, eta, mission_years, f_sky):
         """Residual lensing ``C_ell^BB`` on :attr:`ls` for this design.
 
         Exact at every design (a full solve, not an expansion), and reproduces
-        :attr:`cl_bb_res0` at the reference. Traceable, but see the class docstring
-        before trusting ``jax.grad`` through it.
+        :attr:`cl_bb_res0` at the reference. Traceable in ``jax.grad``.
         """
         nl_bb = _combined_white_nl_bb(
             jnp.asarray(n_det), jnp.asarray(net), jnp.asarray(beam), jnp.asarray(eta),
             self.ells, mission_years, f_sky)
         return _delens_from_combined_bb(
             self.spectra, nl_bb, self.ls, self.l_max_qe, self.n_iter,
-            self.remat)
+            self.remat, fullsky=self.fullsky, n_L_sample=self.n_L_sample,
+            l_batch=self.l_batch)
 
 
 @dataclass(frozen=True)
@@ -288,6 +273,9 @@ class OptimizationContext:
     delens_nl_bb0: jnp.ndarray | None = None      # reference combined nl_bb (on delens_ells)
     delens_jac: jnp.ndarray | None = None         # d(cl_bb_res)/d(nl_bb), linearized mode
     delens_remat: bool = True                     # checkpoint the QE scans (see delensing._scan)
+    delens_fullsky: bool = True                   # full-sky Wigner-3j QE (JAX); False = flat-sky
+    delens_n_L_sample: int | str | None = AUTO_N_L_SAMPLE  # full-sky N_0 L grid; None = every L
+    delens_l_batch: int = 1                       # full-sky only: L values vmapped per map step
 
 
 def make_optimization_context(
@@ -304,13 +292,16 @@ def make_optimization_context(
     delens_n_iter: int = 5,
     delens_ls: jnp.ndarray | None = None,
     delens_remat: bool = True,
+    delens_fullsky: bool = True,
+    delens_n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
+    delens_l_batch: int = 1,
     **signal_kwargs,
 ) -> OptimizationContext:
     """One-time setup for differentiable sigma(r) optimization.
 
     Builds the SignalModel, pre-computes the Jacobian, assembles the prior
-    structure, and extracts channel parameters as JAX arrays. The returned
-    context is passed to sigma_r_from_channels or sigma_r_from_design.
+    structure, and extracts channel parameters as JAX arrays. The returned context
+    is passed to sigma_r_from_channels or sigma_r_from_design.
 
     Args:
         instrument:      Reference instrument (defines frequencies, structure).
@@ -319,24 +310,28 @@ def make_optimization_context(
         fiducial_params: Dict of fiducial parameter values.
         priors:          Dict mapping param name -> prior sigma.
         fixed_params:    List of params to hold fixed.
-        delens:          None (off), 'recompute', or 'linearized' -- enable
-                         self-consistent design-dependent delensing in the
-                         forward (issue #45 Stage 2). Requires
-                         ``lensing_spectra``. 'recompute' re-runs the QE
-                         residual every eval (exact; ~tens of seconds per
-                         solve). 'linearized' precomputes the residual
-                         Jacobian d(cl_bb_res)/d(nl_bb) once (O(n_ls) solves --
-                         expensive build) and applies it linearly per eval
-                         (near-free; first-order accurate). Owns delensed_bb.
+        delens:          None (off), 'recompute', or 'linearized' -- design-dependent
+                         delensing in the forward; requires ``lensing_spectra`` and
+                         owns ``delensed_bb``. 'recompute' re-runs the QE residual
+                         every eval (exact, seconds per solve); 'linearized'
+                         precomputes d(cl_bb_res)/d(nl_bb) once and applies it
+                         linearly (near-free per eval, first-order accurate).
         lensing_spectra: LensingSpectra for the QE delensing (delens only).
         delens_l_max_qe: Max QE multipole for the delensing (delens only).
         delens_n_iter:   Delensing iterations (delens only).
-        delens_remat:    gradient-checkpoint the QE scans (delens only).
-                         Default True; without it a jax.grad through the
-                         recompute path allocates O(l_max_qe**2) of tape
-                         (~90 GB at l_max_qe=1000). Forward-transparent.
-        delens_ls:       ell grid for the residual (delens only; default
-                         2..300, must span the SignalModel [ell_min, ell_max]).
+        delens_remat:    Gradient-checkpoint the QE scans (delens only, default
+                         True). Forward-transparent; required to keep the backward
+                         tape bounded at production l_max_qe.
+        delens_ls:       ell grid for the residual (delens only; default 2..300,
+                         must span the SignalModel [ell_min, ell_max]).
+        delens_fullsky:  True (default): full-sky Wigner-3j QE on the sampled N_0
+                         grid -- exact low-L geometry, and the parallel path.
+                         False: flat-sky Gauss-Legendre QE, whose l1 scan is serial.
+        delens_n_L_sample: full-sky only; N_0 L-sample grid (``"auto"`` =
+                         ``delensing.default_n_L_sample``, ``None`` = every L).
+        delens_l_batch:  full-sky only; L values vmapped into each step of the
+                         per-L map (default 1). Wall-clock knob only; trace-time
+                         constant, like ``delens_remat``.
         **signal_kwargs: Passed to SignalModel (ell_min, ell_max, delta_ell,
                          ell_per_bin_below, delensed_bb, etc.)
 
@@ -354,15 +349,11 @@ def make_optimization_context(
     eta = jnp.array([ch.efficiency.total for ch in channels])
     freqs = tuple(ch.nu_ghz for ch in channels)
 
-    # Self-consistent delensing (issue #45 Stage 2). When enabled, the design
-    # forward recomputes (or linearizes) the residual lensing BB from the
-    # design-dependent combined noise. Here we build the reference solve at the
-    # supplied instrument: it both (a) puts the SignalModel in delensed mode
-    # (A_lens drops out; the residual is additive in r so the Jacobian stays
-    # structural) and (b) serves as the linearization point. The reference
-    # uses the same white-noise combine as the per-eval path, so recompute at
-    # the reference design reproduces this frozen residual exactly (when the
-    # per-eval mission_years / f_sky match the instrument's).
+    # Reference delensing solve at the supplied instrument: it puts the
+    # SignalModel in delensed mode (A_lens drops out; the residual is additive
+    # in r, so the Jacobian stays structural) and serves as the linearization
+    # point. Same white-noise combine as the per-eval path, so recompute at the
+    # reference reproduces this residual when mission_years / f_sky match.
     if delens not in (None, "recompute", "linearized"):
         raise ValueError(
             f"delens must be None, 'recompute', or 'linearized'; got {delens!r}")
@@ -384,16 +375,19 @@ def make_optimization_context(
             instrument.mission_duration_years, instrument.f_sky)
         delens_cl_bb_res0 = _delens_from_combined_bb(
             lensing_spectra, delens_nl_bb0, delens_ls_arr,
-            delens_l_max_qe, delens_n_iter, delens_remat)
+            delens_l_max_qe, delens_n_iter, delens_remat,
+            fullsky=delens_fullsky, n_L_sample=delens_n_L_sample,
+            l_batch=delens_l_batch)
         if delens == "linearized":
-            # J = d(cl_bb_res)/d(nl_bb) at the reference (reverse-mode: output
-            # dim n_ls << input dim n_ells). This precompute costs O(n_ls)
-            # delensing solves -- expensive; amortized over many cheap evals.
+            # d(cl_bb_res)/d(nl_bb) at the reference; O(n_ls) solves, amortized
+            # over many cheap evals.
             delens_jac = jax.jacrev(
                 lambda nlbb: _delens_from_combined_bb(
                     lensing_spectra, nlbb, delens_ls_arr,
                     delens_l_max_qe, delens_n_iter,
-                    delens_remat))(delens_nl_bb0)
+                    delens_remat, fullsky=delens_fullsky,
+                    n_L_sample=delens_n_L_sample,
+                    l_batch=delens_l_batch))(delens_nl_bb0)
         # Put the SignalModel in delensed mode at the reference residual.
         signal_kwargs = dict(signal_kwargs)
         signal_kwargs["delensed_bb"] = delens_cl_bb_res0
@@ -448,6 +442,9 @@ def make_optimization_context(
         delens_ells=delens_ells_arr,
         delens_l_max_qe=delens_l_max_qe,
         delens_remat=delens_remat,
+        delens_fullsky=delens_fullsky,
+        delens_n_L_sample=delens_n_L_sample,
+        delens_l_batch=delens_l_batch,
         delens_n_iter=delens_n_iter,
         delens_cl_bb_res0=delens_cl_bb_res0,
         delens_nl_bb0=delens_nl_bb0,
@@ -489,11 +486,8 @@ def sigma_r_from_channels(
         Scalar sigma(r) -- marginalized Fisher constraint on r.
 
     Note:
-        Uses ``fisher._fisher_from_blocks`` (jnp.linalg.solve per bin),
-        the same primitive as ``FisherForecast.sigma``. The two paths
-        agree to fp64 precision at any allocation. Validated as
-        essentially exact (rel error < 1e-7 outside bin 0, < 1% at bin 0)
-        against mpmath @ 30 dps on the PICO 21-channel moment-FG fixture.
+        Uses ``fisher._fisher_from_blocks``, the same primitive as
+        ``FisherForecast.sigma``; the two paths agree to fp64 precision.
     """
     ells = ctx.ells
     n_chan = n_det.shape[0]
@@ -520,23 +514,21 @@ def sigma_r_from_channels(
         ]
     )
 
-    # Self-consistent delensing: recompute (or linearize) the residual lensing
-    # BB from this design's combined noise and feed it into the covariance
-    # signal as a delensed_bb override. None when delens is off (byte-identical).
+    # Residual lensing BB for this design, fed to the covariance as a
+    # delensed_bb override. None when delens is off.
     delensed_override = None
     if ctx.delens_mode is not None:
-        # Combined *white* pol noise on the full delensing ell grid (1/f
-        # ignored for the QE reconstruction; nl_ee = nl_bb, nl_tt = nl_bb/2
-        # are handled inside _delens_from_combined_bb). Same white combine as
-        # the context-build reference, so recompute at the reference design
-        # reproduces the frozen residual.
+        # Combined *white* pol noise on the delensing ell grid; nl_ee = nl_bb
+        # and nl_tt = nl_bb/2 are applied inside _delens_from_combined_bb.
         nl_bb_del = _combined_white_nl_bb(
             n_det, net, beam_fwhm, eta_total, ctx.delens_ells,
             mission_years, f_sky)
         if ctx.delens_mode == "recompute":
             cl_res = _delens_from_combined_bb(
                 ctx.lensing_spectra, nl_bb_del, ctx.delens_ls,
-                ctx.delens_l_max_qe, ctx.delens_n_iter, ctx.delens_remat)
+                ctx.delens_l_max_qe, ctx.delens_n_iter, ctx.delens_remat,
+                fullsky=ctx.delens_fullsky, n_L_sample=ctx.delens_n_L_sample,
+                l_batch=ctx.delens_l_batch)
         else:  # 'linearized': cl_bb_res0 + J (nl_bb - nl_bb0)
             cl_res = ctx.delens_cl_bb_res0 + ctx.delens_jac @ (
                 nl_bb_del - ctx.delens_nl_bb0)
@@ -566,43 +558,26 @@ def sigma_r_from_external_cov(
 ) -> jnp.ndarray:
     """Differentiable sigma(r) from a full bandpower covariance (cut-sky / MC path).
 
-    The jnp-returning analogue of
-    ``FisherForecast(external_covariance=...).sigma("r")``: builds
-    ``F = Jᵀ C⁻¹ J`` via the same prewhitened dense solve
-    (``fisher._fisher_from_full``), adds Gaussian priors on the diagonal,
-    inverts, and returns ``sqrt((F⁻¹)_{rr})`` as a JAX scalar — no ``float()``
-    boundary, so it is differentiable in ``external_covariance``.
+    jnp-returning analogue of ``FisherForecast(external_covariance=...).sigma("r")``:
+    ``F = J^T C^-1 J`` via ``fisher._fisher_from_full``, Gaussian priors on the
+    diagonal, inverted for ``sqrt((F^-1)_rr)``. No ``float()`` boundary, so it is
+    differentiable in ``external_covariance``. The analytic block-diagonal
+    counterpart is :func:`sigma_r_from_channels`.
 
-    This is the *consumer* end of the end-to-end map-based optimization: the
-    covariance is the output of the cut-sky masked-Wiener Monte-Carlo stage
-    (:func:`augr.spectrum_stages.mc_cutsky_bandpowers`), itself a function of
-    the instrument design. Composing this with that traced stage gives a
-    ``jax.grad``-able σ(r) through component separation. The analytic
-    block-diagonal counterpart is :func:`sigma_r_from_channels`.
-
-    The Jacobian ``ctx.J`` is structural (it depends on the cleaned-map
-    ``SignalModel`` — frequencies, binning, residual template — not on the
-    covariance), so it is pre-computed once and held fixed; only the noise →
-    covariance path carries the design dependence, exactly as in
-    :func:`sigma_r_from_channels`.
+    ``ctx.J`` is structural -- it depends on the cleaned-map ``SignalModel``, not on
+    the covariance -- so it is fixed here and only the noise -> covariance path
+    carries the design dependence.
 
     Args:
         external_covariance: full ``(n_data, n_data)`` bandpower covariance,
-            ``n_data = n_spec × n_bins`` (just ``n_bins`` for a single cleaned
-            map), on the same binning as ``ctx.signal_model``. E.g.
+            ``n_data = n_spec x n_bins`` (just ``n_bins`` for a single cleaned map),
+            on the same binning as ``ctx.signal_model``. E.g.
             ``mc_cutsky_bandpowers(...).covariance``.
-        ctx: ``OptimizationContext`` built on the cleaned-map ``SignalModel``
-            (the residual-template / ``NullForegroundModel`` forecast); supplies
-            ``J``, ``prior_diag``, and ``r_idx``.
+        ctx: ``OptimizationContext`` built on the cleaned-map ``SignalModel``;
+            supplies ``J``, ``prior_diag`` and ``r_idx``.
 
     Returns:
         Scalar sigma(r).
-
-    Note:
-        Routes through ``fisher._fisher_from_full`` — the same prewhitened dense
-        solve as ``FisherForecast(external_covariance=...).compute()`` — so the
-        two paths agree to fp64 precision (the optimize path simply keeps the
-        result as a JAX array instead of casting to ``float`` in ``sigma()``).
     """
     F = _fisher_from_full(ctx.J, jnp.asarray(external_covariance))
     F = F + jnp.diag(ctx.prior_diag)

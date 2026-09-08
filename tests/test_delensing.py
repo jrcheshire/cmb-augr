@@ -1,5 +1,6 @@
 """Tests for delensing.py — QE lensing reconstruction and residual BB."""
 
+import os
 from pathlib import Path
 from typing import ClassVar
 
@@ -289,8 +290,12 @@ class TestIterativeDelensing:
 
 # Light delensing config (mirrors test_result_shape) so the differentiable
 # tests below stay in the fast gate.
+# fullsky=False pins these tests to the flat-sky Gauss-Legendre path they
+# characterize (the design forward defaults to full-sky sampled since
+# 2026-09-06; iterate_delensing's own default is still flat-sky, and
+# test_matches_iterate compares the two entry points bit-for-bit).
 _DIFF_KW = dict(ls=jnp.arange(2, 201, dtype=float),
-                L_max=500, l_max_qe=500, n_phi=32, n_iter=2)
+                L_max=500, l_max_qe=500, n_phi=32, n_iter=2, fullsky=False)
 
 
 class TestDifferentiableDelensing:
@@ -614,6 +619,73 @@ class TestWigner3j:
         pywigxjpf.wig_temp_free()
         pywigxjpf.wig_table_free()
 
+    @pytest.mark.parametrize("m1,m2,m3,L,l1_lo,l1_hi,l2_min", [
+        (-2, 0, 2, 1500, 1000, 3000, 2),   # delensing config on its own grid
+        (2, -2, 0, 2000, 500, 2600, 0),    # MASTER config on its own grid
+    ])
+    def test_closed_form_spin2_large_l(self, m1, m2, m3, L, l1_lo, l1_hi, l2_min):
+        """Closed-form spin-2 table (issue #48) vs pywigxjpf at production multipoles.
+
+        Both J parities, sampled every 50 in l2 along rows l1 = l1_lo, +250, ...
+        Measured worst 8.5e-14 relative (the SG table it replaces measured
+        6.2e-13 on the same cells); gate 1e-11 on cells with |ref| > 1e-3 of the
+        row's largest symbol, exact zeros on the |m| <= j rows.
+        """
+        pywigxjpf = pytest.importorskip("pywigxjpf")
+        from augr.wigner_jax import spin2_body
+        pywigxjpf.wig_table_init(2 * 8000, 3)
+        pywigxjpf.wig_temp_init(2 * 8000)
+        try:
+            l1 = jnp.arange(l1_lo, l1_hi + 1, 250, dtype=float)
+            l2_max = l1_hi + L
+            w = np.asarray(spin2_body(float(L), l1, m1, m2, m3, l2_min, l2_max))
+            checked = 0
+            for i, a in enumerate(l1.astype(int)):
+                a = int(a)
+                scale = np.abs(w[i]).max()
+                for l2 in range(max(abs(a - L), l2_min), min(a + L, l2_max) + 1, 50):
+                    ref = pywigxjpf.wig3jj(2 * a, 2 * L, 2 * l2, 2 * m1, 2 * m2, 2 * m3)
+                    got = w[i, l2 - l2_min]
+                    if abs(ref) > 1e-3 * scale:
+                        assert abs(got - ref) / abs(ref) < 1e-11, (a, L, l2, got, ref)
+                        checked += 1
+                    else:
+                        assert abs(got - ref) < 1e-11 * scale, (a, L, l2, got, ref)
+            assert checked > 200
+        finally:
+            pywigxjpf.wig_temp_free()
+            pywigxjpf.wig_table_free()
+
+    def test_closed_form_000_large_l(self):
+        """Closed-form (l1 l2 L; 0 0 0) table vs pywigxjpf at production multipoles.
+
+        Measured worst 4e-16 relative with the exact g table (a gammaln-built
+        table sat at 1e-11); gate 1e-12.
+        """
+        pywigxjpf = pytest.importorskip("pywigxjpf")
+        from augr.wigner_jax import spin0_body
+        pywigxjpf.wig_table_init(2 * 8000, 3)
+        pywigxjpf.wig_temp_init(2 * 8000)
+        try:
+            L = 1200
+            l1 = jnp.arange(500, 3001, 250, dtype=float)
+            w = np.asarray(spin0_body(float(L), l1, 2, 3000))
+            checked = 0
+            for i, a in enumerate(l1.astype(int)):
+                a = int(a)
+                for l2 in range(max(abs(a - L), 2), min(a + L, 3000) + 1, 37):
+                    ref = pywigxjpf.wig3jj(2 * a, 2 * l2, 2 * L, 0, 0, 0)
+                    got = w[i, l2 - 2]
+                    if ref == 0.0:
+                        assert got == 0.0
+                    else:
+                        assert abs(got - ref) / abs(ref) < 1e-12, (a, l2, L, got, ref)
+                        checked += 1
+            assert checked > 100
+        finally:
+            pywigxjpf.wig_temp_free()
+            pywigxjpf.wig_table_free()
+
 
 # -----------------------------------------------------------------------
 # Full-sky tests
@@ -737,37 +809,28 @@ class TestSignalModelIntegration:
 # -----------------------------------------------------------------------
 # Cross-validation against plancklens (LiteBIRD-PTEP fiducial)
 #
-# Reference NPZ produced by scripts/n0_validation/run_plancklens.py;
-# regen recipe in scripts/n0_validation/README.md. The lightweight test
-# here just compares augr's compute_n0_* on the *same* nl_*/cl_* arrays
-# against the saved reference. Tolerances reflect the conventions both
-# codes use: response = unlensed C_l, filter = lensed + noise, MV =
-# diagonal 1/Sum 1/N_0_alpha.
+# Reference NPZ from scripts/n0_validation/run_plancklens.py; regen recipe in
+# scripts/n0_validation/README.md. Compares augr's compute_n0_* on the *same*
+# nl_*/cl_* arrays against the saved reference. Shared conventions: response =
+# unlensed C_l, filter = lensed + noise, MV = diagonal 1/Sum 1/N_0_alpha.
 # -----------------------------------------------------------------------
 
-# Tolerances for the augr full-sky vs plancklens TT comparison.
-# Locked in 2026-05-06 after the controlled-input test + regen with
-# correct lmin filter (see scripts/n0_validation/README.md "RESOLVED"
-# section). On the LiteBIRD-PTEP fiducial config the agreement is
-# ~1e-6 in the bulk and ~1e-4 at L > 2000 (where both codes feel the
-# l1+l2 boundary truncation). 1e-3 is a safe headroom that catches
-# regressions while not being noisy.
+# Measured agreement on the LiteBIRD-PTEP fiducial is ~1e-6 in the bulk and
+# ~1e-4 at L > 2000, where both codes feel the l1+l2 boundary truncation; 1e-3
+# is headroom that catches regressions without being noisy.
 #
-# Only TT is tested here. plancklens 'p_p' / 'p' include inter-
-# estimator cross-correlations (joint GMV); augr's MV is diagonal
-# (HO02 Eq. 22). The diagonal-vs-joint difference is real physics, not
-# a bug, and varies with the relative weight of estimators -- not
-# something to lock into a tolerance test.
+# Only TT is compared: plancklens 'p_p' / 'p' include inter-estimator
+# cross-correlations (joint GMV) where augr's MV is diagonal (HO02 Eq. 22).
+# That difference is real physics and varies with estimator weights, so it is
+# not something to lock into a tolerance test.
 N0_REF_PATH = Path(__file__).resolve().parents[1] / "data" / "n0_reference_litebird.npz"
 TOL_FULLSKY_TT_BULK = 1e-3   # bulk-L window
 TOL_FULLSKY_TT_TAIL = 1e-3   # high-L (l > 2000) where both feel boundary trunc
 
-# TE has a structural ~5% bulk-L residual not shared with the other 4
-# estimators; see TestN0TEAgainstPlancklens for diagnosis. Bulk-L band
-# stops at L=1800 to avoid the C_TE zero-crossings near l~1850 where
-# the response amplitude vanishes and any structural residual blows
-# up relative to plancklens.
-TOL_FULLSKY_TE_BULK = 6e-2
+# TE carries a structural ~5% bulk-L residual the other four estimators do not;
+# see TestN0TEAgainstPlancklens. The band stops at L=1800 to avoid the C_TE
+# zero-crossings near l~1850.
+TOL_FULLSKY_TE_BULK = 3e-2   # measured 2.35e-2
 L_BULK_TE = (10, 1800)
 
 L_BULK = (10, 2000)
@@ -926,44 +989,19 @@ class TestN0EBAgainstPlancklens:
 class TestN0TEAgainstPlancklens:
     """Augr full-sky TE N_0 vs plancklens 'p_te' (symmetrized).
 
-    Locked at ``TOL_FULLSKY_TE_BULK`` (6e-2) in ``L_BULK_TE`` (10..1800),
-    a deliberately looser gate than the <1e-3 bulk-L lock-in for TT / EE
-    / EB / TB. The looseness is structural, not a tolerance kludge:
+    Locked at ``TOL_FULLSKY_TE_BULK`` (6e-2) in ``L_BULK_TE`` (10..1800), looser
+    than the <1e-3 lock-in for TT / EE / EB / TB. The looseness is structural:
 
-    * **Production filter mismatch**: augr's ``compute_n0_te`` defaults
-      to HO02 Eq. 13's diagonal-approximation filter
-      ``1/(C_TT*C_EE + C_TE^2)``. Plancklens forces ``fal['te']=0``,
-      giving the strict-diagonal filter ``1/(C_TT*C_EE)``. This test
-      calls with ``te_filter='strict_diagonal'`` to align the filters
-      exactly; that part is apples-to-apples.
-    * **Symmetrization residual** (the structural ~5%): plancklens
-      ``p_te`` is the symmetric estimator ``g_pte + g_pet``, whose
-      variance is ``Var(pte) + Var(pet) + 2 Cov(pte, pet)``. Augr's
-      ``_compute_n0_te_fullsky`` implements OkaHu 2003 Table I's
-      single-projection response (E-leg spin-2, T-leg spin-0), which
-      reproduces ``Var(pte)`` only -- it does NOT capture the
-      ``Cov(pte, pet)`` cross-Wick contraction. With ``fal['te']=0``
-      the cross term is non-zero because ``cls_ivfs[te] = cl_te /
-      (C_TT_total * C_EE_total)`` is non-zero, and contributes a few
-      percent at all L. Closing it requires porting plancklens's
-      ``nhl._get_nhl`` cross-Wick logic to harmonic space (the
-      already-validated ``augr/_qe.py`` is the leg-construction
-      reference) -- deferred; out of scope for this test.
-    * **C_TE zero-crossings at L~1850**: the response amplitude
-      vanishes there, so any residual structural percent-level error
-      blows up to 10-20% in relative terms. The bulk-L band stops at
-      L=1800 to keep the test informative about the structural floor
-      rather than dominated by these localized blow-ups.
+    * Filters are aligned exactly -- the test passes
+      ``te_filter='strict_diagonal'`` to match plancklens's ``fal['te']=0``.
+    * ~5% symmetrization residual: plancklens ``p_te`` is ``g_pte + g_pet``, whose
+      variance carries a ``2 Cov(pte, pet)`` cross-Wick term that augr's
+      single-projection OkaHu Table I response does not reproduce.
+    * The band stops at L=1800 because the C_TE zero-crossings near L~1850 make
+      the relative error blow up to 10-20% where the response amplitude vanishes.
 
-    Per ``compute_n0_te``'s own docstring, TE contributes ~1-2% to
-    ``N_0^MV`` at space-experiment noise levels, so the 5% TE residual
-    propagates as <0.1% on N_0^MV and <1% on A_L for realistic delensing
-    efficiencies -- well below decision-relevance for sigma(r) forecasts.
-    Full-sky is production-grade for space-mission applications (where
-    the reionization bump dominates the sigma(r) constraint and the
-    (L+1)^2 / L^2 flat-vs-full geometric correction matters at low L);
-    flat-sky remains the ``iterate_delensing`` default for runtime
-    (~5x faster) but is no longer the math/physics preference.
+    TE contributes ~1-2% to ``N_0^MV`` at space-experiment noise levels, so this
+    propagates as <0.1% on N_0^MV and <1% on A_L.
     """
 
     def test_te_max_rel_err_in_bulk(self):
@@ -1093,7 +1131,9 @@ class TestFullSkyJaxBackend:
 # -----------------------------------------------------------------------
 
 #: Small enough to stay inside the fast gate's --timeout=180.
-_REMAT_KW = dict(ls=jnp.arange(2, 30, dtype=float), n_phi=32, n_iter=2)
+# Flat-sky explicitly: these tests measure the l1-scan tape's L^2 growth and
+# its remat cure; the full-sky path's remat'd per-L map has its own gates.
+_REMAT_KW = dict(ls=jnp.arange(2, 30, dtype=float), n_phi=32, n_iter=2, fullsky=False)
 
 
 def _grad_temp_bytes(spectra, nl, l_max_qe, remat):
@@ -1110,18 +1150,13 @@ class TestRematMemory:
     """``remat=True`` is what stands between the design gradient and an OOM.
 
     ``optimize._delens_from_combined_bb`` ties ``L_max`` to ``l_max_qe``, so the
-    reverse-mode tape over the five N_0 scans grows as ``l_max_qe**2 * n_phi``.
-    Measured on antares: 91.5 GB peak RSS at ``l_max_qe=1000`` and a 217 GB
-    single allocation at 1500, against a 124 GB node.
+    reverse-mode tape over the five N_0 scans grows as ``l_max_qe**2 * n_phi`` --
+    measured 91.5 GB peak RSS at ``l_max_qe=1000`` against a 124 GB node.
 
-    Gated on ``memory_analysis().temp_size_in_bytes`` -- XLA's buffer
-    assignment, which is deterministic for a given HLO -- rather than sampled
-    RSS, which depends on the allocator, the machine, and whatever else the
-    process did, and is meaningless under the ``-n auto`` parallel gate.
-
-    NOT ``peak_memory_in_bytes``: that field read 0.00 MB on a case whose temp
-    was 655 MB, i.e. it does not track the tape at all.
-
+    Gated on ``memory_analysis().temp_size_in_bytes`` (XLA buffer assignment,
+    deterministic for a given HLO), not sampled RSS, which depends on the allocator
+    and the machine and is meaningless under a parallel gate. NOT
+    ``peak_memory_in_bytes``: it read 0.00 MB on a case whose temp was 655 MB.
     Ratios, not absolute byte counts -- absolutes are not portable across XLA
     versions or backends.
     """
@@ -1222,3 +1257,428 @@ class TestRematIsNumericallyTransparent:
         r_b = residual_cl_bb(ls, Ls, spectra, mv_b, nl_ee=noise["ee"],
                              remat=False, **self._KW)
         np.testing.assert_array_equal(np.asarray(r_a), np.asarray(r_b))
+
+
+# -----------------------------------------------------------------------
+# Full-sky N_0 L-sample grid (issue #48 follow-up: sparse-L sampling knob)
+# -----------------------------------------------------------------------
+
+class TestFullSkyLSamples:
+    """``_fullsky_L_samples`` -- the exact (None) grid and the sampled grid."""
+
+    def test_none_is_the_dense_union_grid(self):
+        """``n_L_sample=None`` reproduces the pre-#48 grid: every requested L is in it."""
+        from augr.delensing import _fullsky_L_samples
+        Ls = np.arange(2, 1501)
+        grid = _fullsky_L_samples(Ls)
+        assert grid.shape == Ls.shape and np.array_equal(grid, Ls)
+        # sparse request: internal log grid fills in, requested points kept
+        Ls = np.array([2, 7, 50, 400, 1500])
+        grid = _fullsky_L_samples(Ls, None)
+        assert set(Ls).issubset(set(grid.tolist()))
+        assert len(grid) >= 50 and grid[0] == 2 and grid[-1] == 1500
+        assert np.all(np.diff(grid) > 0)
+
+    @pytest.mark.parametrize("n", [25, 75, 200])
+    def test_sampled_grid_shape(self, n):
+        """Every L < 20, plus n log-spaced samples, plus both ends; requested Ls not unioned."""
+        from augr.delensing import _fullsky_L_samples
+        Ls = np.arange(2, 1501)
+        grid = _fullsky_L_samples(Ls, n)
+        assert grid[0] == 2 and grid[-1] == 1500
+        assert np.all(np.diff(grid) > 0)
+        assert np.array_equal(grid[grid < 20], np.arange(2, 20))
+        # n log-spaced points from 20 to 1500, minus collisions after rounding
+        # (dense at the low end: n=200 loses 12 of them)
+        assert 18 + n // 2 <= len(grid) <= 18 + n
+        assert len(grid) < len(Ls) // 5
+
+    def test_sampled_grid_rejects_degenerate_n(self):
+        from augr.delensing import _fullsky_L_samples
+        with pytest.raises(ValueError):
+            _fullsky_L_samples(np.arange(2, 100), 1)
+        with pytest.raises(ValueError):
+            _fullsky_L_samples(np.arange(2, 100), "dense")
+
+    def test_auto_default_resolves_to_default_n_L_sample(self):
+        """``"auto"`` = ``default_n_L_sample(L_max)``; the rule is 25/e-fold above a floor of 100.
+
+        Values pinned from the convergence study (see the docstring): 100 at
+        L_max=1000, 108 at 1500, 125 at 3000, 132 at 4000.
+        """
+        from augr.delensing import AUTO_N_L_SAMPLE, _fullsky_L_samples, default_n_L_sample
+        assert [default_n_L_sample(L) for L in (300, 1000, 1500, 3000, 4000)] == [100, 100, 108, 125, 132]
+        Ls = np.arange(2, 1501)
+        np.testing.assert_array_equal(_fullsky_L_samples(Ls, AUTO_N_L_SAMPLE),
+                                      _fullsky_L_samples(Ls, default_n_L_sample(1500)))
+        assert len(_fullsky_L_samples(Ls, "auto")) == 125  # 18 + 108 - 1 rounding collision
+
+    def test_sampled_n0_matches_dense_small_lmax(self):
+        """Sampled-grid N_0^MV (jax) vs the dense grid at l_max=250.
+
+        Interp error of ``N_0^{-1}`` in log-L; measured at n=50 on this
+        configuration: 1.95e-3 max (at L=32), 5.8e-4 median over L=2..150
+        (n=25: 5.3e-3 / 2.6e-3; n=100: 6.8e-4 / 0). Gate 5e-3 max.
+        The production default is set by the convergence study in
+        ``scripts/n0_validation/l_sampling_convergence.py``, not by this test.
+        """
+        from augr.delensing import compute_n0_mv, load_lensing_spectra
+        spectra = load_lensing_spectra()
+        n = len(spectra.cl_ee_len)
+        nt, ne, nb = (jnp.full(n, 1e-6), jnp.full(n, 2e-6), jnp.full(n, 2e-6))
+        Ls = jnp.arange(2, 151, dtype=float)
+        dense = np.asarray(compute_n0_mv(Ls, spectra, nt, ne, nb, 2, 250,
+                                         fullsky=True, backend="jax"))
+        sampled = np.asarray(compute_n0_mv(Ls, spectra, nt, ne, nb, 2, 250,
+                                           fullsky=True, backend="jax",
+                                           n_L_sample=50))
+        rel = np.abs(sampled / dense - 1.0)
+        assert np.all(np.isfinite(rel))
+        assert rel.max() < 5e-3, rel.max()
+        # below L=20 the sampled grid is dense: exact by construction
+        np.testing.assert_allclose(sampled[:18], dense[:18], rtol=1e-12)
+
+
+class TestMapBatching:
+    """``_map``'s ``l_batch`` knob: exact on elementwise bodies, and demonstrably live.
+
+    Exactness is asserted rather than measured here because these toy bodies are
+    elementwise in the mapped axis -- ``vmap`` cannot reassociate anything. The
+    real estimators do carry a trailing reduction, and their agreement is gated
+    on a measured tolerance in ``TestFullSkyBatchAgreement``.
+    """
+
+    @staticmethod
+    def _bodies():
+        """(name, body, per-element output shape) -- scalar, vector, matrix."""
+        return [
+            ("scalar", lambda x: jnp.sin(x) * x + 1.0, ()),
+            ("vector", lambda x: x * jnp.arange(4.0) + jnp.cos(x), (4,)),
+            ("matrix", lambda x: jnp.arange(6.0).reshape(2, 3) * x, (2, 3)),
+        ]
+
+    @pytest.mark.parametrize("remat", [False, True])
+    def test_batched_equals_unbatched(self, remat):
+        """Every (n, l_batch) reproduces the sequential map bit-for-bit.
+
+        n and l_batch are looped rather than parametrized: 5 x 5 x 2 ids for one
+        elementwise identity is noise in a 1200-test suite.
+        """
+        from augr.delensing_fullsky_jax import _map
+        for n in (1, 5, 7, 16, 17):
+            xs = jnp.arange(2.0, 2.0 + n)
+            for name, body, shape in self._bodies():
+                ref = _map(body, xs, remat=remat)
+                for l_batch in (1, 2, 4, 16, 32):
+                    out = _map(body, xs, remat=remat, l_batch=l_batch)
+                    tag = f"{name} n={n} B={l_batch}"
+                    assert out.shape == (n, *shape), tag
+                    np.testing.assert_array_equal(np.asarray(out), np.asarray(ref),
+                                                  err_msg=tag)
+
+    def test_remat_is_transparent_to_batching(self):
+        """remat changes the tape, never the value -- at l_batch > 1 too."""
+        from augr.delensing_fullsky_jax import _map
+        xs = jnp.arange(2.0, 13.0)
+        body = self._bodies()[0][1]
+        for l_batch in (1, 4):
+            a = _map(body, xs, remat=False, l_batch=l_batch)
+            b = _map(body, xs, remat=True, l_batch=l_batch)
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_gradient_matches_unbatched(self):
+        """Reverse mode through the batched map agrees with the sequential one."""
+        from augr.delensing_fullsky_jax import _map
+        xs = jnp.arange(2.0, 13.0)
+
+        def total(scale, l_batch):
+            out = _map(lambda x: jnp.sin(x * scale) ** 2, xs,
+                       remat=True, l_batch=l_batch)
+            return jnp.sum(out)
+
+        g1 = jax.grad(lambda s: total(s, 1))(0.7)
+        g4 = jax.grad(lambda s: total(s, 4))(0.7)
+        np.testing.assert_allclose(float(g4), float(g1), rtol=1e-13, atol=0.0)
+
+    @pytest.mark.parametrize("bad", [0, -1, 1.0, True, "4", None])
+    def test_rejects_bad_l_batch(self, bad):
+        from augr.delensing_fullsky_jax import _map
+        with pytest.raises(ValueError):
+            _map(lambda x: x, jnp.arange(4.0), remat=False, l_batch=bad)
+
+    @staticmethod
+    def _scan_lengths(jaxpr):
+        """Lengths of every ``scan`` eqn in a jaxpr, innermost calls included."""
+        lengths = []
+
+        def walk(jx):
+            for eqn in jx.eqns:
+                if eqn.primitive.name == "scan":
+                    lengths.append(eqn.params["length"])
+                for v in eqn.params.values():
+                    for sub in (v if isinstance(v, (list, tuple)) else (v,)):
+                        inner = getattr(sub, "jaxpr", None)
+                        if inner is not None:
+                            walk(getattr(inner, "jaxpr", inner))
+
+        walk(jaxpr.jaxpr)
+        return lengths
+
+    @pytest.mark.parametrize("l_batch,expected", [(1, 17), (2, 9), (4, 5), (16, 2)])
+    def test_knob_is_live_in_the_jaxpr(self, l_batch, expected):
+        """The sequential axis actually shortens: scan length == ceil(n_pad / l_batch).
+
+        A dead knob and a converged answer look identical, so the trace is
+        checked directly rather than inferred from the values agreeing.
+        """
+        from augr.delensing_fullsky_jax import _map
+        xs = jnp.arange(2.0, 19.0)          # n = 17
+        jaxpr = jax.make_jaxpr(
+            lambda x: _map(lambda v: jnp.sin(v) * v, x, remat=False, l_batch=l_batch)
+        )(xs)
+        assert expected in self._scan_lengths(jaxpr), (
+            f"l_batch={l_batch}: scan lengths {self._scan_lengths(jaxpr)}")
+
+    def test_remat_appears_inside_the_batched_scan(self):
+        """``remat=True`` still checkpoints when the step is a vmapped batch."""
+        from augr.delensing_fullsky_jax import _map
+        xs = jnp.arange(2.0, 19.0)
+        txt = str(jax.make_jaxpr(
+            lambda x: _map(lambda v: jnp.sin(v) * v, x, remat=True, l_batch=4)
+        )(xs))
+        assert "remat" in txt or "checkpoint" in txt, txt[:400]
+
+    def test_single_device_single_batch_is_the_old_jaxpr(self):
+        """The (l_batch=1, one device) path is the pre-batching trace, unchanged."""
+        from augr.delensing_fullsky_jax import _map
+        xs = jnp.arange(2.0, 19.0)
+        body = self._bodies()[0][1]
+        from jax import lax
+        new = str(jax.make_jaxpr(lambda x: _map(body, x, remat=True))(xs))
+        old = str(jax.make_jaxpr(
+            lambda x: lax.map(jax.checkpoint(body, prevent_cse=False), x))(xs))
+        assert new == old
+
+    def test_pad_rows_repeats_the_largest_L(self):
+        from augr.delensing_fullsky_jax import _pad_rows
+        xs = jnp.arange(2.0, 7.0)                      # n = 5
+        assert _pad_rows(xs, 1).shape == (5,)
+        assert np.asarray(_pad_rows(xs, 5)).tolist() == [2, 3, 4, 5, 6]
+        padded = np.asarray(_pad_rows(xs, 4))
+        assert padded.tolist() == [2, 3, 4, 5, 6, 6, 6, 6]
+
+    def test_shard_devices_defaults_to_one_here(self, monkeypatch):
+        """Single-device session: no sharding, and the opt-out is honoured."""
+        from augr.delensing_fullsky_jax import _NO_SHARD_ENV, _shard_devices
+        monkeypatch.delenv(_NO_SHARD_ENV, raising=False)
+        assert _shard_devices() == jax.device_count()
+        monkeypatch.setenv(_NO_SHARD_ENV, "1")
+        assert _shard_devices() == 1
+        monkeypatch.setenv(_NO_SHARD_ENV, "0")
+        assert _shard_devices() == jax.device_count()
+
+
+class TestFullSkyBatchAgreement:
+    """``l_batch`` on the real estimators: values exact, gradients to a measured gate.
+
+    Unlike the toy bodies in :class:`TestMapBatching`, these bodies end in a
+    matvec and a sum, so ``vmap`` is *entitled* to reassociate. Measured on
+    {tt,ee,te,eb,tb,mv,kernel,residual} x B in {2,4,16} x l_max in {150,250}
+    x noise scaled 1x and 100x (scratch script, 2026-09-06): every value is
+    bit-identical (XLA maps the row reduction rather than fusing across the
+    batch) and the worst gradient departure is 3.9e-15 relative, in the
+    cotangent accumulation over L. Values are therefore asserted equal --
+    an XLA upgrade could legitimately break that, and the fix is to widen
+    this to the gradient's gate, not to widen it silently -- and the
+    gradient is gated at 4e-13, 100x the worst measurement.
+    """
+
+    L_MAX: ClassVar[int] = 150
+    N_L_SAMPLE: ClassVar[int] = 50
+    GRAD_RTOL: ClassVar[float] = 4e-13
+
+    @pytest.mark.parametrize("l_batch", [4, 16])
+    def test_estimators_and_kernel_are_exact(self, spectra, noise, l_batch):
+        import augr.delensing_fullsky_jax as dj
+        nt, ne, nb = noise["tt"], noise["ee"], noise["bb"]
+        Ls = jnp.arange(2, 101, dtype=float)
+        ls = jnp.arange(2, 61, dtype=float)
+        lmin, lmax = 2, self.L_MAX
+        kw = dict(n_L_sample=self.N_L_SAMPLE, remat=True)
+
+        cases = {
+            "tt": lambda B: dj.compute_n0_tt_fullsky_jax(Ls, spectra, nt, lmin, lmax, l_batch=B, **kw),
+            "ee": lambda B: dj.compute_n0_ee_fullsky_jax(Ls, spectra, ne, lmin, lmax, l_batch=B, **kw),
+            "te": lambda B: dj.compute_n0_te_fullsky_jax(Ls, spectra, nt, ne, lmin, lmax, l_batch=B, **kw),
+            "eb": lambda B: dj.compute_n0_eb_fullsky_jax(Ls, spectra, ne, nb, lmin, lmax, l_batch=B, **kw),
+            "tb": lambda B: dj.compute_n0_tb_fullsky_jax(Ls, spectra, nt, nb, lmin, lmax, l_batch=B, **kw),
+            "mv": lambda B: dj.compute_n0_mv_fullsky_jax(Ls, spectra, nt, ne, nb, lmin, lmax, l_batch=B, **kw),
+            "kernel": lambda B: dj.lensing_kernel_fullsky_jax(ls, Ls, spectra, lmin, lmax,
+                                                             l_batch=B, remat=True),
+        }
+        for name, fn in cases.items():
+            ref, out = np.asarray(fn(1)), np.asarray(fn(l_batch))
+            assert np.all(np.isfinite(ref)), name
+            np.testing.assert_array_equal(out, ref, err_msg=name)
+
+    @pytest.mark.parametrize("l_batch", [4, 16])
+    def test_residual_gradient_matches_unbatched(self, spectra, noise, l_batch):
+        """d/d nl_bb of the residual BB sum -- the production reverse-mode shape."""
+        import augr.delensing_fullsky_jax as dj
+        nt, ne = noise["tt"], noise["ee"]
+        Ls = jnp.arange(2, 101, dtype=float)
+        ls = jnp.arange(2, 61, dtype=float)
+        lmin, lmax = 2, self.L_MAX
+
+        def total(nl_bb, B):
+            n0 = dj.compute_n0_mv_fullsky_jax(Ls, spectra, nt, ne, nl_bb, lmin, lmax,
+                                              n_L_sample=self.N_L_SAMPLE, l_batch=B,
+                                              remat=True)
+            res = dj.residual_cl_bb_fullsky_jax(ls, Ls, spectra, n0, lmin, lmax,
+                                                nl_ee=ne, l_batch=B, remat=True)
+            return jnp.sum(res)
+
+        g1 = np.asarray(jax.grad(lambda x: total(x, 1))(noise["bb"]))
+        gB = np.asarray(jax.grad(lambda x: total(x, l_batch))(noise["bb"]))
+        assert np.all(np.isfinite(g1)) and np.any(g1 != 0.0)
+        np.testing.assert_allclose(gB, g1, rtol=self.GRAD_RTOL, atol=0.0)
+
+    def test_l_batch_reaches_both_kernel_calls_in_the_residual(self, spectra, noise):
+        """``residual_cl_bb_fullsky_jax`` forwards l_batch to K *and* K_wee.
+
+        The W_EE-weighted kernel is a second call with its own default, so a
+        half-threaded knob would leave the expensive one sequential and still
+        return the right answer.
+        """
+        from unittest import mock
+
+        import augr.delensing_fullsky_jax as dj
+        Ls = jnp.arange(2, 41, dtype=float)
+        ls = jnp.arange(2, 31, dtype=float)
+        n0 = jnp.full(Ls.shape, 1e-8)
+        seen = []
+        real = dj.lensing_kernel_fullsky_jax
+        with mock.patch.object(dj, "lensing_kernel_fullsky_jax",
+                               side_effect=lambda *a, **k: (seen.append(k.get("l_batch")),
+                                                            real(*a, **k))[1]):
+            dj.residual_cl_bb_fullsky_jax(ls, Ls, spectra, n0, 2, 60,
+                                          nl_ee=noise["ee"], l_batch=4, remat=True)
+        assert seen == [4, 4], seen
+
+
+class TestFullSkyDeviceSharding:
+    """``_map`` splits the L grid over several CPU devices, in a child process.
+
+    ``JAX_NUM_CPU_DEVICES`` is read once at backend init and refused after, so
+    a multi-device trace cannot be produced in this process -- every arm runs
+    in a child.
+
+    The gradient is the arm that matters. The bodies consume ell-length vectors
+    that are functions of the caller's noise spectra, and under an outer
+    ``grad`` those arrive as tracers whose avals carry the mesh sharding; JAX
+    forbids closing such a value over inside a later ``shard_map`` body, which
+    is why ``_map`` hoists them through ``consts``. The delensing *iteration* is
+    where that bites -- iteration 2 consumes iteration 1's residual -- and a
+    single estimator call would pass either way. Sharded gradient compilation
+    costs ~27 s at any shape (measured), so the iteration comparison is slow-
+    tier and the fast tier keeps a forward-only smoke.
+    """
+
+    CHILD: ClassVar[str] = r'''
+import os, sys
+import numpy as np, jax, jax.numpy as jnp
+n_dev = int(os.environ["JAX_NUM_CPU_DEVICES"])
+assert jax.device_count() == n_dev, (jax.device_count(), n_dev)
+import augr.delensing_fullsky_jax as dj
+from augr.delensing import _delens_core, load_lensing_spectra
+expect = 1 if os.environ.get("AUGR_DELENS_NO_SHARD") else n_dev
+assert dj._shard_devices() == expect, (dj._shard_devices(), expect)
+want_grad = os.environ["AUGR_TEST_GRAD"] == "1"
+
+spectra = load_lensing_spectra()
+n = len(spectra.cl_ee_len)
+nt, ne = jnp.full(n, 1e-6), jnp.full(n, 2e-6)
+ls = jnp.arange(2, 13, dtype=float)
+Ls = jnp.arange(2, 25, dtype=float)
+
+def f(nl_bb):
+    cl, _n0, _a, _h = _delens_core(
+        spectra, nt, ne, nl_bb, ls, Ls, n_iter=2, l_min_qe=2, l_max_qe=40,
+        n_phi=32, fullsky=True, backend="jax", n_L_sample=6)
+    return jnp.sum(cl)
+
+nb = jnp.full(n, 2e-6)
+txt = str(jax.make_jaxpr(f)(nb))
+val = np.asarray(f(nb))
+grad = np.asarray(jax.grad(f)(nb)) if want_grad else np.zeros(1)
+np.savez(sys.argv[1], val=val, grad=grad,
+         sharded=np.array(int("shard_map" in txt)))
+'''
+
+    @staticmethod
+    def _reference():
+        """This process's single-device value and gradient for the same solve."""
+        from augr.delensing import _delens_core, load_lensing_spectra
+        spectra = load_lensing_spectra()
+        n = len(spectra.cl_ee_len)
+        nt, ne = jnp.full(n, 1e-6), jnp.full(n, 2e-6)
+        nb = jnp.full(n, 2e-6)
+        ls = jnp.arange(2, 13, dtype=float)
+        Ls = jnp.arange(2, 25, dtype=float)
+
+        def f(nl_bb):
+            cl, _n0, _a, _h = _delens_core(
+                spectra, nt, ne, nl_bb, ls, Ls, n_iter=2, l_min_qe=2, l_max_qe=40,
+                n_phi=32, fullsky=True, backend="jax", n_L_sample=6)
+            return jnp.sum(cl)
+
+        return f, nb
+
+    def _child(self, tmp_path, tag, *, grad, opt_out=False, devices=2):
+        import subprocess
+        import sys
+
+        script = tmp_path / "child.py"
+        script.write_text(self.CHILD)
+        npz = tmp_path / f"{tag}.npz"
+        env = {k: v for k, v in os.environ.items() if k != "AUGR_DELENS_NO_SHARD"}
+        env.update(JAX_NUM_CPU_DEVICES=str(devices),
+                   AUGR_TEST_GRAD="1" if grad else "0")
+        if opt_out:
+            env["AUGR_DELENS_NO_SHARD"] = "1"
+        proc = subprocess.run([sys.executable, str(script), str(npz)],
+                              capture_output=True, text=True, timeout=600, env=env)
+        assert proc.returncode == 0, proc.stderr[-3000:]
+        return np.load(npz)
+
+    def test_sharded_forward_matches_and_is_actually_sharded(self, tmp_path):
+        """Fast smoke: 2 devices, forward only -- the value and a live shard_map."""
+        f, nb = self._reference()
+        out = self._child(tmp_path, "fwd", grad=False)
+        assert out["sharded"] == 1, "shard_map missing from the sharded jaxpr"
+        np.testing.assert_allclose(out["val"], np.asarray(f(nb)),
+                                   rtol=4e-13, atol=0.0)
+
+    @pytest.mark.slow
+    def test_sharded_gradient_matches_and_opt_out_is_exact(self, tmp_path):
+        """The reverse-mode arm, plus AUGR_DELENS_NO_SHARD as the single-device path.
+
+        Two child processes; the sharded gradient's compile dominates (~27 s).
+        """
+        f, nb = self._reference()
+        ref_val = np.asarray(f(nb))
+        ref_grad = np.asarray(jax.grad(f)(nb))
+        assert np.all(np.isfinite(ref_grad)) and np.any(ref_grad != 0.0)
+
+        sharded = self._child(tmp_path, "sharded", grad=True)
+        optout = self._child(tmp_path, "optout", grad=True, opt_out=True)
+
+        assert sharded["sharded"] == 1
+        assert optout["sharded"] == 0, "opt-out still produced a shard_map"
+        # opt-out is literally the single-device path: exact.
+        np.testing.assert_array_equal(optout["val"], ref_val)
+        np.testing.assert_array_equal(optout["grad"], ref_grad)
+        # sharded: the L axis is split, so reductions assemble in a different
+        # order; measured 0 on this shape, gated at the l_batch tolerance.
+        np.testing.assert_allclose(sharded["val"], ref_val, rtol=4e-13, atol=0.0)
+        np.testing.assert_allclose(sharded["grad"], ref_grad, rtol=4e-13, atol=0.0)

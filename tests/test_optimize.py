@@ -1,5 +1,6 @@
 """Tests for optimize.py — differentiable Fisher forecast for instrument optimization."""
 
+import dataclasses
 from typing import ClassVar
 
 import jax
@@ -731,3 +732,234 @@ class TestCombinedWhiteNoiseOverflow:
         want = self._naive(n_det, net, beam, eta, ells, **self.ARGS)
         assert jnp.all(jnp.isfinite(want)), "control regime must not overflow"
         np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-14)
+
+
+# --- DelensCoupling: full-sky Wigner-3j QE in the design forward (issue #48) ----
+
+
+def test_design_forward_defaults_to_fullsky_sampled():
+    """Full-sky sampled is the design-forward default (2026-09-06), at every entry.
+
+    No compute: reads the signature / dataclass defaults. Flipping any one of
+    them back silently would put that entry on the serial flat-sky scan.
+    """
+    import inspect
+
+    from augr.delensing import delens_residual_bb
+    from augr.optimize import OptimizationContext, _delens_from_combined_bb
+    assert inspect.signature(delens_residual_bb).parameters["fullsky"].default is True
+    assert inspect.signature(_delens_from_combined_bb).parameters["fullsky"].default is True
+    assert inspect.signature(DelensCoupling.build).parameters["fullsky"].default is True
+    assert inspect.signature(make_optimization_context).parameters["delens_fullsky"].default is True
+    fields = {f.name: f.default for f in dataclasses.fields(DelensCoupling)}
+    assert fields["fullsky"] is True and fields["n_L_sample"] == "auto"
+    assert fields["l_batch"] == 1
+    fields = {f.name: f.default for f in dataclasses.fields(OptimizationContext)}
+    assert fields["delens_fullsky"] is True and fields["delens_n_L_sample"] == "auto"
+    assert fields["delens_l_batch"] == 1
+    # l_batch defaults to the sequential map at every entry until a measured
+    # table says otherwise (the flip is a deliberate, documented decision).
+    assert inspect.signature(delens_residual_bb).parameters["l_batch"].default == 1
+    assert inspect.signature(_delens_from_combined_bb).parameters["l_batch"].default == 1
+    assert inspect.signature(DelensCoupling.build).parameters["l_batch"].default == 1
+    assert inspect.signature(make_optimization_context).parameters["delens_l_batch"].default == 1
+
+
+@pytest.mark.slow
+def test_delens_coupling_fullsky_reference_is_exact(_coupling_design):
+    """residual() reproduces cl_bb_res0 at the reference on the full-sky path too."""
+    d = _coupling_design
+    c = DelensCoupling.build(
+        lensing_spectra=load_lensing_spectra(), l_max_qe=300, n_iter=2,
+        ls=jnp.arange(2, 30, dtype=float), fullsky=True, n_L_sample=50, **d,
+    )
+    assert c.fullsky is True and c.n_L_sample == 50
+    got = c.residual(d["n_det"], d["net"], d["beam"], d["eta"],
+                     d["mission_years"], d["f_sky"])
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(c.cl_bb_res0))
+
+
+@pytest.mark.slow
+def test_delens_coupling_fullsky_flags_reach_both_solves(_coupling_design):
+    """``fullsky`` and ``n_L_sample`` must enter build() AND residual() alike.
+
+    If only one half honoured them, the reference contract above would break
+    silently: check that residual() with the flags flipped off does NOT
+    reproduce the full-sky reference, i.e. the flags are live on the per-design
+    path, while remat stays transparent (bit-identical) on the full-sky path.
+    """
+    d = _coupling_design
+    kw = dict(lensing_spectra=load_lensing_spectra(), l_max_qe=300, n_iter=2,
+              ls=jnp.arange(2, 30, dtype=float))
+    args = (d["n_det"], d["net"], d["beam"], d["eta"], d["mission_years"], d["f_sky"])
+    c_full = DelensCoupling.build(**kw, **d, fullsky=True, n_L_sample=50)
+    c_flat = DelensCoupling.build(**kw, **d, fullsky=False)
+    assert not np.array_equal(np.asarray(c_full.cl_bb_res0), np.asarray(c_flat.cl_bb_res0))
+    # the same object with the flags off must give the flat answer, not the full one
+    c_full_as_flat = dataclasses.replace(c_full, fullsky=False, n_L_sample=None)
+    np.testing.assert_array_equal(np.asarray(c_full_as_flat.residual(*args)),
+                                  np.asarray(c_flat.cl_bb_res0))
+    # remat is forward-transparent on the full-sky path
+    c_off = DelensCoupling.build(**kw, **d, fullsky=True, n_L_sample=50, remat=False)
+    np.testing.assert_array_equal(np.asarray(c_full.cl_bb_res0), np.asarray(c_off.cl_bb_res0))
+    np.testing.assert_array_equal(np.asarray(c_full.residual(*args)),
+                                  np.asarray(c_off.residual(*args)))
+    # l_batch likewise reaches both solves, and is recorded on the dataclass
+    c_b = DelensCoupling.build(**kw, **d, fullsky=True, n_L_sample=50, l_batch=4)
+    assert c_b.l_batch == 4
+    np.testing.assert_array_equal(np.asarray(c_b.cl_bb_res0),
+                                  np.asarray(c_full.cl_bb_res0))
+    np.testing.assert_array_equal(np.asarray(c_b.residual(*args)),
+                                  np.asarray(c_full.residual(*args)))
+
+
+@pytest.mark.slow
+def test_delens_coupling_fullsky_matches_flat_to_percent_level(_coupling_design):
+    """Full-sky vs flat-sky residual on the same design: the known geometric offset.
+
+    Measured on this fixture at l_max_qe=500: full/flat = 0.986-0.989 across
+    l=2..29 (full-sky N_0 differs from flat by the ``(L+1)^2/L^2`` factor and
+    the exact couplings). Gate: within 5% and both a genuine fraction of the
+    lensing BB. A larger gap would mean one path has broken, not that the
+    geometry changed.
+    """
+    d = _coupling_design
+    spec = load_lensing_spectra()
+    ls = jnp.arange(2, 30, dtype=float)
+    kw = dict(lensing_spectra=spec, l_max_qe=500, n_iter=2, ls=ls)
+    full = np.asarray(DelensCoupling.build(**kw, **d, fullsky=True, n_L_sample=50).cl_bb_res0)
+    flat = np.asarray(DelensCoupling.build(**kw, **d).cl_bb_res0)
+    ratio = full / flat
+    assert np.all(np.abs(ratio - 1.0) < 0.05), ratio
+    lens = np.asarray(spec.cl_bb_len[2:30])
+    assert np.all((full > 0) & (full < lens))
+
+
+@pytest.mark.slow
+def test_delens_coupling_fullsky_gradient_matches_finite_difference(_coupling_design):
+    """jax.grad through the full-sky QE vs central differences, along a beam scale.
+
+    Measured AD/FD - 1 on this fixture: -1.3e-8 (l_max_qe=300, sampled and
+    dense grids alike) and +3.5e-10 (500); the flat-sky path measures ~5e-7 on
+    the same probe. Gate 1e-6. The remat'd lax.map (``_map``) is on this path.
+    """
+    d = _coupling_design
+    c = DelensCoupling.build(
+        lensing_spectra=load_lensing_spectra(), l_max_qe=300, n_iter=2,
+        ls=jnp.arange(2, 30, dtype=float), fullsky=True, n_L_sample=50, **d,
+    )
+
+    def total(s):
+        return jnp.sum(c.residual(d["n_det"], d["net"], d["beam"] * jnp.exp(s),
+                                  d["eta"], d["mission_years"], d["f_sky"]))
+
+    ad = float(jax.grad(total)(0.0))
+    h = 1e-3
+    fd = (float(total(h)) - float(total(-h))) / (2 * h)
+    assert np.isfinite(ad) and ad != 0.0
+    assert abs(ad / fd - 1.0) < 1e-6, (ad, fd)
+
+
+@pytest.mark.slow
+def test_make_optimization_context_delens_fullsky(_coupling_design):
+    """``delens_fullsky`` / ``delens_n_L_sample`` reach the context and the sigma path."""
+    from augr.config import FIDUCIAL_BK15, simple_probe
+    from augr.foregrounds import GaussianForegroundModel
+    from augr.spectra import CMBSpectra
+    inst = simple_probe()
+    spec = load_lensing_spectra()
+    common = dict(instrument=inst, foreground_model=GaussianForegroundModel(),
+                  cmb_spectra=CMBSpectra(), fiducial_params=FIDUCIAL_BK15,
+                  lensing_spectra=spec, delens_l_max_qe=300, delens_n_iter=2,
+                  ell_max=30)
+    ctx_full = make_optimization_context(**common, delens="recompute",
+                                         delens_fullsky=True, delens_n_L_sample=50)
+    ctx_flat = make_optimization_context(**common, delens="recompute",
+                                         delens_fullsky=False)
+    assert ctx_full.delens_fullsky is True and ctx_full.delens_n_L_sample == 50
+    assert ctx_flat.delens_fullsky is False and ctx_flat.delens_n_L_sample == "auto"
+    assert not np.array_equal(np.asarray(ctx_full.delens_cl_bb_res0),
+                              np.asarray(ctx_flat.delens_cl_bb_res0))
+    s_full = float(sigma_r_from_channels(ctx_full.n_det, ctx_full.net, ctx_full.beam,
+                                         ctx_full.eta, ctx_full))
+    s_flat = float(sigma_r_from_channels(ctx_flat.n_det, ctx_flat.net, ctx_flat.beam,
+                                         ctx_flat.eta, ctx_flat))
+    assert np.isfinite(s_full) and s_full > 0
+    # same design, same physics up to the flat/full geometry: same order of magnitude
+    assert 0.5 < s_full / s_flat < 2.0, (s_full, s_flat)
+
+
+class TestDelensLBatchReachesEverySolve:
+    """``l_batch`` is observed at the ``_map`` call, not inferred from the answer.
+
+    Values are bit-identical at every measured shape (see
+    ``tests/test_delensing.py::TestFullSkyBatchAgreement``), so a half-threaded
+    knob cannot be caught by comparing outputs -- the reference solve would just
+    stay sequential and still be right. These tests mock ``_map`` and read what
+    each call actually saw. Fast: a toy QE (l_max_qe=40, n_iter=1, n_L_sample=5).
+    """
+
+    QE: ClassVar[dict] = dict(l_max_qe=40, n_iter=1, n_L_sample=5)
+
+    @staticmethod
+    def _watch():
+        """Patch ``_map`` with a wrapper recording every ``l_batch`` it is given."""
+        from unittest import mock
+
+        import augr.delensing_fullsky_jax as dj
+        seen = []
+        real = dj._map
+
+        def spy(body, xs, *, remat, l_batch=1, consts=()):
+            seen.append(l_batch)
+            return real(body, xs, remat=remat, l_batch=l_batch, consts=consts)
+
+        return seen, mock.patch.object(dj, "_map", spy)
+
+    def test_build_and_residual_both_see_it(self, _coupling_design):
+        d = _coupling_design
+        args = (d["n_det"], d["net"], d["beam"], d["eta"],
+                d["mission_years"], d["f_sky"])
+        seen, patch = self._watch()
+        with patch:
+            c = DelensCoupling.build(
+                lensing_spectra=load_lensing_spectra(),
+                ls=jnp.arange(2, 12, dtype=float), fullsky=True,
+                l_batch=4, **self.QE, **d)
+            n_build = len(seen)
+            c.residual(*args)
+        assert n_build > 0 and len(seen) > n_build, seen
+        assert set(seen) == {4}, seen
+        assert c.l_batch == 4
+
+        # and the recorded value is what residual() uses, not build()'s argument
+        seen2, patch2 = self._watch()
+        with patch2:
+            dataclasses.replace(c, l_batch=1).residual(*args)
+        assert set(seen2) == {1}, seen2
+
+    def test_context_forwards_to_the_design_forward(self, _coupling_design):
+        """``make_optimization_context(delens_l_batch=)`` reaches sigma_r_from_channels."""
+        inst = simple_probe()
+        seen, patch = self._watch()
+        with patch:
+            ctx = make_optimization_context(
+                instrument=inst,
+                foreground_model=GaussianForegroundModel(),
+                cmb_spectra=CMBSpectra(),
+                fiducial_params=dict(FIDUCIAL_BK15),
+                fixed_params=["T_dust", "Delta_dust"],
+                delens="recompute", lensing_spectra=load_lensing_spectra(),
+                delens_ls=jnp.arange(2, 31, dtype=float),
+                delens_l_max_qe=self.QE["l_max_qe"],
+                delens_n_iter=self.QE["n_iter"],
+                delens_n_L_sample=self.QE["n_L_sample"],
+                delens_l_batch=4, delens_fullsky=True,
+                ell_min=2, ell_max=30, delta_ell=10)
+            n_ctx = len(seen)
+            sigma_r_from_channels(ctx.n_det, ctx.net, ctx.beam, ctx.eta, ctx,
+                                  mission_years=inst.mission_duration_years,
+                                  f_sky=inst.f_sky)
+        assert ctx.delens_l_batch == 4
+        assert n_ctx > 0 and len(seen) > n_ctx, seen
+        assert set(seen) == {4}, seen

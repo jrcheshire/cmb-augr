@@ -1,26 +1,26 @@
-"""
-delensing_fullsky_jax.py -- pure-jnp full-sky QE N_0 and lensing kernel.
+"""delensing_fullsky_jax.py -- pure-jnp full-sky QE N_0 and lensing kernel.
 
-Differentiable (jax.jit / jax.grad) counterparts of the numpy full-sky
-drivers in ``delensing.py`` (issue #45 Stage 3). Each per-L body is
-``jnp`` throughout and uses the traced-L Wigner cores in ``wigner_jax``
-(``spin2_body`` / ``spin0_body``); the per-L sweep is a ``lax.map`` over the
-static ``_fullsky_L_samples`` grid (sequential -> one Wigner table live at a
-time), replacing the numpy ProcessPool. The log-interp onto the requested Ls
-is a differentiable ``jnp.interp``.
+Differentiable (jax.jit / jax.grad) counterparts of the numpy full-sky drivers
+in ``delensing.py``. Each per-L body is ``jnp`` throughout and uses the traced-L
+Wigner cores in ``wigner_jax`` (``spin2_body`` / ``spin0_body``); the per-L
+sweep is a ``lax.map`` over the static ``_fullsky_L_samples`` grid, optionally
+batched and device-sharded (see :func:`_map`). The log-interp onto the
+requested Ls is a differentiable ``jnp.interp``.
 
 Shape contract: ``L`` is traced inside ``lax.map``; the l2 grid bounds are
-static (a *global* l2_max = l_max + max(L_sample) for the spin-2 estimators,
-so the (n_l1, n_l2) table shape is uniform across L -- extra columns fall
-outside the per-L triangle and are zeroed by the Wigner mask). Validated
-bit-for-bit against the numpy drivers in ``tests/test_delensing.py``.
+static (a *global* l2_max = l_max + max(L_sample) for the spin-2 estimators, so
+the (n_l1, n_l2) table shape is uniform across L -- extra columns fall outside
+the per-L triangle and are zeroed by the Wigner mask).
 
 Math (couplings, parity masks, filters, weights) is identical to the numpy
-per-L workers ``_per_L_{eb,tb,tt,ee,te}`` and ``_per_L_lensing_kernel``;
-only the backend changes.
+per-L workers ``_per_L_{eb,tb,tt,ee,te}`` and ``_per_L_lensing_kernel``; only
+the backend changes.
 """
 
 from __future__ import annotations
+
+import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -66,6 +66,107 @@ def _even_mask(l_row: jnp.ndarray, l_col: jnp.ndarray, L_f) -> jnp.ndarray:
     return (parity == 0).astype(float)
 
 
+_NO_SHARD_ENV = "AUGR_DELENS_NO_SHARD"
+
+
+def _shard_devices() -> int:
+    """Number of CPU devices the per-L map shards over (1 = no sharding).
+
+    Read from ``JAX_NUM_CPU_DEVICES``, which JAX fixes at import, so the value is
+    constant for the life of the process and is baked in at trace time.
+    ``AUGR_DELENS_NO_SHARD=1`` forces 1; non-CPU backends are left alone.
+    """
+    if os.environ.get(_NO_SHARD_ENV, "") not in ("", "0"):
+        return 1
+    if jax.default_backend() != "cpu":
+        return 1
+    return int(jax.device_count())
+
+
+@functools.lru_cache(maxsize=4)
+def _l_mesh(n_dev: int):
+    """Cached 1-D device mesh over the L axis.
+
+    ``AxisType.Auto``, not ``make_mesh``'s ``Explicit`` default: the per-L bodies
+    close over unsharded ell-length vectors, which an explicit mesh rejects unless
+    every caller supplies an ambient mesh context.
+    """
+    return jax.make_mesh((n_dev,), ("L",),
+                         axis_types=(jax.sharding.AxisType.Auto,))
+
+
+def _pad_rows(xs: jnp.ndarray, multiple: int) -> jnp.ndarray:
+    """Repeat the last row of ``xs`` up to a length divisible by ``multiple``.
+
+    A padded slot costs a full slot, so callers report ``n -> n_pad``.
+    """
+    n = xs.shape[0]
+    rem = (-n) % multiple
+    if rem == 0:
+        return xs
+    return jnp.concatenate([xs, jnp.repeat(xs[-1:], rem, axis=0)], axis=0)
+
+
+def _map(body, xs, *, remat: bool, l_batch: int = 1, consts: tuple = ()):
+    """``lax.map`` over ``body(L, *consts)``, optionally checkpointed and batched.
+
+    Sibling of :func:`augr.delensing._scan` for the full-sky per-L bodies.
+
+    ``remat=True`` stores only the per-L inputs and recomputes the body on the
+    backward pass; each body builds several ``(n_l1, n_l2)`` tables that reverse
+    mode would otherwise retain for every L sample (tens of GB at l_max_qe ~ 1000).
+    No ``policy=``: every candidate intermediate is the same full table.
+
+    ``l_batch > 1`` vmaps that many L values into each sequential step; it
+    reassociates the trailing reduction, so agreement with ``l_batch=1`` is
+    measured rather than exact. ``_shard_devices() > 1`` splits the grid across CPU
+    devices with ``shard_map``. ``l_batch=1`` on one device is an early return to a
+    plain ``lax.map``, hence bit-identical.
+
+    Caller contract: any body input derived from the caller's *noise* spectra must
+    be passed through ``consts``, not closed over. Values carrying a mesh sharding
+    -- anything produced by an earlier ``shard_map``, e.g. the previous delensing
+    iteration's residual -- may not be closed over by a later ``shard_map`` body.
+    Arrays that are pure functions of the fiducial spectra or the ell grids carry
+    no sharding and may close over.
+    """
+    if isinstance(l_batch, bool) or not isinstance(l_batch, int) or l_batch < 1:
+        raise ValueError(f"l_batch must be a Python int >= 1, got {l_batch!r}")
+
+    n = xs.shape[0]
+    n_dev = _shard_devices()
+
+    if l_batch == 1 and n_dev == 1:
+        def plain(v):
+            return body(v, *consts)
+        step = body if not consts else plain
+        if remat:
+            step = jax.checkpoint(step, prevent_cse=False)
+        return lax.map(step, xs)
+
+    def local_map(x, *cs):
+        """Map over one device's slice; its length is a multiple of l_batch."""
+        def step(v):
+            return body(v, *cs)
+        if l_batch > 1:
+            step = jax.vmap(step)
+        if remat:
+            step = jax.checkpoint(step, prevent_cse=False)
+        if l_batch == 1:
+            return lax.map(step, x)
+        out = lax.map(step, x.reshape((-1, l_batch, *x.shape[1:])))
+        return out.reshape((-1, *out.shape[2:]))
+
+    if n_dev == 1:
+        out = local_map(_pad_rows(xs, l_batch), *consts)
+    else:
+        sharded = jax.shard_map(local_map, mesh=_l_mesh(n_dev),
+                                in_specs=(jax.P("L"), *((jax.P(),) * len(consts))),
+                                out_specs=jax.P("L"))
+        out = sharded(_pad_rows(xs, l_batch * n_dev), *consts)
+    return out[:n]
+
+
 def _interp_n0(n0_inv_samples: jnp.ndarray, L_samples: np.ndarray,
                Ls_np: np.ndarray, use_abs: bool = False) -> jnp.ndarray:
     """Log-interp N_0^{-1} samples onto Ls, then invert -> N_0(L)."""
@@ -83,10 +184,13 @@ def _interp_n0(n0_inv_samples: jnp.ndarray, L_samples: np.ndarray,
 
 def compute_n0_eb_fullsky_jax(Ls, spectra: LensingSpectra,
                               nl_ee, nl_bb,
-                              l_min: int = 2, l_max: int = 3000) -> jnp.ndarray:
+                              l_min: int = 2, l_max: int = 3000,
+                              *, n_L_sample: int | None = None,
+                              l_batch: int = 1,
+                              remat: bool = True) -> jnp.ndarray:
     """jnp full-sky N_0^{EB}(L). Mirrors ``_per_L_eb`` / ``_compute_n0_eb_fullsky``."""
     Ls_np = np.asarray(Ls)
-    L_samples = _fullsky_L_samples(Ls_np)
+    L_samples = _fullsky_L_samples(Ls_np, n_L_sample)
     Lmax_s = int(L_samples.max())
 
     l_E_arr = jnp.arange(l_min, l_max + 1, dtype=float)
@@ -104,7 +208,7 @@ def compute_n0_eb_fullsky_jax(Ls, spectra: LensingSpectra,
     l_B_ll = l_B_grid * (l_B_grid + 1)
     inv_bb = _inv_spectrum_jax(cl_bb_tot, l_B_grid)
 
-    def body(L_f):
+    def body(L_f, weight, inv_b):
         w3j = spin2_body(L_f, l_E_arr, -2, 0, 2, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
         geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
@@ -112,10 +216,11 @@ def compute_n0_eb_fullsky_jax(Ls, spectra: LensingSpectra,
                       * (2 * L_f + 1) / (16.0 * _PI))
         odd_L = _odd_mask(l_E_arr, l_B_grid, L_f)
         f_eb_sq = (pf * w3j * geom) ** 2 * odd_L
-        l_B_sum = f_eb_sq @ inv_bb
-        return jnp.sum(l_E_weight * l_B_sum) / (2 * L_f + 1.0)
+        l_B_sum = f_eb_sq @ inv_b
+        return jnp.sum(weight * l_B_sum) / (2 * L_f + 1.0)
 
-    n0_inv = lax.map(body, jnp.asarray(L_samples, dtype=float))
+    n0_inv = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
+                  l_batch=l_batch, consts=(l_E_weight, inv_bb))
     return _interp_n0(n0_inv, L_samples, Ls_np)
 
 
@@ -125,10 +230,13 @@ def compute_n0_eb_fullsky_jax(Ls, spectra: LensingSpectra,
 
 def compute_n0_tb_fullsky_jax(Ls, spectra: LensingSpectra,
                               nl_tt, nl_bb,
-                              l_min: int = 2, l_max: int = 3000) -> jnp.ndarray:
+                              l_min: int = 2, l_max: int = 3000,
+                              *, n_L_sample: int | None = None,
+                              l_batch: int = 1,
+                              remat: bool = True) -> jnp.ndarray:
     """jnp full-sky N_0^{TB}(L). Same parity-odd coupling as EB, C^TE/C^TT weights."""
     Ls_np = np.asarray(Ls)
-    L_samples = _fullsky_L_samples(Ls_np)
+    L_samples = _fullsky_L_samples(Ls_np, n_L_sample)
     Lmax_s = int(L_samples.max())
 
     l_E_arr = jnp.arange(l_min, l_max + 1, dtype=float)
@@ -146,7 +254,7 @@ def compute_n0_tb_fullsky_jax(Ls, spectra: LensingSpectra,
     l_B_ll = l_B_grid * (l_B_grid + 1)
     inv_bb = _inv_spectrum_jax(cl_bb_tot, l_B_grid)
 
-    def body(L_f):
+    def body(L_f, weight, inv_b):
         w3j = spin2_body(L_f, l_E_arr, -2, 0, 2, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
         geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
@@ -154,10 +262,11 @@ def compute_n0_tb_fullsky_jax(Ls, spectra: LensingSpectra,
                       * (2 * L_f + 1) / (16.0 * _PI))
         odd_L = _odd_mask(l_E_arr, l_B_grid, L_f)
         f_odd_sq = (pf * w3j * geom) ** 2 * odd_L
-        l2_sum = f_odd_sq @ inv_bb
-        return jnp.sum(l1_weight * l2_sum) / (2 * L_f + 1.0)
+        l2_sum = f_odd_sq @ inv_b
+        return jnp.sum(weight * l2_sum) / (2 * L_f + 1.0)
 
-    n0_inv = lax.map(body, jnp.asarray(L_samples, dtype=float))
+    n0_inv = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
+                  l_batch=l_batch, consts=(l1_weight, inv_bb))
     return _interp_n0(n0_inv, L_samples, Ls_np)
 
 
@@ -166,10 +275,13 @@ def compute_n0_tb_fullsky_jax(Ls, spectra: LensingSpectra,
 # -----------------------------------------------------------------------
 
 def compute_n0_tt_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt,
-                              l_min: int = 2, l_max: int = 3000) -> jnp.ndarray:
+                              l_min: int = 2, l_max: int = 3000,
+                              *, n_L_sample: int | None = None,
+                              l_batch: int = 1,
+                              remat: bool = True) -> jnp.ndarray:
     """jnp full-sky N_0^{TT}(L) via (l1 l2 L; 0 0 0). Mirrors ``_per_L_tt``."""
     Ls_np = np.asarray(Ls)
-    L_samples = _fullsky_L_samples(Ls_np)
+    L_samples = _fullsky_L_samples(Ls_np, n_L_sample)
 
     l1_arr = jnp.arange(l_min, l_max + 1, dtype=float)
     cl_tt_tot = spectra.cl_tt_len + nl_tt
@@ -186,7 +298,7 @@ def compute_n0_tt_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt,
     tt_l2 = _gather_spectrum_jax(cl_tt_unl, l2_grid)
     inv_tt_l2 = _inv_spectrum_jax(cl_tt_tot, l2_grid)
 
-    def body(L_f):
+    def body(L_f, inv1, inv2):
         w000 = spin0_body(L_f, l1_arr, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
         alpha1 = (L_LL + l1_ll1[:, None] - l2_ll2[None, :]) / 2.0
@@ -195,10 +307,11 @@ def compute_n0_tt_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt,
                       * (2 * L_f + 1) / (4.0 * _PI))
         f_sq = (tt_l1[:, None] * alpha1 + tt_l2[None, :] * alpha2) ** 2 \
             * pf ** 2 * w000 ** 2
-        integrand = f_sq * inv_tt_l1[:, None] * inv_tt_l2[None, :] / 2.0
+        integrand = f_sq * inv1[:, None] * inv2[None, :] / 2.0
         return jnp.sum(integrand) / (2 * L_f + 1.0)
 
-    n0_inv = lax.map(body, jnp.asarray(L_samples, dtype=float))
+    n0_inv = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
+                  l_batch=l_batch, consts=(inv_tt_l1, inv_tt_l2))
     return _interp_n0(n0_inv, L_samples, Ls_np)
 
 
@@ -207,10 +320,13 @@ def compute_n0_tt_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt,
 # -----------------------------------------------------------------------
 
 def compute_n0_ee_fullsky_jax(Ls, spectra: LensingSpectra, nl_ee,
-                              l_min: int = 2, l_max: int = 3000) -> jnp.ndarray:
+                              l_min: int = 2, l_max: int = 3000,
+                              *, n_L_sample: int | None = None,
+                              l_batch: int = 1,
+                              remat: bool = True) -> jnp.ndarray:
     """jnp full-sky N_0^{EE}(L) (parity-even spin-2). Mirrors ``_per_L_ee``."""
     Ls_np = np.asarray(Ls)
-    L_samples = _fullsky_L_samples(Ls_np)
+    L_samples = _fullsky_L_samples(Ls_np, n_L_sample)
     Lmax_s = int(L_samples.max())
 
     l1_arr = jnp.arange(l_min, l_max + 1, dtype=float)
@@ -228,7 +344,7 @@ def compute_n0_ee_fullsky_jax(Ls, spectra: LensingSpectra, nl_ee,
     ee_at_l2 = _gather_spectrum_jax(cl_ee_unl, l2_grid, l_min_valid=l_min)
     inv_ee_l2 = _inv_spectrum_jax(cl_ee_tot, l2_grid)
 
-    def body(L_f):
+    def body(L_f, inv1, inv2):
         w3j = spin2_body(L_f, l1_arr, -2, 0, 2, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
         alpha1 = L_LL + l1_ll1[:, None] - l2_ll2[None, :]
@@ -238,10 +354,11 @@ def compute_n0_ee_fullsky_jax(Ls, spectra: LensingSpectra, nl_ee,
         even_L = _even_mask(l1_arr, l2_grid, L_f)
         f_sq = (ee_l1[:, None] * alpha1 + ee_at_l2[None, :] * alpha2) ** 2 \
             * pf ** 2 * w3j ** 2 * even_L
-        integrand = f_sq * inv_ee_l1[:, None] * inv_ee_l2[None, :] / 2.0
+        integrand = f_sq * inv1[:, None] * inv2[None, :] / 2.0
         return jnp.sum(integrand) / (2 * L_f + 1.0)
 
-    n0_inv = lax.map(body, jnp.asarray(L_samples, dtype=float))
+    n0_inv = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
+                  l_batch=l_batch, consts=(inv_ee_l1, inv_ee_l2))
     return _interp_n0(n0_inv, L_samples, Ls_np)
 
 
@@ -251,7 +368,10 @@ def compute_n0_ee_fullsky_jax(Ls, spectra: LensingSpectra, nl_ee,
 
 def compute_n0_te_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt, nl_ee,
                               l_min: int = 2, l_max: int = 3000,
-                              te_filter: str = "ho02_exact") -> jnp.ndarray:
+                              te_filter: str = "ho02_exact",
+                              *, n_L_sample: int | None = None,
+                              l_batch: int = 1,
+                              remat: bool = True) -> jnp.ndarray:
     """jnp full-sky N_0^{TE}(L) (spin-mixed). Mirrors ``_per_L_te``.
 
     ``te_filter`` must track :func:`augr.delensing.compute_n0_te` -- this backend
@@ -264,7 +384,7 @@ def compute_n0_te_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt, nl_ee,
             f"te_filter must be 'ho02_exact', 'ho02_diag_approx' or "
             f"'strict_diagonal', got {te_filter!r}")
     Ls_np = np.asarray(Ls)
-    L_samples = _fullsky_L_samples(Ls_np)
+    L_samples = _fullsky_L_samples(Ls_np, n_L_sample)
 
     l1_arr = jnp.arange(l_min, l_max + 1, dtype=float)
     cl_tt_tot = spectra.cl_tt_len + nl_tt
@@ -287,7 +407,7 @@ def compute_n0_te_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt, nl_ee,
     ee_l1 = cl_ee_tot[l_min:l_max + 1]
     tt_l2 = _gather_spectrum_jax(cl_tt_tot, l2_grid)
 
-    def body(L_f):
+    def body(L_f, tt1, ee1, ee2, tt2):
         w000 = spin0_body(L_f, l1_arr, l2_min, l2_max)
         w2F = spin2_body(L_f, l1_arr, -2, 0, 2, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
@@ -307,25 +427,26 @@ def compute_n0_te_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt, nl_ee,
             f_swap = (te_l2[None, :] * alpha2 * pf * w2F * even_L
                       + te_l1[:, None] * alpha1 * pf * w000)
             cross = te_tot_l1[:, None] * te_tot_l2[None, :]
-            num = ee_l1[:, None] * tt_l2[None, :] * f_total - cross * f_swap
-            denom = (tt_l1[:, None] * ee_l2[None, :]
-                     * ee_l1[:, None] * tt_l2[None, :] - cross ** 2)
+            num = ee1[:, None] * tt2[None, :] * f_total - cross * f_swap
+            denom = (tt1[:, None] * ee2[None, :]
+                     * ee1[:, None] * tt2[None, :] - cross ** 2)
             # Non-negative by Cauchy-Schwarz (C_TE(l)^2 <= C_TT(l) C_EE(l)).
             weight = jnp.where(denom > 0,
                                num / jnp.where(denom > 0, denom, 1.0), 0.0)
             return jnp.sum(f_total * weight) / (2 * L_f + 1.0)
         if te_filter == "ho02_diag_approx":
-            denom = (tt_l1[:, None] * ee_l2[None, :]
+            denom = (tt1[:, None] * ee2[None, :]
                      + te_tot_l1[:, None] * te_tot_l2[None, :])
             inv_denom = jnp.where(jnp.abs(denom) > 0,
                                   1.0 / jnp.where(jnp.abs(denom) > 0, denom, 1.0), 0.0)
         else:  # 'strict_diagonal'
-            denom = tt_l1[:, None] * ee_l2[None, :]
+            denom = tt1[:, None] * ee2[None, :]
             inv_denom = jnp.where(denom > 0,
                                   1.0 / jnp.where(denom > 0, denom, 1.0), 0.0)
         return jnp.sum(f_total ** 2 * inv_denom) / (2 * L_f + 1.0)
 
-    n0_inv = lax.map(body, jnp.asarray(L_samples, dtype=float))
+    n0_inv = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
+                  l_batch=l_batch, consts=(tt_l1, ee_l1, ee_l2, tt_l2))
     return _interp_n0(n0_inv, L_samples, Ls_np, use_abs=True)
 
 
@@ -335,7 +456,8 @@ def compute_n0_te_fullsky_jax(Ls, spectra: LensingSpectra, nl_tt, nl_ee,
 
 def lensing_kernel_fullsky_jax(ls, Ls, spectra: LensingSpectra,
                                l_min: int = 2, l_max: int = 3000,
-                               *, w_ee=None) -> jnp.ndarray:
+                               *, w_ee=None, l_batch: int = 1,
+                               remat: bool = True) -> jnp.ndarray:
     """jnp full-sky lensing kernel K(l, L). Mirrors ``_per_L_lensing_kernel``.
 
     Returns (n_l, n_L). C_l^{BB,lens} = sum_L K(l,L) C_L^{phiphi}.
@@ -369,7 +491,7 @@ def lensing_kernel_fullsky_jax(ls, Ls, spectra: LensingSpectra,
     ls_idx = jnp.asarray(np.asarray(ls_np, dtype=int) - l2_min)   # into l_B_grid
     ls_f = jnp.asarray(np.asarray(ls_np), dtype=float)
 
-    def body(L_f):
+    def body(L_f, ee_w):
         w3j = spin2_body(L_f, l_E_arr, -2, 0, 2, l2_min, l2_max)
         L_LL = L_f * (L_f + 1.0)
         geom = -l_B_ll[None, :] + l_E_ll[:, None] + L_LL
@@ -379,10 +501,11 @@ def lensing_kernel_fullsky_jax(ls, Ls, spectra: LensingSpectra,
         f_eb_sq = (pf * w3j * geom) ** 2 * odd_L        # (n_lE, n_l2)
         # K_col[i_l] = sum_lE ee * f_eb_sq[:, col(ls[i_l])] / (2 ls + 1)
         cols = f_eb_sq[:, ls_idx]                       # (n_lE, n_l)
-        K_col = jnp.sum(ee[:, None] * cols, axis=0) / (2.0 * ls_f + 1.0)
+        K_col = jnp.sum(ee_w[:, None] * cols, axis=0) / (2.0 * ls_f + 1.0)
         return jnp.where(L_f >= 2.0, K_col, 0.0)        # (n_l,)
 
-    K_samples = lax.map(body, jnp.asarray(L_samples, dtype=float))  # (n_Lsamp, n_l)
+    K_samples = _map(body, jnp.asarray(L_samples, dtype=float), remat=remat,
+                     l_batch=l_batch, consts=(ee,))         # (n_Lsamp, n_l)
     # Per-l log-interp onto Ls.
     log_K = jnp.log(jnp.maximum(K_samples.T, 1e-300))   # (n_l, n_Lsamp)
     Ls_f = jnp.asarray(np.asarray(Ls_np), dtype=float)
@@ -397,13 +520,17 @@ def lensing_kernel_fullsky_jax(ls, Ls, spectra: LensingSpectra,
 
 def compute_n0_mv_fullsky_jax(Ls, spectra: LensingSpectra,
                               nl_tt, nl_ee, nl_bb,
-                              l_min: int = 2, l_max: int = 3000) -> jnp.ndarray:
+                              l_min: int = 2, l_max: int = 3000,
+                              *, n_L_sample: int | None = None,
+                              l_batch: int = 1,
+                              remat: bool = True) -> jnp.ndarray:
     """jnp full-sky MV N_0(L) = 1 / sum_alpha 1/N_0^alpha. Mirrors ``_compute_n0_mv_body``."""
-    n0_tt = compute_n0_tt_fullsky_jax(Ls, spectra, nl_tt, l_min, l_max)
-    n0_ee = compute_n0_ee_fullsky_jax(Ls, spectra, nl_ee, l_min, l_max)
-    n0_te = compute_n0_te_fullsky_jax(Ls, spectra, nl_tt, nl_ee, l_min, l_max)
-    n0_eb = compute_n0_eb_fullsky_jax(Ls, spectra, nl_ee, nl_bb, l_min, l_max)
-    n0_tb = compute_n0_tb_fullsky_jax(Ls, spectra, nl_tt, nl_bb, l_min, l_max)
+    kw = dict(n_L_sample=n_L_sample, l_batch=l_batch, remat=remat)
+    n0_tt = compute_n0_tt_fullsky_jax(Ls, spectra, nl_tt, l_min, l_max, **kw)
+    n0_ee = compute_n0_ee_fullsky_jax(Ls, spectra, nl_ee, l_min, l_max, **kw)
+    n0_te = compute_n0_te_fullsky_jax(Ls, spectra, nl_tt, nl_ee, l_min, l_max, **kw)
+    n0_eb = compute_n0_eb_fullsky_jax(Ls, spectra, nl_ee, nl_bb, l_min, l_max, **kw)
+    n0_tb = compute_n0_tb_fullsky_jax(Ls, spectra, nl_tt, nl_bb, l_min, l_max, **kw)
     inv_n0_mv = (1.0 / n0_tt + 1.0 / n0_ee + 1.0 / n0_te
                  + 1.0 / n0_eb + 1.0 / n0_tb)
     return 1.0 / inv_n0_mv
@@ -411,18 +538,22 @@ def compute_n0_mv_fullsky_jax(Ls, spectra: LensingSpectra,
 
 def residual_cl_bb_fullsky_jax(ls, Ls, spectra: LensingSpectra, n0_mv,
                                l_min: int = 2, l_max: int = 3000,
-                               *, nl_ee=None) -> jnp.ndarray:
+                               *, nl_ee=None, l_batch: int = 1,
+                               remat: bool = True) -> jnp.ndarray:
     """jnp full-sky residual lensing BB (Smith+ 2012 Eq. 12). Mirrors ``residual_cl_bb``."""
     cl_pp_at_L = _interp_at(spectra.cl_pp, Ls)
     w_pp = cl_pp_at_L / (cl_pp_at_L + n0_mv)
     cl_pp_res = cl_pp_at_L * (1.0 - w_pp)
 
     if nl_ee is None:
-        K = lensing_kernel_fullsky_jax(ls, Ls, spectra, l_min, l_max)
+        K = lensing_kernel_fullsky_jax(ls, Ls, spectra, l_min, l_max,
+                                       l_batch=l_batch, remat=remat)
         return K @ cl_pp_res
 
     cl_ee = spectra.cl_ee_unl
     w_ee = cl_ee / (cl_ee + jnp.asarray(nl_ee))
-    K = lensing_kernel_fullsky_jax(ls, Ls, spectra, l_min, l_max)
-    K_wee = lensing_kernel_fullsky_jax(ls, Ls, spectra, l_min, l_max, w_ee=w_ee)
+    K = lensing_kernel_fullsky_jax(ls, Ls, spectra, l_min, l_max,
+                                   l_batch=l_batch, remat=remat)
+    K_wee = lensing_kernel_fullsky_jax(ls, Ls, spectra, l_min, l_max, w_ee=w_ee,
+                                       l_batch=l_batch, remat=remat)
     return K @ cl_pp_res + (K - K_wee) @ (cl_pp_at_L * w_pp)
