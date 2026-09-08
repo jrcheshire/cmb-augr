@@ -123,18 +123,14 @@ class DelensCoupling:
     """Design-dependent residual lensing BB from an iterative-QE solve.
 
     Build it with :meth:`build` at a reference design; call :meth:`residual` per
-    design. The residual is a full solve at each evaluation, so its **value** is
-    exact at every design, not an expansion about the reference.
+    design. The residual is a full solve at each evaluation, so its value is exact
+    at every design, not an expansion about the reference. For the cheaper
+    first-order alternative see ``make_optimization_context(delens='linearized')``.
 
-    No linearized mode, deliberately: ``delens='linearized'`` in
-    ``make_optimization_context`` was measured to give a 118% error (wrong sign) for
-    a 5% change in detector count at a 3-band reference, because
-    ``delens_residual_bb`` has a jump discontinuity in the noise at isolated
-    multipoles that dominates the Jacobian contraction.
-
-    That discontinuity also limits the design gradient here and in the analytic
-    ``delens=`` path: the value is trustworthy, ``jax.grad`` through the QE solve
-    is not.
+    ``jax.grad`` through the solve agrees with finite differences on both backends
+    (verified along a single-multipole noise direction and against a global noise
+    rescale; the AD-vs-FD gates in ``tests/test_optimize.py`` cover the design
+    directions).
     """
 
     spectra: LensingSpectra
@@ -215,8 +211,7 @@ class DelensCoupling:
         """Residual lensing ``C_ell^BB`` on :attr:`ls` for this design.
 
         Exact at every design (a full solve, not an expansion), and reproduces
-        :attr:`cl_bb_res0` at the reference. Traceable, but see the class docstring
-        before trusting ``jax.grad`` through it.
+        :attr:`cl_bb_res0` at the reference. Traceable in ``jax.grad``.
         """
         nl_bb = _combined_white_nl_bb(
             jnp.asarray(n_det), jnp.asarray(net), jnp.asarray(beam), jnp.asarray(eta),
