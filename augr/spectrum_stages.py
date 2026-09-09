@@ -466,8 +466,8 @@ class CutskyMCContext(eqx.Module):
     the per-band beaming runs *inside* the traced forward — that is what makes the
     beams (FWHM + shape ``p``) differentiable design knobs alongside ``w_inv``.
     ``beam_fwhm_arcmin`` / ``beam_shape_p`` are the concrete *reference* beams (used
-    for the frozen ``var_pix_ref`` filter and as the default when a beam design is
-    not supplied to :func:`mc_cutsky_cov_traced`).
+    for the frozen ``var_pix_ref`` filter on the Wiener path, and as the default
+    when a beam design is not supplied to :func:`mc_cutsky_cov_traced`).
     """
 
     harmonic_skies: (
@@ -481,7 +481,9 @@ class CutskyMCContext(eqx.Module):
     )  # concrete reference per-band beams
     # concrete reference shape exponents (None = Gaussian)
     beam_shape_p: tuple | None = eqx.field(static=True)
-    inv_noise: jax.Array
+    # ``None`` on a MASTER context: the inverse-noise filter exists only for the
+    # masked-Wiener estimator, which is the only branch that reads it.
+    inv_noise: jax.Array | None
     cl_ee_prior: jax.Array
     cl_bb_prior: jax.Array
     bin_matrix: jax.Array
@@ -495,7 +497,8 @@ class CutskyMCContext(eqx.Module):
     max_iter: int = eqx.field(static=True)
     tol: float = eqx.field(static=True)
     n_sims: int = eqx.field(static=True)
-    var_pix_ref: float = eqx.field(static=True)
+    # ``None`` on a MASTER context: it exists only to build ``inv_noise``.
+    var_pix_ref: float | None = eqx.field(static=True)
     f_sky: float = eqx.field(static=True)
     # --- MASTER estimator path (default: the masked-Wiener path, unchanged) ---
     # ``mask`` is a TRACED leaf, unlike ``f_sky``: it is the sky-coverage design
@@ -576,8 +579,11 @@ def make_cutsky_mc_context(
     """Eager precompute for the differentiable cut-sky MC.
 
     Builds, once, the per-sim **unbeamed** :class:`HarmonicSky` ensemble (the
-    non-traceable PySM emission + ``synalm`` draws) plus the Wiener-filter
-    ``inv_noise`` at a frozen ``var_pix_ref``, and packs the binning / prior statics.
+    non-traceable PySM emission + ``synalm`` draws) and packs the binning / prior
+    statics. For ``estimator="wiener"`` it also builds the Wiener filter
+    ``inv_noise`` at a frozen ``var_pix_ref``, derived from one setup clean;
+    ``estimator="master"`` (the default) never reads ``inv_noise`` and so skips
+    that clean, leaving both fields ``None``.
     The per-band beaming is deferred to the *traced* forward
     (:func:`mc_cutsky_cov_traced`) so the beams (FWHM + shape ``p``) are
     differentiable design knobs in addition to ``w_inv``; ``beam_fwhm_arcmin`` /
@@ -590,8 +596,9 @@ def make_cutsky_mc_context(
 
     ``harmonic_skies`` / ``noise_keys`` (optional): a precomputed sky ensemble, e.g.
     from :func:`load_sky_cache` on a pysm3-less env (the aarch64 GPU). When supplied,
-    the PySM foreground generation is skipped entirely (``noise_keys`` and
-    ``var_pix_ref`` must accompany it; ``n_sims`` is taken from the cached ensemble).
+    the PySM foreground generation is skipped entirely (``noise_keys`` must accompany
+    it, and ``var_pix_ref`` too on the Wiener path, which would otherwise need a
+    freshly generated sky; ``n_sims`` is taken from the cached ensemble).
     The remaining pieces (inv_noise, priors, binning) are rebuilt locally -- they need
     no pysm3. Generate the cache once with :func:`save_sky_cache` on a pysm3-capable
     machine; this decouples the slow FG sim from the GPU forward and pins the FG
@@ -605,6 +612,12 @@ def make_cutsky_mc_context(
     ``A_lens = 1`` no matter what the design does. Costs one extra ``synalm`` per sim
     and one ``(lmax+1)`` array; at ``r_in = 0`` the realizations are unchanged.
     """
+    # The inverse-noise filter -- and hence var_pix_ref and the setup clean that
+    # derives it -- exists only for the masked-Wiener estimator. MASTER never
+    # reads inv_noise, so on that path the setup clean is dead work; skipping it
+    # is also what lets a clean_e=False cleaner build a context at all, since the
+    # clean's noise leg calls project_e().
+    needs_inv_noise = str(estimator) != "master"
     spectra = CMBSpectra() if spectra is None else spectra
     freqs_ghz = tuple(float(f) for f in freqs_ghz)
     beam_fwhm_arcmin = tuple(float(b) for b in beam_fwhm_arcmin)
@@ -649,10 +662,11 @@ def make_cutsky_mc_context(
             raise ValueError(
                 "noise_keys must be supplied when harmonic_skies is precomputed."
             )
-        if var_pix_ref is None:
+        if needs_inv_noise and var_pix_ref is None:
             raise ValueError(
-                "var_pix_ref must be supplied when harmonic_skies is precomputed "
-                "(the setup clean needs a generated sky otherwise)."
+                f"var_pix_ref must be supplied when harmonic_skies is precomputed "
+                f"and estimator={estimator!r} (the setup clean needs a generated "
+                f"sky otherwise). estimator='master' needs no var_pix_ref at all."
             )
         n_sims = int(harmonic_skies.cmb_b_alm.shape[0])
         if split_lensing and harmonic_skies.cmb_b_lens_alm is None:
@@ -668,7 +682,7 @@ def make_cutsky_mc_context(
 
     # var_pix_ref: frozen filter knob from one setup clean at the fiducial w_inv +
     # reference beams (matches mc_cutsky_bandpowers; uses the base_seed + n_sims sim).
-    if var_pix_ref is None:
+    if needs_inv_noise and var_pix_ref is None:
         sky0 = beam_harmonic_sky(
             _hsky(base_seed + n_sims), beam_fwhm_arcmin, beam_shape_p
         )
@@ -686,7 +700,9 @@ def make_cutsky_mc_context(
         obs = jnp.asarray(mask) > 0
         var_pix_ref = float(jnp.mean((cn[0] ** 2 + cn[1] ** 2)[obs]) / 2.0)
 
-    inv_noise = mk.inv_noise_map(hit_map, var_pix_ref, mask=mask)
+    inv_noise = (
+        mk.inv_noise_map(hit_map, var_pix_ref, mask=mask) if needs_inv_noise else None
+    )
 
     return CutskyMCContext(
         harmonic_skies=harmonic_skies,
@@ -707,7 +723,7 @@ def make_cutsky_mc_context(
         max_iter=int(max_iter),
         tol=float(tol),
         n_sims=int(n_sims),
-        var_pix_ref=float(var_pix_ref),
+        var_pix_ref=None if var_pix_ref is None else float(var_pix_ref),
         f_sky=mk.f_sky_of(mask),
         mask=jnp.asarray(mask),
         cl_bb_lens_ref=(
@@ -728,7 +744,8 @@ class SkyCache:
 
     Holds the PySM-dependent pieces of a :class:`CutskyMCContext` -- the per-sim
     ``HarmonicSky`` ensemble (CMB + foreground alm), the noise CRN keys, and the
-    filter-normalization ``var_pix_ref`` -- plus the config metadata used to validate
+    filter-normalization ``var_pix_ref`` (``None`` for a MASTER context, which
+    builds no filter) -- plus the config metadata used to validate
     that the GPU-side build matches the generation. Produced by :func:`save_sky_cache`
     on a pysm3-capable machine; consumed via ``make_cutsky_mc_context(
     harmonic_skies=cache.harmonic_skies, noise_keys=cache.noise_keys,
@@ -737,7 +754,9 @@ class SkyCache:
 
     harmonic_skies: HarmonicSky
     noise_keys: jax.Array
-    var_pix_ref: float
+    # ``None`` when the context was built for estimator='master', which skips the
+    # setup clean entirely. Feed it straight back to make_cutsky_mc_context.
+    var_pix_ref: float | None
     freqs_ghz: tuple[float, ...]
     beam_fwhm_arcmin: tuple[float, ...]
     nside: int
@@ -764,7 +783,6 @@ def save_sky_cache(path, ctx: CutskyMCContext, *, fg_model, base_seed: int = 0) 
     blob = dict(
         cmb_b_alm=np.asarray(hs.cmb_b_alm),
         noise_keys=np.asarray(ctx.noise_keys),
-        var_pix_ref=np.asarray(float(ctx.var_pix_ref)),
         freqs_ghz=np.asarray(hs.freqs_ghz, dtype=float),
         beam_fwhm_arcmin=np.asarray(ctx.beam_fwhm_arcmin, dtype=float),
         nside=np.asarray(int(ctx.nside)),
@@ -780,7 +798,13 @@ def save_sky_cache(path, ctx: CutskyMCContext, *, fg_model, base_seed: int = 0) 
         # load their skies here (pysm3-less nodes), and a cache that dropped it
         # would strand them at A_lens = 1.
         has_cmb_b_lens=np.asarray(hs.cmb_b_lens_alm is not None),
+        # Absent on a MASTER context. Written as a presence flag + optional key
+        # (the has_fg / has_cmb_e idiom) rather than a NaN sentinel, so an older
+        # augr reading a newer cache fails loudly instead of filtering a NaN.
+        has_var_pix_ref=np.asarray(ctx.var_pix_ref is not None),
     )
+    if ctx.var_pix_ref is not None:
+        blob["var_pix_ref"] = np.asarray(float(ctx.var_pix_ref))
     if hs.fg_eb_alm is not None:
         blob["fg_eb_alm"] = np.asarray(hs.fg_eb_alm)
     if hs.cmb_e_alm is not None:
@@ -801,6 +825,13 @@ def load_sky_cache(path) -> SkyCache:
         if bool(z.get("has_cmb_b_lens", np.asarray(False)))
         else None
     )
+    # Default True: caches written before MASTER could skip the setup clean have
+    # no flag and always carry a var_pix_ref, so they load exactly as before.
+    var_pix_ref = (
+        float(z["var_pix_ref"])
+        if bool(z.get("has_var_pix_ref", np.asarray(True)))
+        else None
+    )
     freqs = tuple(float(f) for f in z["freqs_ghz"])
     hs = HarmonicSky(
         freqs_ghz=freqs,
@@ -815,7 +846,7 @@ def load_sky_cache(path) -> SkyCache:
     return SkyCache(
         harmonic_skies=hs,
         noise_keys=jnp.asarray(z["noise_keys"]),
-        var_pix_ref=float(z["var_pix_ref"]),
+        var_pix_ref=var_pix_ref,
         freqs_ghz=freqs,
         beam_fwhm_arcmin=tuple(float(b) for b in z["beam_fwhm_arcmin"]),
         nside=int(z["nside"]),
@@ -994,14 +1025,13 @@ def _mc_cutsky_cov_master(
     ``tests/test_nilc.py``), while ``clean_e=True`` costs a second full
     ``(J, n_band, npix)`` needlet array and its recomposition on every sim.
 
-    That saving is **not** currently available to a caller, and the reason is worth
-    recording: :func:`make_cutsky_mc_context` derives ``var_pix_ref`` from a setup
-    clean whose noise leg calls ``project_e()``, so a ``clean_e=False`` cleaner
-    raises at *context build* regardless of estimator. On this path that setup clean
-    is itself dead work -- ``var_pix_ref`` exists only to build ``inv_noise``, which
-    the masked-Wiener branch consumes and this one does not. Skipping it for
-    ``estimator="master"`` is the change that would unlock both; it is deliberately
-    not made here.
+    That saving **is** available: :func:`make_cutsky_mc_context` skips its
+    ``var_pix_ref`` setup clean entirely for ``estimator="master"`` (leaving
+    ``ctx.var_pix_ref`` and ``ctx.inv_noise`` as ``None``), so a ``clean_e=False``
+    cleaner builds a context on this path. The setup clean was dead work here --
+    ``var_pix_ref`` exists only to build ``inv_noise``, which the masked-Wiener
+    branch consumes and this one does not -- and skipping it also drops one extra
+    sky generation and one full cleaner solve per context build.
     """
     m = ctx.mask if mask is None else jnp.asarray(mask)
     if m is None:
@@ -1156,6 +1186,13 @@ def mc_cutsky_cov_traced(
             "mask= is only meaningful for estimator='master'. The masked-Wiener "
             "path folds its mask into inv_noise at context-build time, so an "
             "override here would be silently ignored."
+        )
+    if ctx.inv_noise is None:
+        raise ValueError(
+            "the masked-Wiener path needs ctx.inv_noise, but this context was "
+            "built without it (estimator='master' skips the setup clean that "
+            "derives var_pix_ref). Rebuild with "
+            "make_cutsky_mc_context(estimator='wiener')."
         )
     bp_kw = dict(
         bin_matrix=ctx.bin_matrix,

@@ -29,7 +29,7 @@ BEAMS = (40.0, 30.0, 20.0)
 
 def _build_ctx(
     *, harmonic_skies=None, noise_keys=None, var_pix_ref=1.0, n_sims=3, base_seed=0,
-    split_lensing=False,
+    split_lensing=False, estimator="master",
 ):
     """A tiny CMB-only cut-sky MC context (no pysm3; var_pix_ref supplied -> no setup clean)."""
     ls = load_lensing_spectra()
@@ -71,6 +71,7 @@ def _build_ctx(
         harmonic_skies=harmonic_skies,
         noise_keys=noise_keys,
         split_lensing=split_lensing,
+        estimator=estimator,
     )
 
 
@@ -96,6 +97,14 @@ def test_sky_cache_roundtrip(tmp_path):
     )
     assert np.array_equal(np.asarray(cache.noise_keys), np.asarray(ctx.noise_keys))
     assert cache.harmonic_skies.fg_eb_alm is None  # CMB-only ctx
+
+    # A MASTER ctx carries no var_pix_ref at all; the absence must survive the
+    # round trip as None rather than resurfacing as 0.0 or NaN.
+    ctx_none = _build_ctx(n_sims=3, base_seed=7, var_pix_ref=None, estimator="master")
+    assert ctx_none.var_pix_ref is None
+    p_none = str(tmp_path / "cache_no_vpr.npz")
+    save_sky_cache(p_none, ctx_none, fg_model="none", base_seed=7)
+    assert load_sky_cache(p_none).var_pix_ref is None
 
 
 def test_make_ctx_from_cache_bypasses_generation(tmp_path):
@@ -147,10 +156,21 @@ def test_cache_bypass_validation():
     hs = ctx.harmonic_skies
     with pytest.raises(ValueError, match="noise_keys must be supplied"):
         _build_ctx(harmonic_skies=hs, noise_keys=None, var_pix_ref=1.0)
-    with pytest.raises(ValueError, match="var_pix_ref must be supplied"):
-        _build_ctx(harmonic_skies=hs, noise_keys=ctx.noise_keys, var_pix_ref=None)
     with pytest.raises(ValueError, match="noise_keys has"):
         _build_ctx(harmonic_skies=hs, noise_keys=ctx.noise_keys[:2], var_pix_ref=1.0)
+    # var_pix_ref is required only where inv_noise is: the masked-Wiener path.
+    with pytest.raises(ValueError, match="var_pix_ref must be supplied"):
+        _build_ctx(
+            harmonic_skies=hs, noise_keys=ctx.noise_keys, var_pix_ref=None,
+            estimator="wiener",
+        )
+    # ...and MASTER builds happily without one, since it never reads inv_noise.
+    master = _build_ctx(
+        harmonic_skies=hs, noise_keys=ctx.noise_keys, var_pix_ref=None,
+        estimator="master",
+    )
+    assert master.var_pix_ref is None
+    assert master.inv_noise is None
 
 
 def test_sky_cache_carries_the_lensing_split(tmp_path):

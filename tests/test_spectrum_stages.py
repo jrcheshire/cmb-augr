@@ -11,6 +11,8 @@ Map work needs jht (the [masking] extra) and ducc0 (the SHTs).
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -336,6 +338,102 @@ def _master_setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8):
         estimator="master",
     )
     return ctx, cleaner
+
+
+def _ctx_kwargs(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8):
+    """The _master_setup kwargs, minus cleaner/estimator, so callers can vary them."""
+    cl_ee, cl_bb = _priors(lmax)
+    bm = _bin_matrix(2, ell_max, delta_ell, 2)
+    true_b = mk.bin_spectrum(
+        jnp.clip(CMBSpectra().cl_bb(jnp.arange(lmax + 1, dtype=float), 0.0), 0.0, None),
+        bm, 2,
+    )
+    return dict(
+        freqs_ghz=FREQS, beam_fwhm_arcmin=BEAMS, w_inv=W_INV, nside=nside, lmax=lmax,
+        mask=mk.smooth_gal_cut_mask(nside, 25.0, 8.0), cl_ee=cl_ee,
+        cl_bb_prior_unbeamed=cl_bb, bin_matrix=bm, ell_min=2, true_bb_binned=true_b,
+        n_sims=n_sims, base_seed=0, fg_model=None, r_in=0.0,
+    )
+
+
+def test_master_context_skips_the_var_pix_ref_setup_clean():
+    """MASTER builds no inverse-noise filter, so its setup clean must not run.
+
+    Three things are asserted together because they are one change: the clean is
+    *actually* skipped (a call count -- the covariance alone cannot tell a live
+    skip from a dead one), the fields it fed are None, and the Wiener path still
+    runs it. The last case is the anti-vacuity half: a guard keyed on the wrong
+    thing would skip everywhere and still pass the first two.
+    """
+    kw = _ctx_kwargs(6)
+    calls = {"n": 0}
+    base = nilc_cleaner(clean_e=True)
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return base(*a, **k)
+
+    for estimator, expected in (("master", 0), ("wiener", 1)):
+        calls["n"] = 0
+        ctx = make_cutsky_mc_context(cleaner=counting, estimator=estimator, **kw)
+        assert calls["n"] == expected, f"{estimator}: cleaner ran {calls['n']} times"
+        if estimator == "master":
+            assert ctx.var_pix_ref is None
+            assert ctx.inv_noise is None
+        else:
+            assert ctx.var_pix_ref is not None
+            assert ctx.inv_noise is not None
+
+
+def test_master_bandpowers_are_unchanged_by_skipping_the_setup_clean():
+    """Skipping it changes nothing numerically: MASTER never reads what it produced.
+
+    Byte-identical, not ``allclose`` -- the skipped quantity is genuinely unread on
+    this path, so any difference at all would mean it was not.
+    """
+    kw = _ctx_kwargs(6)
+    cleaner = nilc_cleaner(clean_e=True)
+    wiener = make_cutsky_mc_context(cleaner=cleaner, estimator="wiener", **kw)
+
+    skipped = make_cutsky_mc_context(cleaner=cleaner, estimator="master", **kw)
+    supplied = make_cutsky_mc_context(
+        cleaner=cleaner, estimator="master",
+        var_pix_ref=float(wiener.var_pix_ref), **kw,
+    )
+    a = mc_cutsky_cov_traced(jnp.asarray(W_INV), skipped, cleaner)
+    b = mc_cutsky_cov_traced(jnp.asarray(W_INV), supplied, cleaner)
+    assert np.array_equal(np.asarray(a.covariance), np.asarray(b.covariance))
+
+
+def test_master_accepts_a_clean_e_false_cleaner():
+    """The saving the skip unlocks: no setup clean means no project_e() at build.
+
+    Before this, a ``clean_e=False`` cleaner raised at *context build* on every
+    estimator, because the setup clean's noise leg projected E. MASTER reads only
+    the B solution, which ``tests/test_nilc.py`` pins as byte-identical either way,
+    so the covariance must match exactly.
+    """
+    kw = _ctx_kwargs(6)
+    out = {}
+    for flag in (True, False):
+        cleaner = nilc_cleaner(clean_e=flag)
+        ctx = make_cutsky_mc_context(cleaner=cleaner, estimator="master", **kw)
+        out[flag] = np.asarray(
+            mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner).covariance
+        )
+    assert np.array_equal(out[True], out[False])
+
+
+def test_wiener_rejects_a_context_built_without_inv_noise():
+    """A MASTER-built context fed to the Wiener branch fails loudly, not deep inside."""
+    kw = _ctx_kwargs(6)
+    cleaner = nilc_cleaner(clean_e=True)
+    ctx = make_cutsky_mc_context(cleaner=cleaner, estimator="master", **kw)
+    # estimator is a static field (in the treedef, not a leaf), so tree_at cannot
+    # touch it; eqx.Module is a frozen dataclass, so dataclasses.replace can.
+    ctx_w = dataclasses.replace(ctx, estimator="wiener")
+    with pytest.raises(ValueError, match=r"needs ctx\.inv_noise"):
+        mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx_w, cleaner)
 
 
 def test_edges_from_bin_matrix_matches_the_signal_model_binning():

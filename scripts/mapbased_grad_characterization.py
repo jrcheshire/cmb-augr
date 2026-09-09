@@ -764,10 +764,17 @@ def main():
 
     # Freeze var_pix_ref once so the only thing varying across ensembles is the CRN
     # (var_pix_ref is a filter knob; a common value isolates the MC noise we measure).
+    # On the MASTER estimator -- the default these contexts are built with -- there
+    # is no Wiener filter, so make_cutsky_mc_context returns None and there is
+    # nothing to freeze; the ensembles already differ only by their CRN.
     print("Calibrating shared var_pix_ref ...")
     cal_ctx, _, _ = build_contexts(0, args.n_sims, nside=args.nside, lmax=args.lmax)
     var_pix_ref = cal_ctx.var_pix_ref
-    print(f"  var_pix_ref = {var_pix_ref:.4e}")
+    print(
+        "  var_pix_ref = none (MASTER: no Wiener filter)"
+        if var_pix_ref is None
+        else f"  var_pix_ref = {var_pix_ref:.4e}"
+    )
 
     if args.mode in ("demo", "both"):
         print("\n########## MODE: demo ##########")
