@@ -69,12 +69,13 @@ markers = [
 channels = ["conda-forge"]
 platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 
-# The full dev/CI dependency set lives in a `host` feature pinned to the platforms
-# whose niche compiled deps (namaster, camb, ducc0, pysm3, cmbroom, pywigxjpf) have
-# binaries -- so the default environment does NOT try (and fail) to solve aarch64.
-# The aarch64 GPU env (below) uses only the slim `gpu` feature.
+# `host` is the default environment and spans every workspace platform, so a bare
+# `pixi install` works on any of them (and `pixi install --all` adds cpu/gpu where
+# they apply). The four deps with no linux-aarch64 binaries -- camb, namaster,
+# cmbroom, pywigxjpf -- are scoped to the platforms that do have them via the
+# `target.<platform>` tables below, so aarch64 simply resolves without them.
 [tool.pixi.feature.host]
-platforms = ["osx-arm64", "linux-64"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 
 [tool.pixi.feature.host.dependencies]
 python = ">=3.12"
@@ -84,7 +85,6 @@ matplotlib = ">=3.7"
 healpy = ">=1.16"
 pytest = ">=7.0"
 pytest-xdist = ">=3.0"
-camb = "*"
 ducc0 = "*"
 pysm3 = "*"
 jupyterlab = "*"
@@ -92,11 +92,6 @@ ipykernel = "*"
 ipython = "*"
 ruff = "*"
 pytest-timeout = ">=2.1"
-# NaMaster (conda-forge) — non-differentiable; used only as a gated cross-check
-# in the masked-Wiener validation suite (tests importorskip it). Conda-only:
-# the PyPI `pymaster` builds from source against gsl/fftw/cfitsio, so it is
-# deliberately NOT exposed as a pip extra.
-namaster = "*"
 
 [tool.pixi.feature.host.pypi-dependencies]
 jax = ">=0.4"
@@ -105,10 +100,29 @@ equinox = ">=0.11"
 blackjax = "*"
 optax = "*"
 jaxht = ">=0.2.0"
-pywigxjpf = "*"
-cmbroom = "*"
 pyyaml = "*"
 cmb-augr = { path = ".", editable = true }
+
+# camb / namaster (conda) and cmbroom / pywigxjpf (pypi) have no linux-aarch64
+# binaries, so they are declared only on the platforms that do. NaMaster is
+# non-differentiable and used only as a gated cross-check in the masked-Wiener
+# validation suite (tests importorskip it); conda-only, because the PyPI
+# `pymaster` builds from source against gsl/fftw/cfitsio.
+[tool.pixi.feature.host.target.osx-arm64.dependencies]
+camb = "*"
+namaster = "*"
+
+[tool.pixi.feature.host.target.linux-64.dependencies]
+camb = "*"
+namaster = "*"
+
+[tool.pixi.feature.host.target.osx-arm64.pypi-dependencies]
+cmbroom = "*"
+pywigxjpf = "*"
+
+[tool.pixi.feature.host.target.linux-64.pypi-dependencies]
+cmbroom = "*"
+pywigxjpf = "*"
 
 # GPU environment for ARM CUDA clusters (TACC Vista `gh` / GH200, H200). A minimal
 # feature -- NOT the full default env -- because the GPU path uses the jht JAX-native SHT
