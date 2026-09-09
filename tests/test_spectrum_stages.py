@@ -628,8 +628,18 @@ def test_remat_and_sim_batch_are_live_in_the_trace() -> None:
     ctx, cleaner = _master_setup(6)
     on = str(jax.make_jaxpr(lambda w: _sq_cov(w, ctx, cleaner, remat=True))(W_INV))
     off = str(jax.make_jaxpr(lambda w: _sq_cov(w, ctx, cleaner, remat=False))(W_INV))
-    assert "remat" in on or "checkpoint" in on
-    assert "remat" not in off and "checkpoint" not in off
+
+    # The MASTER coupling build checkpoints its own per-l2 map unconditionally
+    # (pseudo_cl_jax.coupling_matrices, remat=True by default), so "no checkpoint
+    # anywhere" is no longer a proxy for "the sim scan is not checkpointed" --
+    # that assertion would be testing two loops at once. Count instead: turning
+    # this knob off must strictly reduce the checkpoints, and must not remove
+    # the coupling's.
+    n_on, n_off = on.count("remat2["), off.count("remat2[")
+    assert n_off >= 1, "the coupling build's own remat vanished from the trace"
+    assert n_on > n_off, (
+        f"remat=True added no checkpoint to the sim scan ({n_on} vs {n_off})"
+    )
 
     for sim_batch, expected in ((1, 6), (2, 3), (3, 2), (4, 2)):
         lengths = _top_level_scan_lengths(

@@ -85,8 +85,8 @@ def mask_power_spectrum(mask, *, nside: int, lmax_mask: int,
     return alm2cl(alm[0], int(lmax_mask))
 
 
-def coupling_matrices(w_ell, *, lmax: int,
-                      beam_bl=None) -> tuple[jnp.ndarray, jnp.ndarray]:
+def coupling_matrices(w_ell, *, lmax: int, beam_bl=None,
+                      remat: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Parity-split spin-2 mode-coupling matrices ``(M+, M-)``.
 
     Both are ``(lmax + 1, lmax + 1)`` indexed ``[l1, l2]``. Rows and columns
@@ -109,6 +109,22 @@ def coupling_matrices(w_ell, *, lmax: int,
     never appears explicitly. MASTER has no ``F_b`` -- being unbiased by
     construction is the whole point -- so an omitted beam is not absorbed
     anywhere and silently biases the recovered spectrum low.
+
+    ``remat`` (default True) checkpoints the per-l2 body. ``w3j_sq`` depends on
+    no traced input, but the transpose of ``w3j_sq @ pre3`` w.r.t. ``pre3`` needs
+    it, so scan partial-evaluation stacks the whole table as a residual --
+    ``8 (lmax+1)^2 (2 lmax+1)`` bytes, measured. That is 115 MB at lmax=192 and
+    invisible, but 58 GB at lmax=1536 and 464 GB at lmax=3072, which is what
+    makes it a wall rather than an overhead. Checkpointing trades one extra
+    Wigner forward on the backward pass for a tape that no longer grows with
+    lmax: values are **bit-identical**, and ``jax.grad`` moves by 1-2 ulp
+    (measured 2.6e-16 relative at lmax=64) from XLA re-fusing the recomputed
+    forward -- the same signature the delensing remat has. Pass ``remat=False``
+    to recover the previous trace.
+
+    Deliberately *not* batched or device-sharded, unlike the delensing per-L map
+    it otherwise resembles: ``l_batch`` was a measured negative there, and this
+    map runs once per design evaluation rather than per sim.
     """
     lmax = int(lmax)
     l3_max = 2 * lmax
@@ -123,20 +139,27 @@ def coupling_matrices(w_ell, *, lmax: int,
     pre3 = (2.0 * l3 + 1.0) * w
     pre3_signed = pre3 * _parity(l3)
 
-    def body(l2):
+    # pre3 / pre3_signed are the only traced inputs, so they are passed in
+    # rather than closed over -- the discipline the delensing map documents,
+    # and the precondition for ever sharding this body.
+    def body(l2, pre_tot, pre_sgn):
         # 3j(l1[i], l2, l3[j]; 2, -2, 0) -- the m=0 slot is the MASK multipole.
         w3j_sq = spin2_body(l2, l1, 2, -2, 0, 0, l3_max) ** 2
         # One pass, two reductions: (-1)^(l1+l2+l3) factorizes as
         # (-1)^(l1+l2) * (-1)^l3, so the l3 sum is done once for each parity.
-        s_tot = w3j_sq @ pre3
-        s_sgn = (w3j_sq @ pre3_signed) * _parity(l1 + l2)
+        s_tot = w3j_sq @ pre_tot
+        s_sgn = (w3j_sq @ pre_sgn) * _parity(l1 + l2)
         pref = (2.0 * l2 + 1.0) / (4.0 * jnp.pi)
         return 0.5 * pref * (s_tot + s_sgn), 0.5 * pref * (s_tot - s_sgn)
+
+    step = jax.checkpoint(body, prevent_cse=False) if remat else body
 
     # lax.map stacks over l2, giving [l2, l1]; transpose to the [l1, l2] the
     # MASTER convention wants. Sequential by construction -- one Wigner table
     # is live at a time, 0.6 MB at lmax=192.
-    m_plus, m_minus = lax.map(body, jnp.arange(lmax + 1, dtype=float))
+    m_plus, m_minus = lax.map(
+        lambda l2: step(l2, pre3, pre3_signed), jnp.arange(lmax + 1, dtype=float)
+    )
     m_plus, m_minus = m_plus.T, m_minus.T
     if beam_bl is not None:
         b2 = jnp.asarray(beam_bl)[: lmax + 1] ** 2
@@ -288,12 +311,16 @@ class MasterBBJax(eqx.Module):
     @classmethod
     def build(cls, mask, *, bin_edges, nside: int, lmax: int,
               lmax_mask: int | None = None, n_iter: int = 3,
-              beam_bl=None) -> MasterBBJax:
+              beam_bl=None, remat: bool = True) -> MasterBBJax:
         """Compute W_l, the coupling matrices and both windows for ``mask``.
 
         ``beam_bl`` is the transfer of the map that will be passed to
         :meth:`bb`; see :func:`coupling_matrices` for why leaving it out is a
         silent low bias rather than a harmless omission.
+
+        ``remat`` forwards to :func:`coupling_matrices`; it is what keeps this
+        build's reverse-mode tape from growing as ``lmax^3``. This runs inside
+        the differentiated forward whenever the mask is a design coordinate.
         """
         nside, lmax = int(nside), int(lmax)
         lmax_mask = 3 * nside - 1 if lmax_mask is None else int(lmax_mask)
@@ -303,7 +330,8 @@ class MasterBBJax(eqx.Module):
         mask = jnp.asarray(mask)
         w_ell = mask_power_spectrum(mask, nside=nside, lmax_mask=lmax_mask,
                                     n_iter=n_iter)
-        m_plus, m_minus = coupling_matrices(w_ell, lmax=lmax, beam_bl=beam_bl)
+        m_plus, m_minus = coupling_matrices(w_ell, lmax=lmax, beam_bl=beam_bl,
+                                            remat=remat)
         b_w, b_s = bin_matrices(edges, lmax)
         ops = decouple_operators(m_plus, m_minus, b_w, b_s)
         window, window_ee = bandpower_windows_bb(ops)

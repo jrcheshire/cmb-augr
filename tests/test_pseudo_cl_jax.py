@@ -607,3 +607,69 @@ def test_omitting_the_beam_biases_the_recovered_spectrum_low():
         f"omitting the beam no longer biases the top bin (ratio {r_without[-1]:.3f})"
         " -- this tripwire has gone stale"
     )
+
+
+def _linearized_residual_avals(lmax, remat):
+    """Residual constvars of the linearized coupling build -- what the tape holds."""
+    w = jnp.linspace(1.0, 0.5, 3 * lmax + 1)
+    fn = lambda wl: coupling_matrices(wl, lmax=lmax, remat=remat)  # noqa: E731
+    cotangent_fn = jax.linearize(fn, w)[1]
+    return [v.aval for v in jax.make_jaxpr(cotangent_fn)(w).jaxpr.constvars]
+
+
+def test_coupling_remat_drops_the_stacked_wigner_table_from_the_tape():
+    """The knob is checked in the jaxpr, not by its output.
+
+    ``remat`` is value-exact, so no numerical comparison can tell a live knob
+    from a dead one. What distinguishes them is the residual the linearized
+    function carries: without checkpointing, scan partial-eval stacks the whole
+    ``(l1, l2, l3)`` Wigner table, which is ``8 (lmax+1)^2 (2 lmax+1)`` bytes --
+    115 MB at lmax=192, 58 GB at lmax=1536. With it, no 3-D residual survives.
+    """
+    for lmax in (16, 32):
+        off = _linearized_residual_avals(lmax, remat=False)
+        on = _linearized_residual_avals(lmax, remat=True)
+
+        stacked = [a for a in off if a.ndim == 3]
+        assert stacked, f"lmax={lmax}: control arm holds no 3-D residual"
+        assert stacked[0].shape == (lmax + 1, lmax + 1, 2 * lmax + 1)
+        assert not [a for a in on if a.ndim == 3], (
+            f"lmax={lmax}: remat=True still stacks a 3-D residual "
+            f"{[a.shape for a in on if a.ndim == 3]}"
+        )
+
+        nbytes = lambda avals: sum(  # noqa: E731
+            int(np.prod(a.shape)) * a.dtype.itemsize for a in avals
+        )
+        # The control arm must follow the closed form, or the extrapolation to
+        # production lmax that motivates this knob does not hold.
+        assert nbytes(off) == pytest.approx(
+            8 * (lmax + 1) ** 2 * (2 * lmax + 1), rel=0.05
+        )
+        assert nbytes(on) < nbytes(off) / 20
+
+
+def test_coupling_remat_is_numerically_transparent():
+    """Values bit-identical; the gradient moves by ulps, from re-fused recompute.
+
+    The 1e-15 gradient bound is 4x the worst measured departure over
+    lmax in {16, 32, 48, 64} (2.6e-16 at lmax=64) -- measured in this
+    configuration rather than carried in from elsewhere.
+    """
+    for lmax in (16, 32):
+        w = jnp.linspace(1.0, 0.5, 3 * lmax + 1)
+        off = coupling_matrices(w, lmax=lmax, remat=False)
+        on = coupling_matrices(w, lmax=lmax, remat=True)
+        for a, b in zip(off, on, strict=True):
+            assert np.array_equal(np.asarray(a), np.asarray(b))
+
+        def total(wl, remat, lmax=lmax):
+            mp, mm = coupling_matrices(wl, lmax=lmax, remat=remat)
+            return mp.sum() + mm.sum()
+
+        g_off = np.asarray(jax.grad(total)(w, False))
+        g_on = np.asarray(jax.grad(total)(w, True))
+        nz = np.abs(g_off) > 0
+        assert nz.any()
+        rel = np.max(np.abs(g_on[nz] - g_off[nz]) / np.abs(g_off[nz]))
+        assert rel < 1e-15, f"lmax={lmax}: gradient moved {rel:.3e}"
