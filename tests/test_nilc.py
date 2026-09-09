@@ -479,3 +479,30 @@ def test_masked_solve_ridge_applies_to_active_diagonal_only():
     w_ref = np.zeros(6)
     w_ref[idx] = np.asarray(w_act)
     np.testing.assert_allclose(np.asarray(w), w_ref, rtol=1e-12, atol=1e-15)
+
+
+def test_clean_e_does_not_touch_the_b_solution() -> None:
+    """``clean_e=True`` adds an E leg; it must not perturb the B one.
+
+    Load-bearing for the MASTER spectrum path, which reads only ``cleaned_b_alm``
+    and ``project()`` (the stored *B* weights). ``_global_weights`` consumes the B
+    needlet array alone, so the E leg is pure additional work there -- one more
+    full ``(J, n_band, npix)`` array and its recomposition per simulation. This
+    pins that, so the production config can drop it without a numerical argument
+    every time.
+    """
+    nside, lmax = 32, 48
+    band_qu = jax.random.normal(jax.random.PRNGKey(0), (3, 2, 12 * nside**2))
+    beams = (40.0, 30.0, 20.0)
+    with_e = nilc_clean(band_qu, beams, lmax=lmax, nside=nside, clean_e=True)
+    without = nilc_clean(band_qu, beams, lmax=lmax, nside=nside, clean_e=False)
+
+    np.testing.assert_array_equal(
+        np.asarray(with_e.cleaned_b_alm), np.asarray(without.cleaned_b_alm)
+    )
+    np.testing.assert_array_equal(np.asarray(with_e.weights), np.asarray(without.weights))
+    np.testing.assert_array_equal(
+        np.asarray(with_e.project(band_qu)), np.asarray(without.project(band_qu))
+    )
+    # The E leg exists only in the clean_e arm -- otherwise the test is vacuous.
+    assert with_e.cleaned_e_alm is not None and without.cleaned_e_alm is None
