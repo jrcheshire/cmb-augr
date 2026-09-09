@@ -887,8 +887,75 @@ def _lens_scale(ctx: CutskyMCContext, cl_bb_res, cl_bb_res_ells):
     return jnp.where(pos, jnp.sqrt(jnp.where(pos, ratio, 1.0)), 0.0)
 
 
+def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1):
+    """``lax.map`` over the sim axis, optionally checkpointed and batched.
+
+    Sibling of :func:`augr.delensing_fullsky_jax._map`, for the per-sim compsep
+    body rather than the per-L QE body. ``xs`` is a pytree (the batched
+    ``HarmonicSky`` and the noise keys), every leaf carrying the sim axis first.
+
+    ``remat=True`` stores only the per-sim inputs and recomputes the body on the
+    backward pass. Reverse mode otherwise retains *every* sim's residuals, and the
+    body's largest are the ``(J, n_band, npix)`` needlet coefficient arrays, so the
+    tape is ``n_sims`` times a per-sim cost growing as ``npix``. Measured on the
+    design gradient: peak memory is linear in ``n_sims`` at 0.069 GB/sim
+    (nside=64) and 0.267 GB/sim (nside=128), an exponent of 1.95 against npix's 2.
+    Since ``n_bins`` grows with lmax and Hartlap refuses ``n_sims <= n_bins + 2``,
+    the sim count cannot be held fixed as resolution rises, and the product
+    reaches terabytes by nside=1024. No ``policy=``: the large candidates are
+    precisely what must not be retained.
+
+    ``sim_batch > 1`` vmaps that many sims into each sequential step, trading
+    memory back for larger kernels. It reassociates reductions, so agreement with
+    ``sim_batch=1`` is **measured, not exact**. It is also not safe to raise
+    blindly on the masked-Wiener branch, whose body runs a ``while_loop`` CG
+    (``jht.wiener``): under ``vmap`` that loop runs until every lane has
+    converged, so the batch costs the max over its members. Default 1.
+
+    ``sim_batch == 1`` is an early return to a plain ``lax.map``, so with
+    ``remat=False`` the trace is exactly the pre-checkpoint one.
+
+    ``remat`` is read at **trace time** and must be a Python ``bool``, never a
+    traced value.
+    """
+    if isinstance(sim_batch, bool) or not isinstance(sim_batch, int) or sim_batch < 1:
+        raise ValueError(f"sim_batch must be a Python int >= 1, got {sim_batch!r}")
+    if not isinstance(remat, bool):
+        raise ValueError(f"remat must be a Python bool (trace-time), got {remat!r}")
+
+    leaves = jax.tree.leaves(xs)
+    if not leaves:
+        raise ValueError("xs carries no arrays to map over.")
+    n = leaves[0].shape[0]
+
+    if sim_batch == 1:
+        step = jax.checkpoint(body, prevent_cse=False) if remat else body
+        return jax.lax.map(step, xs)
+
+    # vmap FIRST, checkpoint SECOND: one batch is one recompute unit.
+    step = jax.vmap(body)
+    if remat:
+        step = jax.checkpoint(step, prevent_cse=False)
+
+    n_pad = -(-n // sim_batch) * sim_batch
+    if n_pad != n:
+        # A padded slot costs a full slot; repeat the last sim and trim the
+        # output below. Every sim costs the same, so which row is repeated
+        # affects only the wasted work, not the result.
+        xs = jax.tree.map(
+            lambda a: jnp.concatenate([a, jnp.repeat(a[-1:], n_pad - n, axis=0)]), xs
+        )
+    batched = jax.tree.map(
+        lambda a: a.reshape((n_pad // sim_batch, sim_batch, *a.shape[1:])), xs
+    )
+    out = jax.lax.map(step, batched)
+    out = jax.tree.map(lambda a: a.reshape((-1, *a.shape[2:])), out)
+    return jax.tree.map(lambda a: a[:n], out)
+
+
 def _mc_cutsky_cov_master(
-    w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual
+    w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual, *,
+    remat: bool = True, sim_batch: int = 1,
 ) -> CutskyMCTraced:
     """MASTER branch of :func:`mc_cutsky_cov_traced`.
 
@@ -919,6 +986,22 @@ def _mc_cutsky_cov_master(
 
     The estimator is built once, outside the per-sim loop: the coupling matrix
     depends on the mask and beams, not on the realization.
+
+    **This branch never reads the cleaner's E solution**, only ``cleaned_b_alm`` and,
+    under ``fg_residual``, ``project()`` -- which applies the stored *B* weights.
+    Those come from ``_global_weights`` on the B needlet array alone, so the B
+    solution is bit-identical with or without ``clean_e`` (gated in
+    ``tests/test_nilc.py``), while ``clean_e=True`` costs a second full
+    ``(J, n_band, npix)`` needlet array and its recomposition on every sim.
+
+    That saving is **not** currently available to a caller, and the reason is worth
+    recording: :func:`make_cutsky_mc_context` derives ``var_pix_ref`` from a setup
+    clean whose noise leg calls ``project_e()``, so a ``clean_e=False`` cleaner
+    raises at *context build* regardless of estimator. On this path that setup clean
+    is itself dead work -- ``var_pix_ref`` exists only to build ``inv_noise``, which
+    the masked-Wiener branch consumes and this one does not. Skipping it for
+    ``estimator="master"`` is the change that would unlock both; it is deliberately
+    not made here.
     """
     m = ctx.mask if mask is None else jnp.asarray(mask)
     if m is None:
@@ -960,8 +1043,11 @@ def _mc_cutsky_cov_master(
         # No second cleaner solve -- project() reuses the stored weights.
         return full, master.bb_from_b_alm(result.project(band_sky.fg_qu))
 
-    rec, rec_fg = jax.lax.map(
-        lambda bk: _one(bk[0], bk[1]), (ctx.harmonic_skies, ctx.noise_keys)
+    rec, rec_fg = _sim_map(
+        lambda bk: _one(bk[0], bk[1]),
+        (ctx.harmonic_skies, ctx.noise_keys),
+        remat=remat,
+        sim_batch=sim_batch,
     )
     n_bins = rec.shape[1]
     return CutskyMCTraced(
@@ -987,6 +1073,8 @@ def mc_cutsky_cov_traced(
     cl_bb_res=None,
     cl_bb_res_ells=None,
     fg_residual: bool = False,
+    remat: bool = True,
+    sim_batch: int = 1,
 ) -> CutskyMCTraced:
     """Differentiable cut-sky MC bandpower covariance as a function of ``w_inv`` (and beams).
 
@@ -1028,14 +1116,21 @@ def mc_cutsky_cov_traced(
     the r-bias -- see :func:`augr.eig.delta_r_from_residual`. It costs no second
     cleaner solve (``project`` reuses the stored weights), only one more spectrum.
 
-    The per-sim loop is a ``jax.lax.map`` (sequential scan, no ``batch_size``) over
-    the batched ``ctx.harmonic_skies`` -- the cleaner body is traced once, so compile
-    is O(1) in ``n_sims`` and the scan accumulates outputs instead of holding an
-    ``n_sims``-deep unroll live. Scan (not ``vmap``) so the cleaner's inner
-    ``while_loop`` map2alm iteration runs per sim. The straight-through gradient
-    flows through a *sample* covariance, so it carries Monte-Carlo noise --
-    characterise grad std vs ``n_sims`` before trusting a descent step (see the
-    plan's Phase 2 verification).
+    The per-sim loop runs through :func:`_sim_map` over the batched
+    ``ctx.harmonic_skies`` -- the cleaner body is traced once, so compile is O(1) in
+    ``n_sims`` and the scan accumulates outputs instead of holding an
+    ``n_sims``-deep unroll live.
+
+    ``remat`` (default True) checkpoints that body: without it reverse mode retains
+    every sim's residuals, and the tape is ``n_sims`` times a per-sim cost growing
+    as ``npix`` -- terabytes by nside=1024. Values are bit-identical either way;
+    see :func:`_sim_map`. ``sim_batch`` vmaps sims into each step and defaults to 1;
+    on this (masked-Wiener) branch raising it batches a ``while_loop`` CG, so read
+    :func:`_sim_map` before doing so.
+
+    The straight-through gradient flows through a *sample* covariance, so it carries
+    Monte-Carlo noise -- characterise grad std vs ``n_sims`` before trusting a
+    descent step.
     """
     w_inv = jnp.asarray(w_inv)
     # Beam design knobs: default to the frozen reference (the noise-only path, which
@@ -1047,7 +1142,8 @@ def mc_cutsky_cov_traced(
     lens_scale = _lens_scale(ctx, cl_bb_res, cl_bb_res_ells)
     if ctx.estimator == "master":
         return _mc_cutsky_cov_master(
-            w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual
+            w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual,
+            remat=remat, sim_batch=sim_batch,
         )
     if fg_residual:
         raise NotImplementedError(
@@ -1109,14 +1205,20 @@ def mc_cutsky_cov_traced(
         )
         return rec_full, rec_b, rec_e
 
-    # Sequential scan over the sim axis (lax.map, no batch_size): the cleaner body
-    # is traced ONCE and reused per sim -- O(1) compile in n_sims, scan-accumulated
-    # outputs (no live n_sims-deep unroll). Scan, not vmap, so the cleaner's inner
-    # map2alm while_loop runs per sim. ctx.harmonic_skies is a batched (unbeamed)
-    # HarmonicSky (leading sim axis on its alm leaves); lax.map slices it back to a
-    # per-sim HarmonicSky that `_one` beams in-trace.
-    rec_full, rec_b, rec_e = jax.lax.map(
-        lambda bk: _one(bk[0], bk[1]), (ctx.harmonic_skies, ctx.noise_keys)
+    # Sequential scan over the sim axis: the cleaner body is traced ONCE and reused
+    # per sim -- O(1) compile in n_sims, scan-accumulated outputs (no live
+    # n_sims-deep unroll). ctx.harmonic_skies is a batched (unbeamed) HarmonicSky
+    # (leading sim axis on its alm leaves); the map slices it back to a per-sim
+    # HarmonicSky that `_one` beams in-trace. Scan rather than vmap is the default
+    # here for a reason specific to THIS branch: `cutsky_bb_bandpower` runs a
+    # `while_loop` CG (jht.wiener, maxiter=200) three times per sim, and vmapping a
+    # while_loop runs it until every lane converges -- so `sim_batch > 1` makes each
+    # batch cost its slowest member. Raise it only with a measurement.
+    rec_full, rec_b, rec_e = _sim_map(
+        lambda bk: _one(bk[0], bk[1]),
+        (ctx.harmonic_skies, ctx.noise_keys),
+        remat=remat,
+        sim_batch=sim_batch,
     )
 
     transfer = mk.transfer_function(rec_b, ctx.true_bb_binned)
