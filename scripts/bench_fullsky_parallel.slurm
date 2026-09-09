@@ -34,7 +34,7 @@ echo "omp       OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset}"
 echo "started   $(date -Is)"
 echo
 
-pixi run --frozen -e cpu python scripts/bench_wigner_closed.py \
+pixi run --frozen python scripts/bench_wigner_closed.py \
     --sweep --l-max 1500 3000 \
     --sweep-baseline "bench_sweep_baseline.${SLURM_JOB_ID:-local}.npz" "$@"
 

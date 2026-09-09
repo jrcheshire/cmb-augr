@@ -149,41 +149,20 @@ jaxht = ">=0.2.0"
 equinox = ">=0.11"
 cmb-augr = { path = ".", editable = true }
 
-# CPU environment for the GPU-less Grace-Grace Vista nodes (aarch64, ~144 cores/node).
-# Unlike `gpu`, this carries ducc0 + pysm3: conda-forge DOES ship linux-aarch64 builds for
-# them (verified -- ducc0 0.41.0 / pysm3 / healpy import on Grace via `pixi exec`), so PySM
-# FG generation runs inline and the needlet-cleaner SHTs go through the opaque ducc
-# custom_call (`--backend ducc`). The masked-Wiener stage stays jht regardless of backend
-# (masking.py calls jht.wiener / jht.bandpower directly), so compiling at nside>=64 relies
-# on jaxht>=0.2.0's looped azimuth-FFT mode (the driver sets it; --fft-mode) -- unrolled
-# per-ring kernels made the graph multi-GB (~42 min compile / 12 GB measured on Grace).
-# The aarch64-hard deps (camb, namaster, cmbroom, pywigxjpf) are not needed by the map-based
-# forecast / active-subspace driver, so they stay off. Point it at a study driver living
-# outside this repo with
-# `pixi run --manifest-path <cmb-augr>/pyproject.toml -e cpu python <driver.py> --backend ducc --workers N ...`.
-[tool.pixi.feature.cpu]
-platforms = ["linux-aarch64"]
-
-[tool.pixi.feature.cpu.dependencies]
-python = ">=3.12"
-numpy = ">=1.24"
-scipy = ">=1.10"
-matplotlib = ">=3.7"
-healpy = ">=1.16"
-ducc0 = "*"
-pysm3 = "*"
-
-[tool.pixi.feature.cpu.pypi-dependencies]
-jax = ">=0.4"
-jaxlib = ">=0.4"
-equinox = ">=0.11"
-jaxht = ">=0.2.0"
-cmb-augr = { path = ".", editable = true }
+# On linux-aarch64 (Vista Grace-Grace, ~144 cores/node) `default` is what runs:
+# conda-forge ships aarch64 builds of ducc0 / pysm3 / healpy, so PySM foreground
+# generation runs inline and the needlet-cleaner SHTs go through the opaque ducc
+# custom_call (`--backend ducc`). The masked-Wiener stage stays jht regardless of
+# backend (masking.py calls jht.wiener / jht.bandpower directly), so compiling at
+# nside>=64 relies on jaxht>=0.2.0's looped azimuth-FFT mode (the driver sets it;
+# --fft-mode) -- unrolled per-ring kernels made the graph multi-GB (~42 min compile
+# / 12 GB measured on Grace). Point it at a study driver living outside this repo
+# with `pixi run --manifest-path <cmb-augr>/pyproject.toml python <driver.py>
+# --backend ducc --workers N ...`.
 
 [tool.pixi.environments]
 default = { features = ["host"] }
 gpu = { features = ["gpu"], no-default-feature = true }
-cpu = { features = ["cpu"], no-default-feature = true }
 
 [tool.pixi.tasks]
 # JAX_NUM_CPU_DEVICES is pinned to 1 so an ambient export cannot silently
