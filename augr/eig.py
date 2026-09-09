@@ -495,6 +495,8 @@ def design_objective(
     n_outer: int = 256,
     delens: DelensCoupling | None = None,
     bias_w: float | None = None,
+    remat: bool = True,
+    sim_batch: int = 1,
 ):
     """Cost-constrained Bayesian-design objective to MINIMIZE.
 
@@ -604,6 +606,8 @@ def design_objective(
         cl_bb_res=cl_bb_res,
         cl_bb_res_ells=cl_bb_res_ells,
         fg_residual=bias_w is not None,
+        remat=remat,
+        sim_batch=sim_batch,
     )
     util = _utility(
         traced.covariance,
@@ -658,6 +662,8 @@ def physical_design_objective(
     galactic_loading: bool = True,
     delens: DelensCoupling | None = None,
     bias_w: float | None = None,
+    remat: bool = True,
+    sim_batch: int = 1,
 ):
     """Cost-constrained EIG objective from the physical horn-packing design knobs.
 
@@ -729,4 +735,6 @@ def physical_design_objective(
         n_outer=n_outer,
         delens=delens,
         bias_w=bias_w,
+        remat=remat,
+        sim_batch=sim_batch,
     )

@@ -17,6 +17,7 @@ import pytest
 pytest.importorskip("jht")
 pytest.importorskip("ducc0")
 
+import jax
 import jax.numpy as jnp
 
 from augr import masking as mk
@@ -479,3 +480,165 @@ def test_master_and_wiener_agree_on_sigma_r():
         "A ratio near 13 means MASTER is being fed the E+B cleaned map instead "
         "of the cleaned B alm."
     )
+
+
+# ---------------------------------------------------------------------------
+# Gradient checkpointing and batching on the per-sim scan (_sim_map)
+# ---------------------------------------------------------------------------
+#
+# Fast tier holds the trace-level checks -- a dead knob and a correct answer look
+# identical, and tracing is cheap. The executing value / gradient / memory gates
+# are slow, matching every other test that runs this scan.
+
+_SETUPS = {"master": _master_setup, "wiener": _traced_setup}
+
+
+def _top_level_scan_lengths(jaxpr) -> list[int]:
+    """Lengths of the scans at the top of the trace.
+
+    The per-sim map is one of these; the other is the MASTER coupling build over
+    ell. Nested scans (the vmapped body's own) are deliberately not collected --
+    they are what ``sim_batch`` puts *inside* a step, not the step count.
+    """
+    return [e.params["length"] for e in jaxpr.jaxpr.eqns if e.primitive.name == "scan"]
+
+
+def _sq_cov(w, ctx, cleaner, **kw):
+    """Scalar off the covariance, so there is something to differentiate."""
+    return jnp.sum(mc_cutsky_cov_traced(w, ctx, cleaner, **kw).covariance ** 2)
+
+
+def _grad_temp_bytes(ctx, cleaner, **kw) -> int:
+    """Compiled reverse-mode scratch. Deterministic, unlike sampled RSS.
+
+    ``temp_size_in_bytes``, not ``peak_memory_in_bytes`` -- the latter reads ~0 on
+    a tape of hundreds of MB (see ``TestRematMemory`` in ``test_delensing.py``).
+    """
+    g = jax.jit(jax.grad(lambda w: _sq_cov(w, ctx, cleaner, **kw)))
+    return g.lower(W_INV).compile().memory_analysis().temp_size_in_bytes
+
+
+def test_remat_and_sim_batch_are_live_in_the_trace() -> None:
+    """Both knobs checked on the trace, because values cannot distinguish them.
+
+    Values are bit-identical across ``remat`` and agree to 3e-14 across
+    ``sim_batch`` (both gated below), so agreement demonstrates nothing about
+    whether anything was actually checkpointed or batched. ``sim_batch`` gives
+    ``ceil(n_sims / sim_batch)`` sequential steps; 3 does not divide 6, so the
+    loop also covers the padding path.
+    """
+    ctx, cleaner = _master_setup(6)
+    on = str(jax.make_jaxpr(lambda w: _sq_cov(w, ctx, cleaner, remat=True))(W_INV))
+    off = str(jax.make_jaxpr(lambda w: _sq_cov(w, ctx, cleaner, remat=False))(W_INV))
+    assert "remat" in on or "checkpoint" in on
+    assert "remat" not in off and "checkpoint" not in off
+
+    for sim_batch, expected in ((1, 6), (2, 3), (3, 2), (4, 2)):
+        lengths = _top_level_scan_lengths(
+            jax.make_jaxpr(
+                lambda w, b=sim_batch: _sq_cov(w, ctx, cleaner, remat=True, sim_batch=b)
+            )(W_INV)
+        )
+        assert expected in lengths, (
+            f"sim_batch={sim_batch}: no top-level scan of length {expected} "
+            f"in {lengths}"
+        )
+
+
+def test_rejects_bad_knob_values() -> None:
+    """``sim_batch`` is a step count; ``remat`` is a trace-time decision.
+
+    A traced ``remat`` cannot express a choice made while tracing, so it is
+    refused rather than silently coerced to True.
+    """
+    ctx, cleaner = _master_setup(6)
+    for bad in (0, -1, 1.0, True, "4", None):
+        with pytest.raises(ValueError, match="sim_batch"):
+            mc_cutsky_cov_traced(W_INV, ctx, cleaner, sim_batch=bad)
+    with pytest.raises(ValueError, match="remat"):
+        mc_cutsky_cov_traced(W_INV, ctx, cleaner, remat=jnp.array(True))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("estimator", ["master", "wiener"])
+def test_remat_leaves_values_bit_identical(estimator) -> None:
+    """``jax.checkpoint`` rewrites the reverse-mode tape, not the forward jaxpr."""
+    ctx, cleaner = _SETUPS[estimator](6)
+    on = mc_cutsky_cov_traced(W_INV, ctx, cleaner, remat=True)
+    off = mc_cutsky_cov_traced(W_INV, ctx, cleaner, remat=False)
+    np.testing.assert_array_equal(np.asarray(on.covariance), np.asarray(off.covariance))
+    np.testing.assert_array_equal(
+        np.asarray(on.debiased_bandpowers), np.asarray(off.debiased_bandpowers)
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("estimator", ["master", "wiener"])
+def test_remat_gradient_agrees_to_a_few_ulp(estimator) -> None:
+    """Measured max relative difference 1.9e-16 (master) / 1.2e-15 (wiener).
+
+    Gated at 1e-13, i.e. ~100-500x margin. The residual is XLA re-fusing the
+    recomputed forward -- the same 1-2 ulp drift the delensing scans show.
+    """
+    ctx, cleaner = _SETUPS[estimator](6)
+    g_on = jax.grad(lambda w: _sq_cov(w, ctx, cleaner, remat=True))(W_INV)
+    g_off = jax.grad(lambda w: _sq_cov(w, ctx, cleaner, remat=False))(W_INV)
+    assert np.all(np.isfinite(np.asarray(g_on)))
+    np.testing.assert_allclose(np.asarray(g_on), np.asarray(g_off), rtol=1e-13, atol=0.0)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("estimator", ["master", "wiener"])
+def test_remat_makes_the_tape_flat_in_n_sims(estimator) -> None:
+    """The point of the change: the tape stops carrying a factor of ``n_sims``.
+
+    Gating flatness rather than a ratio, because the ratio is just whatever
+    ``n_sims`` happens to be -- at this fixture it is only 2.3-4.9x, while the
+    same structural change is worth orders of magnitude at the nside=1024
+    production shape. Flatness is the invariant; the ratio is a property of the
+    fixture.
+
+    Measured: remat 6.11 MB at both 6 and 12 sims (master) and 11.41 MB (wiener),
+    against a plain arm growing 14.31 -> 22.94 MB and 33.73 -> 55.34 MB.
+    """
+    setup = _SETUPS[estimator]
+    lo_ctx, lo_cleaner = setup(6)
+    hi_ctx, hi_cleaner = setup(12)
+
+    on_lo = _grad_temp_bytes(lo_ctx, lo_cleaner, remat=True)
+    on_hi = _grad_temp_bytes(hi_ctx, hi_cleaner, remat=True)
+    off_lo = _grad_temp_bytes(lo_ctx, lo_cleaner, remat=False)
+    off_hi = _grad_temp_bytes(hi_ctx, hi_cleaner, remat=False)
+
+    assert on_hi == pytest.approx(on_lo, rel=0.05), (
+        f"remat'd tape grew with n_sims: {on_lo} -> {on_hi} bytes. The per-sim "
+        "residuals are being retained after all."
+    )
+    # Anti-vacuity: if the control arm ever stops growing for an unrelated reason,
+    # the flatness assertion above becomes trivially true and must fail loudly.
+    assert off_hi > 1.3 * off_lo, (
+        f"control arm did not grow with n_sims ({off_lo} -> {off_hi} bytes), so "
+        "the flatness check above proves nothing."
+    )
+    assert on_hi < off_hi
+
+
+@pytest.mark.slow
+def test_sim_batch_agrees_with_the_unbatched_scan() -> None:
+    """Measured, not exact: vmapping reassociates the trailing reductions.
+
+    Max relative difference 3.3e-14 on values and 2.4e-15 on the gradient across
+    sim_batch 2/3/4. Gated at 1e-11, ~300x margin.
+    """
+    ctx, cleaner = _master_setup(6)
+    ref = mc_cutsky_cov_traced(W_INV, ctx, cleaner, remat=True).covariance
+    g_ref = jax.grad(lambda w: _sq_cov(w, ctx, cleaner, remat=True))(W_INV)
+    for b in (2, 3, 4):
+        got = mc_cutsky_cov_traced(
+            W_INV, ctx, cleaner, remat=True, sim_batch=b
+        ).covariance
+        g = jax.grad(
+            lambda w, bb=b: _sq_cov(w, ctx, cleaner, remat=True, sim_batch=bb)
+        )(W_INV)
+        np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=1e-11)
+        np.testing.assert_allclose(np.asarray(g), np.asarray(g_ref), rtol=1e-11)

@@ -109,6 +109,8 @@ def sigma_r_from_noise_design(
     opt_ctx: OptimizationContext,
     cleaner: Cleaner,
     f_sky: float | None = None,
+    remat: bool = True,
+    sim_batch: int = 1,
 ) -> jnp.ndarray:
     """Differentiable map-based sigma(r) from the noise design vector.
 
@@ -161,7 +163,9 @@ def sigma_r_from_noise_design(
 
     fsky_noise = mc_ctx.f_sky if f_sky is None else f_sky
     w_inv = w_inv_from_noise_design(n_det_b, net_b, eta_b, mission_years, fsky_noise)
-    cov = mc_cutsky_cov_traced(w_inv, mc_ctx, cleaner).covariance
+    cov = mc_cutsky_cov_traced(
+        w_inv, mc_ctx, cleaner, remat=remat, sim_batch=sim_batch
+    ).covariance
     return sigma_r_from_external_cov(cov, opt_ctx)
 
 
@@ -173,6 +177,8 @@ def sigma_r_from_beam_design(
     mc_ctx: CutskyMCContext,
     opt_ctx: OptimizationContext,
     cleaner: Cleaner,
+    remat: bool = True,
+    sim_batch: int = 1,
 ) -> jnp.ndarray:
     """Differentiable map-based sigma(r) from the per-band beam design (FWHM + shape ``p``).
 
@@ -218,6 +224,7 @@ def sigma_r_from_beam_design(
         ) from exc
 
     cov = mc_cutsky_cov_traced(
-        jnp.asarray(w_inv), mc_ctx, cleaner, beam_fwhm=beam_fwhm_b, beam_p=beam_p_b
+        jnp.asarray(w_inv), mc_ctx, cleaner, beam_fwhm=beam_fwhm_b, beam_p=beam_p_b,
+        remat=remat, sim_batch=sim_batch,
     ).covariance
     return sigma_r_from_external_cov(cov, opt_ctx)
