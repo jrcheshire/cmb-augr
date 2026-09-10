@@ -922,6 +922,31 @@ def _print_gap_histogram(h):
         print(f"    {us / 1e3:>9.1f} ms  {name[:78]}")
 
 
+def _phase_split(rows, split, n_lo, n_hi, c_steady):
+    """Per-sim slope and once-per-eval intercept, from two steady-state rungs.
+
+    The jitted forward is ``coupling build + n_sims * body + covariance/Fisher``
+    and only the middle term scales, so the slope is the per-sim body and the
+    intercept is everything else; ``c_steady`` splits that intercept.
+    """
+    print("\n=== phase split (n_sims regression on the steady-state forward) ===")
+    print(f"  {'':<11s} {'per-sim body':>14s} {'once-per-eval':>15s} {'of which coupling':>19s}")
+    for what in ("value", "value+grad"):
+        t_lo, t_hi = rows[(what, n_lo)][1], rows[(what, n_hi)][1]
+        per_sim = (t_hi - t_lo) / (n_hi - n_lo)
+        fixed = t_lo - per_sim * n_lo
+        split[what] = {"per_sim_s": per_sim, "fixed_s": fixed, "coupling_s": c_steady}
+        print(
+            f"  {what:<11s} {per_sim:>13.4f}s {fixed:>14.3f}s {c_steady:>18.3f}s"
+            f"   (residual = covariance/Fisher {fixed - c_steady:+.3f}s)"
+        )
+    print(
+        "  A negative residual means the two-point regression has resolved the "
+        "intercept no better than its own noise -- widen --profile-n-sims or "
+        "--repeat before reading it."
+    )
+
+
 def run_profile(args):
     """Phase-resolved wall time and peak memory for the map-based design gradient.
 
@@ -994,44 +1019,38 @@ def run_profile(args):
     # that n_sims, so it is kept alive rather than recompiled -- which at nside=128
     # is ~7 min of a job spent measuring nothing.
     traced_vg = None
-    for what in ("value", "value+grad"):
-        for n in (n_lo, n_hi):
-            value_fn, vg_fn = _make_objectives(pieces, n_total)
-            fn = value_fn if what == "value" else vg_fn
-            first, steady = _timed(fn, logits, ctxs[n], repeat=args.repeat)
-            rows[(what, n)] = (first, steady)
-            mark(f"{what} n_sims={n}")
-            print(
-                f"  {what:<11s} n_sims={n:>3d}   compile+first {first:8.2f} s"
-                f"   steady {steady:8.3f} s",
-                flush=True,
-            )
-            keep = args.trace_dir and what == "value+grad" and n == n_hi
-            if keep:
-                traced_vg = fn
-            del value_fn, vg_fn, fn
-            if not keep:
-                jax.clear_caches()
-
-    print("\n=== phase split (n_sims regression on the steady-state forward) ===")
-    print(f"  {'':<11s} {'per-sim body':>14s} {'once-per-eval':>15s} {'of which coupling':>19s}")
-    split = {}
-    for what in ("value", "value+grad"):
-        t_lo, t_hi = rows[(what, n_lo)][1], rows[(what, n_hi)][1]
-        per_sim = (t_hi - t_lo) / (n_hi - n_lo)
-        fixed = t_lo - per_sim * n_lo
-        split[what] = {"per_sim_s": per_sim, "fixed_s": fixed, "coupling_s": c_steady}
+    if args.trace_only:
+        if not args.trace_dir:
+            raise SystemExit("--trace-only needs --trace-dir; there is nothing else to do.")
+        print("  --trace-only: skipping the timing rungs.", flush=True)
+    plan = [("value+grad", n_hi)] if args.trace_only else [
+        (w, n) for w in ("value", "value+grad") for n in (n_lo, n_hi)
+    ]
+    for what, n in plan:
+        value_fn, vg_fn = _make_objectives(pieces, n_total)
+        fn = value_fn if what == "value" else vg_fn
+        first, steady = _timed(fn, logits, ctxs[n], repeat=args.repeat)
+        rows[(what, n)] = (first, steady)
+        mark(f"{what} n_sims={n}")
         print(
-            f"  {what:<11s} {per_sim:>13.4f}s {fixed:>14.3f}s {c_steady:>18.3f}s"
-            f"   (residual = covariance/Fisher {fixed - c_steady:+.3f}s)"
+            f"  {what:<11s} n_sims={n:>3d}   compile+first {first:8.2f} s"
+            f"   steady {steady:8.3f} s",
+            flush=True,
         )
-    print(
-        "  A negative residual means the two-point regression has resolved the "
-        "intercept no better than its own noise -- widen --profile-n-sims or "
-        "--repeat before reading it."
-    )
-    grad_tax = rows[("value+grad", n_hi)][1] / max(rows[("value", n_hi)][1], 1e-12)
-    print(f"  value+grad / value at n_sims={n_hi}: {grad_tax:.2f}x")
+        keep = args.trace_dir and what == "value+grad" and n == n_hi
+        if keep:
+            traced_vg = fn
+        del value_fn, vg_fn, fn
+        if not keep:
+            jax.clear_caches()
+
+    split, grad_tax = {}, float("nan")
+    if args.trace_only:
+        print("\n  (phase split skipped: --trace-only ran one rung.)")
+    else:
+        _phase_split(rows, split, n_lo, n_hi, c_steady)
+        grad_tax = rows[("value+grad", n_hi)][1] / max(rows[("value", n_hi)][1], 1e-12)
+        print(f"  value+grad / value at n_sims={n_hi}: {grad_tax:.2f}x")
 
     print("\n=== peak memory (monotone high-water mark; increments) ===")
     print(f"  {'phase':<24s} {'device GB':>10s} {'d(device)':>10s} {'rss GB':>8s} {'d(rss)':>8s}")
@@ -1190,6 +1209,13 @@ def main():
         default=None,
         help="profile: capture a JAX profiler trace here and report the kernel-gap "
         "histogram. Needs a device stream, so it is a GPU-backend diagnostic.",
+    )
+    p.add_argument(
+        "--trace-only",
+        action="store_true",
+        help="profile: skip the timing rungs and compile only value+grad at the high "
+        "rung, for a re-run that just wants the kernel-gap histogram. At nside=128 "
+        "that is one ~23 min compile instead of four.",
     )
     args = p.parse_args()
 
