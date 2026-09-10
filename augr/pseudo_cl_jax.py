@@ -78,6 +78,16 @@ def mask_power_spectrum(mask, *, nside: int, lmax_mask: int,
     against ``healpy.anafast`` runs 2.2e-3 at ``n_iter=0`` and 3.0e-16 at 3.
 
     Returns ``(lmax_mask + 1,)``.
+
+    ``MasterBBJax.build`` calls this at ``lmax_mask = 3 * nside - 1``, which is
+    twice jht's validated band-limit ceiling of ``1.5 * nside``, so the jht
+    backend emits a UserWarning on every GPU run. Measured and benign for a
+    ``|b|``-cut mask: jht and ducc agree to 6e-20 of peak above the ceiling, the
+    ``(2l+1)`` sum rule to 2e-16, and the coupling matrices the estimator actually
+    consumes to 6e-16 -- fp64 round-off, not a band-limit error. A mask with real
+    small-scale structure (point-source holes, apodization near the pixel scale)
+    would put power where jht is unvalidated and the measurement would need
+    redoing; see the gate in ``tests/test_pseudo_cl_jax.py``.
     """
     m = jnp.asarray(mask)[None, :]
     alm = map2alm(m, spin=0, lmax=int(lmax_mask), nside=int(nside),

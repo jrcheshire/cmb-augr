@@ -673,3 +673,56 @@ def test_coupling_remat_is_numerically_transparent():
         assert nz.any()
         rel = np.max(np.abs(g_on[nz] - g_off[nz]) / np.abs(g_off[nz]))
         assert rel < 1e-15, f"lmax={lmax}: gradient moved {rel:.3e}"
+
+
+def test_mask_power_spectrum_agrees_across_sht_backends_above_the_band_limit():
+    """jht warns above ``1.5 * nside``; for the mask it is benign, and measured so.
+
+    ``MasterBBJax.build`` takes ``W_l`` out to ``lmax_mask = 3 * nside - 1``, which
+    is twice jht's validated band-limit ceiling, so every GPU MASTER run raises a
+    UserWarning about accuracy it cannot vouch for. What propagates into the
+    estimator is not ``W_l`` per multipole but the coupling matrices, and those
+    come back backend-identical to fp64 round-off.
+
+    SCOPE: this is a |b|-cut binary galactic mask, whose power above the ceiling is
+    ~1e-20 of its peak. A mask carrying real small-scale structure -- point-source
+    holes, or apodization resolved near the pixel scale -- would put power where
+    jht is unvalidated, and this result would not transfer to it.
+    """
+    pytest.importorskip("ducc0")
+    pytest.importorskip("jht")
+    import jax.numpy as jnp
+
+    from augr import masking as mk
+    from augr import sht
+    from augr.pseudo_cl_jax import coupling_matrices, mask_power_spectrum
+
+    nside, lmax = 32, 48
+    lmax_mask = 3 * nside - 1
+    ceiling = int(1.5 * nside)
+    assert lmax_mask > ceiling, "fixture must actually exceed the band-limit ceiling"
+
+    mask = jnp.asarray(mk.galactic_mask(nside, 0.6))
+    w = {}
+    for backend in ("ducc", "jht"):
+        with sht.sht_backend(backend):
+            w[backend] = np.asarray(
+                mask_power_spectrum(mask, nside=nside, lmax_mask=lmax_mask)
+            )
+
+    peak = np.abs(w["ducc"]).max()
+    above = np.abs(w["jht"] - w["ducc"])[ceiling + 1 :].max() / peak
+    assert above < 1e-14, f"above-band W_l disagreement {above:.2e}"
+
+    # The (2l+1) sum rule is the weighted integral the coupling build consumes.
+    ell = np.arange(lmax_mask + 1)
+    sums = [float(np.sum((2 * ell + 1) * w[b])) for b in ("ducc", "jht")]
+    assert sums[0] == pytest.approx(sums[1], rel=1e-13)
+
+    # What actually reaches the estimator.
+    m_d = coupling_matrices(jnp.asarray(w["ducc"]), lmax=lmax)
+    m_j = coupling_matrices(jnp.asarray(w["jht"]), lmax=lmax)
+    for name, a, b in zip(("M+", "M-"), m_d, m_j, strict=True):
+        a, b = np.asarray(a), np.asarray(b)
+        rel = np.abs(a - b).max() / np.abs(a).max()
+        assert rel < 1e-13, f"{name} differs by {rel:.2e} between SHT backends"
