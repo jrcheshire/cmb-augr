@@ -1121,6 +1121,17 @@ def run_profile(args):
             + ("  (reused)" if t_warm < 3 * steady_ref else "  (RECOMPILED?)"),
             flush=True,
         )
+        # Reproduced twice on TACC Vista `gb` (GB200): the call below fails with
+        # CUDA_ERROR_LAUNCH_FAILED while the IDENTICAL call on the line above, same
+        # executable and same inputs, succeeds -- 986936 and 987876, naming a
+        # different fused kernel each time (loop_dynamic_slice_fusion_275,
+        # input_reduce_fusion_234). The only difference is that the profiler is
+        # active. In 987876 the executable was reused, not recompiled, and had
+        # already run four times at 105 s, so it is not a compile or a warm-up
+        # effect. JAX warns at startup on these nodes that cuBLAS < 13.2 frees TMEM
+        # buffers multiple times when a kernel runs concurrently with another --
+        # TMEM is Blackwell-only, which makes a Hopper (`gh`) node the natural
+        # control. Untested as of 2026-09-10.
         try:
             with jax.profiler.trace(args.trace_dir):
                 for _ in range(args.repeat):
