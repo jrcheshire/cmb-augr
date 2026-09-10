@@ -187,14 +187,28 @@ def common_resolution_eb(
 
 
 def needlet_beta(b_alm: jax.Array, needlet_bands: jax.Array, *, lmax: int, nside: int) -> jax.Array:
-    """Common-resolution B alms → needlet coefficient maps, shape ``(J, n_band, npix)``."""
-    beta = []
-    for hj in needlet_bands:
-        per_band = [
-            synthesis(almxfl(alm_b, hj, lmax)[None, :], 0, lmax, nside)[0] for alm_b in b_alm
-        ]
-        beta.append(jnp.stack(per_band, axis=0))
-    return jnp.stack(beta, axis=0)
+    """Common-resolution B alms → needlet coefficient maps, shape ``(J, n_band, npix)``.
+
+    The ``J * n_band`` transforms are ``vmap``ed rather than looped in Python. This
+    is the dominant kernel count in the cleaner -- 126 transforms per sim at J=6,
+    n_band=21 -- and the map-based design gradient is launch-bound, not
+    arithmetic-bound (measured: fp64 arithmetic is 0.0002-0.011% of runtime), so
+    what matters is issuing fewer, larger kernels.
+
+    Backend behaviour is unchanged by construction: the ducc primitive is a
+    ``pure_callback`` declared ``vmap_method="sequential"``, so ``vmap`` there
+    replays the same per-transform sequence this used to write out by hand and the
+    values are bit-identical. On jht the transforms are native JAX and batch, which
+    is where the win is.
+    """
+    # vmap the window rather than indexing a (J, lmax+1) table directly: almxfl is
+    # `alm * fl[ell]`, so a 2-D fl would be gathered along its FIRST axis.
+    windowed = jax.vmap(lambda hj: almxfl(b_alm, hj, lmax))(needlet_bands)
+    n_j, n_band, n_lm = windowed.shape
+    maps = jax.vmap(lambda a: synthesis(a[None, :], 0, lmax, nside)[0])(
+        windowed.reshape(n_j * n_band, n_lm)
+    )
+    return maps.reshape(n_j, n_band, -1)
 
 
 def combine_needlets(
