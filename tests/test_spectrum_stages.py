@@ -37,6 +37,7 @@ from augr.spectrum_stages import (
     make_cutsky_mc_context,
     mc_cutsky_bandpowers,
     mc_cutsky_cov_traced,
+    share_constant_fg,
 )
 
 FREQS = (90.0, 150.0, 220.0)
@@ -750,3 +751,89 @@ def test_sim_batch_agrees_with_the_unbatched_scan() -> None:
         )(W_INV)
         np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=1e-11)
         np.testing.assert_allclose(np.asarray(g), np.asarray(g_ref), rtol=1e-11)
+
+
+def _skies_with_constant_fg(n_sims, n_band, lmax, *, vary=False):
+    """A batched CMB-only sky given a synthetic per-band foreground.
+
+    Built by hand rather than through PySM so these stay in the fast tier: the
+    mechanism under test is the sharing, not the foreground model. ``vary=True``
+    gives an ensemble that genuinely differs per sim, standing in for a
+    stochastic preset (d10s6 / s6).
+    """
+    from augr.compsep_sims import HarmonicSky
+    from augr.sht import alm_size
+
+    n_alm = alm_size(lmax)
+    rng = np.random.default_rng(0)
+    one = (rng.normal(size=(n_band, 2, n_alm))
+           + 1j * rng.normal(size=(n_band, 2, n_alm)))
+    fg = np.broadcast_to(one, (n_sims, n_band, 2, n_alm)).copy()
+    if vary:
+        fg[1] += 1.0
+    cmb = (rng.normal(size=(n_sims, n_alm)) + 1j * rng.normal(size=(n_sims, n_alm)))
+    return HarmonicSky(
+        freqs_ghz=FREQS[:n_band], nside=16, lmax=lmax, r_in=0.0,
+        cmb_b_alm=jnp.asarray(cmb), fg_eb_alm=jnp.asarray(fg),
+        cmb_e_alm=jnp.asarray(cmb),
+    )
+
+
+def test_share_constant_fg_collapses_only_a_constant_ensemble():
+    """Rank marks the shared case; a varying ensemble is refused, not averaged.
+
+    The refusal is the anti-vacuity half: a check that accepted anything would
+    silently replace a stochastic foreground ensemble with its first realization.
+    """
+    keep = _skies_with_constant_fg(4, 3, 24)
+    shared = share_constant_fg(keep)
+    assert shared.fg_eb_alm.ndim == 3
+    assert np.array_equal(np.asarray(shared.fg_eb_alm),
+                          np.asarray(keep.fg_eb_alm)[0])
+    assert shared.fg_eb_alm.nbytes * 4 == keep.fg_eb_alm.nbytes
+
+    # Idempotent, and a no-op on a CMB-only sky.
+    assert share_constant_fg(shared) is shared
+    assert share_constant_fg(dataclasses.replace(keep, fg_eb_alm=None)).fg_eb_alm is None
+
+    with pytest.raises(ValueError, match="varies across sims"):
+        share_constant_fg(_skies_with_constant_fg(4, 3, 24, vary=True))
+
+
+def test_shared_fg_is_bit_identical_and_survives_the_scan_knobs():
+    """Sharing changes storage, not arithmetic -- so nothing may move at all.
+
+    Byte-identical rather than ``allclose``: the shared foreground is re-attached
+    inside the body, so every sim sees exactly the array it saw before. The
+    ``sim_batch`` leg is the real trap -- ``jax.vmap`` maps over every positional
+    argument by default, so a scan constant passed through the vmap rather than
+    bound before it would be mapped along the sim axis and silently mismatch.
+    """
+    n_sims, lmax = 6, 24  # > n_bins + 2, or the Hartlap guard fires first
+    per_sim = _skies_with_constant_fg(n_sims, 3, lmax)
+    shared = share_constant_fg(per_sim)
+    kw = _ctx_kwargs(n_sims, lmax=lmax, ell_max=lmax)
+    cleaner = nilc_cleaner(clean_e=True)
+    keys = jnp.stack([jax.random.PRNGKey(s) for s in range(n_sims)], axis=0)
+
+    def cov(skies, **extra):
+        ctx = make_cutsky_mc_context(
+            cleaner=cleaner, estimator="master", harmonic_skies=skies,
+            noise_keys=keys, **kw,
+        )
+        return np.asarray(
+            mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner, **extra).covariance
+        )
+
+    # Vary ONE thing: sharing, at each fixed setting of the other knobs. Comparing
+    # a shared sim_batch=2 run against an unshared sim_batch=1 run would fold in
+    # that knob's own documented reassociation (measured 2.7e-15 here, and
+    # identical with and without sharing -- so it is not ours).
+    for sim_batch in (1, 2, 3):
+        assert np.array_equal(
+            cov(per_sim, sim_batch=sim_batch), cov(shared, sim_batch=sim_batch)
+        ), f"sharing moved the covariance at sim_batch={sim_batch}"
+    for remat in (True, False):
+        assert np.array_equal(cov(per_sim, remat=remat), cov(shared, remat=remat)), (
+            f"sharing moved the covariance at remat={remat}"
+        )

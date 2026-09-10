@@ -45,6 +45,7 @@ beamed by ``B_c`` so the transfer absorbs ``B_c²`` on debias.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from dataclasses import dataclass
 
@@ -575,6 +576,7 @@ def make_cutsky_mc_context(
     estimator: str = "master",
     lmax_mask: int | None = None,
     split_lensing: bool = False,
+    share_fg: bool = False,
 ) -> CutskyMCContext:
     """Eager precompute for the differentiable cut-sky MC.
 
@@ -611,6 +613,13 @@ def make_cutsky_mc_context(
     the design's residual in-trace. Without it the Monte-Carlo covariance is stuck at
     ``A_lens = 1`` no matter what the design does. Costs one extra ``synalm`` per sim
     and one ``(lmax+1)`` array; at ``r_in = 0`` the realizations are unchanged.
+
+    ``share_fg`` (default False) collapses the foreground ensemble to the single
+    sky it already is for the deterministic PySM presets -- see
+    :func:`share_constant_fg`, which does the checking and states the sizes. It
+    raises rather than approximating if the ensemble genuinely varies, so it is
+    safe to pass without knowing the model. Off by default because it changes the
+    shape of a public field.
     """
     # The inverse-noise filter -- and hence var_pix_ref and the setup clean that
     # derives it -- exists only for the masked-Wiener estimator. MASTER never
@@ -653,6 +662,8 @@ def make_cutsky_mc_context(
         _hsky_tuple = tuple(_hsky(s) for s in seeds)
         harmonic_skies = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *_hsky_tuple)
         noise_keys = jnp.stack([jax.random.PRNGKey(int(s)) for s in seeds], axis=0)
+        if share_fg:
+            harmonic_skies = share_constant_fg(harmonic_skies)
     else:
         # Precomputed FG sky ensemble -- e.g. loaded from a sky cache (save_sky_cache /
         # load_sky_cache) on a pysm3-less env (the aarch64 GPU). No PySM is touched here.
@@ -918,12 +929,76 @@ def _lens_scale(ctx: CutskyMCContext, cl_bb_res, cl_bb_res_ells):
     return jnp.where(pos, jnp.sqrt(jnp.where(pos, ratio, 1.0)), 0.0)
 
 
-def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1):
-    """``lax.map`` over the sim axis, optionally checkpointed and batched.
+def share_constant_fg(hsky: HarmonicSky) -> HarmonicSky:
+    """Collapse a per-sim foreground ensemble to the single sky they all are.
+
+    PySM's fixed-template components (``d1``/``d10``/``s1``/``s5``, i.e. the
+    ``d1s1`` and ``d10s5`` presets) ignore ``fg_seed`` entirely, so every sim in a
+    batched :class:`HarmonicSky` carries a **bit-identical** ``fg_eb_alm`` --
+    verified on a production cache and by regenerating at two seeds. Storing
+    ``n_sims`` copies of it is the largest resident array in the cut-sky MC:
+    ``(n_sims, n_band, 2, n_alm)`` complex128 reaches 610 GB at nside=1024 and
+    4.9 TB at nside=2048, against 0.8 GB / 3.2 GB for the one sky.
+
+    Returns a sky whose ``fg_eb_alm`` has lost its leading sim axis (rank 3 rather
+    than 4). Rank is what marks it shared -- unambiguous, unlike a leading-axis
+    length that could coincide with ``n_band``.
+
+    Raises if the ensemble is **not** constant, which is the case for the
+    stochastic ``*Realization`` presets (``d10s6``, ``s6``). The check is exact
+    equality, not a tolerance: the deterministic case is bit-identical, so any
+    departure at all means the model draws per sim and sharing would be wrong.
+    """
+    fg = hsky.fg_eb_alm
+    if fg is None:
+        return hsky
+    fg = jnp.asarray(fg)
+    if fg.ndim == 3:
+        return hsky  # already shared
+    if fg.ndim != 4:
+        raise ValueError(
+            f"fg_eb_alm must be (n_sims, n_band, 2, n_alm) or (n_band, 2, n_alm); "
+            f"got shape {fg.shape}."
+        )
+    dev = float(jnp.max(jnp.abs(fg - fg[0:1])))
+    if dev != 0.0:
+        raise ValueError(
+            f"the foreground ensemble varies across sims (max|fg[i] - fg[0]| = "
+            f"{dev:g}), so it cannot be shared. That is expected for a stochastic "
+            f"PySM preset (a *Realization component, e.g. d10s6 / s6); those must "
+            f"keep the per-sim ensemble."
+        )
+    return dataclasses.replace(hsky, fg_eb_alm=fg[0])
+
+
+def _split_shared_fg(hsky: HarmonicSky) -> tuple[HarmonicSky, jax.Array | None]:
+    """Peel a shared (rank-3) ``fg_eb_alm`` off, so every remaining leaf is per-sim.
+
+    ``_sim_map`` requires every leaf of ``xs`` to carry the sim axis, so a shared
+    foreground cannot travel in the mapped pytree; it goes through ``consts``.
+    Returns ``(sky_without_fg, shared_fg_or_None)``; a per-sim (rank-4) ensemble is
+    returned untouched with ``None``.
+    """
+    fg = hsky.fg_eb_alm
+    if fg is None or jnp.asarray(fg).ndim == 4:
+        return hsky, None
+    return dataclasses.replace(hsky, fg_eb_alm=None), jnp.asarray(fg)
+
+
+def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1, consts: tuple = ()):
+    """``lax.map`` over ``body(sim, *consts)``, optionally checkpointed and batched.
 
     Sibling of :func:`augr.delensing_fullsky_jax._map`, for the per-sim compsep
     body rather than the per-L QE body. ``xs`` is a pytree (the batched
     ``HarmonicSky`` and the noise keys), every leaf carrying the sim axis first.
+
+    ``consts`` are passed to every step *unmapped* -- values that are the same for
+    every sim, e.g. a foreground shared across the ensemble. They are arguments
+    rather than closures for the reason the delensing sibling documents: a value
+    carrying a mesh sharding cannot be closed over inside a later ``shard_map``,
+    so a body that closes over one cannot be sharded later. Note ``jax.vmap`` maps
+    over *every* positional argument by default, so ``consts`` are bound into the
+    step before the vmap rather than passed through it.
 
     ``remat=True`` stores only the per-sim inputs and recomputes the body on the
     backward pass. Reverse mode otherwise retains *every* sim's residuals, and the
@@ -959,12 +1034,19 @@ def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1):
         raise ValueError("xs carries no arrays to map over.")
     n = leaves[0].shape[0]
 
+    # Bind consts here, so neither lax.map nor vmap ever sees them as a mapped
+    # argument (vmap's in_axes default would map them along axis 0).
+    def bound(v):
+        return body(v, *consts)
+
+    plain = body if not consts else bound
+
     if sim_batch == 1:
-        step = jax.checkpoint(body, prevent_cse=False) if remat else body
+        step = jax.checkpoint(plain, prevent_cse=False) if remat else plain
         return jax.lax.map(step, xs)
 
     # vmap FIRST, checkpoint SECOND: one batch is one recompute unit.
-    step = jax.vmap(body)
+    step = jax.vmap(plain)
     if remat:
         step = jax.checkpoint(step, prevent_cse=False)
 
@@ -1056,7 +1138,16 @@ def _mc_cutsky_cov_master(
         beam_bl=beam_bl(ells, common_fwhm),
     )
 
-    def _one(hsky, key):
+    # A shared (rank-3) foreground cannot ride in the mapped pytree -- every leaf
+    # there must carry the sim axis -- so it travels as a scan constant and is
+    # re-attached inside the body. Per-sim compute is therefore unchanged; what
+    # changes is that one sky is stored instead of n_sims copies of it.
+    mapped_skies, shared_fg_alm = _split_shared_fg(ctx.harmonic_skies)
+    fg_consts = () if shared_fg_alm is None else (shared_fg_alm,)
+
+    def _one(hsky, key, *shared_fg):
+        if shared_fg:
+            hsky = dataclasses.replace(hsky, fg_eb_alm=shared_fg[0])
         band_sky = beam_harmonic_sky(
             hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin, lens_scale=lens_scale
         )
@@ -1074,10 +1165,11 @@ def _mc_cutsky_cov_master(
         return full, master.bb_from_b_alm(result.project(band_sky.fg_qu))
 
     rec, rec_fg = _sim_map(
-        lambda bk: _one(bk[0], bk[1]),
-        (ctx.harmonic_skies, ctx.noise_keys),
+        lambda bk, *cs: _one(bk[0], bk[1], *cs),
+        (mapped_skies, ctx.noise_keys),
         remat=remat,
         sim_batch=sim_batch,
+        consts=fg_consts,
     )
     n_bins = rec.shape[1]
     return CutskyMCTraced(
@@ -1203,10 +1295,16 @@ def mc_cutsky_cov_traced(
         tol=ctx.tol,
     )
 
-    def _one(hsky, key):
+    # Same shared-foreground handling as the MASTER branch; see the comment there.
+    mapped_skies, shared_fg_alm = _split_shared_fg(ctx.harmonic_skies)
+    fg_consts = () if shared_fg_alm is None else (shared_fg_alm,)
+
+    def _one(hsky, key, *shared_fg):
         # Beam the (frozen, unbeamed) per-sim harmonic sky in-trace, so the beams flow
         # the gradient. The BandSky static beam field carries the concrete reference
         # (metadata only; assemble_band_maps reads only cmb_qu / fg_qu).
+        if shared_fg:
+            hsky = dataclasses.replace(hsky, fg_eb_alm=shared_fg[0])
         band_sky = beam_harmonic_sky(
             hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin, lens_scale=lens_scale
         )
@@ -1252,10 +1350,11 @@ def mc_cutsky_cov_traced(
     # while_loop runs it until every lane converges -- so `sim_batch > 1` makes each
     # batch cost its slowest member. Raise it only with a measurement.
     rec_full, rec_b, rec_e = _sim_map(
-        lambda bk: _one(bk[0], bk[1]),
-        (ctx.harmonic_skies, ctx.noise_keys),
+        lambda bk, *cs: _one(bk[0], bk[1], *cs),
+        (mapped_skies, ctx.noise_keys),
         remat=remat,
         sim_batch=sim_batch,
+        consts=fg_consts,
     )
 
     transfer = mk.transfer_function(rec_b, ctx.true_bb_binned)
