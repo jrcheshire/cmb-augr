@@ -988,6 +988,12 @@ def run_profile(args):
     print("\n=== phase: full forward, value and value+grad ===", flush=True)
     n_total = float(sum(N_DET))
     logits = jnp.zeros(len(FREQS))
+    # A fresh function object per variant, because jax.jit caches on the object and
+    # would otherwise re-run the first executable for every row. The exception is
+    # the last variant: the trace leg below needs exactly that function at exactly
+    # that n_sims, so it is kept alive rather than recompiled -- which at nside=128
+    # is ~7 min of a job spent measuring nothing.
+    traced_vg = None
     for what in ("value", "value+grad"):
         for n in (n_lo, n_hi):
             value_fn, vg_fn = _make_objectives(pieces, n_total)
@@ -1000,8 +1006,12 @@ def run_profile(args):
                 f"   steady {steady:8.3f} s",
                 flush=True,
             )
+            keep = args.trace_dir and what == "value+grad" and n == n_hi
+            if keep:
+                traced_vg = fn
             del value_fn, vg_fn, fn
-            jax.clear_caches()
+            if not keep:
+                jax.clear_caches()
 
     print("\n=== phase split (n_sims regression on the steady-state forward) ===")
     print(f"  {'':<11s} {'per-sim body':>14s} {'once-per-eval':>15s} {'of which coupling':>19s}")
@@ -1038,8 +1048,20 @@ def run_profile(args):
     hist = None
     if args.trace_dir:
         print("\n=== kernel-gap histogram (value+grad, steady state) ===", flush=True)
-        value_fn, vg_fn = _make_objectives(pieces, n_total)
-        jax.block_until_ready(vg_fn(logits, ctxs[n_hi]))  # compile outside the trace
+        vg_fn = traced_vg
+        # Timed, because "reused the executable" and "silently recompiled" differ
+        # only in this number: it must land near the steady state above, not near
+        # the compile.
+        t0 = time.perf_counter()
+        jax.block_until_ready(vg_fn(logits, ctxs[n_hi]))
+        t_warm = time.perf_counter() - t0
+        steady_ref = rows[("value+grad", n_hi)][1]
+        print(
+            f"  warm-up call    : {t_warm:.3f} s vs steady {steady_ref:.3f} s and "
+            f"compile {rows[('value+grad', n_hi)][0]:.1f} s"
+            + ("  (reused)" if t_warm < 3 * steady_ref else "  (RECOMPILED?)"),
+            flush=True,
+        )
         with jax.profiler.trace(args.trace_dir):
             for _ in range(args.repeat):
                 jax.block_until_ready(vg_fn(logits, ctxs[n_hi]))
@@ -1051,7 +1073,7 @@ def run_profile(args):
             print("  the launch-latency question is not even posed on this backend.")
         else:
             _print_gap_histogram(hist)
-        del value_fn, vg_fn
+        del vg_fn, traced_vg
         jax.clear_caches()
 
     payload = {
