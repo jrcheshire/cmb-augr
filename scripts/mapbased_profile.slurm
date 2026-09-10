@@ -11,9 +11,10 @@
 # needs a GPU node -- and, because that env has no pysm3, a CMB-only config or a
 # pre-built sky cache. The defaults below are CMB-only.
 #
-# The trace leg is the point of running this on a GPU at all: on CPU there is no
-# device stream to form a gap histogram from, since augr's ducc transforms are
-# pure_callbacks and never appear as device kernels.
+# The kernel-gap trace leg is OFF by default -- set MB_TRACE=1 to ask for it. It
+# overruns CUPTI on this workload (jobs 986936, 987876, 988346: "too many activity
+# events", then a launch failure, on both Blackwell and Hopper), and the profile
+# reports an arithmetic-intensity bound instead, which needs no profiler.
 #SBATCH -J mb_profile
 #SBATCH -N 1
 #SBATCH -n 1
@@ -49,7 +50,7 @@ pixi run --frozen -e gpu python scripts/mapbased_grad_characterization.py \
     --nside "${MB_NSIDE:-128}" --lmax "${MB_LMAX:-192}" \
     --profile-n-sims ${MB_NSIMS:-32 64} \
     --repeat "${MB_REPEAT:-3}" \
-    --trace-dir "mb_profile_trace.${SLURM_JOB_ID:-local}" \
+    ${MB_TRACE:+--trace-dir "mb_profile_trace.${SLURM_JOB_ID:-local}"} \
     --out-prefix "mb_profile.${SLURM_JOB_ID:-local}" "$@"
 
 echo
