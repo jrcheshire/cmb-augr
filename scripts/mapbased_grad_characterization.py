@@ -1045,6 +1045,46 @@ def run_profile(args):
     if marks[-1][1] is None:
         print("  (device counters absent: the CPU backend does not report them; rss is the gate.)")
 
+    # The timings and the memory table are complete at this point, and the trace
+    # leg below is the part that can fail: job 986936 lost 88 min of GB200 time to
+    # a CUDA launch failure there, with every number above already printed to a log
+    # and none of it written anywhere machine-readable. So the payload is written
+    # HERE, and rewritten with the histogram if the trace leg survives.
+    def _payload(hist):
+        return {
+            "config": {
+                "sht_backend": backend,
+                "jax_backend": jax.default_backend(),
+                "devices": [str(d) for d in jax.devices()],
+                "nside": args.nside,
+                "lmax": args.lmax,
+                "n_sims": [n_lo, n_hi],
+                "n_bins": n_bins,
+                "repeat": args.repeat,
+            },
+            "context_build_s": {"static": t_static, **{str(k): v for k, v in t_ctx.items()}},
+            "coupling_build_s": {"compile_first": c_first, "steady": c_steady},
+            "forward_s": {
+                f"{w}/{n}": {"compile_first": v[0], "steady": v[1]} for (w, n), v in rows.items()
+            },
+            "phase_split_s": split,
+            "grad_tax": grad_tax,
+            "peak_gb": [{"phase": lb, "device": dv, "rss": rs} for lb, dv, rs in marks],
+            "kernel_gap": None
+            if hist is None
+            else {k: v for k, v in hist.items() if k != "gaps"},
+        }
+
+    out = f"{args.out_prefix}_profile.json"
+
+    def _write(hist):
+        with open(out, "w") as fh:
+            json.dump(_payload(hist), fh, indent=2)
+        print(f"  wrote {out}", flush=True)
+
+    print()
+    _write(None)
+
     hist = None
     if args.trace_dir:
         print("\n=== kernel-gap histogram (value+grad, steady state) ===", flush=True)
@@ -1062,10 +1102,20 @@ def run_profile(args):
             + ("  (reused)" if t_warm < 3 * steady_ref else "  (RECOMPILED?)"),
             flush=True,
         )
-        with jax.profiler.trace(args.trace_dir):
-            for _ in range(args.repeat):
-                jax.block_until_ready(vg_fn(logits, ctxs[n_hi]))
-        hist = _kernel_gap_histogram(args.trace_dir)
+        try:
+            with jax.profiler.trace(args.trace_dir):
+                for _ in range(args.repeat):
+                    jax.block_until_ready(vg_fn(logits, ctxs[n_hi]))
+            hist = _kernel_gap_histogram(args.trace_dir)
+        except Exception as exc:  # report what was kept, then re-raise
+            print(f"  TRACE LEG FAILED: {type(exc).__name__}: {exc}", flush=True)
+            print(
+                f"  The timings and the memory table are already in {out} and are "
+                "unaffected -- only the kernel-gap histogram is missing. Re-run with "
+                "--trace-dir alone against a warm process, or drop it.",
+                flush=True,
+            )
+            raise
         if hist is None:
             print("  no device stream in the trace.")
             print("  On CPU this is the answer, not a failure: augr's ducc transforms are")
@@ -1075,33 +1125,7 @@ def run_profile(args):
             _print_gap_histogram(hist)
         del vg_fn, traced_vg
         jax.clear_caches()
-
-    payload = {
-        "config": {
-            "sht_backend": backend,
-            "jax_backend": jax.default_backend(),
-            "devices": [str(d) for d in jax.devices()],
-            "nside": args.nside,
-            "lmax": args.lmax,
-            "n_sims": [n_lo, n_hi],
-            "repeat": args.repeat,
-        },
-        "context_build_s": {"static": t_static, **{str(k): v for k, v in t_ctx.items()}},
-        "coupling_build_s": {"compile_first": c_first, "steady": c_steady},
-        "forward_s": {f"{w}/{n}": {"compile_first": v[0], "steady": v[1]} for (w, n), v in rows.items()},
-        "phase_split_s": split,
-        "grad_tax": grad_tax,
-        "peak_gb": [
-            {"phase": label, "device": dev, "rss": rss} for label, dev, rss in marks
-        ],
-        "kernel_gap": None
-        if hist is None
-        else {k: v for k, v in hist.items() if k not in ("gaps",)},
-    }
-    out = f"{args.out_prefix}_profile.json"
-    with open(out, "w") as fh:
-        json.dump(payload, fh, indent=2)
-    print(f"\n  wrote {out}", flush=True)
+        _write(hist)
 
 
 def main():
