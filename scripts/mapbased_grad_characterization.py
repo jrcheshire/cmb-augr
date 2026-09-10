@@ -1291,8 +1291,17 @@ def run_nside_ladder(args):
         if len(rows) == 2:
             print("  TWO POINTS: this exponent has no residual to check it against.")
         print(
-            "  n_sims tracks n_bins tracks lmax, so an EVALUATION scales as one power "
-            f"more than this: nside^{slope + 1:.3f}."
+            f"  An EVALUATION costs this times n_sims, and n_sims is set by Hartlap "
+            f"from n_bins -- so the evaluation exponent is nside^{slope + 1:.3f} ONLY "
+            "while the bin schedule keeps n_bins proportional to lmax."
+        )
+        print(
+            "  That proportionality is a hardcoded delta_ell, not a physical fact: "
+            "_static_pieces fixes delta_ell=8 to lmax (SignalModel's own default is "
+            "35, and it accepts explicit ell_bins). Coarsening high-ell scales the "
+            "COEFFICIENT down; only a schedule whose bin count saturates with lmax "
+            "-- log spacing above ell~300, or a cap -- removes the extra power. "
+            "Gate any such change on the design gradient, not just sigma(r)."
         )
     payload = {"config": {"sht_backend": sht.get_sht_backend(),
                           "jax_backend": jax.default_backend(),
