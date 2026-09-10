@@ -1106,7 +1106,10 @@ def run_profile(args):
 
     hist = None
     if args.trace_dir:
-        print("\n=== kernel-gap histogram (value+grad, steady state) ===", flush=True)
+        print(
+            f"\n=== kernel-gap histogram (value+grad, {args.trace_repeat} traced call(s)) ===",
+            flush=True,
+        )
         vg_fn = traced_vg
         # Timed, because "reused the executable" and "silently recompiled" differ
         # only in this number: it must land near the steady state above, not near
@@ -1130,11 +1133,15 @@ def run_profile(args):
         # already run four times at 105 s, so it is not a compile or a warm-up
         # effect. JAX warns at startup on these nodes that cuBLAS < 13.2 frees TMEM
         # buffers multiple times when a kernel runs concurrently with another --
-        # TMEM is Blackwell-only, which makes a Hopper (`gh`) node the natural
-        # control. Untested as of 2026-09-10.
+        # A jax-only reproducer -- matmul, lax.scan, and grad through that scan, five
+        # calls each inside the profiler -- runs CLEAN on gb (job 988366,
+        # scripts/profiler_smoke.py), so the profiler is not broken on these nodes
+        # and this is not a site bug to file. What differs here is volume: the trace
+        # leg was capturing three calls of ~105 s each. Hence --trace-repeat,
+        # default 1; the histogram wants one call's kernel sequence, not an average.
         try:
             with jax.profiler.trace(args.trace_dir):
-                for _ in range(args.repeat):
+                for _ in range(args.trace_repeat):
                     jax.block_until_ready(vg_fn(logits, ctxs[n_hi]))
             hist = _kernel_gap_histogram(args.trace_dir)
         except Exception as exc:  # report what was kept, then re-raise
@@ -1220,6 +1227,14 @@ def main():
         default=None,
         help="profile: capture a JAX profiler trace here and report the kernel-gap "
         "histogram. Needs a device stream, so it is a GPU-backend diagnostic.",
+    )
+    p.add_argument(
+        "--trace-repeat",
+        type=int,
+        default=1,
+        help="profile: calls to capture inside the profiler (default 1). The gap "
+        "histogram needs one call's kernel sequence, not an average, and tracing a "
+        "105 s call three times is what appears to overrun the device tracer.",
     )
     p.add_argument(
         "--trace-only",
