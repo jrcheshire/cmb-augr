@@ -38,6 +38,20 @@ run), ducc on CPU (where it is ~100x faster):
   fully-determined ``4·nside − 2`` is Vandermonde-ill-conditioned and was rejected
   upstream, so extending the band would take a better-conditioned weight solve.
 
+Sizing memory: do not do it on the ducc backend
+-----------------------------------------------
+``compiled.memory_analysis()`` reports only what XLA allocates. ducc's transforms
+run inside a ``pure_callback``, so their working memory is allocated in C++ where
+XLA cannot see it and does not appear in ``temp_size_in_bytes`` at all; jht's is
+native JAX and appears in full. Measured on the map-based design gradient (3
+bands, ``lmax = 1.5·nside``), jht's XLA-visible transient is **15x** the ducc
+figure at nside=16 and **26x** at nside=32 -- a gap that grows with resolution,
+because it is a whole cost term appearing rather than a constant factor.
+
+So a CPU/ducc memory analysis is blind to what will dominate a GPU run, and
+under-predicts it by more than an order of magnitude. Size GPU memory from a GPU
+measurement, or at least from a ducc-free lowering.
+
 ``s2fft`` (the other JAX-native candidate) has a structural spin-2 HEALPix
 *inverse* defect as of v1.4.0, so it is not used; jht is the JAX-native backend.
 
