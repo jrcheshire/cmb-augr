@@ -192,7 +192,10 @@ def test_master_forward_has_no_while_loop():
         return out
 
     pieces = gc._static_pieces(16, 24)
-    ctx = gc._mc_ctx(pieces, 0, 6)
+    # n_sims must clear this schedule's Hartlap floor. At lmax=24 every bin under
+    # (ell_per_bin_below=30, delta_ell=35) is per-ell, so there are 23 of them and
+    # the floor is 25 -- the toy config is FINER than production, not coarser.
+    ctx = gc._mc_ctx(pieces, 0, 28)
     assert ctx.estimator == "master"
     value_fn, _ = gc._make_objectives(pieces, float(sum(gc.N_DET)))
     counts = census(jax.make_jaxpr(value_fn)(jnp.zeros(len(gc.FREQS)), ctx).jaxpr)
