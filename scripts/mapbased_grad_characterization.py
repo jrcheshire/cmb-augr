@@ -1234,11 +1234,81 @@ def run_profile(args):
         _write(hist)
 
 
+def run_nside_ladder(args):
+    """Measure how the per-sim body scales with resolution, instead of assuming it.
+
+    Transform cost is often quoted as ``nside^3`` (an SHT at ``lmax proportional to
+    nside``), and the sim count Hartlap forces adds another power, so the projected
+    cost of a resolution is extremely sensitive to an exponent nobody has measured.
+    This fits it: at each nside, time value+grad at two sim counts placed just above
+    that resolution's own Hartlap floor, take the per-sim slope, and regress
+    ``log(per_sim)`` on ``log(nside)``.
+
+    Reports the fit and its residuals. Two points would give an exponent with no way
+    to know it is wrong, so this wants three or more."""
+    rows = []
+    for nside in args.nside_ladder:
+        lmax = round(args.lmax_factor * nside)
+        pieces = _static_pieces(nside, lmax)
+        n_bins = int(np.asarray(pieces["bm"]).shape[0])
+        n_lo = n_bins + 3  # just clears the Hartlap floor at THIS resolution
+        n_hi = 2 * n_lo
+        print(
+            f"\n########## nside={nside} lmax={lmax} bins={n_bins} "
+            f"sims={n_lo},{n_hi} ##########",
+            flush=True,
+        )
+        steady = {}
+        for n in (n_lo, n_hi):
+            ctx = jax.block_until_ready(_mc_ctx(pieces, 0, n))
+            _, vg_fn = _make_objectives(pieces, float(sum(N_DET)))
+            first, s = _timed(vg_fn, jnp.zeros(len(FREQS)), ctx, repeat=args.repeat)
+            steady[n] = s
+            print(
+                f"  value+grad n_sims={n:>4d}  compile+first {first:8.1f} s  steady {s:8.3f} s",
+                flush=True,
+            )
+            del ctx, vg_fn
+            jax.clear_caches()
+        per_sim = (steady[n_hi] - steady[n_lo]) / (n_hi - n_lo)
+        print(f"  per-sim body: {per_sim:.4f} s", flush=True)
+        rows.append({"nside": nside, "lmax": lmax, "n_bins": n_bins,
+                     "n_sims": [n_lo, n_hi], "steady_s": [steady[n_lo], steady[n_hi]],
+                     "per_sim_s": per_sim})
+
+    print("\n=== measured resolution scaling ===")
+    print(f"  {'nside':>6} {'bins':>5} {'per-sim':>10}")
+    for r in rows:
+        print(f"  {r['nside']:>6} {r['n_bins']:>5} {r['per_sim_s']:>9.4f}s")
+    fit = None
+    if len(rows) >= 2:
+        x = np.log(np.array([r["nside"] for r in rows], dtype=float))
+        y = np.log(np.array([r["per_sim_s"] for r in rows], dtype=float))
+        slope, intercept = np.polyfit(x, y, 1)
+        resid = y - (slope * x + intercept)
+        fit = {"exponent": float(slope), "log_residuals": resid.tolist()}
+        print(f"  per_sim ~ nside^{slope:.3f}   (max |log resid| {np.abs(resid).max():.3f})")
+        if len(rows) == 2:
+            print("  TWO POINTS: this exponent has no residual to check it against.")
+        print(
+            "  n_sims tracks n_bins tracks lmax, so an EVALUATION scales as one power "
+            f"more than this: nside^{slope + 1:.3f}."
+        )
+    payload = {"config": {"sht_backend": sht.get_sht_backend(),
+                          "jax_backend": jax.default_backend(),
+                          "lmax_factor": args.lmax_factor, "repeat": args.repeat},
+               "rungs": rows, "fit": fit}
+    out = f"{args.out_prefix}_nside_ladder.json"
+    with open(out, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"\n  wrote {out}", flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "--mode",
-        choices=["demo", "stability", "beam", "both", "ladder", "profile"],
+        choices=["demo", "stability", "beam", "both", "ladder", "profile", "nside-ladder"],
         default="demo",
     )
     p.add_argument("--n-sims", type=int, default=12)
@@ -1298,6 +1368,20 @@ def main():
         "histogram. Needs a device stream, so it is a GPU-backend diagnostic.",
     )
     p.add_argument(
+        "--nside-ladder",
+        type=int,
+        nargs="+",
+        default=[64, 128, 192],
+        help="nside-ladder: resolutions to measure the per-sim scaling exponent over.",
+    )
+    p.add_argument(
+        "--lmax-factor",
+        type=float,
+        default=1.5,
+        help="nside-ladder: lmax = factor * nside at every rung, so the exponent is "
+        "measured along the line the production configs actually sit on.",
+    )
+    p.add_argument(
         "--skip-arith",
         action="store_true",
         help="profile: skip the arithmetic-intensity bound. It costs one extra "
@@ -1327,6 +1411,11 @@ def main():
     if args.mode == "ladder":
         print("\n########## MODE: ladder ##########")
         run_ladder(args)
+        return
+
+    if args.mode == "nside-ladder":
+        print("\n########## MODE: nside-ladder ##########")
+        run_nside_ladder(args)
         return
 
     if args.mode == "profile":
