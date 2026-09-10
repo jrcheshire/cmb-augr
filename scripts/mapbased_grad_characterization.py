@@ -50,6 +50,23 @@ straight-through gradient usable for descent?" -- with two diagnostics:
       MC-stability (resultant R, per-component CoV) of the beam gradient direction
       across CRN ensembles, via optimize_mapbased.sigma_r_from_beam_design.
 
+  --mode profile:
+      Where a design gradient spends its time and its memory, as the input to
+      deciding which parts of the forward are worth restructuring. The forward is
+      one fused executable, so phases are separated by REGRESSION rather than by
+      wall clock: the jitted graph is ``coupling build + n_sims * body +
+      covariance/Fisher`` and only the middle term scales with n_sims, so two
+      rungs give the per-sim body as the slope and everything else as the
+      intercept; the MASTER coupling build is timed standalone to split that
+      intercept. Reports compile vs steady state separately, the value+grad tax,
+      and peak memory as increments of the (monotone) high-water mark. With
+      ``--trace-dir`` it also captures a JAX profiler trace and prints the
+      KERNEL-GAP HISTOGRAM -- device time is either inside a kernel or between
+      kernels, and the between-fraction is what distinguishes a launch-latency-
+      bound workload from an arithmetic-bound one. That question is only posed on
+      a GPU backend: augr's CPU transforms are ducc ``pure_callback``s and never
+      appear as device kernels.
+
 Tiny CMB-only config (nside=16, no PySM) so the diagnostic is cheap; the gradient
 mechanism is foreground-independent. The scientifically interesting FG-driven
 allocation needs fg_model="d1s1" at higher nside (heavier) -- deferred to a real
@@ -62,6 +79,9 @@ Usage:
     pixi run python scripts/mapbased_grad_characterization.py --mode beam --n-batches 3
     pixi run python scripts/mapbased_grad_characterization.py --mode ladder \
         --n-sims-ladder 12 24 48 96 --backend jht
+    pixi run python scripts/mapbased_grad_characterization.py --mode profile
+    pixi run -e gpu python scripts/mapbased_grad_characterization.py --mode profile \
+        --backend jht --nside 128 --lmax 192 --profile-n-sims 8 16 --trace-dir prof_trace
 
 The map-based sigma(r) objective is wrapped in ``eqx.filter_jit`` over
 ``(logits, mc_ctx)``, so it compiles ONCE and reuses the executable across all
@@ -79,7 +99,12 @@ GPU run (TACC Vista, ``gh`` partition, account JPL-PUB):
 from __future__ import annotations
 
 import argparse
+import glob
+import gzip
 import json
+import os
+import resource
+import sys
 import time
 
 import jax
@@ -708,10 +733,344 @@ def run_ladder(args):
     print(f"  wrote {args.out_prefix}.png")
 
 
+# --- mode: profile -----------------------------------------------------------
+#
+# Where does a design gradient spend its time and its memory? The forward is one
+# fused executable, so the phases cannot be read off a wall clock directly. Two
+# independent decompositions are reported so they can be checked against each
+# other:
+#
+#   * n_sims regression. The jitted forward is `coupling build + n_sims * body +
+#     covariance/Fisher`, and only the middle term scales with n_sims. Timing two
+#     rung sizes gives the per-sim body as the slope and everything else as the
+#     intercept; the MASTER coupling build is then timed standalone to split that
+#     intercept, leaving covariance/Fisher as the remainder.
+#   * kernel-gap histogram, from a JAX profiler trace. Device-stream time is
+#     either inside a kernel or between kernels, and a large between-fraction is
+#     the signature of a launch-latency-bound workload -- which is what the July
+#     H200 verdict asserted from a single unprofiled wall-clock comparison.
+#
+# Peak memory is a monotone high-water mark on both backends, so what is reported
+# per phase is the INCREMENT of that mark, never an independent per-phase peak.
+
+
+def _peak_device_gb():
+    """Peak device bytes if the backend reports them, else None (the CPU backend)."""
+    try:
+        stats = jax.local_devices()[0].memory_stats()
+    except Exception:
+        return None
+    if not stats:
+        return None
+    for k in ("peak_bytes_in_use", "peak_bytes", "bytes_in_use"):
+        if k in stats:
+            return stats[k] / 1e9
+    return None
+
+
+def _peak_rss_gb():
+    """Peak RSS of this process. ``ru_maxrss`` is bytes on macOS, kilobytes on Linux."""
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return rss / 1e9 if sys.platform == "darwin" else rss / 1e6
+
+
+def _timed(fn, *args, repeat: int):
+    """``(first-call seconds including compile, median steady-state seconds)``.
+
+    Handing in a FRESH function object is the caller's job: ``jax.jit`` caches on
+    the function object, so reusing one across variants silently re-runs the
+    first executable and every row comes back 1.0x (reference_jax_benchmark_traps).
+    """
+    t0 = time.perf_counter()
+    out = jax.block_until_ready(fn(*args))
+    first = time.perf_counter() - t0
+    ts = []
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        out = jax.block_until_ready(fn(*args))
+        ts.append(time.perf_counter() - t0)
+    del out
+    return first, float(np.median(ts))
+
+
+def _coupling_build_fn(mc_ctx):
+    """A fresh jitted MASTER coupling build for ``mc_ctx``'s mask, traced in the mask.
+
+    This is the same call ``_mc_cutsky_cov_master`` makes once per evaluation, so
+    timing it alone splits the n_sims-regression intercept. The mask is the traced
+    argument (it is the sky-coverage design coordinate), which also stops XLA from
+    constant-folding the whole build away.
+    """
+    from augr.instrument import beam_bl
+    from augr.pseudo_cl_jax import MasterBBJax
+
+    ells = jnp.arange(int(mc_ctx.lmax) + 1, dtype=float)
+    bl = beam_bl(ells, float(min(BEAMS)))
+
+    def build(mask):
+        m = MasterBBJax.build(
+            mask,
+            bin_edges=mc_ctx.master_bin_edges,
+            nside=mc_ctx.nside,
+            lmax=mc_ctx.lmax,
+            lmax_mask=mc_ctx.lmax_mask,
+            beam_bl=bl,
+        )
+        return m.window
+
+    return jax.jit(build)
+
+
+def _kernel_gap_histogram(trace_dir):
+    """Kernel durations and inter-kernel gaps from the newest trace under ``trace_dir``.
+
+    Returns None when the trace carries no device stream. On CPU that absence is
+    itself the answer: augr's CPU transforms are ducc ``pure_callback``s, so they
+    never appear as device kernels and a gap histogram cannot be formed.
+    """
+    paths = sorted(glob.glob(os.path.join(trace_dir, "**", "*.trace.json.gz"), recursive=True))
+    if not paths:
+        return None
+    with gzip.open(paths[-1], "rt") as fh:
+        events = json.load(fh).get("traceEvents", [])
+    pid_name, tid_name = {}, {}
+    for e in events:
+        if e.get("ph") != "M":
+            continue
+        if e.get("name") == "process_name":
+            pid_name[e.get("pid")] = e.get("args", {}).get("name", "")
+        elif e.get("name") == "thread_name":
+            tid_name[(e.get("pid"), e.get("tid"))] = e.get("args", {}).get("name", "")
+    # Kernels live on a device process, on the thread the profiler calls "XLA Ops".
+    # That thread name is not contractual, so fall back to every thread on a device
+    # process except the known non-kernel ones -- and REPORT which stream was used,
+    # because an empty histogram from a naming change and a genuinely gap-free run
+    # would otherwise look identical.
+    on_device = [
+        e for e in events if e.get("ph") == "X" and "/device:" in pid_name.get(e.get("pid"), "")
+    ]
+    if not on_device:
+        return None
+    not_kernels = {"XLA Modules", "Steps", "Launch Stats", "Source", "Framework Ops"}
+    ops = [e for e in on_device if tid_name.get((e.get("pid"), e.get("tid"))) == "XLA Ops"]
+    stream = "XLA Ops"
+    if not ops:
+        ops = [
+            e
+            for e in on_device
+            if tid_name.get((e.get("pid"), e.get("tid")), "") not in not_kernels
+        ]
+        streams = sorted({tid_name.get((e.get("pid"), e.get("tid")), "?") for e in ops})
+        stream = "fallback: " + ", ".join(streams)
+    if not ops:
+        return None
+    ops.sort(key=lambda e: e["ts"])
+    ts = np.array([float(e["ts"]) for e in ops])
+    dur = np.array([float(e.get("dur", 0.0)) for e in ops])
+    gaps = np.clip(ts[1:] - (ts[:-1] + dur[:-1]), 0.0, None)
+    span = float((ts[-1] + dur[-1]) - ts[0])
+    by_op = {}
+    for e, d in zip(ops, dur, strict=True):
+        by_op[e["name"]] = by_op.get(e["name"], 0.0) + float(d)
+    return {
+        "trace": paths[-1],
+        "stream": stream,
+        "n_kernels": len(ops),
+        "kernel_us": float(dur.sum()),
+        "gap_us": float(gaps.sum()),
+        "span_us": span,
+        "gap_fraction": float(gaps.sum() / span) if span > 0 else float("nan"),
+        "gap_median_us": float(np.median(gaps)) if gaps.size else 0.0,
+        "gap_p90_us": float(np.percentile(gaps, 90)) if gaps.size else 0.0,
+        "kernel_median_us": float(np.median(dur)),
+        "gaps": gaps,
+        "top_ops": sorted(by_op.items(), key=lambda kv: -kv[1])[:10],
+    }
+
+
+_GAP_BUCKETS = (1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
+
+
+def _print_gap_histogram(h):
+    print(f"  trace           : {h['trace']}")
+    print(f"  device stream   : {h['stream']}")
+    print(f"  kernels         : {h['n_kernels']}  (median {h['kernel_median_us']:.1f} us)")
+    print(f"  in kernel       : {h['kernel_us'] / 1e3:.1f} ms")
+    print(f"  between kernels : {h['gap_us'] / 1e3:.1f} ms")
+    print(
+        f"  GAP FRACTION    : {h['gap_fraction'] * 100:.1f}% of the {h['span_us'] / 1e3:.1f} ms span"
+        f"   (median gap {h['gap_median_us']:.1f} us, p90 {h['gap_p90_us']:.1f} us)"
+    )
+    gaps = h["gaps"]
+    print("  gap histogram (us):")
+    lo = 0.0
+    for hi in (*_GAP_BUCKETS, float("inf")):
+        n = int(np.sum((gaps >= lo) & (gaps < hi)))
+        frac = n / max(gaps.size, 1)
+        label = f"  {lo:>5.0f}-{hi:<5.0f}" if np.isfinite(hi) else f"  {lo:>5.0f}+     "
+        print(f"  {label} {n:>7d}  {'#' * round(40 * frac)}")
+        lo = hi
+    print("  top device ops by total time:")
+    for name, us in h["top_ops"]:
+        print(f"    {us / 1e3:>9.1f} ms  {name[:78]}")
+
+
+def run_profile(args):
+    """Phase-resolved wall time and peak memory for the map-based design gradient.
+
+    Reports, for value and for value+grad: context build, MASTER coupling build,
+    per-sim body (n_sims slope), and covariance/Fisher (the residual intercept);
+    plus a kernel-gap histogram when ``--trace-dir`` is given and the backend has
+    a device stream."""
+    n_lo, n_hi = args.profile_n_sims
+    if n_hi <= n_lo:
+        raise SystemExit(f"--profile-n-sims needs an increasing pair, got {n_lo} {n_hi}")
+    backend = sht.get_sht_backend()
+    print("=== configuration ===")
+    print(f"  sht backend     : {backend}")
+    print(f"  jax backend     : {jax.default_backend()}")
+    for d in jax.devices():
+        print(f"  device          : {d} kind={getattr(d, 'device_kind', '?')}")
+    print(f"  nside / lmax    : {args.nside} / {args.lmax}")
+    print(f"  n_sims rungs    : {n_lo}, {n_hi}   (repeat {args.repeat})")
+    print(f"  rss at entry    : {_peak_rss_gb():.2f} GB", flush=True)
+
+    rows = {}
+    marks = []
+
+    def mark(label):
+        marks.append((label, _peak_device_gb(), _peak_rss_gb()))
+
+    mark("entry")
+
+    print("\n=== phase: context build (outside the jit) ===", flush=True)
+    t0 = time.perf_counter()
+    pieces = _static_pieces(args.nside, args.lmax)
+    t_static = time.perf_counter() - t0
+    mark("static pieces")
+    ctxs = {}
+    t_ctx = {}
+    for n in (n_lo, n_hi):
+        t0 = time.perf_counter()
+        ctxs[n] = jax.block_until_ready(_mc_ctx(pieces, 0, n))
+        t_ctx[n] = time.perf_counter() - t0
+        mark(f"mc_ctx n_sims={n}")
+        print(f"  mc_ctx(n_sims={n:>3d})  {t_ctx[n]:8.2f} s", flush=True)
+    print(f"  static pieces     {t_static:8.2f} s")
+
+    print("\n=== phase: MASTER coupling build (once per evaluation, in-trace) ===", flush=True)
+    build = _coupling_build_fn(ctxs[n_lo])
+    mask = ctxs[n_lo].mask
+    c_first, c_steady = _timed(build, mask, repeat=args.repeat)
+    mark("coupling build")
+    print(f"  compile + first   {c_first:8.2f} s")
+    print(f"  steady state      {c_steady:8.3f} s")
+    del build
+    jax.clear_caches()
+
+    print("\n=== phase: full forward, value and value+grad ===", flush=True)
+    n_total = float(sum(N_DET))
+    logits = jnp.zeros(len(FREQS))
+    for what in ("value", "value+grad"):
+        for n in (n_lo, n_hi):
+            value_fn, vg_fn = _make_objectives(pieces, n_total)
+            fn = value_fn if what == "value" else vg_fn
+            first, steady = _timed(fn, logits, ctxs[n], repeat=args.repeat)
+            rows[(what, n)] = (first, steady)
+            mark(f"{what} n_sims={n}")
+            print(
+                f"  {what:<11s} n_sims={n:>3d}   compile+first {first:8.2f} s"
+                f"   steady {steady:8.3f} s",
+                flush=True,
+            )
+            del value_fn, vg_fn, fn
+            jax.clear_caches()
+
+    print("\n=== phase split (n_sims regression on the steady-state forward) ===")
+    print(f"  {'':<11s} {'per-sim body':>14s} {'once-per-eval':>15s} {'of which coupling':>19s}")
+    split = {}
+    for what in ("value", "value+grad"):
+        t_lo, t_hi = rows[(what, n_lo)][1], rows[(what, n_hi)][1]
+        per_sim = (t_hi - t_lo) / (n_hi - n_lo)
+        fixed = t_lo - per_sim * n_lo
+        split[what] = {"per_sim_s": per_sim, "fixed_s": fixed, "coupling_s": c_steady}
+        print(
+            f"  {what:<11s} {per_sim:>13.4f}s {fixed:>14.3f}s {c_steady:>18.3f}s"
+            f"   (residual = covariance/Fisher {fixed - c_steady:+.3f}s)"
+        )
+    print(
+        "  A negative residual means the two-point regression has resolved the "
+        "intercept no better than its own noise -- widen --profile-n-sims or "
+        "--repeat before reading it."
+    )
+    grad_tax = rows[("value+grad", n_hi)][1] / max(rows[("value", n_hi)][1], 1e-12)
+    print(f"  value+grad / value at n_sims={n_hi}: {grad_tax:.2f}x")
+
+    print("\n=== peak memory (monotone high-water mark; increments) ===")
+    print(f"  {'phase':<24s} {'device GB':>10s} {'d(device)':>10s} {'rss GB':>8s} {'d(rss)':>8s}")
+    prev_dev, prev_rss = None, None
+    for label, dev, rss in marks:
+        d_dev = "-" if (dev is None or prev_dev is None) else f"{dev - prev_dev:+.3f}"
+        d_rss = "-" if prev_rss is None else f"{rss - prev_rss:+.3f}"
+        dev_s = "-" if dev is None else f"{dev:.3f}"
+        print(f"  {label:<24s} {dev_s:>10s} {d_dev:>10s} {rss:>8.2f} {d_rss:>8s}")
+        prev_dev, prev_rss = dev, rss
+    if marks[-1][1] is None:
+        print("  (device counters absent: the CPU backend does not report them; rss is the gate.)")
+
+    hist = None
+    if args.trace_dir:
+        print("\n=== kernel-gap histogram (value+grad, steady state) ===", flush=True)
+        value_fn, vg_fn = _make_objectives(pieces, n_total)
+        jax.block_until_ready(vg_fn(logits, ctxs[n_hi]))  # compile outside the trace
+        with jax.profiler.trace(args.trace_dir):
+            for _ in range(args.repeat):
+                jax.block_until_ready(vg_fn(logits, ctxs[n_hi]))
+        hist = _kernel_gap_histogram(args.trace_dir)
+        if hist is None:
+            print("  no device stream in the trace.")
+            print("  On CPU this is the answer, not a failure: augr's ducc transforms are")
+            print("  pure_callbacks into C++, so they are invisible as device kernels and")
+            print("  the launch-latency question is not even posed on this backend.")
+        else:
+            _print_gap_histogram(hist)
+        del value_fn, vg_fn
+        jax.clear_caches()
+
+    payload = {
+        "config": {
+            "sht_backend": backend,
+            "jax_backend": jax.default_backend(),
+            "devices": [str(d) for d in jax.devices()],
+            "nside": args.nside,
+            "lmax": args.lmax,
+            "n_sims": [n_lo, n_hi],
+            "repeat": args.repeat,
+        },
+        "context_build_s": {"static": t_static, **{str(k): v for k, v in t_ctx.items()}},
+        "coupling_build_s": {"compile_first": c_first, "steady": c_steady},
+        "forward_s": {f"{w}/{n}": {"compile_first": v[0], "steady": v[1]} for (w, n), v in rows.items()},
+        "phase_split_s": split,
+        "grad_tax": grad_tax,
+        "peak_gb": [
+            {"phase": label, "device": dev, "rss": rss} for label, dev, rss in marks
+        ],
+        "kernel_gap": None
+        if hist is None
+        else {k: v for k, v in hist.items() if k not in ("gaps",)},
+    }
+    out = f"{args.out_prefix}_profile.json"
+    with open(out, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"\n  wrote {out}", flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--mode", choices=["demo", "stability", "beam", "both", "ladder"], default="demo"
+        "--mode",
+        choices=["demo", "stability", "beam", "both", "ladder", "profile"],
+        default="demo",
     )
     p.add_argument("--n-sims", type=int, default=12)
     p.add_argument(
@@ -752,6 +1111,23 @@ def main():
     p.add_argument(
         "--out-prefix", default="grad_char_ladder", help="ladder/demo: JSON/PNG output path prefix"
     )
+    p.add_argument(
+        "--profile-n-sims",
+        type=int,
+        nargs=2,
+        default=[6, 12],
+        metavar=("LO", "HI"),
+        help="profile: the two n_sims rungs the per-sim/fixed split is regressed on.",
+    )
+    p.add_argument(
+        "--repeat", type=int, default=3, help="profile: steady-state repeats per timing (median)."
+    )
+    p.add_argument(
+        "--trace-dir",
+        default=None,
+        help="profile: capture a JAX profiler trace here and report the kernel-gap "
+        "histogram. Needs a device stream, so it is a GPU-backend diagnostic.",
+    )
     args = p.parse_args()
 
     sht.set_sht_backend(args.backend)
@@ -760,6 +1136,11 @@ def main():
     if args.mode == "ladder":
         print("\n########## MODE: ladder ##########")
         run_ladder(args)
+        return
+
+    if args.mode == "profile":
+        print("\n########## MODE: profile ##########")
+        run_profile(args)
         return
 
     # Freeze var_pix_ref once so the only thing varying across ensembles is the CRN
