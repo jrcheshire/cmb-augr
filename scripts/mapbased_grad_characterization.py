@@ -110,7 +110,6 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from scipy.optimize import minimize
 
 from augr import masking as mk
@@ -434,7 +433,15 @@ def _descent_adam(args, pieces, n_sims, var_pix_ref, value_fn, vg_fn, val_ctx):
     the optimizer never fits a single realization's empirical-ILC-bias noise. The
     frozen ``var_pix_ref`` keeps the Wiener filter fixed, so re-draws reuse the one
     compiled forward trace. Returns (history, logits_final, logits_best_on_val,
-    build_s, per_eval_s); ``history`` is (step, sigma_train, sigma_val)."""
+    build_s, per_eval_s); ``history`` is (step, sigma_train, sigma_val).
+
+    ``optax`` is imported here rather than at module scope for the reason
+    ``design_opt.stochastic_design_descent`` gives: only the Adam descent needs
+    it, and the slim aarch64 ``gpu`` env does not ship it. A module-level import
+    made every mode of this script -- including the GPU-only ones -- unimportable
+    there."""
+    import optax
+
     n_band = len(N_DET)
     n_resamples = (args.steps - 1) // args.resample_every
     assert _train_base(n_resamples, n_sims) + n_sims < VAL_BASE, (

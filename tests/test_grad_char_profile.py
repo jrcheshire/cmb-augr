@@ -15,6 +15,7 @@ from __future__ import annotations
 import gzip
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -124,3 +125,37 @@ def test_gap_histogram_falls_back_when_the_thread_is_renamed(gc_mod, tmp_path):
 def test_gap_histogram_is_absent_without_a_trace(gc_mod, tmp_path):
     """No trace file at all is None, not a crash."""
     assert gc_mod._kernel_gap_histogram(str(tmp_path)) is None
+
+
+def test_script_imports_without_optax():
+    """The script must import in the slim aarch64 ``gpu`` env, which has no optax.
+
+    ``design_opt.stochastic_design_descent`` already imports optax lazily for this
+    reason; a module-level import in the driver undid it, and made every mode --
+    including the GPU-only ones -- unimportable on the cluster. That failure costs
+    a queue wait to discover, so it is pinned here instead.
+    """
+
+    class _NoOptax:
+        def find_spec(self, name, path=None, target=None):
+            if name == "optax" or name.startswith("optax."):
+                raise ImportError("No module named 'optax' (simulated slim gpu env)")
+            return None
+
+    blocker = _NoOptax()
+    saved = sys.modules.pop("optax", None)
+    sys.meta_path.insert(0, blocker)
+    try:
+        spec = importlib.util.spec_from_file_location("_gc_no_optax", _SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert callable(mod.run_profile)
+        # Anti-vacuity: the Adam path still needs optax, so it must raise rather
+        # than silently degrade -- otherwise this test would pass on a script that
+        # had quietly dropped the optimizer.
+        with pytest.raises(ImportError, match="optax"):
+            mod._descent_adam(None, None, None, None, None, None, None)
+    finally:
+        sys.meta_path.remove(blocker)
+        if saved is not None:
+            sys.modules["optax"] = saved
