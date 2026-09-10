@@ -183,7 +183,14 @@ def common_resolution_eb(
 # ---------------------------------------------------------------------------
 
 
-def needlet_beta(b_alm: jax.Array, needlet_bands: jax.Array, *, lmax: int, nside: int) -> jax.Array:
+def needlet_beta(
+    b_alm: jax.Array,
+    needlet_bands: jax.Array,
+    *,
+    lmax: int,
+    nside: int,
+    batch: int | None = None,
+) -> jax.Array:
     """Common-resolution B alms → needlet coefficient maps, shape ``(J, n_band, npix)``.
 
     The ``J * n_band`` transforms are ``vmap``ed rather than looped in Python. This
@@ -197,14 +204,36 @@ def needlet_beta(b_alm: jax.Array, needlet_bands: jax.Array, *, lmax: int, nside
     replays the same per-transform sequence this used to write out by hand and the
     values are bit-identical. On jht the transforms are native JAX and batch, which
     is where the win is.
+
+    ``batch`` chunks the transforms through ``lax.map`` instead of issuing all
+    ``J * n_band`` at once. It buys a flat **1.36x** on the cleaner's working set
+    and **nothing further with width**: measured at nside=64, n_band=21, the
+    transient is 384 MB unchunked and 282 / 282 / 288 / 284 MB at widths 42 / 21 /
+    8 / 4. Chunking at all is the whole saving; how finely is irrelevant. So set it
+    if you want that 1.36x, and leave the width at something coarse.
+
+    What it does NOT do is make high resolution affordable, contrary to what a
+    per-transform-buffer picture would suggest. The transient scales as ``npix``
+    regardless of chunking -- 96.6 MB at nside=32 and 384.1 MB at nside=64, an
+    exact 4x -- and sub-linearly in ``n_band`` (84.8 -> 384.1 MB from 3 to 21
+    bands). XLA is evidently already sharing buffers across the batch. Extrapolated
+    on that npix scaling, nside=2048 needs ~390 GB whether chunked or not, so the
+    lever there is precision or resolution, not batch width.
+
+    (PR #67's batched-SHT curve, where B=32 OOMs at nside=2048, measured standalone
+    ``jht.synthesis`` calls on independent full maps -- a different allocation
+    pattern from vmapped transforms inside one fused graph. It does not transfer.)
     """
     # vmap the window rather than indexing a (J, lmax+1) table directly: almxfl is
     # `alm * fl[ell]`, so a 2-D fl would be gathered along its FIRST axis.
     windowed = jax.vmap(lambda hj: almxfl(b_alm, hj, lmax))(needlet_bands)
     n_j, n_band, n_lm = windowed.shape
-    maps = jax.vmap(lambda a: synthesis(a[None, :], 0, lmax, nside)[0])(
-        windowed.reshape(n_j * n_band, n_lm)
-    )
+    flat = windowed.reshape(n_j * n_band, n_lm)
+
+    def _one(a):
+        return synthesis(a[None, :], 0, lmax, nside)[0]
+
+    maps = jax.vmap(_one)(flat) if batch is None else jax.lax.map(_one, flat, batch_size=batch)
     return maps.reshape(n_j, n_band, -1)
 
 
@@ -488,6 +517,7 @@ class NILCResult:
     cleaned_e_alm: jax.Array | None = None
     weights_e: jax.Array | None = None
     beam_shape_p: jax.Array | None = None
+    needlet_batch: int | None = None
 
     def project(self, passive_band_qu: jax.Array) -> jax.Array:
         """Apply the stored weights to another map set → its cleaned B alm.
@@ -504,7 +534,9 @@ class NILCResult:
             common_fwhm_arcmin=self.common_fwhm_arcmin,
             beam_shape_p=self.beam_shape_p,
         )
-        beta = needlet_beta(b_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside)
+        beta = needlet_beta(
+            b_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside, batch=self.needlet_batch
+        )
         return combine_needlets(
             self.weights,
             beta,
@@ -535,7 +567,9 @@ class NILCResult:
             common_fwhm_arcmin=self.common_fwhm_arcmin,
             beam_shape_p=self.beam_shape_p,
         )
-        beta = needlet_beta(e_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside)
+        beta = needlet_beta(
+            e_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside, batch=self.needlet_batch
+        )
         return combine_needlets(
             self.weights_e,
             beta,
@@ -582,6 +616,7 @@ def nilc_clean(
     ridge: float = 1e-10,
     beam_band_limit: float = 0.1,
     clean_e: bool = False,
+    needlet_batch: int | None = None,
 ) -> NILCResult:
     """Run the differentiable empirical needlet ILC on per-band Q/U maps.
 
@@ -678,14 +713,16 @@ def nilc_clean(
             active=active,
         )
 
-    beta = needlet_beta(b_alm, needlet_bands, lmax=lmax, nside=nside)
+    beta = needlet_beta(b_alm, needlet_bands, lmax=lmax, nside=nside, batch=needlet_batch)
     weights = _weights(beta)
     cleaned = combine_needlets(weights, beta, needlet_bands, lmax=lmax, nside=nside, n_iter=n_iter)
 
     cleaned_e = None
     weights_e = None
     if clean_e:
-        beta_e = needlet_beta(e_alm, needlet_bands, lmax=lmax, nside=nside)
+        beta_e = needlet_beta(
+            e_alm, needlet_bands, lmax=lmax, nside=nside, batch=needlet_batch
+        )
         weights_e = _weights(beta_e)
         cleaned_e = combine_needlets(
             weights_e, beta_e, needlet_bands, lmax=lmax, nside=nside, n_iter=n_iter
@@ -703,4 +740,5 @@ def nilc_clean(
         cleaned_e_alm=cleaned_e,
         weights_e=weights_e,
         beam_shape_p=ps,
+        needlet_batch=needlet_batch,
     )

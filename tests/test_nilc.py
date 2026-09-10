@@ -653,3 +653,24 @@ def test_cleaner_graph_is_flat_in_band_count():
     # 5.2x more bands must not cost 5.2x more graph. Bound set from the measured
     # 3% drift, with room for a stage that legitimately adds a little per band.
     assert many < 1.25 * few, f"graph grew with band count: {few} -> {many}"
+
+
+@pytest.mark.parametrize("batch", [1, 4, 9])
+def test_needlet_batch_is_exact_on_ducc(batch):
+    """Chunking the transform batch must not move a bit on the CPU backend.
+
+    ``batch`` exists to trade a little working memory back; it must not be a
+    numerical knob. On ducc the primitive is a sequential ``pure_callback`` either
+    way, so full-width and chunked have to agree exactly. (On jht they differ at
+    the fp64 reassociation level, ~2e-15, which is the batching signature and not
+    checked here.)
+    """
+    pytest.importorskip("ducc0")
+    from augr import sht
+
+    lmax, nside = 24, 16
+    b_alm, bands = _beta_fixture(n_band=6, n_j=6, lmax=lmax)
+    with sht.sht_backend("ducc"):
+        full = needlet_beta(b_alm, bands, lmax=lmax, nside=nside)
+        chunked = needlet_beta(b_alm, bands, lmax=lmax, nside=nside, batch=batch)
+    assert np.array_equal(np.asarray(full), np.asarray(chunked))

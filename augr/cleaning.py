@@ -122,6 +122,7 @@ def nilc_cleaner(
     ridge: float = 1e-10,
     beam_band_limit: float = 0.1,
     clean_e: bool = False,
+    needlet_batch: int | None = None,
 ) -> Cleaner:
     """A blind-NILC :class:`Cleaner`; kwargs are forwarded to :func:`augr.nilc.nilc_clean`.
 
@@ -137,6 +138,7 @@ def nilc_cleaner(
     return functools.partial(
         nilc_clean,
         needlet_peaks=needlet_peaks,
+        needlet_batch=needlet_batch,
         localization_fwhm_arcmin=localization_fwhm_arcmin,
         common_fwhm_arcmin=common_fwhm_arcmin,
         n_iter=n_iter,
