@@ -947,6 +947,45 @@ def _phase_split(rows, split, n_lo, n_hi, c_steady):
     )
 
 
+def _peak_fp64_flops(n: int = 4096, repeat: int = 3) -> float:
+    """Realized fp64 matmul rate on this device [FLOP/s] -- measured, not a vendor figure."""
+    a = jax.random.normal(jax.random.PRNGKey(0), (n, n), dtype=jnp.float64)
+    mm = jax.jit(lambda x: x @ x)
+    jax.block_until_ready(mm(a))
+    t0 = time.perf_counter()
+    for _ in range(repeat):
+        jax.block_until_ready(mm(a))
+    return 2 * n**3 / ((time.perf_counter() - t0) / repeat)
+
+
+def _arithmetic_bound(fn, logits, ctx, n_sims, steady_s, rate):
+    """Bracket the share of runtime that is fp64 arithmetic, without a profiler.
+
+    ``cost_analysis`` counts a loop body ONCE regardless of trip count, so the
+    per-sim scan contributes a single pass to the static figure. That turns into a
+    bracket rather than a defect: true dynamic flops lie between the static count
+    (body runs once) and ``n_sims`` times it (body runs every sim). When both ends
+    of the bracket are negligible against the measured time, the workload is not
+    arithmetic-bound and no profiler is needed to say so.
+
+    Costs one extra compile: the cost analysis needs a ``Compiled``, and re-lowering
+    does not hit the in-process cache (measured).
+    """
+    compiled = jax.jit(fn).lower(logits, ctx).compile()
+    ca = compiled.cost_analysis()
+    ca = ca[0] if isinstance(ca, list | tuple) else ca
+    static = float(ca.get("flops", float("nan")))
+    lo, hi = static / rate, static * n_sims / rate
+    return {
+        "static_flops": static,
+        "peak_fp64_flops_per_s": rate,
+        "arith_s_low": lo,
+        "arith_s_high": hi,
+        "arith_frac_low": lo / steady_s,
+        "arith_frac_high": hi / steady_s,
+    }
+
+
 def run_profile(args):
     """Phase-resolved wall time and peak memory for the map-based design gradient.
 
@@ -1037,7 +1076,7 @@ def run_profile(args):
             f"   steady {steady:8.3f} s",
             flush=True,
         )
-        keep = args.trace_dir and what == "value+grad" and n == n_hi
+        keep = (args.trace_dir or not args.skip_arith) and what == "value+grad" and n == n_hi
         if keep:
             traced_vg = fn
         del value_fn, vg_fn, fn
@@ -1064,6 +1103,35 @@ def run_profile(args):
     if marks[-1][1] is None:
         print("  (device counters absent: the CPU backend does not report them; rss is the gate.)")
 
+    arith = None
+    if not args.skip_arith and traced_vg is not None:
+        print("\n=== arithmetic intensity (no profiler; one extra compile) ===", flush=True)
+        rate = _peak_fp64_flops()
+        print(f"  measured fp64   : {rate / 1e12:.2f} TFLOP/s", flush=True)
+        steady_ref = rows[("value+grad", n_hi)][1]
+        arith = _arithmetic_bound(traced_vg, logits, ctxs[n_hi], n_hi, steady_ref, rate)
+        print(f"  static flops    : {arith['static_flops']:.4g}  (scan body counted once)")
+        if backend == "ducc":
+            print(
+                "  NOTE: on the ducc backend the transforms are pure_callbacks into C++, "
+                "so their flops never reach cost_analysis and this share is a LOWER "
+                "bound on a number that is already small. Read it on jht."
+            )
+        print(
+            f"  arithmetic      : {arith['arith_s_low'] * 1e3:.3f} ms to "
+            f"{arith['arith_s_high'] * 1e3:.3f} ms of the {steady_ref:.2f} s measured"
+        )
+        print(
+            f"  ARITHMETIC SHARE: {arith['arith_frac_low'] * 100:.5f}% to "
+            f"{arith['arith_frac_high'] * 100:.5f}%"
+            + (
+                "   -> NOT arithmetic-bound: the cost is kernel launches and memory"
+                if arith["arith_frac_high"] < 0.05
+                else "   -> arithmetic is a real share; read the bracket"
+            ),
+            flush=True,
+        )
+
     # The timings and the memory table are complete at this point, and the trace
     # leg below is the part that can fail: job 986936 lost 88 min of GB200 time to
     # a CUDA launch failure there, with every number above already printed to a log
@@ -1089,6 +1157,7 @@ def run_profile(args):
             "phase_split_s": split,
             "grad_tax": grad_tax,
             "peak_gb": [{"phase": lb, "device": dv, "rss": rs} for lb, dv, rs in marks],
+            "arithmetic": arith,
             "kernel_gap": None
             if hist is None
             else {k: v for k, v in hist.items() if k != "gaps"},
@@ -1160,7 +1229,7 @@ def run_profile(args):
             print("  the launch-latency question is not even posed on this backend.")
         else:
             _print_gap_histogram(hist)
-        del vg_fn, traced_vg
+        del vg_fn
         jax.clear_caches()
         _write(hist)
 
@@ -1227,6 +1296,13 @@ def main():
         default=None,
         help="profile: capture a JAX profiler trace here and report the kernel-gap "
         "histogram. Needs a device stream, so it is a GPU-backend diagnostic.",
+    )
+    p.add_argument(
+        "--skip-arith",
+        action="store_true",
+        help="profile: skip the arithmetic-intensity bound. It costs one extra "
+        "compile (the cost analysis needs a Compiled and re-lowering does not hit "
+        "the cache), and it is the no-profiler answer to launch- vs arithmetic-bound.",
     )
     p.add_argument(
         "--trace-repeat",
