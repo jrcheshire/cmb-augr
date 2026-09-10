@@ -954,6 +954,16 @@ def run_profile(args):
     t0 = time.perf_counter()
     pieces = _static_pieces(args.nside, args.lmax)
     t_static = time.perf_counter() - t0
+    # Both rungs must clear the Hartlap floor, or the low one dies inside the
+    # forward AFTER paying its compile -- which on a GPU queue is the whole job.
+    n_bins = int(np.asarray(pieces["bm"]).shape[0])
+    if n_lo <= n_bins + 2:
+        raise SystemExit(
+            f"--profile-n-sims {n_lo} {n_hi}: the low rung is at or below the Hartlap "
+            f"floor (n_sims > n_bins + 2 = {n_bins + 2} at lmax={args.lmax}, "
+            f"{n_bins} bins). Raise it; the MC covariance is refused below that."
+        )
+    print(f"  bins / Hartlap floor  {n_bins} / n_sims > {n_bins + 2}")
     mark("static pieces")
     ctxs = {}
     t_ctx = {}

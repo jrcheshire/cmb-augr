@@ -39,12 +39,15 @@ else
 fi
 echo
 
-# nside/lmax and the two n_sims rungs are the knobs worth changing per run; the
-# rungs must straddle a real difference or the intercept is unresolvable.
+# nside/lmax and the two n_sims rungs are the knobs worth changing per run. The
+# rungs must straddle a real difference or the intercept is unresolvable, and
+# BOTH must clear the Hartlap floor n_sims > n_bins + 2 -- 26 at the default
+# lmax=192, which is 24 bins at delta_ell=8. The script checks this before it
+# compiles anything.
 pixi run --frozen -e gpu python scripts/mapbased_grad_characterization.py \
     --mode profile --backend jht \
     --nside "${MB_NSIDE:-128}" --lmax "${MB_LMAX:-192}" \
-    --profile-n-sims ${MB_NSIMS:-8 32} \
+    --profile-n-sims ${MB_NSIMS:-32 64} \
     --repeat "${MB_REPEAT:-3}" \
     --trace-dir "mb_profile_trace.${SLURM_JOB_ID:-local}" \
     --out-prefix "mb_profile.${SLURM_JOB_ID:-local}" "$@"
