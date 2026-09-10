@@ -159,7 +159,9 @@ def _bin_matrix(ell_min, ell_max, delta_ell, ell_per_bin_below):
     return jnp.asarray(sm.bin_matrix)
 
 
-def _static_pieces(nside, lmax, delta_ell: int = 35, ell_per_bin_below: int = 30):
+def _static_pieces(
+    nside, lmax, delta_ell: int = 35, ell_per_bin_below: int = 30, ell_max_like: int = 300
+):
     """Design-INDEPENDENT pieces for the tiny CMB-only config, built once.
 
     Everything here is fixed across the design optimization: the binning, the
@@ -177,9 +179,19 @@ def _static_pieces(nside, lmax, delta_ell: int = 35, ell_per_bin_below: int = 30
     lmax=1000, ``(30, 35)`` gives σ(r) = 6.74e-5 against ``(2, 8)``'s 7.55e-5, 11%
     TIGHTER on 56 bins rather than 125, and ``(30, 70)`` is indistinguishable from
     ``(30, 35)`` -- bin width above ℓ=30 buys essentially nothing. Bin count also
-    sets the Hartlap floor on ``n_sims``, so this is the lever on how the whole
-    thing scales with resolution."""
-    ell_max = lmax
+    sets the Hartlap floor on ``n_sims``.
+
+    ``ell_max_like`` is where the r likelihood's bandpowers END, independent of the
+    map ``lmax``. Resolution enters through the NILC weights (built over every
+    needlet band to ``lmax``) and through delensing; the r constraint itself lives
+    in the reionization bump and the recombination bump, which is gone by
+    ell~300 (``SignalModel``'s own default). The MASTER coupling matrix is still
+    built over the full ``lmax``, so mode coupling from above the cut is handled;
+    only the bins stop. With the cut fixed, ``n_bins`` -- and so the Hartlap floor
+    on ``n_sims`` -- no longer grows with resolution at all. Capped at ``lmax`` when
+    the map does not reach it (nside=128/lmax=192), which reproduces the old
+    ``ell_max = lmax`` behaviour there."""
+    ell_max = min(int(lmax), int(ell_max_like))
     cl_ee, cl_bb = _priors(lmax)
     bm = _bin_matrix(2, ell_max, delta_ell, ell_per_bin_below)
     true_b = mk.bin_spectrum(
@@ -248,10 +260,11 @@ def _mc_ctx(pieces, base_seed, n_sims, var_pix_ref=None):
 
 
 def build_contexts(
-    base_seed, n_sims, *, nside, lmax, var_pix_ref=None, delta_ell=35, ell_per_bin_below=30
+    base_seed, n_sims, *, nside, lmax, var_pix_ref=None, delta_ell=35, ell_per_bin_below=30,
+    ell_max_like=300,
 ):
     """Build (mc_ctx, opt_ctx, cleaner) for a CMB-only tiny config at one CRN seed."""
-    pieces = _static_pieces(nside, lmax, delta_ell, ell_per_bin_below)
+    pieces = _static_pieces(nside, lmax, delta_ell, ell_per_bin_below, ell_max_like)
     mc_ctx = _mc_ctx(pieces, base_seed, n_sims, var_pix_ref=var_pix_ref)
     return mc_ctx, pieces["opt_ctx"], pieces["cleaner"]
 
@@ -586,7 +599,9 @@ def run_demo(args, var_pix_ref, *, n_sims=None, return_metrics=False):
     n_band = len(N_DET)
     logits0 = np.zeros(n_band)
 
-    pieces = _static_pieces(args.nside, args.lmax, args.delta_ell, args.ell_per_bin_below)
+    pieces = _static_pieces(
+        args.nside, args.lmax, args.delta_ell, args.ell_per_bin_below, args.ell_max_like
+    )
     value_fn, vg_fn = _make_objectives(pieces, n_total)
 
     # Disjoint validation + test ensembles, all sharing the frozen var_pix_ref filter.
@@ -678,6 +693,7 @@ def run_ladder(args):
         cal_ctx, _, _ = build_contexts(
             0, n_sims, nside=args.nside, lmax=args.lmax,
             delta_ell=args.delta_ell, ell_per_bin_below=args.ell_per_bin_below,
+            ell_max_like=args.ell_max_like,
         )
         rows.append(run_demo(args, cal_ctx.var_pix_ref, n_sims=n_sims, return_metrics=True))
 
@@ -1019,6 +1035,7 @@ def run_profile(args):
     for d in jax.devices():
         print(f"  device          : {d} kind={getattr(d, 'device_kind', '?')}")
     print(f"  nside / lmax    : {args.nside} / {args.lmax}")
+    print(f"  likelihood bins : ell 2..{min(args.lmax, args.ell_max_like)}")
     print(f"  n_sims rungs    : {n_lo}, {n_hi}   (repeat {args.repeat})")
     print(f"  rss at entry    : {_peak_rss_gb():.2f} GB", flush=True)
 
@@ -1032,7 +1049,9 @@ def run_profile(args):
 
     print("\n=== phase: context build (outside the jit) ===", flush=True)
     t0 = time.perf_counter()
-    pieces = _static_pieces(args.nside, args.lmax, args.delta_ell, args.ell_per_bin_below)
+    pieces = _static_pieces(
+        args.nside, args.lmax, args.delta_ell, args.ell_per_bin_below, args.ell_max_like
+    )
     t_static = time.perf_counter() - t0
     # Both rungs must clear the Hartlap floor, or the low one dies inside the
     # forward AFTER paying its compile -- which on a GPU queue is the whole job.
@@ -1041,6 +1060,7 @@ def run_profile(args):
         raise SystemExit(
             f"--profile-n-sims {n_lo} {n_hi}: the low rung is at or below the Hartlap "
             f"floor (n_sims > n_bins + 2 = {n_bins + 2} at lmax={args.lmax}, "
+            f"likelihood bins to ell={min(args.lmax, args.ell_max_like)}, "
             f"{n_bins} bins). Raise it; the MC covariance is refused below that."
         )
     print(f"  bins / Hartlap floor  {n_bins} / n_sims > {n_bins + 2}")
@@ -1161,6 +1181,7 @@ def run_profile(args):
                 "devices": [str(d) for d in jax.devices()],
                 "nside": args.nside,
                 "lmax": args.lmax,
+                "ell_max_like": min(args.lmax, args.ell_max_like),
                 "n_sims": [n_lo, n_hi],
                 "n_bins": n_bins,
                 "repeat": args.repeat,
@@ -1265,7 +1286,9 @@ def run_nside_ladder(args):
     rows = []
     for nside in args.nside_ladder:
         lmax = round(args.lmax_factor * nside)
-        pieces = _static_pieces(nside, lmax, args.delta_ell, args.ell_per_bin_below)
+        pieces = _static_pieces(
+            nside, lmax, args.delta_ell, args.ell_per_bin_below, args.ell_max_like
+        )
         n_bins = int(np.asarray(pieces["bm"]).shape[0])
         n_lo = n_bins + 3  # just clears the Hartlap floor at THIS resolution
         n_hi = 2 * n_lo
@@ -1321,7 +1344,8 @@ def run_nside_ladder(args):
         )
     payload = {"config": {"sht_backend": sht.get_sht_backend(),
                           "jax_backend": jax.default_backend(),
-                          "lmax_factor": args.lmax_factor, "repeat": args.repeat},
+                          "lmax_factor": args.lmax_factor, "repeat": args.repeat,
+                          "ell_max_like": args.ell_max_like},
                "rungs": rows, "fit": fit}
     out = f"{args.out_prefix}_nside_ladder.json"
     with open(out, "w") as fh:
@@ -1405,6 +1429,15 @@ def main():
         default=30,
         help="per-ell bins below this multipole -- the reionization bump, which is "
         "where a space mission's constraint actually lives.",
+    )
+    p.add_argument(
+        "--ell-max-like",
+        type=int,
+        default=300,
+        help="last multipole of the r likelihood's bandpowers, independent of the map "
+        "--lmax (capped at it). Cleaning and delensing still run to --lmax; r lives "
+        "at ell < ~300, so the bin count -- and the Hartlap floor -- stop growing "
+        "with resolution.",
     )
     p.add_argument(
         "--nside-ladder",

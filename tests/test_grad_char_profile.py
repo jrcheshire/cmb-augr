@@ -204,3 +204,37 @@ def test_master_forward_has_no_while_loop():
     # Anti-vacuity: a jaxpr that walked nothing would also report zero whiles.
     assert counts["scan"] >= 1
     assert sum(counts.values()) > 100
+
+
+def test_likelihood_range_is_decoupled_from_the_map_lmax():
+    """``ell_max_like`` ends the r-likelihood bins below the map ``lmax``.
+
+    Cleaning runs to ``lmax``; the bandpowers stop at ``ell_max_like``, so the bin
+    count -- and with it the Hartlap floor on n_sims -- stops tracking resolution.
+    Both halves are pinned: the bin matrix and the MASTER edges end at the cut,
+    while the context's map lmax is untouched. The default (300) is capped at
+    ``lmax`` where the map does not reach it, reproducing the old behaviour.
+    """
+    pytest.importorskip("jax")
+
+    spec = importlib.util.spec_from_file_location("_gc_like", _SCRIPT)
+    gc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gc)
+
+    # Cap: default 300 > lmax=24 -> bins over ell 2..24, per-ell -> 23 bins.
+    full = gc._static_pieces(16, 24)
+    assert full["bm"].shape == (23, 23)
+    assert full["lmax"] == 24
+
+    # Cut below lmax: bins over ell 2..12, per-ell -> 11 bins; map lmax unchanged.
+    cut = gc._static_pieces(16, 24, ell_max_like=12)
+    assert cut["bm"].shape == (11, 11)
+    assert cut["true_b"].shape == (11,)
+    assert cut["lmax"] == 24
+    assert cut["opt_ctx"].signal_model.bin_matrix.shape == (11, 11)
+
+    ctx = gc._mc_ctx(cut, 0, 14)  # clears the cut's Hartlap floor (13), not the full one
+    assert ctx.lmax == 24
+    assert ctx.master_bin_edges[0] == (2, 2)
+    assert ctx.master_bin_edges[-1] == (12, 12)
+    assert len(ctx.master_bin_edges) == 11
