@@ -1100,6 +1100,12 @@ def _mc_cutsky_cov_master(
       weighting and no signal prior at all.
     * **The beam is explicit.** With no ``F_b`` to absorb ``B_c^2`` it goes into
       the coupling matrix, at the common resolution the cleaner delivers.
+    * **``sim_batch > 1`` is structurally safe here**, unlike on the masked-Wiener
+      branch. The caution in :func:`_sim_map` is about vmapping a ``while_loop``
+      CG, which makes a batch cost its slowest lane; this branch's forward traces
+      to **zero** ``while`` primitives (pinned by a test), so batching only trades
+      memory for larger kernels. It still reassociates reductions, so agreement
+      with ``sim_batch=1`` is measured rather than exact.
 
     It consumes the cleaned **B alm**, not ``cleaned_qu()``. That is not a
     micro-optimization: the full cleaned Q/U carries the cleaned *E* as well, and

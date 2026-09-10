@@ -16,6 +16,7 @@ import gzip
 import importlib.util
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -159,3 +160,44 @@ def test_script_imports_without_optax():
         sys.meta_path.remove(blocker)
         if saved is not None:
             sys.modules["optax"] = saved
+
+
+def test_master_forward_has_no_while_loop():
+    """``sim_batch > 1`` is safe on MASTER because there is no CG lane to straggle.
+
+    ``_sim_map`` warns that batching sims vmaps the masked-Wiener branch's
+    ``while_loop`` CG, so a batch costs its slowest-converging member. That
+    reasoning does not transfer to MASTER, which is a mode deconvolution with no
+    iterative solve -- and the difference is what makes the knob free on the
+    production path. Pinned structurally rather than argued: an iterative solver
+    added to this branch would reintroduce the hazard silently.
+    """
+    jax = pytest.importorskip("jax")
+    jnp = jax.numpy
+
+    spec = importlib.util.spec_from_file_location("_gc_master", _SCRIPT)
+    gc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gc)
+
+    def census(jaxpr, out=None):
+        out = Counter() if out is None else out
+        for eqn in jaxpr.eqns:
+            out[eqn.primitive.name] += 1
+            for v in eqn.params.values():
+                sub = getattr(v, "jaxpr", None)
+                if sub is not None:
+                    census(getattr(sub, "jaxpr", sub), out)
+                elif type(v).__name__ == "Jaxpr":
+                    census(v, out)
+        return out
+
+    pieces = gc._static_pieces(16, 24)
+    ctx = gc._mc_ctx(pieces, 0, 6)
+    assert ctx.estimator == "master"
+    value_fn, _ = gc._make_objectives(pieces, float(sum(gc.N_DET)))
+    counts = census(jax.make_jaxpr(value_fn)(jnp.zeros(len(gc.FREQS)), ctx).jaxpr)
+
+    assert counts["while"] == 0, f"MASTER forward grew a while_loop: {counts['while']}"
+    # Anti-vacuity: a jaxpr that walked nothing would also report zero whiles.
+    assert counts["scan"] >= 1
+    assert sum(counts.values()) > 100
