@@ -837,3 +837,34 @@ def test_shared_fg_is_bit_identical_and_survives_the_scan_knobs():
         assert np.array_equal(cov(per_sim, remat=remat), cov(shared, remat=remat)), (
             f"sharing moved the covariance at remat={remat}"
         )
+
+
+def test_share_fg_defaults_on_and_keeps_a_varying_ensemble():
+    """The default shares a constant ensemble and leaves a varying one alone.
+
+    Defaulting to the strict form would break the stochastic presets (d10s6 / s6)
+    at context build, where a per-sim ensemble is the *correct* representation
+    rather than an error -- so the builder uses the non-raising form. The varying
+    leg is the anti-vacuity half: a builder that shared unconditionally would
+    replace the ensemble with its first realization and still pass the first.
+    """
+    n_sims, lmax = 6, 24
+    kw = _ctx_kwargs(n_sims, lmax=lmax, ell_max=lmax)
+    cleaner = nilc_cleaner(clean_e=True)
+    keys = jnp.stack([jax.random.PRNGKey(s) for s in range(n_sims)], axis=0)
+
+    def built(skies, **extra):
+        return make_cutsky_mc_context(
+            cleaner=cleaner, estimator="master", harmonic_skies=skies,
+            noise_keys=keys, **kw, **extra,
+        ).harmonic_skies.fg_eb_alm
+
+    constant = _skies_with_constant_fg(n_sims, 3, lmax)
+    varying = _skies_with_constant_fg(n_sims, 3, lmax, vary=True)
+
+    assert built(constant).ndim == 3, "the default did not share a constant ensemble"
+    assert built(varying).ndim == 4, "a varying ensemble was collapsed"
+    assert np.array_equal(
+        np.asarray(built(varying)), np.asarray(varying.fg_eb_alm)
+    ), "a varying ensemble was modified"
+    assert built(constant, share_fg=False).ndim == 4, "share_fg=False was ignored"

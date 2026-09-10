@@ -576,7 +576,7 @@ def make_cutsky_mc_context(
     estimator: str = "master",
     lmax_mask: int | None = None,
     split_lensing: bool = False,
-    share_fg: bool = False,
+    share_fg: bool = True,
 ) -> CutskyMCContext:
     """Eager precompute for the differentiable cut-sky MC.
 
@@ -614,12 +614,17 @@ def make_cutsky_mc_context(
     ``A_lens = 1`` no matter what the design does. Costs one extra ``synalm`` per sim
     and one ``(lmax+1)`` array; at ``r_in = 0`` the realizations are unchanged.
 
-    ``share_fg`` (default False) collapses the foreground ensemble to the single
+    ``share_fg`` (default True) collapses the foreground ensemble to the single
     sky it already is for the deterministic PySM presets -- see
-    :func:`share_constant_fg`, which does the checking and states the sizes. It
-    raises rather than approximating if the ensemble genuinely varies, so it is
-    safe to pass without knowing the model. Off by default because it changes the
-    shape of a public field.
+    :func:`share_constant_fg` for the sizes, which reach 610 GB -> 0.79 GB at
+    nside=1024. Applied to a cached ensemble too, so an existing cache gets the
+    saving on load. A genuinely varying ensemble (the stochastic ``d10s6`` /
+    ``s6`` presets) is **kept per-sim** rather than raising: that is the correct
+    representation for those models, not an error. Pass ``share_fg=False`` to keep
+    the per-sim ensemble unconditionally.
+
+    Note this reduces what the *forward* carries, not the peak during generation:
+    the ensemble is stacked and then collapsed. Peak at generation is unchanged.
     """
     # The inverse-noise filter -- and hence var_pix_ref and the setup clean that
     # derives it -- exists only for the masked-Wiener estimator. MASTER never
@@ -662,8 +667,6 @@ def make_cutsky_mc_context(
         _hsky_tuple = tuple(_hsky(s) for s in seeds)
         harmonic_skies = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *_hsky_tuple)
         noise_keys = jnp.stack([jax.random.PRNGKey(int(s)) for s in seeds], axis=0)
-        if share_fg:
-            harmonic_skies = share_constant_fg(harmonic_skies)
     else:
         # Precomputed FG sky ensemble -- e.g. loaded from a sky cache (save_sky_cache /
         # load_sky_cache) on a pysm3-less env (the aarch64 GPU). No PySM is touched here.
@@ -690,6 +693,11 @@ def make_cutsky_mc_context(
             raise ValueError(
                 f"noise_keys has {int(noise_keys.shape[0])} sims but harmonic_skies has {n_sims}."
             )
+
+    # Applied to a generated AND a cached ensemble: a cache written before this
+    # existed still carries n_sims copies, and gets collapsed on load here.
+    if share_fg:
+        harmonic_skies = share_constant_fg(harmonic_skies, strict=False)
 
     # var_pix_ref: frozen filter knob from one setup clean at the fiducial w_inv +
     # reference beams (matches mc_cutsky_bandpowers; uses the base_seed + n_sims sim).
@@ -929,7 +937,7 @@ def _lens_scale(ctx: CutskyMCContext, cl_bb_res, cl_bb_res_ells):
     return jnp.where(pos, jnp.sqrt(jnp.where(pos, ratio, 1.0)), 0.0)
 
 
-def share_constant_fg(hsky: HarmonicSky) -> HarmonicSky:
+def share_constant_fg(hsky: HarmonicSky, *, strict: bool = True) -> HarmonicSky:
     """Collapse a per-sim foreground ensemble to the single sky they all are.
 
     PySM's fixed-template components (``d1``/``d10``/``s1``/``s5``, i.e. the
@@ -944,10 +952,16 @@ def share_constant_fg(hsky: HarmonicSky) -> HarmonicSky:
     than 4). Rank is what marks it shared -- unambiguous, unlike a leading-axis
     length that could coincide with ``n_band``.
 
-    Raises if the ensemble is **not** constant, which is the case for the
-    stochastic ``*Realization`` presets (``d10s6``, ``s6``). The check is exact
-    equality, not a tolerance: the deterministic case is bit-identical, so any
-    departure at all means the model draws per sim and sharing would be wrong.
+    The check is exact equality, not a tolerance: the deterministic case is
+    bit-identical, so any departure at all means the model genuinely draws per sim
+    and sharing would silently replace an ensemble with its first realization.
+
+    ``strict=True`` (default) **raises** on a varying ensemble -- use it when you
+    believe the model is deterministic and want to be told if it is not.
+    ``strict=False`` returns the ensemble untouched instead, which is what
+    :func:`make_cutsky_mc_context` wants: the stochastic ``*Realization`` presets
+    (``d10s6``, ``s6``) genuinely vary, and keeping them per-sim is correct rather
+    than exceptional.
     """
     fg = hsky.fg_eb_alm
     if fg is None:
@@ -962,6 +976,8 @@ def share_constant_fg(hsky: HarmonicSky) -> HarmonicSky:
         )
     dev = float(jnp.max(jnp.abs(fg - fg[0:1])))
     if dev != 0.0:
+        if not strict:
+            return hsky
         raise ValueError(
             f"the foreground ensemble varies across sims (max|fg[i] - fg[0]| = "
             f"{dev:g}), so it cannot be shared. That is expected for a stochastic "
