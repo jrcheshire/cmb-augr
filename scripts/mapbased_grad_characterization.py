@@ -159,7 +159,7 @@ def _bin_matrix(ell_min, ell_max, delta_ell, ell_per_bin_below):
     return jnp.asarray(sm.bin_matrix)
 
 
-def _static_pieces(nside, lmax):
+def _static_pieces(nside, lmax, delta_ell: int = 35, ell_per_bin_below: int = 30):
     """Design-INDEPENDENT pieces for the tiny CMB-only config, built once.
 
     Everything here is fixed across the design optimization: the binning, the
@@ -167,8 +167,19 @@ def _static_pieces(nside, lmax):
     ``w_inv`` (only used to seed ``var_pix_ref``), the analysis mask, and the
     OptimizationContext. The per-CRN ensemble is built separately by
     :func:`_mc_ctx` so a stochastic descent can re-draw it cheaply (same shapes
-    reuse the compiled forward trace; only the sky/noise leaves change)."""
-    ell_max, delta_ell, ell_per_bin_below = lmax, 8, 2
+    reuse the compiled forward trace; only the sky/noise leaves change).
+
+    The bin schedule defaults to ``SignalModel``'s own ``(ell_per_bin_below=30,
+    delta_ell=35)``: per-ℓ bins across the reionization bump, coarse above it. It
+    used to be ``(2, 8)``, which is backwards at both ends -- smearing the bump in
+    Δℓ=8 chunks while resolving high ℓ far past what any real analysis does. Fixing
+    it is not merely cheaper: measured on the analytic pico_like Fisher at
+    lmax=1000, ``(30, 35)`` gives σ(r) = 6.74e-5 against ``(2, 8)``'s 7.55e-5, 11%
+    TIGHTER on 56 bins rather than 125, and ``(30, 70)`` is indistinguishable from
+    ``(30, 35)`` -- bin width above ℓ=30 buys essentially nothing. Bin count also
+    sets the Hartlap floor on ``n_sims``, so this is the lever on how the whole
+    thing scales with resolution."""
+    ell_max = lmax
     cl_ee, cl_bb = _priors(lmax)
     bm = _bin_matrix(2, ell_max, delta_ell, ell_per_bin_below)
     true_b = mk.bin_spectrum(
@@ -236,9 +247,11 @@ def _mc_ctx(pieces, base_seed, n_sims, var_pix_ref=None):
     )
 
 
-def build_contexts(base_seed, n_sims, *, nside, lmax, var_pix_ref=None):
+def build_contexts(
+    base_seed, n_sims, *, nside, lmax, var_pix_ref=None, delta_ell=35, ell_per_bin_below=30
+):
     """Build (mc_ctx, opt_ctx, cleaner) for a CMB-only tiny config at one CRN seed."""
-    pieces = _static_pieces(nside, lmax)
+    pieces = _static_pieces(nside, lmax, delta_ell, ell_per_bin_below)
     mc_ctx = _mc_ctx(pieces, base_seed, n_sims, var_pix_ref=var_pix_ref)
     return mc_ctx, pieces["opt_ctx"], pieces["cleaner"]
 
@@ -573,7 +586,7 @@ def run_demo(args, var_pix_ref, *, n_sims=None, return_metrics=False):
     n_band = len(N_DET)
     logits0 = np.zeros(n_band)
 
-    pieces = _static_pieces(args.nside, args.lmax)
+    pieces = _static_pieces(args.nside, args.lmax, args.delta_ell, args.ell_per_bin_below)
     value_fn, vg_fn = _make_objectives(pieces, n_total)
 
     # Disjoint validation + test ensembles, all sharing the frozen var_pix_ref filter.
@@ -662,7 +675,10 @@ def run_ladder(args):
         print(f"\n########## ladder rung: n_sims = {n_sims} ##########")
         # Per-rung var_pix_ref (a filter knob -- self-consistent at each n_sims;
         # absorbed by the transfer/leakage debias, so it does not bias sigma(r)).
-        cal_ctx, _, _ = build_contexts(0, n_sims, nside=args.nside, lmax=args.lmax)
+        cal_ctx, _, _ = build_contexts(
+            0, n_sims, nside=args.nside, lmax=args.lmax,
+            delta_ell=args.delta_ell, ell_per_bin_below=args.ell_per_bin_below,
+        )
         rows.append(run_demo(args, cal_ctx.var_pix_ref, n_sims=n_sims, return_metrics=True))
 
     print("\n=== n_sims ladder summary ===")
@@ -1016,7 +1032,7 @@ def run_profile(args):
 
     print("\n=== phase: context build (outside the jit) ===", flush=True)
     t0 = time.perf_counter()
-    pieces = _static_pieces(args.nside, args.lmax)
+    pieces = _static_pieces(args.nside, args.lmax, args.delta_ell, args.ell_per_bin_below)
     t_static = time.perf_counter() - t0
     # Both rungs must clear the Hartlap floor, or the low one dies inside the
     # forward AFTER paying its compile -- which on a GPU queue is the whole job.
@@ -1249,7 +1265,7 @@ def run_nside_ladder(args):
     rows = []
     for nside in args.nside_ladder:
         lmax = round(args.lmax_factor * nside)
-        pieces = _static_pieces(nside, lmax)
+        pieces = _static_pieces(nside, lmax, args.delta_ell, args.ell_per_bin_below)
         n_bins = int(np.asarray(pieces["bm"]).shape[0])
         n_lo = n_bins + 3  # just clears the Hartlap floor at THIS resolution
         n_hi = 2 * n_lo
@@ -1377,6 +1393,20 @@ def main():
         "histogram. Needs a device stream, so it is a GPU-backend diagnostic.",
     )
     p.add_argument(
+        "--delta-ell",
+        type=int,
+        default=35,
+        help="bin width above --ell-per-bin-below (SignalModel's default; the "
+        "measured sigma(r) is insensitive to it above ell=30).",
+    )
+    p.add_argument(
+        "--ell-per-bin-below",
+        type=int,
+        default=30,
+        help="per-ell bins below this multipole -- the reionization bump, which is "
+        "where a space mission's constraint actually lives.",
+    )
+    p.add_argument(
         "--nside-ladder",
         type=int,
         nargs="+",
@@ -1438,7 +1468,10 @@ def main():
     # is no Wiener filter, so make_cutsky_mc_context returns None and there is
     # nothing to freeze; the ensembles already differ only by their CRN.
     print("Calibrating shared var_pix_ref ...")
-    cal_ctx, _, _ = build_contexts(0, args.n_sims, nside=args.nside, lmax=args.lmax)
+    cal_ctx, _, _ = build_contexts(
+        0, args.n_sims, nside=args.nside, lmax=args.lmax,
+        delta_ell=args.delta_ell, ell_per_bin_below=args.ell_per_bin_below,
+    )
     var_pix_ref = cal_ctx.var_pix_ref
     print(
         "  var_pix_ref = none (MASTER: no Wiener filter)"
