@@ -605,3 +605,51 @@ def test_needlet_beta_graph_size_is_independent_of_transform_count():
     assert small == large, f"graph grew with transform count: {small} -> {large}"
     # Anti-vacuity: the looped reference DOES grow, so the check can fail.
     assert small < 5000
+
+
+def test_cleaner_graph_is_flat_in_band_count():
+    """The cleaner's graph must not grow with the number of bands.
+
+    Every per-band and per-needlet stage is vmapped rather than looped in Python,
+    so adding bands should widen arrays, not lengthen the graph. Measured at
+    nside=16: 14365 equations at 4 bands and 14860 at 21, a 3% drift against the
+    10x that the looped form cost at 21 bands. The design gradient is launch-bound,
+    so graph length is the cost being controlled here -- and a regression to
+    unrolling changes no value at all, only compile time and kernel count, so it
+    has to be caught structurally.
+    """
+    pytest.importorskip("jht")
+    from augr import sht
+    from augr.cleaning import nilc_cleaner
+
+    lmax, nside = 24, 16
+    npix = 12 * nside**2
+
+    def eqns(n_band):
+        beams = jnp.linspace(40.0, 20.0, n_band)
+        ps = jnp.ones(n_band)
+        qu = jax.random.normal(jax.random.PRNGKey(0), (n_band, 2, npix))
+        cleaner = nilc_cleaner(clean_e=True)
+        with sht.sht_backend("jht"):
+            jx = jax.make_jaxpr(
+                lambda m: cleaner(m, beams, ps, lmax=lmax, nside=nside).cleaned_b_alm
+            )(qu)
+
+        def walk(jaxpr):
+            n = 0
+            for e in jaxpr.eqns:
+                n += 1
+                for v in e.params.values():
+                    sub = getattr(v, "jaxpr", None)
+                    if sub is not None:
+                        n += walk(getattr(sub, "jaxpr", sub))
+                    elif type(v).__name__ == "Jaxpr":
+                        n += walk(v)
+            return n
+
+        return walk(jx.jaxpr)
+
+    few, many = eqns(4), eqns(21)
+    # 5.2x more bands must not cost 5.2x more graph. Bound set from the measured
+    # 3% drift, with room for a stage that legitimately adds a little per band.
+    assert many < 1.25 * few, f"graph grew with band count: {few} -> {many}"

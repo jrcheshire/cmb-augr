@@ -133,13 +133,12 @@ def common_resolution_b_alm(
         common_fwhm_arcmin = jnp.min(beams)
     ells = jnp.arange(lmax + 1, dtype=float)
     bl_common = beam_bl(ells, common_fwhm_arcmin)
-    out = []
-    for qu_b, fwhm_b, p_b in zip(band_qu, beams, ps, strict=True):
+    def _one(qu_b, fwhm_b, p_b):
         eb = map2alm(qu_b, 2, lmax, nside, n_iter)  # (2, Nlm) = (E, B)
-        bl_band = beam_bl(ells, fwhm_b, p_b)
-        ratio = bl_common / jnp.maximum(bl_band, 1e-30)
-        out.append(almxfl(eb[1], ratio, lmax))
-    return jnp.stack(out, axis=0), common_fwhm_arcmin
+        ratio = bl_common / jnp.maximum(beam_bl(ells, fwhm_b, p_b), 1e-30)
+        return almxfl(eb[1], ratio, lmax)
+
+    return jax.vmap(_one)(band_qu, beams, ps), common_fwhm_arcmin
 
 
 def common_resolution_eb(
@@ -170,15 +169,13 @@ def common_resolution_eb(
         common_fwhm_arcmin = jnp.min(beams)
     ells = jnp.arange(lmax + 1, dtype=float)
     bl_common = beam_bl(ells, common_fwhm_arcmin)
-    out_e = []
-    out_b = []
-    for qu_b, fwhm_b, p_b in zip(band_qu, beams, ps, strict=True):
+    def _one(qu_b, fwhm_b, p_b):
         eb = map2alm(qu_b, 2, lmax, nside, n_iter)  # (2, Nlm) = (E, B)
-        bl_band = beam_bl(ells, fwhm_b, p_b)
-        ratio = bl_common / jnp.maximum(bl_band, 1e-30)
-        out_e.append(almxfl(eb[0], ratio, lmax))
-        out_b.append(almxfl(eb[1], ratio, lmax))
-    return jnp.stack(out_e, axis=0), jnp.stack(out_b, axis=0), common_fwhm_arcmin
+        ratio = bl_common / jnp.maximum(beam_bl(ells, fwhm_b, p_b), 1e-30)
+        return almxfl(eb[0], ratio, lmax), almxfl(eb[1], ratio, lmax)
+
+    e_alm, b_alm = jax.vmap(_one)(band_qu, beams, ps)
+    return e_alm, b_alm, common_fwhm_arcmin
 
 
 # ---------------------------------------------------------------------------
@@ -232,11 +229,10 @@ def combine_needlets(
         s = jnp.einsum("jb,jbp->jp", weights, beta)  # global: pixel-constant weights
     else:
         s = jnp.einsum("jbp,jbp->jp", weights, beta)  # localized: per-pixel weights
-    acc = [
-        almxfl(map2alm(s[j][None, :], 0, lmax, nside, n_iter)[0], hj, lmax)
-        for j, hj in enumerate(needlet_bands)
-    ]
-    return jnp.sum(jnp.stack(acc, axis=0), axis=0)
+    acc = jax.vmap(
+        lambda s_j, hj: almxfl(map2alm(s_j[None, :], 0, lmax, nside, n_iter)[0], hj, lmax)
+    )(s, needlet_bands)
+    return jnp.sum(acc, axis=0)
 
 
 # ---------------------------------------------------------------------------
