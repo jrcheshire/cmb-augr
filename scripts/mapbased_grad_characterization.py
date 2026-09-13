@@ -1031,6 +1031,7 @@ def run_profile(args):
     backend = sht.get_sht_backend()
     print("=== configuration ===")
     print(f"  sht backend     : {backend}")
+    print(f"  jht fft mode    : {args.fft_mode if backend == 'jht' else '-'}")
     print(f"  jax backend     : {jax.default_backend()}")
     for d in jax.devices():
         print(f"  device          : {d} kind={getattr(d, 'device_kind', '?')}")
@@ -1140,39 +1141,11 @@ def run_profile(args):
         print("  (device counters absent: the CPU backend does not report them; rss is the gate.)")
 
     arith = None
-    if not args.skip_arith and traced_vg is not None:
-        print("\n=== arithmetic intensity (no profiler; one extra compile) ===", flush=True)
-        rate = _peak_fp64_flops()
-        print(f"  measured fp64   : {rate / 1e12:.2f} TFLOP/s", flush=True)
-        steady_ref = rows[("value+grad", n_hi)][1]
-        arith = _arithmetic_bound(traced_vg, logits, ctxs[n_hi], n_hi, steady_ref, rate)
-        print(f"  static flops    : {arith['static_flops']:.4g}  (scan body counted once)")
-        if backend == "ducc":
-            print(
-                "  NOTE: on the ducc backend the transforms are pure_callbacks into C++, "
-                "so their flops never reach cost_analysis and this share is a LOWER "
-                "bound on a number that is already small. Read it on jht."
-            )
-        print(
-            f"  arithmetic      : {arith['arith_s_low'] * 1e3:.3f} ms to "
-            f"{arith['arith_s_high'] * 1e3:.3f} ms of the {steady_ref:.2f} s measured"
-        )
-        print(
-            f"  ARITHMETIC SHARE: {arith['arith_frac_low'] * 100:.5f}% to "
-            f"{arith['arith_frac_high'] * 100:.5f}%"
-            + (
-                "   -> NOT arithmetic-bound: the cost is kernel launches and memory"
-                if arith["arith_frac_high"] < 0.05
-                else "   -> arithmetic is a real share; read the bracket"
-            ),
-            flush=True,
-        )
 
-    # The timings and the memory table are complete at this point, and the trace
-    # leg below is the part that can fail: job 986936 lost 88 min of GB200 time to
-    # a CUDA launch failure there, with every number above already printed to a log
-    # and none of it written anywhere machine-readable. So the payload is written
-    # HERE, and rewritten with the histogram if the trace leg survives.
+    # The timings and the memory table are complete at this point; the legs below
+    # (arithmetic bound: one extra compile; trace) are the parts that can fail or
+    # run out the wall clock, so the payload is written HERE and rewritten as each
+    # later leg completes.
     def _payload(hist):
         return {
             "config": {
@@ -1182,6 +1155,7 @@ def run_profile(args):
                 "nside": args.nside,
                 "lmax": args.lmax,
                 "ell_max_like": min(args.lmax, args.ell_max_like),
+                "fft_mode": args.fft_mode if backend == "jht" else None,
                 "n_sims": [n_lo, n_hi],
                 "n_bins": n_bins,
                 "repeat": args.repeat,
@@ -1209,6 +1183,35 @@ def run_profile(args):
 
     print()
     _write(None)
+
+    if not args.skip_arith and traced_vg is not None:
+        print("\n=== arithmetic intensity (no profiler; one extra compile) ===", flush=True)
+        rate = _peak_fp64_flops()
+        print(f"  measured fp64   : {rate / 1e12:.2f} TFLOP/s", flush=True)
+        steady_ref = rows[("value+grad", n_hi)][1]
+        arith = _arithmetic_bound(traced_vg, logits, ctxs[n_hi], n_hi, steady_ref, rate)
+        print(f"  static flops    : {arith['static_flops']:.4g}  (scan body counted once)")
+        if backend == "ducc":
+            print(
+                "  NOTE: on the ducc backend the transforms are pure_callbacks into C++, "
+                "so their flops never reach cost_analysis and this share is a LOWER "
+                "bound on a number that is already small. Read it on jht."
+            )
+        print(
+            f"  arithmetic      : {arith['arith_s_low'] * 1e3:.3f} ms to "
+            f"{arith['arith_s_high'] * 1e3:.3f} ms of the {steady_ref:.2f} s measured"
+        )
+        print(
+            f"  ARITHMETIC SHARE: {arith['arith_frac_low'] * 100:.5f}% to "
+            f"{arith['arith_frac_high'] * 100:.5f}%"
+            + (
+                "   -> NOT arithmetic-bound: the cost is kernel launches and memory"
+                if arith["arith_frac_high"] < 0.05
+                else "   -> arithmetic is a real share; read the bracket"
+            ),
+            flush=True,
+        )
+        _write(None)
 
     hist = None
     if args.trace_dir:
@@ -1284,6 +1287,21 @@ def run_nside_ladder(args):
     Reports the fit and its residuals. Two points would give an exponent with no way
     to know it is wrong, so this wants three or more."""
     rows = []
+    out = f"{args.out_prefix}_nside_ladder.json"
+
+    def _write(fit):
+        # Rewritten after every rung, so a rung that OOMs or hits the wall clock
+        # leaves the finished rungs on disk.
+        payload = {"config": {"sht_backend": sht.get_sht_backend(),
+                              "jax_backend": jax.default_backend(),
+                              "fft_mode": args.fft_mode,
+                              "lmax_factor": args.lmax_factor, "repeat": args.repeat,
+                              "ell_max_like": args.ell_max_like},
+                   "rungs": rows, "fit": fit}
+        with open(out, "w") as fh:
+            json.dump(payload, fh, indent=2)
+        print(f"  wrote {out}", flush=True)
+
     for nside in args.nside_ladder:
         lmax = round(args.lmax_factor * nside)
         pieces = _static_pieces(
@@ -1297,23 +1315,28 @@ def run_nside_ladder(args):
             f"sims={n_lo},{n_hi} ##########",
             flush=True,
         )
-        steady = {}
+        steady, first = {}, {}
         for n in (n_lo, n_hi):
             ctx = jax.block_until_ready(_mc_ctx(pieces, 0, n))
             _, vg_fn = _make_objectives(pieces, float(sum(N_DET)))
-            first, s = _timed(vg_fn, jnp.zeros(len(FREQS)), ctx, repeat=args.repeat)
-            steady[n] = s
+            first[n], steady[n] = _timed(vg_fn, jnp.zeros(len(FREQS)), ctx, repeat=args.repeat)
             print(
-                f"  value+grad n_sims={n:>4d}  compile+first {first:8.1f} s  steady {s:8.3f} s",
+                f"  value+grad n_sims={n:>4d}  compile+first {first[n]:8.1f} s  "
+                f"steady {steady[n]:8.3f} s  peak device {_peak_device_gb()} GB  "
+                f"rss {_peak_rss_gb():.2f} GB",
                 flush=True,
             )
             del ctx, vg_fn
             jax.clear_caches()
         per_sim = (steady[n_hi] - steady[n_lo]) / (n_hi - n_lo)
         print(f"  per-sim body: {per_sim:.4f} s", flush=True)
+        # Peaks are process high-water marks, so a rung's value includes earlier rungs.
         rows.append({"nside": nside, "lmax": lmax, "n_bins": n_bins,
                      "n_sims": [n_lo, n_hi], "steady_s": [steady[n_lo], steady[n_hi]],
-                     "per_sim_s": per_sim})
+                     "compile_first_s": [first[n_lo], first[n_hi]],
+                     "per_sim_s": per_sim,
+                     "peak_device_gb": _peak_device_gb(), "peak_rss_gb": _peak_rss_gb()})
+        _write(None)
 
     print("\n=== measured resolution scaling ===")
     print(f"  {'nside':>6} {'bins':>5} {'per-sim':>10}")
@@ -1330,27 +1353,11 @@ def run_nside_ladder(args):
         if len(rows) == 2:
             print("  TWO POINTS: this exponent has no residual to check it against.")
         print(
-            f"  An EVALUATION costs this times n_sims, and n_sims is set by Hartlap "
-            f"from n_bins -- so the evaluation exponent is nside^{slope + 1:.3f} ONLY "
-            "while the bin schedule keeps n_bins proportional to lmax."
+            "  An EVALUATION costs this times n_sims. With --ell-max-like capping the "
+            "bandpowers, n_bins (and so the Hartlap sim floor) is constant across "
+            "rungs, so the evaluation exponent equals the per-sim one."
         )
-        print(
-            "  That proportionality is a hardcoded delta_ell, not a physical fact: "
-            "_static_pieces fixes delta_ell=8 to lmax (SignalModel's own default is "
-            "35, and it accepts explicit ell_bins). Coarsening high-ell scales the "
-            "COEFFICIENT down; only a schedule whose bin count saturates with lmax "
-            "-- log spacing above ell~300, or a cap -- removes the extra power. "
-            "Gate any such change on the design gradient, not just sigma(r)."
-        )
-    payload = {"config": {"sht_backend": sht.get_sht_backend(),
-                          "jax_backend": jax.default_backend(),
-                          "lmax_factor": args.lmax_factor, "repeat": args.repeat,
-                          "ell_max_like": args.ell_max_like},
-               "rungs": rows, "fit": fit}
-    out = f"{args.out_prefix}_nside_ladder.json"
-    with open(out, "w") as fh:
-        json.dump(payload, fh, indent=2)
-    print(f"\n  wrote {out}", flush=True)
+    _write(fit)
 
 
 def main():
@@ -1396,6 +1403,14 @@ def main():
         help="demo: # disjoint held-out TEST ensembles for the generalization check.",
     )
     p.add_argument("--backend", choices=["ducc", "jht"], default="ducc")
+    p.add_argument(
+        "--fft-mode",
+        choices=["unrolled", "looped"],
+        default="looped",
+        help="jht azimuth FFT mode (jht backend only). 'looped' is what production "
+        "uses; 'unrolled' compiles one kernel per ring length, so its compile time "
+        "and host memory grow with nside.",
+    )
     p.add_argument(
         "--out-prefix", default="grad_char_ladder", help="ladder/demo: JSON/PNG output path prefix"
     )
@@ -1479,6 +1494,11 @@ def main():
 
     sht.set_sht_backend(args.backend)
     print(f"SHT backend: {sht.get_sht_backend()}")
+    if args.backend == "jht":
+        import jht
+
+        jht.set_azimuth_fft_mode(args.fft_mode)
+        print(f"jht azimuth FFT mode: {jht.get_azimuth_fft_mode()}")
 
     if args.mode == "ladder":
         print("\n########## MODE: ladder ##########")
