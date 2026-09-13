@@ -322,17 +322,7 @@ class TestBackendParity:
 
     def test_grad_parity_through_real_roundtrip(self) -> None:
         """The pipeline-relevant gradient (through map->alm->map on a REAL map)
-        matches between backends.
-
-        A direct gradient w.r.t. a free complex alm differs between backends on
-        ONE non-physical degree of freedom: the imaginary part of the m=0
-        coefficient (zero by the real-sky reality constraint). ducc's custom_vjp
-        projects it to zero; jht's native AD returns the ambient complex cotangent.
-        The physical DOFs (m>0 full complex, m=0 real part) agree to ~1e-9. That
-        m=0-imaginary DOF never appears in the map-based pipeline, where every alm
-        is produced by map2alm from a real map (real m=0), so the real map ->
-        alm -> map gradient the cleaners actually backprop through matches cleanly
-        and sidesteps the convention entirely."""
+        matches between backends."""
         m = jnp.asarray(np.random.default_rng(8).standard_normal((2, 12 * _NS_P**2)))
 
         def scalar(x, backend):
@@ -343,3 +333,85 @@ class TestBackendParity:
         g_d = jax.grad(lambda x: scalar(x, "ducc"))(m)
         g_j = jax.grad(lambda x: scalar(x, "jht"))(m)
         np.testing.assert_allclose(np.asarray(g_j), np.asarray(g_d), rtol=1e-7, atol=1e-9)
+
+
+    def test_grad_parity_free_complex_alm(self) -> None:
+        """grad w.r.t. a FREE (physical) complex alm agrees on every DOF.
+
+        Both backends use the same transpose-pair custom_vjp, so the gradient's
+        non-physical m=0-imaginary component (which jht's native AD once left as
+        the ambient complex cotangent) is projected to zero on both. The input
+        must be physical (real m=0): the forwards themselves differ otherwise,
+        since jht's spin-2 assembly uses Im(alm[m=0]) and ducc ignores it."""
+        a = jnp.asarray(_random_alm_p(seed=9, ncomp=2))
+
+        def scalar(x, backend):
+            with sht_backend(backend):
+                mp = synthesis(x, 2, _LMAX_P, _NS_P)
+                return jnp.sum(mp**2) + jnp.sum(adjoint_synthesis(mp, 2, _LMAX_P, _NS_P).real)
+
+        g_d = np.asarray(jax.grad(lambda x: scalar(x, "ducc"))(a))
+        g_j = np.asarray(jax.grad(lambda x: scalar(x, "jht"))(a))
+        np.testing.assert_allclose(g_j, g_d, rtol=1e-7, atol=1e-9)
+        m0 = _m_of_alm(_LMAX_P) == 0
+        assert np.all(g_j[:, m0].imag == 0.0) and np.all(g_d[:, m0].imag == 0.0)
+
+
+# --- jht memory gates: no (lmax+1, lmax+1, 2 nside) table in the gradient graph --
+#
+# jht's Legendre recursion is a lax.scan over l. Two mechanisms retain one
+# complex (lmax+1, lmax+1, 2*nside) table PER TRANSFORM (~nside^3 bytes; 156 GB at
+# nside=384 in the map-based design gradient, measured on GB200):
+#   1. reverse-mode AD through the scan stores each iteration's residuals;
+#   2. under grad of a lax.scan over sims, JAX partial-evaluates the body and
+#      hoists the recursion (it depends only on the grid) out of the sim loop,
+#      storing its per-l output stacked -- consumed by the loop as a constant.
+# The custom_vjp closes 1 and the save-nothing checkpoint (_opaque) closes 2.
+# Counts at this fixture, measured 2026-09-12: native jht 36 / 44; custom_vjp
+# without _opaque 0 / 44; both in place 0 / 0. Each gate fails on exactly one
+# mechanism's removal.
+
+_NS_G, _LMAX_G, _NSIM_G = 16, 24, 4
+
+
+def _table_count(fn, *args) -> int:
+    """Distinct HLO values shaped (lmax+1, lmax+1, 2 nside) in the compiled graph."""
+    import re
+
+    pat = re.compile(rf"(c128|f64)\[{_LMAX_G + 1},{_LMAX_G + 1},{2 * _NS_G}\]")
+    txt = jax.jit(fn).lower(*args).compile().as_text()
+    names = set()
+    for line in txt.splitlines():
+        if pat.search(line):
+            m = re.match(r"\s*%?([A-Za-z_0-9.-]+) =", line)
+            if m:
+                names.add(m.group(1))
+    return len(names)
+
+
+def _alms_g(n: int) -> jnp.ndarray:
+    rng = np.random.default_rng(3)
+    nlm = alm_size(_LMAX_G)
+    return jnp.asarray(rng.standard_normal((n, 2, nlm)) + 1j * rng.standard_normal((n, 2, nlm)))
+
+
+def test_jht_grad_through_synthesis_keeps_no_recursion_tape() -> None:
+    """Mechanism 1: grad w.r.t. the alm stores no per-l recursion table."""
+    with sht_backend("jht"):
+        loss = lambda a: jnp.sum(synthesis(a, 2, _LMAX_G, _NS_G) ** 2)  # noqa: E731
+        assert _table_count(lambda a: jax.grad(loss)(a), _alms_g(1)[0]) == 0
+
+
+def test_jht_synthesis_in_sim_scan_hoists_no_recursion_table() -> None:
+    """Mechanism 2: grad through lax.map over sims hoists no stacked recursion.
+
+    The knob enters AFTER the transform (the production shape: a per-sim sky
+    that does not depend on the design), which is what invites the hoist."""
+    with sht_backend("jht"):
+
+        def loss(s, A):
+            return jnp.sum(
+                jax.lax.map(lambda a: jnp.sum((synthesis(a, 2, _LMAX_G, _NS_G) * s) ** 2), A)
+            )
+
+        assert _table_count(lambda s, A: jax.grad(loss)(s, A), 1.0, _alms_g(_NSIM_G)) == 0
