@@ -200,8 +200,9 @@ def _static_pieces(
         2,
     )
     # clean_e=False: every context here is MASTER, which reads only the B solution
-    # (bit-identical without the E leg, tests/test_nilc.py) -- the E leg is a third
-    # of the per-sim transforms for nothing.
+    # (bit-identical without the E leg, tests/test_nilc.py). Under jit the unused E
+    # leg is already dead-code-eliminated: dropping it measured 6.60 -> 6.47 s per
+    # sim at nside=512 (jobs 994495 / 995493), so this is tidiness, not speed.
     cleaner = nilc_cleaner(clean_e=False)
     w_inv_fid = np.asarray(
         w_inv_from_noise_design(
