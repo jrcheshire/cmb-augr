@@ -127,7 +127,7 @@ from augr.optimize_mapbased import (
 )
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
-from augr.spectrum_stages import make_cutsky_mc_context
+from augr.spectrum_stages import _sim_shard_devices, make_cutsky_mc_context
 
 # --- fixed fiducial design (3 bands) -----------------------------------------
 FREQS = (90.0, 150.0, 220.0)
@@ -199,7 +199,10 @@ def _static_pieces(
         bm,
         2,
     )
-    cleaner = nilc_cleaner(clean_e=True)
+    # clean_e=False: every context here is MASTER, which reads only the B solution
+    # (bit-identical without the E leg, tests/test_nilc.py) -- the E leg is a third
+    # of the per-sim transforms for nothing.
+    cleaner = nilc_cleaner(clean_e=False)
     w_inv_fid = np.asarray(
         w_inv_from_noise_design(
             jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA), MISSION_YEARS, F_SKY
@@ -294,7 +297,7 @@ def _test_base(i):
     return (i + 2) * SEED_STRIDE
 
 
-def _make_objectives(pieces, n_total):
+def _make_objectives(pieces, n_total, sim_batch=1):
     """Return (value_fn, value_and_grad_fn) for the softmax-allocation objective.
 
     The objective ``sigma(r)(logits, mc_ctx)`` is jitted over ``(logits, mc_ctx)``
@@ -317,6 +320,7 @@ def _make_objectives(pieces, n_total):
             mc_ctx=mc_ctx,
             opt_ctx=opt_ctx,
             cleaner=cleaner,
+            sim_batch=sim_batch,
         )
 
     return build_design_objectives(_loss)
@@ -602,7 +606,7 @@ def run_demo(args, var_pix_ref, *, n_sims=None, return_metrics=False):
     pieces = _static_pieces(
         args.nside, args.lmax, args.delta_ell, args.ell_per_bin_below, args.ell_max_like
     )
-    value_fn, vg_fn = _make_objectives(pieces, n_total)
+    value_fn, vg_fn = _make_objectives(pieces, n_total, args.sim_batch)
 
     # Disjoint validation + test ensembles, all sharing the frozen var_pix_ref filter.
     val_ctx = _mc_ctx(pieces, VAL_BASE, n_sims, var_pix_ref)
@@ -1038,6 +1042,7 @@ def run_profile(args):
     print(f"  nside / lmax    : {args.nside} / {args.lmax}")
     print(f"  likelihood bins : ell 2..{min(args.lmax, args.ell_max_like)}")
     print(f"  n_sims rungs    : {n_lo}, {n_hi}   (repeat {args.repeat})")
+    print(f"  sim devices     : {_sim_shard_devices()}   (sim_batch {args.sim_batch})")
     print(f"  rss at entry    : {_peak_rss_gb():.2f} GB", flush=True)
 
     rows = {}
@@ -1103,7 +1108,7 @@ def run_profile(args):
         (w, n) for w in ("value", "value+grad") for n in (n_lo, n_hi)
     ]
     for what, n in plan:
-        value_fn, vg_fn = _make_objectives(pieces, n_total)
+        value_fn, vg_fn = _make_objectives(pieces, n_total, args.sim_batch)
         fn = value_fn if what == "value" else vg_fn
         first, steady = _timed(fn, logits, ctxs[n], repeat=args.repeat)
         rows[(what, n)] = (first, steady)
@@ -1159,6 +1164,8 @@ def run_profile(args):
                 "n_sims": [n_lo, n_hi],
                 "n_bins": n_bins,
                 "repeat": args.repeat,
+                "sim_devices": _sim_shard_devices(),
+                "sim_batch": args.sim_batch,
             },
             "context_build_s": {"static": t_static, **{str(k): v for k, v in t_ctx.items()}},
             "coupling_build_s": {"compile_first": c_first, "steady": c_steady},
@@ -1296,6 +1303,8 @@ def run_nside_ladder(args):
                               "jax_backend": jax.default_backend(),
                               "fft_mode": args.fft_mode,
                               "lmax_factor": args.lmax_factor, "repeat": args.repeat,
+                              "sim_devices": _sim_shard_devices(),
+                              "sim_batch": args.sim_batch,
                               "ell_max_like": args.ell_max_like},
                    "rungs": rows, "fit": fit}
         with open(out, "w") as fh:
@@ -1318,7 +1327,7 @@ def run_nside_ladder(args):
         steady, first = {}, {}
         for n in (n_lo, n_hi):
             ctx = jax.block_until_ready(_mc_ctx(pieces, 0, n))
-            _, vg_fn = _make_objectives(pieces, float(sum(N_DET)))
+            _, vg_fn = _make_objectives(pieces, float(sum(N_DET)), args.sim_batch)
             first[n], steady[n] = _timed(vg_fn, jnp.zeros(len(FREQS)), ctx, repeat=args.repeat)
             print(
                 f"  value+grad n_sims={n:>4d}  compile+first {first[n]:8.1f} s  "
@@ -1424,6 +1433,13 @@ def main():
     )
     p.add_argument(
         "--repeat", type=int, default=3, help="profile: steady-state repeats per timing (median)."
+    )
+    p.add_argument(
+        "--sim-batch",
+        type=int,
+        default=1,
+        help="sims vmapped into each step of the per-sim map (per device when sharded). "
+        "The sim axis is sharded over every visible device unless AUGR_SIM_NO_SHARD=1.",
     )
     p.add_argument(
         "--trace-dir",

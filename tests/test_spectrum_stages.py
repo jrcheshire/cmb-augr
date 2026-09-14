@@ -12,6 +12,7 @@ Map work needs jht (the [masking] extra) and ducc0 (the SHTs).
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import numpy as np
 import pytest
@@ -751,6 +752,114 @@ def test_sim_batch_agrees_with_the_unbatched_scan() -> None:
         )(W_INV)
         np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=1e-11)
         np.testing.assert_allclose(np.asarray(g), np.asarray(g_ref), rtol=1e-11)
+
+
+# --- sim-axis device sharding ------------------------------------------------
+#
+# JAX fixes the device count at import, so every multi-device arm runs in a child
+# process with JAX_NUM_CPU_DEVICES set. n_sims=6 over 4 devices pads to 8
+# (sim_batch 1) and 12 (sim_batch 3), so both arms cover the padding path.
+
+_SHARD_CHILD = r'''
+import os, sys
+import numpy as np, jax, jax.numpy as jnp
+sys.path.insert(0, sys.argv[2])
+import test_spectrum_stages as T
+from augr import sht
+from augr.spectrum_stages import _sim_shard_devices, mc_cutsky_cov_traced
+
+n_dev = int(os.environ["JAX_NUM_CPU_DEVICES"])
+assert jax.device_count() == n_dev, (jax.device_count(), n_dev)
+expect = 1 if os.environ.get("AUGR_SIM_NO_SHARD") else n_dev
+assert _sim_shard_devices() == expect, (_sim_shard_devices(), expect)
+sht.set_sht_backend(os.environ["AUGR_TEST_BACKEND"])
+mode = os.environ["AUGR_TEST_MODE"]
+
+w = jnp.asarray(T.W_INV)
+out = {}
+ctx, cleaner = T._master_setup(6)
+for b in (1, 3):
+    def f(ww, bb=b):
+        return T._sq_cov(ww, ctx, cleaner, remat=True, sim_batch=bb)
+    out[f"sharded{b}"] = np.array(int("shard_map" in str(jax.make_jaxpr(f)(w))))
+    if mode == "run":
+        out[f"cov{b}"] = np.asarray(
+            mc_cutsky_cov_traced(w, ctx, cleaner, remat=True, sim_batch=b).covariance)
+        out[f"grad{b}"] = np.asarray(jax.grad(f)(w))
+if mode == "trace":
+    wctx, wcleaner = T._traced_setup(6)
+    txt = str(jax.make_jaxpr(lambda ww: T._sq_cov(ww, wctx, wcleaner))(w))
+    out["wiener_sharded"] = np.array(int("shard_map" in txt))
+np.savez(sys.argv[1], **out)
+'''
+
+
+def _shard_child(tmp_path, tag, *, devices, backend="ducc", mode="run", opt_out=False):
+    """Run ``_SHARD_CHILD`` under ``devices`` CPU devices; return its npz."""
+    import subprocess
+    import sys
+
+    script = tmp_path / "shard_child.py"
+    script.write_text(_SHARD_CHILD)
+    npz = tmp_path / f"{tag}.npz"
+    env = {k: v for k, v in os.environ.items() if k != "AUGR_SIM_NO_SHARD"}
+    env.update(JAX_NUM_CPU_DEVICES=str(devices), AUGR_TEST_BACKEND=backend,
+               AUGR_TEST_MODE=mode)
+    if opt_out:
+        env["AUGR_SIM_NO_SHARD"] = "1"
+    proc = subprocess.run(
+        [sys.executable, str(script), str(npz), os.path.dirname(os.path.abspath(__file__))],
+        capture_output=True, text=True, timeout=900, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    return np.load(npz)
+
+
+def test_master_sim_axis_is_sharded_and_wiener_is_not(tmp_path) -> None:
+    """Trace-only, 4 CPU devices: a live ``shard_map`` on MASTER, none on Wiener.
+
+    Values cannot tell a sharded map from an unsharded one (they agree to ~1e-15),
+    so liveness is checked on the trace. The Wiener branch stays unsharded: its
+    body was never measured under sharding.
+    """
+    out = _shard_child(tmp_path, "trace", devices=4, mode="trace")
+    assert out["sharded1"] == 1 and out["sharded3"] == 1, "MASTER sim map not sharded"
+    assert out["wiener_sharded"] == 0, "masked-Wiener sim map picked up a shard_map"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("backend", ["ducc", "jht"])
+def test_sharded_sim_axis_matches_one_device(tmp_path, backend) -> None:
+    """Sharded value and gradient against the same ``sim_batch`` on one device.
+
+    Measured on 2 and 4 CPU devices, both backends, sim_batch 1/2/3: max relative
+    difference 6.5e-16 on the covariance and 2.6e-15 on the gradient. Gated at
+    1e-12, ~400x margin. ``AUGR_SIM_NO_SHARD=1`` is the one-device path: exact.
+    """
+    from augr import sht
+
+    w = jnp.asarray(W_INV)
+    ref = {}
+    with sht.sht_backend(backend):
+        ctx, cleaner = _master_setup(6)
+        for b in (1, 3):
+            ref[f"cov{b}"] = np.asarray(
+                mc_cutsky_cov_traced(w, ctx, cleaner, remat=True, sim_batch=b).covariance
+            )
+            ref[f"grad{b}"] = np.asarray(
+                jax.grad(lambda ww, bb=b: _sq_cov(ww, ctx, cleaner, remat=True, sim_batch=bb))(w)
+            )
+    assert np.all(np.isfinite(ref["grad1"])) and np.any(ref["grad1"] != 0.0)
+
+    sharded = _shard_child(tmp_path, "sharded", devices=4, backend=backend)
+    optout = _shard_child(tmp_path, "optout", devices=4, backend=backend, opt_out=True)
+    for b in (1, 3):
+        assert sharded[f"sharded{b}"] == 1, f"sim_batch={b}: no shard_map in the trace"
+        assert optout[f"sharded{b}"] == 0, f"sim_batch={b}: opt-out still sharded"
+        np.testing.assert_array_equal(optout[f"cov{b}"], ref[f"cov{b}"])
+        np.testing.assert_array_equal(optout[f"grad{b}"], ref[f"grad{b}"])
+        np.testing.assert_allclose(sharded[f"cov{b}"], ref[f"cov{b}"], rtol=1e-12, atol=0.0)
+        np.testing.assert_allclose(sharded[f"grad{b}"], ref[f"grad{b}"], rtol=1e-12, atol=0.0)
 
 
 def _skies_with_constant_fg(n_sims, n_band, lmax, *, vary=False):

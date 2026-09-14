@@ -42,13 +42,15 @@ echo
 
 # nside/lmax and the two n_sims rungs are the knobs worth changing per run. The
 # rungs must straddle a real difference or the intercept is unresolvable, and
-# BOTH must clear the Hartlap floor n_sims > n_bins + 2 -- 26 at the default
-# lmax=192, which is 24 bins at delta_ell=8. The script checks this before it
-# compiles anything.
+# BOTH must clear the Hartlap floor n_sims > n_bins + 2. The bin count is set by
+# the script's bin schedule and --ell-max-like, not by lmax; the script prints it
+# and checks the floor before it compiles anything. The sim axis is sharded over
+# every GPU on the node (AUGR_SIM_NO_SHARD=1 opts out); pass --sim-batch N to vmap
+# N sims per step on each device.
 pixi run --frozen -e gpu python scripts/mapbased_grad_characterization.py \
     --mode profile --backend jht \
     --nside "${MB_NSIDE:-128}" --lmax "${MB_LMAX:-192}" \
-    --profile-n-sims ${MB_NSIMS:-32 64} \
+    --profile-n-sims ${MB_NSIMS:-39 78} \
     --repeat "${MB_REPEAT:-3}" \
     ${MB_TRACE:+--trace-dir "mb_profile_trace.${SLURM_JOB_ID:-local}"} \
     --out-prefix "mb_profile.${SLURM_JOB_ID:-local}" "$@"

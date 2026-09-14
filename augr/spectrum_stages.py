@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 from dataclasses import dataclass
 
 import equinox as eqx
@@ -1001,8 +1002,32 @@ def _split_shared_fg(hsky: HarmonicSky) -> tuple[HarmonicSky, jax.Array | None]:
     return dataclasses.replace(hsky, fg_eb_alm=None), jnp.asarray(fg)
 
 
-def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1, consts: tuple = ()):
-    """``lax.map`` over ``body(sim, *consts)``, optionally checkpointed and batched.
+_SIM_NO_SHARD_ENV = "AUGR_SIM_NO_SHARD"
+
+
+def _sim_shard_devices() -> int:
+    """Devices a ``shard=True`` per-sim map splits over (1 = no sharding).
+
+    ``jax.device_count()``: the visible GPUs, or ``JAX_NUM_CPU_DEVICES`` logical
+    devices on CPU. JAX fixes it at import, so it is baked in at trace time.
+    ``AUGR_SIM_NO_SHARD=1`` forces 1.
+    """
+    if os.environ.get(_SIM_NO_SHARD_ENV, "") not in ("", "0"):
+        return 1
+    return int(jax.device_count())
+
+
+@functools.lru_cache(maxsize=4)
+def _sim_mesh(n_dev: int):
+    """Cached 1-D mesh over the sim axis; ``AxisType.Auto`` for the reason in
+    :func:`augr.delensing_fullsky_jax._l_mesh`."""
+    return jax.make_mesh((n_dev,), ("sims",), axis_types=(jax.sharding.AxisType.Auto,))
+
+
+def _sim_map(
+    body, xs, *, remat: bool, sim_batch: int = 1, consts: tuple = (), shard: bool = False
+):
+    """``lax.map`` over ``body(sim, *consts)``, optionally checkpointed, batched and sharded.
 
     Sibling of :func:`augr.delensing_fullsky_jax._map`, for the per-sim compsep
     body rather than the per-L QE body. ``xs`` is a pytree (the batched
@@ -1034,8 +1059,14 @@ def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1, consts: tuple = ()):
     (``jht.wiener``): under ``vmap`` that loop runs until every lane has
     converged, so the batch costs the max over its members. Default 1.
 
-    ``sim_batch == 1`` is an early return to a plain ``lax.map``, so with
-    ``remat=False`` the trace is exactly the pre-checkpoint one.
+    ``shard=True`` splits the sim axis across :func:`_sim_shard_devices` devices
+    with ``shard_map``; each device runs the same sequential (or batched) map over
+    its slice. Padding goes to a multiple of ``sim_batch * n_dev`` and a padded slot
+    costs a full sim. Anything the body needs that could carry a mesh sharding --
+    i.e. descends from the caller's traced inputs -- must come through ``consts``.
+
+    ``sim_batch == 1`` on one device is an early return to a plain ``lax.map``, so
+    with ``remat=False`` the trace is exactly the pre-checkpoint one.
 
     ``remat`` is read at **trace time** and must be a Python ``bool``, never a
     traced value.
@@ -1057,16 +1088,29 @@ def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1, consts: tuple = ()):
 
     plain = body if not consts else bound
 
-    if sim_batch == 1:
+    n_dev = _sim_shard_devices() if shard else 1
+    if sim_batch == 1 and n_dev == 1:
         step = jax.checkpoint(plain, prevent_cse=False) if remat else plain
         return jax.lax.map(step, xs)
 
-    # vmap FIRST, checkpoint SECOND: one batch is one recompute unit.
-    step = jax.vmap(plain)
-    if remat:
-        step = jax.checkpoint(step, prevent_cse=False)
+    def local_map(x, *cs):
+        """Map over one device's slice; its length is a multiple of ``sim_batch``."""
+        def one(v):
+            return body(v, *cs)
 
-    n_pad = -(-n // sim_batch) * sim_batch
+        # vmap FIRST, checkpoint SECOND: one batch is one recompute unit. The
+        # consts are closed over here, so the vmap never maps them.
+        step = jax.vmap(one) if sim_batch > 1 else one
+        if remat:
+            step = jax.checkpoint(step, prevent_cse=False)
+        if sim_batch == 1:
+            return jax.lax.map(step, x)
+        batched = jax.tree.map(lambda a: a.reshape((-1, sim_batch, *a.shape[1:])), x)
+        out = jax.lax.map(step, batched)
+        return jax.tree.map(lambda a: a.reshape((-1, *a.shape[2:])), out)
+
+    multiple = sim_batch * n_dev
+    n_pad = -(-n // multiple) * multiple
     if n_pad != n:
         # A padded slot costs a full slot; repeat the last sim and trim the
         # output below. Every sim costs the same, so which row is repeated
@@ -1074,11 +1118,24 @@ def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1, consts: tuple = ()):
         xs = jax.tree.map(
             lambda a: jnp.concatenate([a, jnp.repeat(a[-1:], n_pad - n, axis=0)]), xs
         )
-    batched = jax.tree.map(
-        lambda a: a.reshape((n_pad // sim_batch, sim_batch, *a.shape[1:])), xs
-    )
-    out = jax.lax.map(step, batched)
-    out = jax.tree.map(lambda a: a.reshape((-1, *a.shape[2:])), out)
+    if n_dev == 1:
+        out = local_map(xs, *consts)
+    else:
+        # check_vma=False: with it on, every per-device value is typed "varying over
+        # sims", and kernels that build a value from constants -- jht's recursion
+        # scan carries, ducc's pure_callback VJP outputs -- come out untyped and
+        # are rejected. The body has no collectives and the output is concatenated
+        # over sims, so there is no replication promise for the check to guard.
+        sharded = jax.shard_map(
+            local_map,
+            mesh=_sim_mesh(n_dev),
+            in_specs=(jax.P("sims"), *((jax.P(),) * len(consts))),
+            out_specs=jax.P("sims"),
+            check_vma=False,
+        )
+        # jit: JAX cannot evaluate the body's checkpoint / custom_vjp calls eagerly
+        # inside a shard_map. Under an outer jit this is an inlined call.
+        out = jax.jit(sharded)(xs, *consts)
     return jax.tree.map(lambda a: a[:n], out)
 
 
@@ -1167,7 +1224,7 @@ def _mc_cutsky_cov_master(
     mapped_skies, shared_fg_alm = _split_shared_fg(ctx.harmonic_skies)
     fg_consts = () if shared_fg_alm is None else (shared_fg_alm,)
 
-    def _one(hsky, key, *shared_fg):
+    def _one(hsky, key, w_inv, lens_scale, *shared_fg):
         if shared_fg:
             hsky = dataclasses.replace(hsky, fg_eb_alm=shared_fg[0])
         band_sky = beam_harmonic_sky(
@@ -1186,12 +1243,16 @@ def _mc_cutsky_cov_master(
         # No second cleaner solve -- project() reuses the stored weights.
         return full, master.bb_from_b_alm(result.project(band_sky.fg_qu))
 
+    # Sharded across every visible device. w_inv and lens_scale ride as consts,
+    # not closures: lens_scale can come out of a CPU-sharded delensing solve, and
+    # shard_map refuses to close over a value that carries a mesh sharding.
     rec, rec_fg = _sim_map(
         lambda bk, *cs: _one(bk[0], bk[1], *cs),
         (mapped_skies, ctx.noise_keys),
         remat=remat,
         sim_batch=sim_batch,
-        consts=fg_consts,
+        consts=(w_inv, lens_scale, *fg_consts),
+        shard=True,
     )
     n_bins = rec.shape[1]
     return CutskyMCTraced(
@@ -1269,8 +1330,10 @@ def mc_cutsky_cov_traced(
     every sim's residuals, and the tape is ``n_sims`` times a per-sim cost growing
     as ``npix`` -- terabytes by nside=1024. Values are bit-identical either way;
     see :func:`_sim_map`. ``sim_batch`` vmaps sims into each step and defaults to 1;
-    on this (masked-Wiener) branch raising it batches a ``while_loop`` CG, so read
-    :func:`_sim_map` before doing so.
+    on the masked-Wiener branch raising it batches a ``while_loop`` CG, so read
+    :func:`_sim_map` before doing so. On the MASTER branch the sim axis is split
+    across every visible device (the GPUs, or ``JAX_NUM_CPU_DEVICES`` on CPU);
+    ``AUGR_SIM_NO_SHARD=1`` opts out. The masked-Wiener branch is not sharded.
 
     The straight-through gradient flows through a *sample* covariance, so it carries
     Monte-Carlo noise -- characterise grad std vs ``n_sims`` before trusting a
