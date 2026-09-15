@@ -243,20 +243,31 @@ def _m_zero_mask(lmax: int) -> np.ndarray:
     return _m_of_alm(lmax) == 0
 
 
+def _ell_index(lmax: int) -> jax.Array:
+    """alm-index → ℓ (healpy packing), built in-trace behind ``optimization_barrier``.
+
+    ``ℓ = i − m(2·lmax+1−m)/2``, with ``m`` found by ``searchsorted`` on the per-m block
+    starts (block m begins at ``(ℓ=m, m)``, index ``m(2·lmax+1−m)/2 + m``). Built from
+    ``arange`` rather than closed over, so a static window gathered by it is not
+    constant-folded into a per-use ``(…, Nlm)`` XLA constant.
+    """
+    lmax = int(lmax)
+    m = jnp.arange(lmax + 1)
+    offsets = m * (2 * lmax + 1 - m) // 2
+    idx = jnp.arange(alm_size(lmax))
+    m_of_idx = jnp.searchsorted(offsets + m, idx, side="right") - 1
+    return jax.lax.optimization_barrier(idx - offsets[m_of_idx])
+
+
 def almxfl(alm: jax.Array, fl: jax.Array, lmax: int) -> jax.Array:
     """Multiply ``alm[(ℓ,m)]`` by ``fl[ℓ]`` (healpy.almxfl), JAX-differentiable.
 
     Used to apply beam / needlet-band window functions ``B(ℓ)`` / ``h_j(ℓ)``
-    on alms. Differentiable in both ``alm`` and ``fl``.
-
-    ``ell`` is kept as a NumPy index (not ``jnp``): ``fl[ell]`` then works for both
-    a jnp ``fl`` (jnp gather) and a numpy ``fl`` (numpy gather), the latter under
-    ``jax.jit`` / ``lax.map`` too -- a jnp ``ell`` would force numpy ``fl`` through
-    ``numpy[tracer]`` and raise. Static-index gather, so differentiability in
-    ``alm`` / ``fl`` is unchanged.
+    on alms. Differentiable in both ``alm`` and ``fl``; ``fl`` may be NumPy or jnp,
+    and is converted to jnp before the gather so a NumPy ``fl`` works under
+    ``jax.jit`` / ``lax.map``. The ℓ index is built in-trace (:func:`_ell_index`).
     """
-    ell = _ell_of_alm(lmax)
-    return alm * fl[ell]
+    return alm * jnp.asarray(fl)[_ell_index(lmax)]
 
 
 
@@ -527,8 +538,8 @@ def _opaque(fn):
     consumed by the sim loop as a constant. A checkpoint boundary keeps the
     kernel one unit, so the recursion is recomputed per transform (its cost is a
     small fraction of the transform) and nothing of that shape is retained.
-    Verified in the production gradient graph, not just a toy: without this the
-    tables survive the custom_vjp below.
+    Since jaxht 0.3.0 jht checkpoints each kernel itself, so this is belt-and-braces:
+    the sim-scan gate in ``tests/test_sht.py`` reads 0 tables with or without it.
     """
     return jax.checkpoint(fn, policy=jax.checkpoint_policies.nothing_saveable)
 

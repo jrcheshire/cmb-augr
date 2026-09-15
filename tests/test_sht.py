@@ -19,11 +19,13 @@ import healpy as hp
 
 from augr.sht import (
     _default_backend,
+    _ell_index,
     _ell_of_alm,
     _m_of_alm,
     _resolve_nthreads,
     adjoint_synthesis,
     alm_size,
+    almxfl,
     band_limit,
     check_band_limit,
     get_sht_backend,
@@ -59,6 +61,31 @@ def test_synthesis_spin0_matches_healpy() -> None:
     out = np.asarray(synthesis(alm, 0, LMAX, NSIDE))[0]
     ref = hp.alm2map(alm[0].copy(), NSIDE, lmax=LMAX)
     np.testing.assert_allclose(out, ref, rtol=1e-9, atol=1e-10)
+
+
+@pytest.mark.parametrize("lmax", [0, 1, 2, 7, LMAX, 97])
+def test_ell_index_matches_healpy(lmax: int) -> None:
+    ref = hp.Alm.getlm(lmax)[0]
+    np.testing.assert_array_equal(np.asarray(_ell_index(lmax)), ref)
+    np.testing.assert_array_equal(_ell_of_alm(lmax), ref)
+
+
+def test_almxfl_matches_healpy_and_folds_no_window_table() -> None:
+    """almxfl == healpy.almxfl eagerly and under jit/vmap over NumPy windows (the needlet
+    path), and the compiled graph holds no (n_windows, Nlm) constant: the in-trace ℓ
+    index keeps XLA from folding ``window[ell]`` into a per-use table."""
+    rng = np.random.default_rng(11)
+    alm = _random_alm(seed=12)[0]
+    windows = rng.standard_normal((3, LMAX + 1))  # NumPy, as nilc.needlet_bands returns
+    ref = np.stack([hp.almxfl(alm.copy(), w) for w in windows])
+    np.testing.assert_allclose(np.asarray(almxfl(alm, windows[0], LMAX)), ref[0], rtol=1e-15, atol=0)
+
+    fn = jax.jit(lambda a: jax.vmap(lambda w: almxfl(a, w, LMAX))(windows))
+    np.testing.assert_allclose(np.asarray(fn(jnp.asarray(alm))), ref, rtol=1e-15, atol=0)
+    import re
+
+    hlo = fn.lower(jnp.asarray(alm)).compile().as_text().replace(" ", "")
+    assert not re.search(rf"\[3,{NLM}\](\{{[^}}]*\}})?constant\(", hlo)
 
 
 def test_synthesis_pol_matches_healpy() -> None:
@@ -366,10 +393,10 @@ class TestBackendParity:
 #   2. under grad of a lax.scan over sims, JAX partial-evaluates the body and
 #      hoists the recursion (it depends only on the grid) out of the sim loop,
 #      storing its per-l output stacked -- consumed by the loop as a constant.
-# The custom_vjp closes 1 and the save-nothing checkpoint (_opaque) closes 2.
-# Counts at this fixture, measured 2026-09-12: native jht 36 / 44; custom_vjp
-# without _opaque 0 / 44; both in place 0 / 0. Each gate fails on exactly one
-# mechanism's removal.
+# The custom_vjp closes 1; a save-nothing checkpoint per kernel closes 2. Counts at
+# this fixture, measured 2026-09-12 on jaxht 0.2.0: native jht 36 / 44; custom_vjp
+# without augr's _opaque 0 / 44; both 0 / 0. Since jaxht 0.3.0 jht checkpoints each
+# kernel itself, so gate 2 reads 0 with or without _opaque (measured 2026-09-14).
 
 _NS_G, _LMAX_G, _NSIM_G = 16, 24, 4
 
