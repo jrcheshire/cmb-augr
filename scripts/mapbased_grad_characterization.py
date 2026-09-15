@@ -1306,7 +1306,9 @@ def run_nside_ladder(args):
                               "lmax_factor": args.lmax_factor, "repeat": args.repeat,
                               "sim_devices": _sim_shard_devices(),
                               "sim_batch": args.sim_batch,
-                              "ell_max_like": args.ell_max_like},
+                              "ell_max_like": args.ell_max_like,
+                              "xla_mem_fraction": os.environ.get(
+                                  "XLA_PYTHON_CLIENT_MEM_FRACTION")},
                    "rungs": rows, "fit": fit}
         with open(out, "w") as fh:
             json.dump(payload, fh, indent=2)
@@ -1319,31 +1321,43 @@ def run_nside_ladder(args):
         )
         n_bins = int(np.asarray(pieces["bm"]).shape[0])
         n_lo = n_bins + 3  # just clears the Hartlap floor at THIS resolution
-        n_hi = 2 * n_lo
+        counts = tuple(args.ladder_n_sims) if args.ladder_n_sims else (n_lo, 2 * n_lo)
+        if min(counts) <= n_bins + 2:
+            raise ValueError(
+                f"--ladder-n-sims {counts} at nside={nside}: Hartlap needs "
+                f"n_sims > n_bins + 2 = {n_bins + 2}."
+            )
         print(
             f"\n########## nside={nside} lmax={lmax} bins={n_bins} "
-            f"sims={n_lo},{n_hi} ##########",
+            f"sims={','.join(str(n) for n in counts)} ##########",
             flush=True,
         )
-        steady, first = {}, {}
-        for n in (n_lo, n_hi):
+        steady, first, peak_dev = {}, {}, {}
+        for n in counts:
             ctx = jax.block_until_ready(_mc_ctx(pieces, 0, n))
             _, vg_fn = _make_objectives(pieces, float(sum(N_DET)), args.sim_batch)
             first[n], steady[n] = _timed(vg_fn, jnp.zeros(len(FREQS)), ctx, repeat=args.repeat)
+            peak_dev[n] = _peak_device_gb()
             print(
                 f"  value+grad n_sims={n:>4d}  compile+first {first[n]:8.1f} s  "
-                f"steady {steady[n]:8.3f} s  peak device {_peak_device_gb()} GB  "
+                f"steady {steady[n]:8.3f} s  peak device {peak_dev[n]} GB  "
                 f"rss {_peak_rss_gb():.2f} GB",
                 flush=True,
             )
             del ctx, vg_fn
             jax.clear_caches()
-        per_sim = (steady[n_hi] - steady[n_lo]) / (n_hi - n_lo)
-        print(f"  per-sim body: {per_sim:.4f} s", flush=True)
+        per_sim = None
+        if len(counts) >= 2:
+            lo, hi = min(counts), max(counts)
+            per_sim = (steady[hi] - steady[lo]) / (hi - lo)
+            print(f"  per-sim body: {per_sim:.4f} s", flush=True)
+        else:
+            print("  one n_sims in this process: no per-sim slope.", flush=True)
         # Peaks are process high-water marks, so a rung's value includes earlier rungs.
         rows.append({"nside": nside, "lmax": lmax, "n_bins": n_bins,
-                     "n_sims": [n_lo, n_hi], "steady_s": [steady[n_lo], steady[n_hi]],
-                     "compile_first_s": [first[n_lo], first[n_hi]],
+                     "n_sims": list(counts), "steady_s": [steady[n] for n in counts],
+                     "compile_first_s": [first[n] for n in counts],
+                     "peak_device_gb_after": [peak_dev[n] for n in counts],
                      "per_sim_s": per_sim,
                      "peak_device_gb": _peak_device_gb(), "peak_rss_gb": _peak_rss_gb()})
         _write(None)
@@ -1351,16 +1365,18 @@ def run_nside_ladder(args):
     print("\n=== measured resolution scaling ===")
     print(f"  {'nside':>6} {'bins':>5} {'per-sim':>10}")
     for r in rows:
-        print(f"  {r['nside']:>6} {r['n_bins']:>5} {r['per_sim_s']:>9.4f}s")
+        ps = "n/a" if r["per_sim_s"] is None else f"{r['per_sim_s']:.4f}s"
+        print(f"  {r['nside']:>6} {r['n_bins']:>5} {ps:>10}")
     fit = None
-    if len(rows) >= 2:
-        x = np.log(np.array([r["nside"] for r in rows], dtype=float))
-        y = np.log(np.array([r["per_sim_s"] for r in rows], dtype=float))
+    fit_rows = [r for r in rows if r["per_sim_s"] is not None]
+    if len(fit_rows) >= 2:
+        x = np.log(np.array([r["nside"] for r in fit_rows], dtype=float))
+        y = np.log(np.array([r["per_sim_s"] for r in fit_rows], dtype=float))
         slope, intercept = np.polyfit(x, y, 1)
         resid = y - (slope * x + intercept)
         fit = {"exponent": float(slope), "log_residuals": resid.tolist()}
         print(f"  per_sim ~ nside^{slope:.3f}   (max |log resid| {np.abs(resid).max():.3f})")
-        if len(rows) == 2:
+        if len(fit_rows) == 2:
             print("  TWO POINTS: this exponent has no residual to check it against.")
         print(
             "  An EVALUATION costs this times n_sims. With --ell-max-like capping the "
@@ -1484,6 +1500,16 @@ def main():
         default=1.5,
         help="nside-ladder: lmax = factor * nside at every rung, so the exponent is "
         "measured along the line the production configs actually sit on.",
+    )
+    p.add_argument(
+        "--ladder-n-sims",
+        type=int,
+        nargs="+",
+        default=None,
+        help="nside-ladder: sim counts to time at every rung, replacing the default "
+        "(n_bins+3, 2*(n_bins+3)). One count per process is the high-nside mode: a "
+        "second program in the same process can fail on a fragmented GPU pool when "
+        "one evaluation nearly fills the card. A single count gives no per-sim slope.",
     )
     p.add_argument(
         "--skip-arith",
