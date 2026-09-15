@@ -134,7 +134,7 @@ def _require_jht():
             "Install it with:\n"
             "    pip install 'cmb-augr[masking]'\n"
             "or, in the development env:\n"
-            "    pixi add --pypi 'jaxht>=0.1.3'"
+            "    pixi add --pypi 'jaxht>=0.3.0'"
         ) from exc
 
 
