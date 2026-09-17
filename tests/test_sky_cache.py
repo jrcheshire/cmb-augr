@@ -18,9 +18,16 @@ from augr.cleaning import nilc_cleaner
 from augr.config import cleaned_map_instrument
 from augr.delensing import load_lensing_spectra
 from augr.foregrounds import NullForegroundModel
+from augr.sht import alm_size
 from augr.signal import SignalModel
 from augr.spectra import CMBSpectra
-from augr.spectrum_stages import load_sky_cache, make_cutsky_mc_context, save_sky_cache
+from augr.spectrum_stages import (
+    load_fg_cache,
+    load_sky_cache,
+    make_cutsky_mc_context,
+    save_fg_cache,
+    save_sky_cache,
+)
 
 NSIDE, LMAX, F_SKY = 16, 24, 0.6
 FREQS = (90.0, 150.0, 220.0)
@@ -29,7 +36,7 @@ BEAMS = (40.0, 30.0, 20.0)
 
 def _build_ctx(
     *, harmonic_skies=None, noise_keys=None, var_pix_ref=1.0, n_sims=3, base_seed=0,
-    split_lensing=False, estimator="master",
+    split_lensing=False, estimator="master", fg_model=None, fg_eb_alm=None,
 ):
     """A tiny CMB-only cut-sky MC context (no pysm3; var_pix_ref supplied -> no setup clean)."""
     ls = load_lensing_spectra()
@@ -65,11 +72,12 @@ def _build_ctx(
         true_bb_binned=true_b,
         n_sims=n_sims,
         base_seed=base_seed,
-        fg_model=None,
+        fg_model=fg_model,
         r_in=0.0,
         var_pix_ref=var_pix_ref,
         harmonic_skies=harmonic_skies,
         noise_keys=noise_keys,
+        fg_eb_alm=fg_eb_alm,
         split_lensing=split_lensing,
         estimator=estimator,
     )
@@ -213,4 +221,103 @@ def test_unsplit_cache_refuses_a_delensing_context(tmp_path):
             noise_keys=cache.noise_keys,
             var_pix_ref=cache.var_pix_ref,
             split_lensing=True,
+        )
+
+
+# --- static foreground generated / cached once ------------------------------------------
+
+
+def _fake_fg():
+    """A deterministic stand-in for one static PySM sky, ``(n_band, 2, n_alm)``."""
+    rng = np.random.default_rng(3)
+    shape = (len(FREQS), 2, alm_size(LMAX))
+    return jnp.asarray(rng.normal(size=shape) + 1j * rng.normal(size=shape))
+
+
+@pytest.fixture
+def fake_pysm(monkeypatch):
+    """Replace PySM generation with a call-counting fake; ``static`` sets the preset type.
+
+    Patches the per-band generator in ``compsep_sims`` (reached by both the per-sim
+    ``harmonic_sky`` path and the real ``static_fg_eb_alm``), so the count is the
+    number of PySM runs whichever path builds the ensemble.
+    """
+    import augr.compsep_sims as cs
+    import augr.spectrum_stages as ss
+
+    state = {"calls": 0, "static": True}
+    fg = _fake_fg()
+
+    def gen(freqs_ghz, fg_model, lmax, nside, *, fg_seed=0, bandpasses=None):
+        state["calls"] += 1
+        return fg
+
+    monkeypatch.setattr(cs, "_fg_eb_alm", gen)
+    monkeypatch.setattr(cs, "fg_model_is_static", lambda m: state["static"])
+    monkeypatch.setattr(ss, "fg_model_is_static", lambda m: state["static"])
+    state["fg"] = fg
+    return state
+
+
+def _assert_same_ensemble(a, b):
+    ha, hb = a.harmonic_skies, b.harmonic_skies
+    for name in ("cmb_b_alm", "cmb_e_alm", "fg_eb_alm"):
+        np.testing.assert_array_equal(np.asarray(getattr(ha, name)), np.asarray(getattr(hb, name)))
+    np.testing.assert_array_equal(np.asarray(a.noise_keys), np.asarray(b.noise_keys))
+
+
+def test_static_fg_is_generated_once_and_matches_per_sim_generation(fake_pysm):
+    """A static preset runs PySM once, not n_sims times, and builds the same ensemble.
+
+    The stochastic leg is the anti-vacuity half: it must still generate per sim, or a
+    builder that always shared would pass the first leg while replacing a genuinely
+    varying foreground with one realization.
+    """
+    n_sims = 4
+    fake_pysm["static"] = False
+    per_sim = _build_ctx(n_sims=n_sims, base_seed=5, fg_model="d1s1")
+    assert fake_pysm["calls"] == n_sims
+
+    fake_pysm["calls"], fake_pysm["static"] = 0, True
+    once = _build_ctx(n_sims=n_sims, base_seed=5, fg_model="d1s1")
+    assert fake_pysm["calls"] == 1
+    assert once.harmonic_skies.fg_eb_alm.ndim == 3
+
+    fake_pysm["calls"] = 0
+    supplied = _build_ctx(n_sims=n_sims, base_seed=5, fg_eb_alm=fake_pysm["fg"])
+    assert fake_pysm["calls"] == 0
+
+    # per_sim was collapsed by share_fg, so all three carry the same rank-3 foreground.
+    _assert_same_ensemble(per_sim, once)
+    _assert_same_ensemble(per_sim, supplied)
+
+
+def test_fg_cache_roundtrip_rebuilds_the_generated_ensemble(tmp_path, fake_pysm):
+    """Generate -> save_fg_cache -> load -> fg_eb_alm= reproduces the ensemble bitwise."""
+    generated = _build_ctx(n_sims=3, base_seed=9, fg_model="d10s5")
+    p = str(tmp_path / "fg_once.npz")
+    save_fg_cache(
+        p, generated.harmonic_skies.fg_eb_alm, fg_model="d10s5",
+        freqs_ghz=FREQS, nside=NSIDE, lmax=LMAX,
+    )
+    cache = load_fg_cache(p)
+    assert (cache.fg_model, cache.freqs_ghz, cache.nside, cache.lmax) == ("d10s5", FREQS, NSIDE, LMAX)
+
+    fake_pysm["calls"] = 0
+    rebuilt = _build_ctx(n_sims=3, base_seed=9, fg_eb_alm=cache.fg_eb_alm)
+    assert fake_pysm["calls"] == 0
+    _assert_same_ensemble(generated, rebuilt)
+
+
+def test_fg_eb_alm_validation(tmp_path):
+    fg = _fake_fg()
+    ctx = _build_ctx(n_sims=3)
+    with pytest.raises(ValueError, match="not both"):
+        _build_ctx(harmonic_skies=ctx.harmonic_skies, noise_keys=ctx.noise_keys, fg_eb_alm=fg)
+    with pytest.raises(ValueError, match="fg_eb_alm has shape"):
+        _build_ctx(n_sims=3, fg_eb_alm=fg[:, :, :-1])
+    with pytest.raises(ValueError, match="fg_eb_alm has shape"):
+        save_fg_cache(
+            str(tmp_path / "bad.npz"), fg[:2], fg_model="d1s1",
+            freqs_ghz=FREQS, nside=NSIDE, lmax=LMAX,
         )

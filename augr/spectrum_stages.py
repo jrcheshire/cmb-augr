@@ -61,13 +61,15 @@ from .compsep_sims import (
     HarmonicSky,
     assemble_band_maps,
     beam_harmonic_sky,
+    fg_model_is_static,
     harmonic_sky,
+    static_fg_eb_alm,
 )
 from .covariance import mc_bandpower_covariance
 from .instrument import beam_bl
 from .parallel import parallel_map
 from .pseudo_cl_jax import MasterBBJax
-from .sht import synthesis_pol
+from .sht import alm_size, synthesis_pol
 from .spectra import CMBSpectra
 
 
@@ -567,6 +569,7 @@ def make_cutsky_mc_context(
     var_pix_ref: float | None = None,
     harmonic_skies: HarmonicSky | None = None,
     noise_keys: jax.Array | None = None,
+    fg_eb_alm: jax.Array | None = None,
     knee_ell: jax.Array | None = None,
     alpha_knee: float = 1.0,
     max_iter: int = 200,
@@ -624,8 +627,16 @@ def make_cutsky_mc_context(
     representation for those models, not an error. Pass ``share_fg=False`` to keep
     the per-sim ensemble unconditionally.
 
-    Note this reduces what the *forward* carries, not the peak during generation:
-    the ensemble is stacked and then collapsed. Peak at generation is unchanged.
+    When generating (no ``harmonic_skies``), a static preset's foreground is built
+    **once** and attached to the stacked CMB ensemble, so PySM runs once rather than
+    ``n_sims`` times; a stochastic preset, or ``share_fg=False``, keeps the per-sim
+    generation.
+
+    ``fg_eb_alm`` (optional, ``(n_band, 2, n_alm)``): a precomputed shared foreground,
+    e.g. from :func:`load_fg_cache` on a pysm3-less env. The CMB E/B and noise keys are
+    still drawn from ``base_seed``, so the ensemble matches a generated one exactly.
+    ``fg_model`` is not read when it is supplied; the caller checks the cache's
+    ``fg_model``. Exclusive with ``harmonic_skies``.
     """
     # The inverse-noise filter -- and hence var_pix_ref and the setup clean that
     # derives it -- exists only for the masked-Wiener estimator. MASTER never
@@ -645,19 +656,43 @@ def make_cutsky_mc_context(
     cl_ee_prior = beamed_prior(cl_ee, common_fwhm, lmax)
     cl_bb_prior = beamed_prior(cl_bb_prior_unbeamed, common_fwhm, lmax)
 
-    def _hsky(seed: int) -> HarmonicSky:
-        return harmonic_sky(
+    if fg_eb_alm is not None and harmonic_skies is not None:
+        raise ValueError("pass fg_eb_alm or harmonic_skies, not both.")
+    shared_fg = None
+    if fg_eb_alm is not None:
+        shared_fg = jnp.asarray(fg_eb_alm)
+        expected = (len(freqs_ghz), 2, alm_size(int(lmax)))
+        if tuple(shared_fg.shape) != expected:
+            raise ValueError(
+                f"fg_eb_alm has shape {tuple(shared_fg.shape)}; expected {expected} "
+                f"(n_band, 2, n_alm at lmax={int(lmax)})."
+            )
+    elif (
+        harmonic_skies is None
+        and fg_model is not None
+        and share_fg
+        and fg_model_is_static(fg_model)
+    ):
+        shared_fg = static_fg_eb_alm(
+            freqs_ghz, fg_model, int(lmax), int(nside), bandpasses=bandpasses
+        )
+
+    def _hsky(seed: int, *, attach_fg: bool = True) -> HarmonicSky:
+        sky = harmonic_sky(
             freqs_ghz,
             spectra=spectra,
             r_in=float(r_in),
             nside=int(nside),
             lmax=int(lmax),
-            fg_model=fg_model,
+            fg_model=fg_model if shared_fg is None else None,
             cmb_seed=int(seed),
             cl_ee=cl_ee,
             bandpasses=bandpasses,
             split_lensing=split_lensing,
         )
+        if shared_fg is not None and attach_fg:
+            sky = dataclasses.replace(sky, fg_eb_alm=shared_fg)
+        return sky
 
     if harmonic_skies is None:
         seeds = list(range(int(base_seed), int(base_seed) + int(n_sims)))
@@ -665,8 +700,10 @@ def make_cutsky_mc_context(
         # leaves get a leading sim axis; the static fields are shared) + stacked keys, so
         # the traced forward can lax.map over the sim axis instead of Python-unrolling the
         # cleaner n_sims times (O(1) compile, scan-accumulated memory -> higher n_sims).
-        _hsky_tuple = tuple(_hsky(s) for s in seeds)
+        _hsky_tuple = tuple(_hsky(s, attach_fg=False) for s in seeds)
         harmonic_skies = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *_hsky_tuple)
+        if shared_fg is not None:
+            harmonic_skies = dataclasses.replace(harmonic_skies, fg_eb_alm=shared_fg)
         noise_keys = jnp.stack([jax.random.PRNGKey(int(s)) for s in seeds], axis=0)
     else:
         # Precomputed FG sky ensemble -- e.g. loaded from a sky cache (save_sky_cache /
@@ -875,6 +912,53 @@ def load_sky_cache(path) -> SkyCache:
         f_sky=float(z["f_sky"]),
         fg_model=str(z["fg_model"]),
         base_seed=int(z["base_seed"]),
+    )
+
+
+@dataclass(frozen=True)
+class FgCache:
+    """One static foreground sky, shared by every sim and every seed block.
+
+    ``fg_eb_alm`` is ``(n_band, 2, n_alm)``, unbeamed; pass it to
+    ``make_cutsky_mc_context(fg_eb_alm=...)``, which draws the CMB and noise from
+    ``base_seed`` as usual. Unlike :class:`SkyCache` it carries no per-sim data, so
+    one file serves any ``n_sims`` and any ensemble. The caller checks the metadata
+    against its run (bands, nside, lmax, fg_model); bandpasses are not recorded.
+    """
+
+    fg_eb_alm: jax.Array
+    fg_model: str
+    freqs_ghz: tuple[float, ...]
+    nside: int
+    lmax: int
+
+
+def save_fg_cache(path, fg_eb_alm, *, fg_model: str, freqs_ghz, nside: int, lmax: int) -> None:
+    """Write a static foreground (e.g. from ``compsep_sims.static_fg_eb_alm``) to ``path`` (.npz)."""
+    fg = np.asarray(fg_eb_alm)
+    freqs = np.asarray(tuple(float(f) for f in freqs_ghz), dtype=float)
+    expected = (freqs.size, 2, alm_size(int(lmax)))
+    if fg.shape != expected:
+        raise ValueError(f"fg_eb_alm has shape {fg.shape}; expected {expected}.")
+    np.savez(
+        path,
+        fg_eb_alm=fg,
+        fg_model=np.asarray(str(fg_model)),
+        freqs_ghz=freqs,
+        nside=np.asarray(int(nside)),
+        lmax=np.asarray(int(lmax)),
+    )
+
+
+def load_fg_cache(path) -> FgCache:
+    """Load an :class:`FgCache` written by :func:`save_fg_cache` (no pysm3 required)."""
+    z = np.load(path, allow_pickle=False)
+    return FgCache(
+        fg_eb_alm=jnp.asarray(z["fg_eb_alm"]),
+        fg_model=str(z["fg_model"]),
+        freqs_ghz=tuple(float(f) for f in z["freqs_ghz"]),
+        nside=int(z["nside"]),
+        lmax=int(z["lmax"]),
     )
 
 

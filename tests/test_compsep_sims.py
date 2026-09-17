@@ -24,9 +24,11 @@ from augr.compsep_sims import (
     cmb_b_alm,
     cmb_b_alm_split,
     cmb_band_qu,
+    fg_model_is_static,
     generate_band_sky,
     harmonic_sky,
     pysm_fg_iqu,
+    static_fg_eb_alm,
 )
 from augr.instrument import beam_bl
 from augr.spectra import CMBSpectra
@@ -353,6 +355,29 @@ def test_beam_harmonic_sky_matches_generate_band_sky_with_fg() -> None:
         )
         np.testing.assert_array_equal(np.asarray(reused.fg_qu), np.asarray(fresh.fg_qu))
         np.testing.assert_array_equal(np.asarray(reused.cmb_qu), np.asarray(fresh.cmb_qu))
+
+
+@pytest.mark.slow
+def test_static_fg_matches_per_seed_generation_and_refuses_stochastic() -> None:
+    """The once-generated foreground is exactly what every seed would draw.
+
+    Checked against PySM itself at a nonzero seed, since the FG-once path is only
+    correct because fixed-template presets ignore ``fg_seed``; the stochastic presets
+    must be classified as such and refused.
+    """
+    pytest.importorskip("pysm3")
+    from augr.compsep_sims import _fg_eb_alm
+
+    assert fg_model_is_static("d1s1") and fg_model_is_static("d10s5")
+    assert not fg_model_is_static("d10s6") and not fg_model_is_static("s6")
+
+    nside, lmax, freqs = 16, 24, (30.0, 150.0)
+    once = static_fg_eb_alm(freqs, "d10s5", lmax, nside)
+    np.testing.assert_array_equal(
+        np.asarray(once), np.asarray(_fg_eb_alm(freqs, "d10s5", lmax, nside, fg_seed=12345))
+    )
+    with pytest.raises(ValueError, match="stochastic"):
+        static_fg_eb_alm(freqs, "d10s6", lmax, nside)
 
 
 # --- lensing/tensor split + the delensing lens_scale knob ---------------------
