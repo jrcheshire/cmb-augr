@@ -655,6 +655,84 @@ def test_cleaner_graph_is_flat_in_band_count():
     assert many < 1.25 * few, f"graph grew with band count: {few} -> {many}"
 
 
+def _ducc_cleaner_fixture(n_band=4, lmax=24, nside=16):
+    from augr.cleaning import nilc_cleaner
+
+    npix = 12 * nside**2
+    beams = jnp.linspace(40.0, 20.0, n_band)
+    ps = jnp.ones(n_band)
+    qu = jax.random.normal(jax.random.PRNGKey(0), (n_band, 2, npix))
+    cleaner = nilc_cleaner(clean_e=True)
+
+    def value(m):
+        return cleaner(m, beams, ps, lmax=lmax, nside=nside).cleaned_b_alm
+
+    def loss(m):
+        return jnp.sum(jnp.abs(value(m)) ** 2)
+
+    return qu, value, loss
+
+
+def _callbacks_inside_loops(jaxpr, inside=False):
+    """Count callback equations nested in a scan / while body."""
+    n = 0
+    for e in jaxpr.eqns:
+        if "callback" in e.primitive.name and inside:
+            n += 1
+        nested = inside or e.primitive.name in ("scan", "while")
+        for v in e.params.values():
+            for sub in v if isinstance(v, (list, tuple)) else [v]:
+                j = getattr(sub, "jaxpr", None)
+                if j is not None:
+                    n += _callbacks_inside_loops(getattr(j, "jaxpr", j), nested)
+                elif type(sub).__name__ == "Jaxpr":
+                    n += _callbacks_inside_loops(sub, nested)
+    return n
+
+
+def test_cleaner_loop_on_ducc_is_bit_identical_to_vmapped_form():
+    """The ducc loop and the jht-style vmap must agree exactly, value and gradient."""
+    pytest.importorskip("ducc0")
+    from unittest import mock
+
+    import augr.nilc as nilc_mod
+    from augr import sht
+
+    qu, value, loss = _ducc_cleaner_fixture()
+    with sht.sht_backend("ducc"):
+        v_loop, g_loop = value(qu), jax.grad(loss)(qu)
+        with mock.patch.object(nilc_mod, "get_sht_backend", return_value="jht"):
+            v_vmap, g_vmap = value(qu), jax.grad(loss)(qu)
+    assert np.array_equal(np.asarray(v_loop), np.asarray(v_vmap))
+    assert np.array_equal(np.asarray(g_loop), np.asarray(g_vmap))
+
+
+def test_cleaner_gradient_does_not_serialize_ducc_transforms():
+    """On ducc no transform callback may sit inside a scan in the cleaner's gradient.
+
+    ``vmap`` over a ``vmap_method="sequential"`` callback lowers to a scan, which
+    runs the per-band transforms strictly one after another; separate callbacks
+    can run concurrently. Values are identical either way, so only structure can
+    catch it: measured 0 in-loop callbacks with the loop and 38 with the vmapped
+    form (n_band=4, nside=16). That regression took the nside=128 CPU design
+    gradient from 49.5 s to 59.8 s on a 16-core laptop.
+    """
+    pytest.importorskip("ducc0")
+    from unittest import mock
+
+    import augr.nilc as nilc_mod
+    from augr import sht
+
+    qu, _, loss = _ducc_cleaner_fixture()
+    with sht.sht_backend("ducc"):
+        jx = jax.make_jaxpr(jax.grad(loss))(qu)
+        assert _callbacks_inside_loops(jx.jaxpr) == 0
+        # Anti-vacuity: the vmapped form does serialize, so this check can fail.
+        with mock.patch.object(nilc_mod, "get_sht_backend", return_value="jht"):
+            jx_vmap = jax.make_jaxpr(jax.grad(loss))(qu)
+        assert _callbacks_inside_loops(jx_vmap.jaxpr) > 0
+
+
 @pytest.mark.parametrize("batch", [1, 4, 9])
 def test_needlet_batch_is_exact_on_ducc(batch):
     """Chunking the transform batch must not move a bit on the CPU backend.

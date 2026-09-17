@@ -48,7 +48,34 @@ import jax.numpy as jnp
 import numpy as np
 
 from .instrument import beam_bl
-from .sht import almxfl, check_band_limit, map2alm, synthesis, synthesis_pol
+from .sht import (
+    almxfl,
+    check_band_limit,
+    get_sht_backend,
+    map2alm,
+    synthesis,
+    synthesis_pol,
+)
+
+# ---------------------------------------------------------------------------
+# per-band transform dispatch
+# ---------------------------------------------------------------------------
+
+
+def _map_transforms(fn, *xs):
+    """Apply ``fn`` along the leading axis of ``xs``: vmapped on jht, looped on ducc.
+
+    On jht the transforms batch natively, so ``vmap`` issues fewer, larger kernels.
+    On ducc each transform is a ``pure_callback`` declared
+    ``vmap_method="sequential"``, so ``vmap`` chains them into one strictly serial
+    scan, whereas a Python loop leaves independent callbacks that XLA can run
+    concurrently. Values and gradients are bit-identical either way.
+    """
+    if get_sht_backend() == "jht":
+        return jax.vmap(fn)(*xs)
+    outs = [fn(*(x[i] for x in xs)) for i in range(xs[0].shape[0])]
+    return jax.tree.map(lambda *o: jnp.stack(o), *outs)
+
 
 # ---------------------------------------------------------------------------
 # cosine needlet bands
@@ -138,7 +165,7 @@ def common_resolution_b_alm(
         ratio = bl_common / jnp.maximum(beam_bl(ells, fwhm_b, p_b), 1e-30)
         return almxfl(eb[1], ratio, lmax)
 
-    return jax.vmap(_one)(band_qu, beams, ps), common_fwhm_arcmin
+    return _map_transforms(_one, band_qu, beams, ps), common_fwhm_arcmin
 
 
 def common_resolution_eb(
@@ -174,7 +201,7 @@ def common_resolution_eb(
         ratio = bl_common / jnp.maximum(beam_bl(ells, fwhm_b, p_b), 1e-30)
         return almxfl(eb[0], ratio, lmax), almxfl(eb[1], ratio, lmax)
 
-    e_alm, b_alm = jax.vmap(_one)(band_qu, beams, ps)
+    e_alm, b_alm = _map_transforms(_one, band_qu, beams, ps)
     return e_alm, b_alm, common_fwhm_arcmin
 
 
@@ -193,17 +220,12 @@ def needlet_beta(
 ) -> jax.Array:
     """Common-resolution B alms → needlet coefficient maps, shape ``(J, n_band, npix)``.
 
-    The ``J * n_band`` transforms are ``vmap``ed rather than looped in Python. This
-    is the dominant kernel count in the cleaner -- 126 transforms per sim at J=6,
-    n_band=21 -- and the map-based design gradient is launch-bound, not
-    arithmetic-bound (measured: fp64 arithmetic is 0.0002-0.011% of runtime), so
-    what matters is issuing fewer, larger kernels.
-
-    Backend behaviour is unchanged by construction: the ducc primitive is a
-    ``pure_callback`` declared ``vmap_method="sequential"``, so ``vmap`` there
-    replays the same per-transform sequence this used to write out by hand and the
-    values are bit-identical. On jht the transforms are native JAX and batch, which
-    is where the win is.
+    On jht the ``J * n_band`` transforms are ``vmap``ed: this is the dominant kernel
+    count in the cleaner -- 126 transforms per sim at J=6, n_band=21 -- and the
+    GPU design gradient is launch-bound, not arithmetic-bound (fp64 arithmetic is
+    0.0002-0.011% of runtime), so issuing fewer, larger kernels is the win. On ducc
+    they stay a loop, which lets XLA run the callbacks concurrently; see
+    :func:`_map_transforms`. Values are bit-identical between the two forms.
 
     ``batch`` chunks the transforms through ``lax.map`` instead of issuing all
     ``J * n_band`` at once. It buys a flat **1.36x** on the cleaner's working set
@@ -233,7 +255,7 @@ def needlet_beta(
     def _one(a):
         return synthesis(a[None, :], 0, lmax, nside)[0]
 
-    maps = jax.vmap(_one)(flat) if batch is None else jax.lax.map(_one, flat, batch_size=batch)
+    maps = _map_transforms(_one, flat) if batch is None else jax.lax.map(_one, flat, batch_size=batch)
     return maps.reshape(n_j, n_band, -1)
 
 
@@ -258,9 +280,11 @@ def combine_needlets(
         s = jnp.einsum("jb,jbp->jp", weights, beta)  # global: pixel-constant weights
     else:
         s = jnp.einsum("jbp,jbp->jp", weights, beta)  # localized: per-pixel weights
-    acc = jax.vmap(
-        lambda s_j, hj: almxfl(map2alm(s_j[None, :], 0, lmax, nside, n_iter)[0], hj, lmax)
-    )(s, needlet_bands)
+    acc = _map_transforms(
+        lambda s_j, hj: almxfl(map2alm(s_j[None, :], 0, lmax, nside, n_iter)[0], hj, lmax),
+        s,
+        needlet_bands,
+    )
     return jnp.sum(acc, axis=0)
 
 
