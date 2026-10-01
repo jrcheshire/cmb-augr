@@ -44,7 +44,7 @@ camb = ["camb"]
 broom = ["cmbroom", "pyyaml"]
 compsep = ["ducc0", "pysm3"]
 sampling = ["blackjax", "optax"]
-masking = ["jaxht>=0.2.0"]
+masking = ["jaxht>=0.3.0"]
 notebooks = ["jupyterlab", "ipykernel", "matplotlib"]
 
 [tool.setuptools.packages.find]
@@ -99,7 +99,7 @@ jaxlib = ">=0.4"
 equinox = ">=0.11"
 blackjax = "*"
 optax = "*"
-jaxht = ">=0.2.0"
+jaxht = ">=0.3.0"
 pyyaml = "*"
 cmb-augr = { path = ".", editable = true }
 
@@ -145,7 +145,7 @@ healpy = ">=1.16"
 
 [tool.pixi.feature.gpu.pypi-dependencies]
 jax = { version = ">=0.4", extras = ["cuda12"] }
-jaxht = ">=0.2.0"
+jaxht = ">=0.3.0"
 equinox = ">=0.11"
 cmb-augr = { path = ".", editable = true }
 

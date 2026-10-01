@@ -19,8 +19,9 @@ run), ducc on CPU (where it is ~100x faster):
   Also the accurate choice when ``lmax > 1.5·nside``, where jht's quadrature
   weights leave the validated band (see below).
 * **jht** (``pip install jaxht``, GPU/TPU default) — native-JAX spin-0/2 SHTs (pure
-  JAX, no C++), so every transform runs on CUDA with no code change and is
-  differentiated by JAX directly (no ``custom_vjp``). Validated bit-for-bit against
+  JAX, no C++), so every transform runs on CUDA with no code change. Wrapped in
+  the same transpose-pair ``custom_vjp`` as ducc (native AD through jht's
+  recursion scan stores an ~nside^3 tape per transform). Validated bit-for-bit against
   the ducc backend to fp64 on synthesis / adjoint, spin-0 and spin-2, through high
   band limit (``lmax ≈ 4000`` at ``nside = 4096``). Its validated band is ``lmax ≲
   1.5·nside``; within that range it is the trustworthy GPU / end-to-end-
@@ -37,6 +38,21 @@ run), ducc on CPU (where it is ~100x faster):
   ``n_iter`` recovers precision above the ceiling. Pushing ``Lw`` to the
   fully-determined ``4·nside − 2`` is Vandermonde-ill-conditioned and was rejected
   upstream, so extending the band would take a better-conditioned weight solve.
+
+Sizing memory: do not do it on the ducc backend
+-----------------------------------------------
+``compiled.memory_analysis()`` reports only what XLA allocates. ducc's transforms
+run inside a ``pure_callback``, so their working memory is allocated in C++ where
+XLA cannot see it and does not appear in ``temp_size_in_bytes`` at all; jht's is
+native JAX and appears in full. So a CPU/ducc memory analysis is blind to the
+transform working set that a GPU run carries. Size GPU memory from a GPU
+measurement, or at least from a ducc-free lowering.
+
+Two ways the jht path once retained an ``(lmax+1, lmax+1, 2·nside)`` complex
+table per transform (~nside^3 bytes; 156 GB at nside=384 in the design
+gradient) are closed below: the AD tape of jht's recursion scan (``custom_vjp``)
+and JAX hoisting that recursion out of the per-sim scan as a loop-invariant
+(``_opaque``). ``tests/test_sht.py`` pins both on the compiled HLO.
 
 ``s2fft`` (the other JAX-native candidate) has a structural spin-2 HEALPix
 *inverse* defect as of v1.4.0, so it is not used; jht is the JAX-native backend.
@@ -118,7 +134,7 @@ def _require_jht():
             "Install it with:\n"
             "    pip install 'cmb-augr[masking]'\n"
             "or, in the development env:\n"
-            "    pixi add --pypi 'jaxht>=0.1.3'"
+            "    pixi add --pypi 'jaxht>=0.3.0'"
         ) from exc
 
 
@@ -227,20 +243,31 @@ def _m_zero_mask(lmax: int) -> np.ndarray:
     return _m_of_alm(lmax) == 0
 
 
+def _ell_index(lmax: int) -> jax.Array:
+    """alm-index → ℓ (healpy packing), built in-trace behind ``optimization_barrier``.
+
+    ``ℓ = i − m(2·lmax+1−m)/2``, with ``m`` found by ``searchsorted`` on the per-m block
+    starts (block m begins at ``(ℓ=m, m)``, index ``m(2·lmax+1−m)/2 + m``). Built from
+    ``arange`` rather than closed over, so a static window gathered by it is not
+    constant-folded into a per-use ``(…, Nlm)`` XLA constant.
+    """
+    lmax = int(lmax)
+    m = jnp.arange(lmax + 1)
+    offsets = m * (2 * lmax + 1 - m) // 2
+    idx = jnp.arange(alm_size(lmax))
+    m_of_idx = jnp.searchsorted(offsets + m, idx, side="right") - 1
+    return jax.lax.optimization_barrier(idx - offsets[m_of_idx])
+
+
 def almxfl(alm: jax.Array, fl: jax.Array, lmax: int) -> jax.Array:
     """Multiply ``alm[(ℓ,m)]`` by ``fl[ℓ]`` (healpy.almxfl), JAX-differentiable.
 
     Used to apply beam / needlet-band window functions ``B(ℓ)`` / ``h_j(ℓ)``
-    on alms. Differentiable in both ``alm`` and ``fl``.
-
-    ``ell`` is kept as a NumPy index (not ``jnp``): ``fl[ell]`` then works for both
-    a jnp ``fl`` (jnp gather) and a numpy ``fl`` (numpy gather), the latter under
-    ``jax.jit`` / ``lax.map`` too -- a jnp ``ell`` would force numpy ``fl`` through
-    ``numpy[tracer]`` and raise. Static-index gather, so differentiability in
-    ``alm`` / ``fl`` is unchanged.
+    on alms. Differentiable in both ``alm`` and ``fl``; ``fl`` may be NumPy or jnp,
+    and is converted to jnp before the gather so a NumPy ``fl`` works under
+    ``jax.jit`` / ``lax.map``. The ℓ index is built in-trace (:func:`_ell_index`).
     """
-    ell = _ell_of_alm(lmax)
-    return alm * fl[ell]
+    return alm * jnp.asarray(fl)[_ell_index(lmax)]
 
 
 
@@ -486,10 +513,58 @@ _adjoint_synthesis_ducc.defvjp(_adjoint_synthesis_fwd, _adjoint_synthesis_bwd)
 
 
 # ---------------------------------------------------------------------------
-# jht backend (native-JAX; differentiated by JAX directly, no custom_vjp)
+# jht backend (native-JAX; custom_vjp so the backward is one adjoint transform)
 # ---------------------------------------------------------------------------
+#
+# jht's kernels are plain JAX and differentiate natively, but native reverse mode
+# through its Legendre recursion (a ``lax.scan`` over l) stores every iteration's
+# residuals: one complex ``(lmax+1, lmax+1, 2·nside)`` table PER TRANSFORM, i.e.
+# ~nside^3 bytes each and ~40 of them live in one cleaner backward pass. Measured
+# on GB200: 20 / 48 / 156 GB at nside 192 / 256 / 384 (the last OOMs a 189 GB
+# card) while the forward needs < 1 GB. The transpose pair below replaces that
+# tape with a single call to the partner kernel, exactly as the ducc primitives
+# do; the JAX-convention corrections are the same because jht's adjoint matches
+# ducc's to fp64 (``tests/test_sht.py``).
 
 
+def _opaque(fn):
+    """Make a jht kernel opaque to partial evaluation (``jax.checkpoint``, save nothing).
+
+    Under ``grad`` of a ``lax.scan`` over sims, JAX partial-evaluates each body and
+    hoists whatever depends only on loop constants out of the loop. jht's Legendre
+    recursion depends only on the grid, so JAX splits its l-scan, hoists the
+    recursion, and stores its output stacked over l: the same
+    ``(lmax+1, lmax+1, 2·nside)`` complex table per transform as the AD tape,
+    consumed by the sim loop as a constant. A checkpoint boundary keeps the
+    kernel one unit, so the recursion is recomputed per transform (its cost is a
+    small fraction of the transform) and nothing of that shape is retained.
+    Since jaxht 0.3.0 jht checkpoints each kernel itself, so this is belt-and-braces:
+    the sim-scan gate in ``tests/test_sht.py`` reads 0 tables with or without it.
+    """
+    return jax.checkpoint(fn, policy=jax.checkpoint_policies.nothing_saveable)
+
+
+def _synthesis_jht_raw(alm: jax.Array, spin: int, lmax: int, nside: int) -> jax.Array:
+    jht = _require_jht()
+    if int(spin) == 0:
+        f = _opaque(lambda a: jht.synthesis(a, nside=int(nside), lmax=int(lmax), spin=0))
+        return f(alm[0])[None, :]
+    f = _opaque(lambda a: jht.synthesis(a, nside=int(nside), lmax=int(lmax), spin=int(spin)))
+    return f(alm)
+
+
+def _adjoint_synthesis_jht_raw(m: jax.Array, spin: int, lmax: int, nside: int) -> jax.Array:
+    jht = _require_jht()
+    if int(spin) == 0:
+        f = _opaque(lambda x: jht.adjoint_synthesis(x, nside=int(nside), lmax=int(lmax), spin=0))
+        return f(m[0])[None, :]
+    f = _opaque(
+        lambda x: jht.adjoint_synthesis(x, nside=int(nside), lmax=int(lmax), spin=int(spin))
+    )
+    return f(m)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
 def _synthesis_jht(alm: jax.Array, spin: int, lmax: int, nside: int) -> jax.Array:
     """jht-backend synthesis ``alm → map``; matches the ducc primitive's shapes.
 
@@ -498,29 +573,47 @@ def _synthesis_jht(alm: jax.Array, spin: int, lmax: int, nside: int) -> jax.Arra
     Spin 2 ``(2, Nlm) → (2, Npix)`` passes straight through. Convention parity
     with the ducc primitive is validated to fp64 in ``tests/test_sht.py``.
 
-    Gradient convention note: jht is differentiated by JAX natively (no
-    ``custom_vjp``), and its VJP returns the *ambient* complex cotangent — it does
-    NOT project the m=0 coefficient onto the real axis the way the ducc primitive's
-    hand-written VJP does. So ``jax.grad`` w.r.t. a *free* complex alm differs
-    between backends on exactly one non-physical DOF: ``Im(alm[m=0])`` (zero by the
-    real-sky reality constraint). All physical DOFs (m>0, and ``Re(alm[m=0])``)
-    agree to fp64. This never bites the map-based pipeline, where every alm is
-    produced by ``map2alm`` from a real map (real m=0); parameterize a free sky by
-    real DOFs (jht's ``real_to_alm`` / ``alm_to_real``) if you need m=0-imaginary
-    gradients to agree.
+    The VJP is the ducc primitive's, evaluated with jht kernels: one adjoint
+    transform, no residuals (see the section comment above). As a consequence the
+    gradient w.r.t. a free complex alm now matches ducc on every DOF including the
+    non-physical ``Im(alm[m=0])``, which native jht AD left as the ambient complex
+    cotangent.
     """
-    jht = _require_jht()
-    if int(spin) == 0:
-        return jht.synthesis(alm[0], nside=int(nside), lmax=int(lmax), spin=0)[None, :]
-    return jht.synthesis(alm, nside=int(nside), lmax=int(lmax), spin=int(spin))
+    return _synthesis_jht_raw(alm, spin, lmax, nside)
 
 
+def _synthesis_jht_fwd(alm, spin, lmax, nside):
+    return _synthesis_jht_raw(alm, spin, lmax, nside), None
+
+
+def _synthesis_jht_bwd(spin, lmax, nside, _res, map_cot):
+    raw = _adjoint_synthesis_jht_raw(map_cot, spin, lmax, nside)
+    return (_jax_convention_vjp_synth(raw, lmax),)
+
+
+_synthesis_jht.defvjp(_synthesis_jht_fwd, _synthesis_jht_bwd)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
 def _adjoint_synthesis_jht(m: jax.Array, spin: int, lmax: int, nside: int) -> jax.Array:
-    """jht-backend adjoint synthesis ``Yᵀ m``; matches the ducc primitive's shapes."""
-    jht = _require_jht()
-    if int(spin) == 0:
-        return jht.adjoint_synthesis(m[0], nside=int(nside), lmax=int(lmax), spin=0)[None, :]
-    return jht.adjoint_synthesis(m, nside=int(nside), lmax=int(lmax), spin=int(spin))
+    """jht-backend adjoint synthesis ``Yᵀ m``; matches the ducc primitive's shapes.
+
+    VJP = one synthesis of the convention-corrected cotangent (see
+    :func:`_synthesis_jht`).
+    """
+    return _adjoint_synthesis_jht_raw(m, spin, lmax, nside)
+
+
+def _adjoint_synthesis_jht_fwd(m, spin, lmax, nside):
+    return _adjoint_synthesis_jht_raw(m, spin, lmax, nside), None
+
+
+def _adjoint_synthesis_jht_bwd(spin, lmax, nside, _res, alm_cot):
+    modified = _jax_convention_vjp_adjsynth(alm_cot, lmax)
+    return (_synthesis_jht_raw(modified, spin, lmax, nside),)
+
+
+_adjoint_synthesis_jht.defvjp(_adjoint_synthesis_jht_fwd, _adjoint_synthesis_jht_bwd)
 
 
 # ---------------------------------------------------------------------------

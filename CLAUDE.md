@@ -232,6 +232,16 @@ Knowing how the modules chain together matters more than any one file:
    1: at l_max_qe=3000 it costs 53.8 s at 4 and 73.8 s at 16 against
    52.1 s sequential, for 2.5-7x the memory.
 
+   **The map forward's per-sim loop shards the same way.**
+   `spectrum_stages._sim_map` splits the MASTER branch's sim axis across every
+   visible device -- the GPUs on a multi-GPU node, or `JAX_NUM_CPU_DEVICES` on
+   CPU -- and `AUGR_SIM_NO_SHARD=1` opts out; `sim_batch` then vmaps that many
+   sims per step on each device. It passes `check_vma=False` to `shard_map`,
+   because jht's recursion-scan carries and ducc's `pure_callback` VJP outputs
+   are built from constants and fail the varying-axis type check. Values match one
+   device to ~1e-15 (`test_sharded_sim_axis_matches_one_device`). The
+   masked-Wiener branch is not sharded.
+
    **N₀ validation status (2026-05-07).** Validated against `plancklens`
    at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:
    - **TT flat-sky**: machine-precision against the constant-Cℓ closed

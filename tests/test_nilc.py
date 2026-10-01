@@ -506,3 +506,249 @@ def test_clean_e_does_not_touch_the_b_solution() -> None:
     )
     # The E leg exists only in the clean_e arm -- otherwise the test is vacuous.
     assert with_e.cleaned_e_alm is not None and without.cleaned_e_alm is None
+
+
+# --- needlet_beta vectorization -------------------------------------------
+
+
+def _needlet_beta_looped(b_alm, needlet_bands, *, lmax, nside):
+    """The pre-vectorization implementation, kept verbatim as the reference.
+
+    ``needlet_beta`` used to write the ``J * n_band`` transforms out as nested
+    Python loops. The vectorized form must reproduce it exactly on ducc.
+    """
+    from augr.sht import almxfl, synthesis
+
+    beta = []
+    for hj in needlet_bands:
+        per_band = [
+            synthesis(almxfl(alm_b, hj, lmax)[None, :], 0, lmax, nside)[0] for alm_b in b_alm
+        ]
+        beta.append(jnp.stack(per_band, axis=0))
+    return jnp.stack(beta, axis=0)
+
+
+def _beta_fixture(n_band=4, n_j=4, lmax=24):
+    bands = jnp.asarray(cosine_needlet_bands(lmax, default_needlet_peaks(lmax, n_j)))
+    nlm = alm_size(lmax)
+    b_alm = jax.random.normal(jax.random.PRNGKey(0), (n_band, nlm)) + 1j * jax.random.normal(
+        jax.random.PRNGKey(1), (n_band, nlm)
+    )
+    return b_alm, bands
+
+
+def test_needlet_beta_vectorization_is_bit_identical_on_ducc():
+    """vmap must not move a single bit on the CPU backend, value or gradient.
+
+    ducc's transform is a ``pure_callback`` declared ``vmap_method="sequential"``,
+    so ``vmap`` replays exactly the per-transform sequence the Python loop used to
+    write by hand. Anything other than bit-identity here means the batching changed
+    the arithmetic on a path where it was supposed to change only the plumbing.
+    """
+    pytest.importorskip("ducc0")
+    from augr import sht
+
+    nside, lmax = 16, 24
+    b_alm, bands = _beta_fixture(lmax=lmax)
+
+    with sht.sht_backend("ducc"):
+        new = needlet_beta(b_alm, bands, lmax=lmax, nside=nside)
+        ref = _needlet_beta_looped(b_alm, bands, lmax=lmax, nside=nside)
+        assert np.array_equal(np.asarray(new), np.asarray(ref))
+
+        def loss(fn):
+            return jax.grad(
+                lambda a: jnp.sum(jnp.abs(fn(a, bands, lmax=lmax, nside=nside)) ** 2)
+            )(b_alm)
+
+        assert np.array_equal(np.asarray(loss(needlet_beta)), np.asarray(loss(_needlet_beta_looped)))
+
+
+def test_needlet_beta_graph_size_is_independent_of_transform_count():
+    """The vectorized form must not unroll -- that is the whole point.
+
+    The map-based design gradient is launch-bound rather than arithmetic-bound
+    (measured: fp64 arithmetic is 0.0002-0.011% of runtime), so what the cleaner
+    costs is the NUMBER of transforms it issues, and the looped form put every one
+    of them in the graph separately. A regression to unrolling would keep every
+    value identical and only show up as a slower, larger compile -- so it is
+    checked structurally rather than by timing.
+    """
+    from augr import sht
+
+    def eqn_count(n_band, n_j, lmax=24, nside=16):
+        b_alm, bands = _beta_fixture(n_band=n_band, n_j=n_j, lmax=lmax)
+        with sht.sht_backend("jht"):
+            jx = jax.make_jaxpr(
+                lambda a: needlet_beta(a, bands, lmax=lmax, nside=nside)
+            )(b_alm)
+
+        def walk(jaxpr):
+            n = 0
+            for e in jaxpr.eqns:
+                n += 1
+                for v in e.params.values():
+                    sub = getattr(v, "jaxpr", None)
+                    if sub is not None:
+                        n += walk(getattr(sub, "jaxpr", sub))
+                    elif type(v).__name__ == "Jaxpr":
+                        n += walk(v)
+            return n
+
+        return walk(jx.jaxpr)
+
+    pytest.importorskip("jht")
+    small = eqn_count(4, 4)  # 16 transforms
+    large = eqn_count(16, 6)  # 96 transforms, 6x more
+
+    # Same graph, larger arrays: the count must not track the transform count.
+    assert small == large, f"graph grew with transform count: {small} -> {large}"
+    # Anti-vacuity: the looped reference DOES grow, so the check can fail.
+    assert small < 5000
+
+
+def test_cleaner_graph_is_flat_in_band_count():
+    """The cleaner's graph must not grow with the number of bands.
+
+    Every per-band and per-needlet stage is vmapped rather than looped in Python,
+    so adding bands should widen arrays, not lengthen the graph. Measured at
+    nside=16: 14365 equations at 4 bands and 14860 at 21, a 3% drift against the
+    10x that the looped form cost at 21 bands. The design gradient is launch-bound,
+    so graph length is the cost being controlled here -- and a regression to
+    unrolling changes no value at all, only compile time and kernel count, so it
+    has to be caught structurally.
+    """
+    pytest.importorskip("jht")
+    from augr import sht
+    from augr.cleaning import nilc_cleaner
+
+    lmax, nside = 24, 16
+    npix = 12 * nside**2
+
+    def eqns(n_band):
+        beams = jnp.linspace(40.0, 20.0, n_band)
+        ps = jnp.ones(n_band)
+        qu = jax.random.normal(jax.random.PRNGKey(0), (n_band, 2, npix))
+        cleaner = nilc_cleaner(clean_e=True)
+        with sht.sht_backend("jht"):
+            jx = jax.make_jaxpr(
+                lambda m: cleaner(m, beams, ps, lmax=lmax, nside=nside).cleaned_b_alm
+            )(qu)
+
+        def walk(jaxpr):
+            n = 0
+            for e in jaxpr.eqns:
+                n += 1
+                for v in e.params.values():
+                    sub = getattr(v, "jaxpr", None)
+                    if sub is not None:
+                        n += walk(getattr(sub, "jaxpr", sub))
+                    elif type(v).__name__ == "Jaxpr":
+                        n += walk(v)
+            return n
+
+        return walk(jx.jaxpr)
+
+    few, many = eqns(4), eqns(21)
+    # 5.2x more bands must not cost 5.2x more graph. Bound set from the measured
+    # 3% drift, with room for a stage that legitimately adds a little per band.
+    assert many < 1.25 * few, f"graph grew with band count: {few} -> {many}"
+
+
+def _ducc_cleaner_fixture(n_band=4, lmax=24, nside=16):
+    from augr.cleaning import nilc_cleaner
+
+    npix = 12 * nside**2
+    beams = jnp.linspace(40.0, 20.0, n_band)
+    ps = jnp.ones(n_band)
+    qu = jax.random.normal(jax.random.PRNGKey(0), (n_band, 2, npix))
+    cleaner = nilc_cleaner(clean_e=True)
+
+    def value(m):
+        return cleaner(m, beams, ps, lmax=lmax, nside=nside).cleaned_b_alm
+
+    def loss(m):
+        return jnp.sum(jnp.abs(value(m)) ** 2)
+
+    return qu, value, loss
+
+
+def _callbacks_inside_loops(jaxpr, inside=False):
+    """Count callback equations nested in a scan / while body."""
+    n = 0
+    for e in jaxpr.eqns:
+        if "callback" in e.primitive.name and inside:
+            n += 1
+        nested = inside or e.primitive.name in ("scan", "while")
+        for v in e.params.values():
+            for sub in v if isinstance(v, (list, tuple)) else [v]:
+                j = getattr(sub, "jaxpr", None)
+                if j is not None:
+                    n += _callbacks_inside_loops(getattr(j, "jaxpr", j), nested)
+                elif type(sub).__name__ == "Jaxpr":
+                    n += _callbacks_inside_loops(sub, nested)
+    return n
+
+
+def test_cleaner_loop_on_ducc_is_bit_identical_to_vmapped_form():
+    """The ducc loop and the jht-style vmap must agree exactly, value and gradient."""
+    pytest.importorskip("ducc0")
+    from unittest import mock
+
+    import augr.nilc as nilc_mod
+    from augr import sht
+
+    qu, value, loss = _ducc_cleaner_fixture()
+    with sht.sht_backend("ducc"):
+        v_loop, g_loop = value(qu), jax.grad(loss)(qu)
+        with mock.patch.object(nilc_mod, "get_sht_backend", return_value="jht"):
+            v_vmap, g_vmap = value(qu), jax.grad(loss)(qu)
+    assert np.array_equal(np.asarray(v_loop), np.asarray(v_vmap))
+    assert np.array_equal(np.asarray(g_loop), np.asarray(g_vmap))
+
+
+def test_cleaner_gradient_does_not_serialize_ducc_transforms():
+    """On ducc no transform callback may sit inside a scan in the cleaner's gradient.
+
+    ``vmap`` over a ``vmap_method="sequential"`` callback lowers to a scan, which
+    runs the per-band transforms strictly one after another; separate callbacks
+    can run concurrently. Values are identical either way, so only structure can
+    catch it: measured 0 in-loop callbacks with the loop and 38 with the vmapped
+    form (n_band=4, nside=16). That regression took the nside=128 CPU design
+    gradient from 49.5 s to 59.8 s on a 16-core laptop.
+    """
+    pytest.importorskip("ducc0")
+    from unittest import mock
+
+    import augr.nilc as nilc_mod
+    from augr import sht
+
+    qu, _, loss = _ducc_cleaner_fixture()
+    with sht.sht_backend("ducc"):
+        jx = jax.make_jaxpr(jax.grad(loss))(qu)
+        assert _callbacks_inside_loops(jx.jaxpr) == 0
+        # Anti-vacuity: the vmapped form does serialize, so this check can fail.
+        with mock.patch.object(nilc_mod, "get_sht_backend", return_value="jht"):
+            jx_vmap = jax.make_jaxpr(jax.grad(loss))(qu)
+        assert _callbacks_inside_loops(jx_vmap.jaxpr) > 0
+
+
+@pytest.mark.parametrize("batch", [1, 4, 9])
+def test_needlet_batch_is_exact_on_ducc(batch):
+    """Chunking the transform batch must not move a bit on the CPU backend.
+
+    ``batch`` exists to trade a little working memory back; it must not be a
+    numerical knob. On ducc the primitive is a sequential ``pure_callback`` either
+    way, so full-width and chunked have to agree exactly. (On jht they differ at
+    the fp64 reassociation level, ~2e-15, which is the batching signature and not
+    checked here.)
+    """
+    pytest.importorskip("ducc0")
+    from augr import sht
+
+    lmax, nside = 24, 16
+    b_alm, bands = _beta_fixture(n_band=6, n_j=6, lmax=lmax)
+    with sht.sht_backend("ducc"):
+        full = needlet_beta(b_alm, bands, lmax=lmax, nside=nside)
+        chunked = needlet_beta(b_alm, bands, lmax=lmax, nside=nside, batch=batch)
+    assert np.array_equal(np.asarray(full), np.asarray(chunked))

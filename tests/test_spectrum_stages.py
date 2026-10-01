@@ -11,6 +11,9 @@ Map work needs jht (the [masking] extra) and ducc0 (the SHTs).
 
 from __future__ import annotations
 
+import dataclasses
+import os
+
 import numpy as np
 import pytest
 
@@ -35,6 +38,7 @@ from augr.spectrum_stages import (
     make_cutsky_mc_context,
     mc_cutsky_bandpowers,
     mc_cutsky_cov_traced,
+    share_constant_fg,
 )
 
 FREQS = (90.0, 150.0, 220.0)
@@ -338,6 +342,102 @@ def _master_setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8):
     return ctx, cleaner
 
 
+def _ctx_kwargs(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8):
+    """The _master_setup kwargs, minus cleaner/estimator, so callers can vary them."""
+    cl_ee, cl_bb = _priors(lmax)
+    bm = _bin_matrix(2, ell_max, delta_ell, 2)
+    true_b = mk.bin_spectrum(
+        jnp.clip(CMBSpectra().cl_bb(jnp.arange(lmax + 1, dtype=float), 0.0), 0.0, None),
+        bm, 2,
+    )
+    return dict(
+        freqs_ghz=FREQS, beam_fwhm_arcmin=BEAMS, w_inv=W_INV, nside=nside, lmax=lmax,
+        mask=mk.smooth_gal_cut_mask(nside, 25.0, 8.0), cl_ee=cl_ee,
+        cl_bb_prior_unbeamed=cl_bb, bin_matrix=bm, ell_min=2, true_bb_binned=true_b,
+        n_sims=n_sims, base_seed=0, fg_model=None, r_in=0.0,
+    )
+
+
+def test_master_context_skips_the_var_pix_ref_setup_clean():
+    """MASTER builds no inverse-noise filter, so its setup clean must not run.
+
+    Three things are asserted together because they are one change: the clean is
+    *actually* skipped (a call count -- the covariance alone cannot tell a live
+    skip from a dead one), the fields it fed are None, and the Wiener path still
+    runs it. The last case is the anti-vacuity half: a guard keyed on the wrong
+    thing would skip everywhere and still pass the first two.
+    """
+    kw = _ctx_kwargs(6)
+    calls = {"n": 0}
+    base = nilc_cleaner(clean_e=True)
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return base(*a, **k)
+
+    for estimator, expected in (("master", 0), ("wiener", 1)):
+        calls["n"] = 0
+        ctx = make_cutsky_mc_context(cleaner=counting, estimator=estimator, **kw)
+        assert calls["n"] == expected, f"{estimator}: cleaner ran {calls['n']} times"
+        if estimator == "master":
+            assert ctx.var_pix_ref is None
+            assert ctx.inv_noise is None
+        else:
+            assert ctx.var_pix_ref is not None
+            assert ctx.inv_noise is not None
+
+
+def test_master_bandpowers_are_unchanged_by_skipping_the_setup_clean():
+    """Skipping it changes nothing numerically: MASTER never reads what it produced.
+
+    Byte-identical, not ``allclose`` -- the skipped quantity is genuinely unread on
+    this path, so any difference at all would mean it was not.
+    """
+    kw = _ctx_kwargs(6)
+    cleaner = nilc_cleaner(clean_e=True)
+    wiener = make_cutsky_mc_context(cleaner=cleaner, estimator="wiener", **kw)
+
+    skipped = make_cutsky_mc_context(cleaner=cleaner, estimator="master", **kw)
+    supplied = make_cutsky_mc_context(
+        cleaner=cleaner, estimator="master",
+        var_pix_ref=float(wiener.var_pix_ref), **kw,
+    )
+    a = mc_cutsky_cov_traced(jnp.asarray(W_INV), skipped, cleaner)
+    b = mc_cutsky_cov_traced(jnp.asarray(W_INV), supplied, cleaner)
+    assert np.array_equal(np.asarray(a.covariance), np.asarray(b.covariance))
+
+
+def test_master_accepts_a_clean_e_false_cleaner():
+    """The saving the skip unlocks: no setup clean means no project_e() at build.
+
+    Before this, a ``clean_e=False`` cleaner raised at *context build* on every
+    estimator, because the setup clean's noise leg projected E. MASTER reads only
+    the B solution, which ``tests/test_nilc.py`` pins as byte-identical either way,
+    so the covariance must match exactly.
+    """
+    kw = _ctx_kwargs(6)
+    out = {}
+    for flag in (True, False):
+        cleaner = nilc_cleaner(clean_e=flag)
+        ctx = make_cutsky_mc_context(cleaner=cleaner, estimator="master", **kw)
+        out[flag] = np.asarray(
+            mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner).covariance
+        )
+    assert np.array_equal(out[True], out[False])
+
+
+def test_wiener_rejects_a_context_built_without_inv_noise():
+    """A MASTER-built context fed to the Wiener branch fails loudly, not deep inside."""
+    kw = _ctx_kwargs(6)
+    cleaner = nilc_cleaner(clean_e=True)
+    ctx = make_cutsky_mc_context(cleaner=cleaner, estimator="master", **kw)
+    # estimator is a static field (in the treedef, not a leaf), so tree_at cannot
+    # touch it; eqx.Module is a frozen dataclass, so dataclasses.replace can.
+    ctx_w = dataclasses.replace(ctx, estimator="wiener")
+    with pytest.raises(ValueError, match=r"needs ctx\.inv_noise"):
+        mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx_w, cleaner)
+
+
 def test_edges_from_bin_matrix_matches_the_signal_model_binning():
     """Edges are read off bin_matrix, so MASTER bins cannot drift from Fisher bins."""
     bm = _bin_matrix(2, 24, 8, 2)
@@ -530,8 +630,18 @@ def test_remat_and_sim_batch_are_live_in_the_trace() -> None:
     ctx, cleaner = _master_setup(6)
     on = str(jax.make_jaxpr(lambda w: _sq_cov(w, ctx, cleaner, remat=True))(W_INV))
     off = str(jax.make_jaxpr(lambda w: _sq_cov(w, ctx, cleaner, remat=False))(W_INV))
-    assert "remat" in on or "checkpoint" in on
-    assert "remat" not in off and "checkpoint" not in off
+
+    # The MASTER coupling build checkpoints its own per-l2 map unconditionally
+    # (pseudo_cl_jax.coupling_matrices, remat=True by default), so "no checkpoint
+    # anywhere" is no longer a proxy for "the sim scan is not checkpointed" --
+    # that assertion would be testing two loops at once. Count instead: turning
+    # this knob off must strictly reduce the checkpoints, and must not remove
+    # the coupling's.
+    n_on, n_off = on.count("remat2["), off.count("remat2[")
+    assert n_off >= 1, "the coupling build's own remat vanished from the trace"
+    assert n_on > n_off, (
+        f"remat=True added no checkpoint to the sim scan ({n_on} vs {n_off})"
+    )
 
     for sim_batch, expected in ((1, 6), (2, 3), (3, 2), (4, 2)):
         lengths = _top_level_scan_lengths(
@@ -642,3 +752,228 @@ def test_sim_batch_agrees_with_the_unbatched_scan() -> None:
         )(W_INV)
         np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=1e-11)
         np.testing.assert_allclose(np.asarray(g), np.asarray(g_ref), rtol=1e-11)
+
+
+# --- sim-axis device sharding ------------------------------------------------
+#
+# JAX fixes the device count at import, so every multi-device arm runs in a child
+# process with JAX_NUM_CPU_DEVICES set. n_sims=6 over 4 devices pads to 8
+# (sim_batch 1) and 12 (sim_batch 3), so both arms cover the padding path.
+
+_SHARD_CHILD = r'''
+import os, sys
+import numpy as np, jax, jax.numpy as jnp
+sys.path.insert(0, sys.argv[2])
+import test_spectrum_stages as T
+from augr import sht
+from augr.spectrum_stages import _sim_shard_devices, mc_cutsky_cov_traced
+
+n_dev = int(os.environ["JAX_NUM_CPU_DEVICES"])
+assert jax.device_count() == n_dev, (jax.device_count(), n_dev)
+expect = 1 if os.environ.get("AUGR_SIM_NO_SHARD") else n_dev
+assert _sim_shard_devices() == expect, (_sim_shard_devices(), expect)
+sht.set_sht_backend(os.environ["AUGR_TEST_BACKEND"])
+mode = os.environ["AUGR_TEST_MODE"]
+
+w = jnp.asarray(T.W_INV)
+out = {}
+ctx, cleaner = T._master_setup(6)
+for b in (1, 3):
+    def f(ww, bb=b):
+        return T._sq_cov(ww, ctx, cleaner, remat=True, sim_batch=bb)
+    out[f"sharded{b}"] = np.array(int("shard_map" in str(jax.make_jaxpr(f)(w))))
+    if mode == "run":
+        out[f"cov{b}"] = np.asarray(
+            mc_cutsky_cov_traced(w, ctx, cleaner, remat=True, sim_batch=b).covariance)
+        out[f"grad{b}"] = np.asarray(jax.grad(f)(w))
+if mode == "trace":
+    wctx, wcleaner = T._traced_setup(6)
+    txt = str(jax.make_jaxpr(lambda ww: T._sq_cov(ww, wctx, wcleaner))(w))
+    out["wiener_sharded"] = np.array(int("shard_map" in txt))
+np.savez(sys.argv[1], **out)
+'''
+
+
+def _shard_child(tmp_path, tag, *, devices, backend="ducc", mode="run", opt_out=False):
+    """Run ``_SHARD_CHILD`` under ``devices`` CPU devices; return its npz."""
+    import subprocess
+    import sys
+
+    script = tmp_path / "shard_child.py"
+    script.write_text(_SHARD_CHILD)
+    npz = tmp_path / f"{tag}.npz"
+    env = {k: v for k, v in os.environ.items() if k != "AUGR_SIM_NO_SHARD"}
+    env.update(JAX_NUM_CPU_DEVICES=str(devices), AUGR_TEST_BACKEND=backend,
+               AUGR_TEST_MODE=mode)
+    if opt_out:
+        env["AUGR_SIM_NO_SHARD"] = "1"
+    proc = subprocess.run(
+        [sys.executable, str(script), str(npz), os.path.dirname(os.path.abspath(__file__))],
+        capture_output=True, text=True, timeout=900, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    return np.load(npz)
+
+
+def test_master_sim_axis_is_sharded_and_wiener_is_not(tmp_path) -> None:
+    """Trace-only, 4 CPU devices: a live ``shard_map`` on MASTER, none on Wiener.
+
+    Values cannot tell a sharded map from an unsharded one (they agree to ~1e-15),
+    so liveness is checked on the trace. The Wiener branch stays unsharded: its
+    body was never measured under sharding.
+    """
+    out = _shard_child(tmp_path, "trace", devices=4, mode="trace")
+    assert out["sharded1"] == 1 and out["sharded3"] == 1, "MASTER sim map not sharded"
+    assert out["wiener_sharded"] == 0, "masked-Wiener sim map picked up a shard_map"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("backend", ["ducc", "jht"])
+def test_sharded_sim_axis_matches_one_device(tmp_path, backend) -> None:
+    """Sharded value and gradient against the same ``sim_batch`` on one device.
+
+    Measured on 2 and 4 CPU devices, both backends, sim_batch 1/2/3: max relative
+    difference 6.5e-16 on the covariance and 2.6e-15 on the gradient. Gated at
+    1e-12, ~400x margin. ``AUGR_SIM_NO_SHARD=1`` is the one-device path: exact.
+    """
+    from augr import sht
+
+    w = jnp.asarray(W_INV)
+    ref = {}
+    with sht.sht_backend(backend):
+        ctx, cleaner = _master_setup(6)
+        for b in (1, 3):
+            ref[f"cov{b}"] = np.asarray(
+                mc_cutsky_cov_traced(w, ctx, cleaner, remat=True, sim_batch=b).covariance
+            )
+            ref[f"grad{b}"] = np.asarray(
+                jax.grad(lambda ww, bb=b: _sq_cov(ww, ctx, cleaner, remat=True, sim_batch=bb))(w)
+            )
+    assert np.all(np.isfinite(ref["grad1"])) and np.any(ref["grad1"] != 0.0)
+
+    sharded = _shard_child(tmp_path, "sharded", devices=4, backend=backend)
+    optout = _shard_child(tmp_path, "optout", devices=4, backend=backend, opt_out=True)
+    for b in (1, 3):
+        assert sharded[f"sharded{b}"] == 1, f"sim_batch={b}: no shard_map in the trace"
+        assert optout[f"sharded{b}"] == 0, f"sim_batch={b}: opt-out still sharded"
+        np.testing.assert_array_equal(optout[f"cov{b}"], ref[f"cov{b}"])
+        np.testing.assert_array_equal(optout[f"grad{b}"], ref[f"grad{b}"])
+        np.testing.assert_allclose(sharded[f"cov{b}"], ref[f"cov{b}"], rtol=1e-12, atol=0.0)
+        np.testing.assert_allclose(sharded[f"grad{b}"], ref[f"grad{b}"], rtol=1e-12, atol=0.0)
+
+
+def _skies_with_constant_fg(n_sims, n_band, lmax, *, vary=False):
+    """A batched CMB-only sky given a synthetic per-band foreground.
+
+    Built by hand rather than through PySM so these stay in the fast tier: the
+    mechanism under test is the sharing, not the foreground model. ``vary=True``
+    gives an ensemble that genuinely differs per sim, standing in for a
+    stochastic preset (d10s6 / s6).
+    """
+    from augr.compsep_sims import HarmonicSky
+    from augr.sht import alm_size
+
+    n_alm = alm_size(lmax)
+    rng = np.random.default_rng(0)
+    one = (rng.normal(size=(n_band, 2, n_alm))
+           + 1j * rng.normal(size=(n_band, 2, n_alm)))
+    fg = np.broadcast_to(one, (n_sims, n_band, 2, n_alm)).copy()
+    if vary:
+        fg[1] += 1.0
+    cmb = (rng.normal(size=(n_sims, n_alm)) + 1j * rng.normal(size=(n_sims, n_alm)))
+    return HarmonicSky(
+        freqs_ghz=FREQS[:n_band], nside=16, lmax=lmax, r_in=0.0,
+        cmb_b_alm=jnp.asarray(cmb), fg_eb_alm=jnp.asarray(fg),
+        cmb_e_alm=jnp.asarray(cmb),
+    )
+
+
+def test_share_constant_fg_collapses_only_a_constant_ensemble():
+    """Rank marks the shared case; a varying ensemble is refused, not averaged.
+
+    The refusal is the anti-vacuity half: a check that accepted anything would
+    silently replace a stochastic foreground ensemble with its first realization.
+    """
+    keep = _skies_with_constant_fg(4, 3, 24)
+    shared = share_constant_fg(keep)
+    assert shared.fg_eb_alm.ndim == 3
+    assert np.array_equal(np.asarray(shared.fg_eb_alm),
+                          np.asarray(keep.fg_eb_alm)[0])
+    assert shared.fg_eb_alm.nbytes * 4 == keep.fg_eb_alm.nbytes
+
+    # Idempotent, and a no-op on a CMB-only sky.
+    assert share_constant_fg(shared) is shared
+    assert share_constant_fg(dataclasses.replace(keep, fg_eb_alm=None)).fg_eb_alm is None
+
+    with pytest.raises(ValueError, match="varies across sims"):
+        share_constant_fg(_skies_with_constant_fg(4, 3, 24, vary=True))
+
+
+def test_shared_fg_is_bit_identical_and_survives_the_scan_knobs():
+    """Sharing changes storage, not arithmetic -- so nothing may move at all.
+
+    Byte-identical rather than ``allclose``: the shared foreground is re-attached
+    inside the body, so every sim sees exactly the array it saw before. The
+    ``sim_batch`` leg is the real trap -- ``jax.vmap`` maps over every positional
+    argument by default, so a scan constant passed through the vmap rather than
+    bound before it would be mapped along the sim axis and silently mismatch.
+    """
+    n_sims, lmax = 6, 24  # > n_bins + 2, or the Hartlap guard fires first
+    per_sim = _skies_with_constant_fg(n_sims, 3, lmax)
+    shared = share_constant_fg(per_sim)
+    kw = _ctx_kwargs(n_sims, lmax=lmax, ell_max=lmax)
+    cleaner = nilc_cleaner(clean_e=True)
+    keys = jnp.stack([jax.random.PRNGKey(s) for s in range(n_sims)], axis=0)
+
+    def cov(skies, **extra):
+        ctx = make_cutsky_mc_context(
+            cleaner=cleaner, estimator="master", harmonic_skies=skies,
+            noise_keys=keys, **kw,
+        )
+        return np.asarray(
+            mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner, **extra).covariance
+        )
+
+    # Vary ONE thing: sharing, at each fixed setting of the other knobs. Comparing
+    # a shared sim_batch=2 run against an unshared sim_batch=1 run would fold in
+    # that knob's own documented reassociation (measured 2.7e-15 here, and
+    # identical with and without sharing -- so it is not ours).
+    for sim_batch in (1, 2, 3):
+        assert np.array_equal(
+            cov(per_sim, sim_batch=sim_batch), cov(shared, sim_batch=sim_batch)
+        ), f"sharing moved the covariance at sim_batch={sim_batch}"
+    for remat in (True, False):
+        assert np.array_equal(cov(per_sim, remat=remat), cov(shared, remat=remat)), (
+            f"sharing moved the covariance at remat={remat}"
+        )
+
+
+def test_share_fg_defaults_on_and_keeps_a_varying_ensemble():
+    """The default shares a constant ensemble and leaves a varying one alone.
+
+    Defaulting to the strict form would break the stochastic presets (d10s6 / s6)
+    at context build, where a per-sim ensemble is the *correct* representation
+    rather than an error -- so the builder uses the non-raising form. The varying
+    leg is the anti-vacuity half: a builder that shared unconditionally would
+    replace the ensemble with its first realization and still pass the first.
+    """
+    n_sims, lmax = 6, 24
+    kw = _ctx_kwargs(n_sims, lmax=lmax, ell_max=lmax)
+    cleaner = nilc_cleaner(clean_e=True)
+    keys = jnp.stack([jax.random.PRNGKey(s) for s in range(n_sims)], axis=0)
+
+    def built(skies, **extra):
+        return make_cutsky_mc_context(
+            cleaner=cleaner, estimator="master", harmonic_skies=skies,
+            noise_keys=keys, **kw, **extra,
+        ).harmonic_skies.fg_eb_alm
+
+    constant = _skies_with_constant_fg(n_sims, 3, lmax)
+    varying = _skies_with_constant_fg(n_sims, 3, lmax, vary=True)
+
+    assert built(constant).ndim == 3, "the default did not share a constant ensemble"
+    assert built(varying).ndim == 4, "a varying ensemble was collapsed"
+    assert np.array_equal(
+        np.asarray(built(varying)), np.asarray(varying.fg_eb_alm)
+    ), "a varying ensemble was modified"
+    assert built(constant, share_fg=False).ndim == 4, "share_fg=False was ignored"

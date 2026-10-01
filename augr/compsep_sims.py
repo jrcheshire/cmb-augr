@@ -475,6 +475,47 @@ def _fg_eb_alm(
     return jnp.stack(eb, axis=0)
 
 
+def fg_model_is_static(fg_model: str) -> bool:
+    """True if every PySM component of ``fg_model`` is seed-independent.
+
+    Fixed-template presets (``d1s1``, ``d10s5``) give the same sky for every
+    ``fg_seed``, so one foreground serves a whole sim ensemble; any ``*Realization``
+    component (``s6`` in ``d10s6``) draws per seed. Read from PySM's preset classes,
+    the same test :func:`_seeded_component_config` uses to decide what to seed.
+    Requires pysm3.
+    """
+    if fg_model not in _FG_PRESETS:
+        raise ValueError(f"unknown fg_model {fg_model!r}; expected one of {sorted(_FG_PRESETS)}")
+    _require_pysm()
+    from pysm3.sky import PRESET_MODELS
+
+    return not any(
+        "Realization" in PRESET_MODELS[p].get("class", "") for p in _FG_PRESETS[fg_model]
+    )
+
+
+def static_fg_eb_alm(
+    freqs_ghz: tuple[float, ...],
+    fg_model: str,
+    lmax: int,
+    nside: int,
+    *,
+    bandpasses: Sequence[Bandpass | None] | None = None,
+) -> jax.Array:
+    """The single foreground E/B alm ``(n_band, 2, n_alm)`` of a static preset.
+
+    Shared by every sim of an ensemble (``make_cutsky_mc_context(fg_eb_alm=...)``)
+    and the payload of :func:`augr.spectrum_stages.save_fg_cache`. Raises for a
+    stochastic preset, whose foreground must be drawn per sim.
+    """
+    if not fg_model_is_static(fg_model):
+        raise ValueError(
+            f"fg_model {fg_model!r} has a stochastic (*Realization) component, so its "
+            "foreground differs per sim and cannot be generated once."
+        )
+    return _fg_eb_alm(tuple(freqs_ghz), fg_model, lmax, nside, fg_seed=0, bandpasses=bandpasses)
+
+
 def _beam_fg_eb(
     fg_eb_alm: jax.Array,
     beam_fwhm_arcmin: tuple[float, ...],

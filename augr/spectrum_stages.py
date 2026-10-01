@@ -45,7 +45,9 @@ beamed by ``B_c`` so the transfer absorbs ``B_c²`` on debias.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
+import os
 from dataclasses import dataclass
 
 import equinox as eqx
@@ -59,13 +61,15 @@ from .compsep_sims import (
     HarmonicSky,
     assemble_band_maps,
     beam_harmonic_sky,
+    fg_model_is_static,
     harmonic_sky,
+    static_fg_eb_alm,
 )
 from .covariance import mc_bandpower_covariance
 from .instrument import beam_bl
 from .parallel import parallel_map
 from .pseudo_cl_jax import MasterBBJax
-from .sht import synthesis_pol
+from .sht import alm_size, synthesis_pol
 from .spectra import CMBSpectra
 
 
@@ -466,8 +470,8 @@ class CutskyMCContext(eqx.Module):
     the per-band beaming runs *inside* the traced forward — that is what makes the
     beams (FWHM + shape ``p``) differentiable design knobs alongside ``w_inv``.
     ``beam_fwhm_arcmin`` / ``beam_shape_p`` are the concrete *reference* beams (used
-    for the frozen ``var_pix_ref`` filter and as the default when a beam design is
-    not supplied to :func:`mc_cutsky_cov_traced`).
+    for the frozen ``var_pix_ref`` filter on the Wiener path, and as the default
+    when a beam design is not supplied to :func:`mc_cutsky_cov_traced`).
     """
 
     harmonic_skies: (
@@ -481,7 +485,9 @@ class CutskyMCContext(eqx.Module):
     )  # concrete reference per-band beams
     # concrete reference shape exponents (None = Gaussian)
     beam_shape_p: tuple | None = eqx.field(static=True)
-    inv_noise: jax.Array
+    # ``None`` on a MASTER context: the inverse-noise filter exists only for the
+    # masked-Wiener estimator, which is the only branch that reads it.
+    inv_noise: jax.Array | None
     cl_ee_prior: jax.Array
     cl_bb_prior: jax.Array
     bin_matrix: jax.Array
@@ -495,7 +501,8 @@ class CutskyMCContext(eqx.Module):
     max_iter: int = eqx.field(static=True)
     tol: float = eqx.field(static=True)
     n_sims: int = eqx.field(static=True)
-    var_pix_ref: float = eqx.field(static=True)
+    # ``None`` on a MASTER context: it exists only to build ``inv_noise``.
+    var_pix_ref: float | None = eqx.field(static=True)
     f_sky: float = eqx.field(static=True)
     # --- MASTER estimator path (default: the masked-Wiener path, unchanged) ---
     # ``mask`` is a TRACED leaf, unlike ``f_sky``: it is the sky-coverage design
@@ -562,6 +569,7 @@ def make_cutsky_mc_context(
     var_pix_ref: float | None = None,
     harmonic_skies: HarmonicSky | None = None,
     noise_keys: jax.Array | None = None,
+    fg_eb_alm: jax.Array | None = None,
     knee_ell: jax.Array | None = None,
     alpha_knee: float = 1.0,
     max_iter: int = 200,
@@ -572,12 +580,16 @@ def make_cutsky_mc_context(
     estimator: str = "master",
     lmax_mask: int | None = None,
     split_lensing: bool = False,
+    share_fg: bool = True,
 ) -> CutskyMCContext:
     """Eager precompute for the differentiable cut-sky MC.
 
     Builds, once, the per-sim **unbeamed** :class:`HarmonicSky` ensemble (the
-    non-traceable PySM emission + ``synalm`` draws) plus the Wiener-filter
-    ``inv_noise`` at a frozen ``var_pix_ref``, and packs the binning / prior statics.
+    non-traceable PySM emission + ``synalm`` draws) and packs the binning / prior
+    statics. For ``estimator="wiener"`` it also builds the Wiener filter
+    ``inv_noise`` at a frozen ``var_pix_ref``, derived from one setup clean;
+    ``estimator="master"`` (the default) never reads ``inv_noise`` and so skips
+    that clean, leaving both fields ``None``.
     The per-band beaming is deferred to the *traced* forward
     (:func:`mc_cutsky_cov_traced`) so the beams (FWHM + shape ``p``) are
     differentiable design knobs in addition to ``w_inv``; ``beam_fwhm_arcmin`` /
@@ -590,8 +602,9 @@ def make_cutsky_mc_context(
 
     ``harmonic_skies`` / ``noise_keys`` (optional): a precomputed sky ensemble, e.g.
     from :func:`load_sky_cache` on a pysm3-less env (the aarch64 GPU). When supplied,
-    the PySM foreground generation is skipped entirely (``noise_keys`` and
-    ``var_pix_ref`` must accompany it; ``n_sims`` is taken from the cached ensemble).
+    the PySM foreground generation is skipped entirely (``noise_keys`` must accompany
+    it, and ``var_pix_ref`` too on the Wiener path, which would otherwise need a
+    freshly generated sky; ``n_sims`` is taken from the cached ensemble).
     The remaining pieces (inv_noise, priors, binning) are rebuilt locally -- they need
     no pysm3. Generate the cache once with :func:`save_sky_cache` on a pysm3-capable
     machine; this decouples the slow FG sim from the GPU forward and pins the FG
@@ -604,7 +617,33 @@ def make_cutsky_mc_context(
     the design's residual in-trace. Without it the Monte-Carlo covariance is stuck at
     ``A_lens = 1`` no matter what the design does. Costs one extra ``synalm`` per sim
     and one ``(lmax+1)`` array; at ``r_in = 0`` the realizations are unchanged.
+
+    ``share_fg`` (default True) collapses the foreground ensemble to the single
+    sky it already is for the deterministic PySM presets -- see
+    :func:`share_constant_fg` for the sizes, which reach 610 GB -> 0.79 GB at
+    nside=1024. Applied to a cached ensemble too, so an existing cache gets the
+    saving on load. A genuinely varying ensemble (the stochastic ``d10s6`` /
+    ``s6`` presets) is **kept per-sim** rather than raising: that is the correct
+    representation for those models, not an error. Pass ``share_fg=False`` to keep
+    the per-sim ensemble unconditionally.
+
+    When generating (no ``harmonic_skies``), a static preset's foreground is built
+    **once** and attached to the stacked CMB ensemble, so PySM runs once rather than
+    ``n_sims`` times; a stochastic preset, or ``share_fg=False``, keeps the per-sim
+    generation.
+
+    ``fg_eb_alm`` (optional, ``(n_band, 2, n_alm)``): a precomputed shared foreground,
+    e.g. from :func:`load_fg_cache` on a pysm3-less env. The CMB E/B and noise keys are
+    still drawn from ``base_seed``, so the ensemble matches a generated one exactly.
+    ``fg_model`` is not read when it is supplied; the caller checks the cache's
+    ``fg_model``. Exclusive with ``harmonic_skies``.
     """
+    # The inverse-noise filter -- and hence var_pix_ref and the setup clean that
+    # derives it -- exists only for the masked-Wiener estimator. MASTER never
+    # reads inv_noise, so on that path the setup clean is dead work; skipping it
+    # is also what lets a clean_e=False cleaner build a context at all, since the
+    # clean's noise leg calls project_e().
+    needs_inv_noise = str(estimator) != "master"
     spectra = CMBSpectra() if spectra is None else spectra
     freqs_ghz = tuple(float(f) for f in freqs_ghz)
     beam_fwhm_arcmin = tuple(float(b) for b in beam_fwhm_arcmin)
@@ -617,19 +656,43 @@ def make_cutsky_mc_context(
     cl_ee_prior = beamed_prior(cl_ee, common_fwhm, lmax)
     cl_bb_prior = beamed_prior(cl_bb_prior_unbeamed, common_fwhm, lmax)
 
-    def _hsky(seed: int) -> HarmonicSky:
-        return harmonic_sky(
+    if fg_eb_alm is not None and harmonic_skies is not None:
+        raise ValueError("pass fg_eb_alm or harmonic_skies, not both.")
+    shared_fg = None
+    if fg_eb_alm is not None:
+        shared_fg = jnp.asarray(fg_eb_alm)
+        expected = (len(freqs_ghz), 2, alm_size(int(lmax)))
+        if tuple(shared_fg.shape) != expected:
+            raise ValueError(
+                f"fg_eb_alm has shape {tuple(shared_fg.shape)}; expected {expected} "
+                f"(n_band, 2, n_alm at lmax={int(lmax)})."
+            )
+    elif (
+        harmonic_skies is None
+        and fg_model is not None
+        and share_fg
+        and fg_model_is_static(fg_model)
+    ):
+        shared_fg = static_fg_eb_alm(
+            freqs_ghz, fg_model, int(lmax), int(nside), bandpasses=bandpasses
+        )
+
+    def _hsky(seed: int, *, attach_fg: bool = True) -> HarmonicSky:
+        sky = harmonic_sky(
             freqs_ghz,
             spectra=spectra,
             r_in=float(r_in),
             nside=int(nside),
             lmax=int(lmax),
-            fg_model=fg_model,
+            fg_model=fg_model if shared_fg is None else None,
             cmb_seed=int(seed),
             cl_ee=cl_ee,
             bandpasses=bandpasses,
             split_lensing=split_lensing,
         )
+        if shared_fg is not None and attach_fg:
+            sky = dataclasses.replace(sky, fg_eb_alm=shared_fg)
+        return sky
 
     if harmonic_skies is None:
         seeds = list(range(int(base_seed), int(base_seed) + int(n_sims)))
@@ -637,8 +700,10 @@ def make_cutsky_mc_context(
         # leaves get a leading sim axis; the static fields are shared) + stacked keys, so
         # the traced forward can lax.map over the sim axis instead of Python-unrolling the
         # cleaner n_sims times (O(1) compile, scan-accumulated memory -> higher n_sims).
-        _hsky_tuple = tuple(_hsky(s) for s in seeds)
+        _hsky_tuple = tuple(_hsky(s, attach_fg=False) for s in seeds)
         harmonic_skies = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *_hsky_tuple)
+        if shared_fg is not None:
+            harmonic_skies = dataclasses.replace(harmonic_skies, fg_eb_alm=shared_fg)
         noise_keys = jnp.stack([jax.random.PRNGKey(int(s)) for s in seeds], axis=0)
     else:
         # Precomputed FG sky ensemble -- e.g. loaded from a sky cache (save_sky_cache /
@@ -649,10 +714,11 @@ def make_cutsky_mc_context(
             raise ValueError(
                 "noise_keys must be supplied when harmonic_skies is precomputed."
             )
-        if var_pix_ref is None:
+        if needs_inv_noise and var_pix_ref is None:
             raise ValueError(
-                "var_pix_ref must be supplied when harmonic_skies is precomputed "
-                "(the setup clean needs a generated sky otherwise)."
+                f"var_pix_ref must be supplied when harmonic_skies is precomputed "
+                f"and estimator={estimator!r} (the setup clean needs a generated "
+                f"sky otherwise). estimator='master' needs no var_pix_ref at all."
             )
         n_sims = int(harmonic_skies.cmb_b_alm.shape[0])
         if split_lensing and harmonic_skies.cmb_b_lens_alm is None:
@@ -666,9 +732,14 @@ def make_cutsky_mc_context(
                 f"noise_keys has {int(noise_keys.shape[0])} sims but harmonic_skies has {n_sims}."
             )
 
+    # Applied to a generated AND a cached ensemble: a cache written before this
+    # existed still carries n_sims copies, and gets collapsed on load here.
+    if share_fg:
+        harmonic_skies = share_constant_fg(harmonic_skies, strict=False)
+
     # var_pix_ref: frozen filter knob from one setup clean at the fiducial w_inv +
     # reference beams (matches mc_cutsky_bandpowers; uses the base_seed + n_sims sim).
-    if var_pix_ref is None:
+    if needs_inv_noise and var_pix_ref is None:
         sky0 = beam_harmonic_sky(
             _hsky(base_seed + n_sims), beam_fwhm_arcmin, beam_shape_p
         )
@@ -686,7 +757,9 @@ def make_cutsky_mc_context(
         obs = jnp.asarray(mask) > 0
         var_pix_ref = float(jnp.mean((cn[0] ** 2 + cn[1] ** 2)[obs]) / 2.0)
 
-    inv_noise = mk.inv_noise_map(hit_map, var_pix_ref, mask=mask)
+    inv_noise = (
+        mk.inv_noise_map(hit_map, var_pix_ref, mask=mask) if needs_inv_noise else None
+    )
 
     return CutskyMCContext(
         harmonic_skies=harmonic_skies,
@@ -707,7 +780,7 @@ def make_cutsky_mc_context(
         max_iter=int(max_iter),
         tol=float(tol),
         n_sims=int(n_sims),
-        var_pix_ref=float(var_pix_ref),
+        var_pix_ref=None if var_pix_ref is None else float(var_pix_ref),
         f_sky=mk.f_sky_of(mask),
         mask=jnp.asarray(mask),
         cl_bb_lens_ref=(
@@ -728,7 +801,8 @@ class SkyCache:
 
     Holds the PySM-dependent pieces of a :class:`CutskyMCContext` -- the per-sim
     ``HarmonicSky`` ensemble (CMB + foreground alm), the noise CRN keys, and the
-    filter-normalization ``var_pix_ref`` -- plus the config metadata used to validate
+    filter-normalization ``var_pix_ref`` (``None`` for a MASTER context, which
+    builds no filter) -- plus the config metadata used to validate
     that the GPU-side build matches the generation. Produced by :func:`save_sky_cache`
     on a pysm3-capable machine; consumed via ``make_cutsky_mc_context(
     harmonic_skies=cache.harmonic_skies, noise_keys=cache.noise_keys,
@@ -737,7 +811,9 @@ class SkyCache:
 
     harmonic_skies: HarmonicSky
     noise_keys: jax.Array
-    var_pix_ref: float
+    # ``None`` when the context was built for estimator='master', which skips the
+    # setup clean entirely. Feed it straight back to make_cutsky_mc_context.
+    var_pix_ref: float | None
     freqs_ghz: tuple[float, ...]
     beam_fwhm_arcmin: tuple[float, ...]
     nside: int
@@ -764,7 +840,6 @@ def save_sky_cache(path, ctx: CutskyMCContext, *, fg_model, base_seed: int = 0) 
     blob = dict(
         cmb_b_alm=np.asarray(hs.cmb_b_alm),
         noise_keys=np.asarray(ctx.noise_keys),
-        var_pix_ref=np.asarray(float(ctx.var_pix_ref)),
         freqs_ghz=np.asarray(hs.freqs_ghz, dtype=float),
         beam_fwhm_arcmin=np.asarray(ctx.beam_fwhm_arcmin, dtype=float),
         nside=np.asarray(int(ctx.nside)),
@@ -780,7 +855,13 @@ def save_sky_cache(path, ctx: CutskyMCContext, *, fg_model, base_seed: int = 0) 
         # load their skies here (pysm3-less nodes), and a cache that dropped it
         # would strand them at A_lens = 1.
         has_cmb_b_lens=np.asarray(hs.cmb_b_lens_alm is not None),
+        # Absent on a MASTER context. Written as a presence flag + optional key
+        # (the has_fg / has_cmb_e idiom) rather than a NaN sentinel, so an older
+        # augr reading a newer cache fails loudly instead of filtering a NaN.
+        has_var_pix_ref=np.asarray(ctx.var_pix_ref is not None),
     )
+    if ctx.var_pix_ref is not None:
+        blob["var_pix_ref"] = np.asarray(float(ctx.var_pix_ref))
     if hs.fg_eb_alm is not None:
         blob["fg_eb_alm"] = np.asarray(hs.fg_eb_alm)
     if hs.cmb_e_alm is not None:
@@ -801,6 +882,13 @@ def load_sky_cache(path) -> SkyCache:
         if bool(z.get("has_cmb_b_lens", np.asarray(False)))
         else None
     )
+    # Default True: caches written before MASTER could skip the setup clean have
+    # no flag and always carry a var_pix_ref, so they load exactly as before.
+    var_pix_ref = (
+        float(z["var_pix_ref"])
+        if bool(z.get("has_var_pix_ref", np.asarray(True)))
+        else None
+    )
     freqs = tuple(float(f) for f in z["freqs_ghz"])
     hs = HarmonicSky(
         freqs_ghz=freqs,
@@ -815,7 +903,7 @@ def load_sky_cache(path) -> SkyCache:
     return SkyCache(
         harmonic_skies=hs,
         noise_keys=jnp.asarray(z["noise_keys"]),
-        var_pix_ref=float(z["var_pix_ref"]),
+        var_pix_ref=var_pix_ref,
         freqs_ghz=freqs,
         beam_fwhm_arcmin=tuple(float(b) for b in z["beam_fwhm_arcmin"]),
         nside=int(z["nside"]),
@@ -824,6 +912,53 @@ def load_sky_cache(path) -> SkyCache:
         f_sky=float(z["f_sky"]),
         fg_model=str(z["fg_model"]),
         base_seed=int(z["base_seed"]),
+    )
+
+
+@dataclass(frozen=True)
+class FgCache:
+    """One static foreground sky, shared by every sim and every seed block.
+
+    ``fg_eb_alm`` is ``(n_band, 2, n_alm)``, unbeamed; pass it to
+    ``make_cutsky_mc_context(fg_eb_alm=...)``, which draws the CMB and noise from
+    ``base_seed`` as usual. Unlike :class:`SkyCache` it carries no per-sim data, so
+    one file serves any ``n_sims`` and any ensemble. The caller checks the metadata
+    against its run (bands, nside, lmax, fg_model); bandpasses are not recorded.
+    """
+
+    fg_eb_alm: jax.Array
+    fg_model: str
+    freqs_ghz: tuple[float, ...]
+    nside: int
+    lmax: int
+
+
+def save_fg_cache(path, fg_eb_alm, *, fg_model: str, freqs_ghz, nside: int, lmax: int) -> None:
+    """Write a static foreground (e.g. from ``compsep_sims.static_fg_eb_alm``) to ``path`` (.npz)."""
+    fg = np.asarray(fg_eb_alm)
+    freqs = np.asarray(tuple(float(f) for f in freqs_ghz), dtype=float)
+    expected = (freqs.size, 2, alm_size(int(lmax)))
+    if fg.shape != expected:
+        raise ValueError(f"fg_eb_alm has shape {fg.shape}; expected {expected}.")
+    np.savez(
+        path,
+        fg_eb_alm=fg,
+        fg_model=np.asarray(str(fg_model)),
+        freqs_ghz=freqs,
+        nside=np.asarray(int(nside)),
+        lmax=np.asarray(int(lmax)),
+    )
+
+
+def load_fg_cache(path) -> FgCache:
+    """Load an :class:`FgCache` written by :func:`save_fg_cache` (no pysm3 required)."""
+    z = np.load(path, allow_pickle=False)
+    return FgCache(
+        fg_eb_alm=jnp.asarray(z["fg_eb_alm"]),
+        fg_model=str(z["fg_model"]),
+        freqs_ghz=tuple(float(f) for f in z["freqs_ghz"]),
+        nside=int(z["nside"]),
+        lmax=int(z["lmax"]),
     )
 
 
@@ -887,12 +1022,108 @@ def _lens_scale(ctx: CutskyMCContext, cl_bb_res, cl_bb_res_ells):
     return jnp.where(pos, jnp.sqrt(jnp.where(pos, ratio, 1.0)), 0.0)
 
 
-def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1):
-    """``lax.map`` over the sim axis, optionally checkpointed and batched.
+def share_constant_fg(hsky: HarmonicSky, *, strict: bool = True) -> HarmonicSky:
+    """Collapse a per-sim foreground ensemble to the single sky they all are.
+
+    PySM's fixed-template components (``d1``/``d10``/``s1``/``s5``, i.e. the
+    ``d1s1`` and ``d10s5`` presets) ignore ``fg_seed`` entirely, so every sim in a
+    batched :class:`HarmonicSky` carries a **bit-identical** ``fg_eb_alm`` --
+    verified on a production cache and by regenerating at two seeds. Storing
+    ``n_sims`` copies of it is the largest resident array in the cut-sky MC:
+    ``(n_sims, n_band, 2, n_alm)`` complex128 reaches 610 GB at nside=1024 and
+    4.9 TB at nside=2048, against 0.8 GB / 3.2 GB for the one sky.
+
+    Returns a sky whose ``fg_eb_alm`` has lost its leading sim axis (rank 3 rather
+    than 4). Rank is what marks it shared -- unambiguous, unlike a leading-axis
+    length that could coincide with ``n_band``.
+
+    The check is exact equality, not a tolerance: the deterministic case is
+    bit-identical, so any departure at all means the model genuinely draws per sim
+    and sharing would silently replace an ensemble with its first realization.
+
+    ``strict=True`` (default) **raises** on a varying ensemble -- use it when you
+    believe the model is deterministic and want to be told if it is not.
+    ``strict=False`` returns the ensemble untouched instead, which is what
+    :func:`make_cutsky_mc_context` wants: the stochastic ``*Realization`` presets
+    (``d10s6``, ``s6``) genuinely vary, and keeping them per-sim is correct rather
+    than exceptional.
+    """
+    fg = hsky.fg_eb_alm
+    if fg is None:
+        return hsky
+    fg = jnp.asarray(fg)
+    if fg.ndim == 3:
+        return hsky  # already shared
+    if fg.ndim != 4:
+        raise ValueError(
+            f"fg_eb_alm must be (n_sims, n_band, 2, n_alm) or (n_band, 2, n_alm); "
+            f"got shape {fg.shape}."
+        )
+    dev = float(jnp.max(jnp.abs(fg - fg[0:1])))
+    if dev != 0.0:
+        if not strict:
+            return hsky
+        raise ValueError(
+            f"the foreground ensemble varies across sims (max|fg[i] - fg[0]| = "
+            f"{dev:g}), so it cannot be shared. That is expected for a stochastic "
+            f"PySM preset (a *Realization component, e.g. d10s6 / s6); those must "
+            f"keep the per-sim ensemble."
+        )
+    return dataclasses.replace(hsky, fg_eb_alm=fg[0])
+
+
+def _split_shared_fg(hsky: HarmonicSky) -> tuple[HarmonicSky, jax.Array | None]:
+    """Peel a shared (rank-3) ``fg_eb_alm`` off, so every remaining leaf is per-sim.
+
+    ``_sim_map`` requires every leaf of ``xs`` to carry the sim axis, so a shared
+    foreground cannot travel in the mapped pytree; it goes through ``consts``.
+    Returns ``(sky_without_fg, shared_fg_or_None)``; a per-sim (rank-4) ensemble is
+    returned untouched with ``None``.
+    """
+    fg = hsky.fg_eb_alm
+    if fg is None or jnp.asarray(fg).ndim == 4:
+        return hsky, None
+    return dataclasses.replace(hsky, fg_eb_alm=None), jnp.asarray(fg)
+
+
+_SIM_NO_SHARD_ENV = "AUGR_SIM_NO_SHARD"
+
+
+def _sim_shard_devices() -> int:
+    """Devices a ``shard=True`` per-sim map splits over (1 = no sharding).
+
+    ``jax.device_count()``: the visible GPUs, or ``JAX_NUM_CPU_DEVICES`` logical
+    devices on CPU. JAX fixes it at import, so it is baked in at trace time.
+    ``AUGR_SIM_NO_SHARD=1`` forces 1.
+    """
+    if os.environ.get(_SIM_NO_SHARD_ENV, "") not in ("", "0"):
+        return 1
+    return int(jax.device_count())
+
+
+@functools.lru_cache(maxsize=4)
+def _sim_mesh(n_dev: int):
+    """Cached 1-D mesh over the sim axis; ``AxisType.Auto`` for the reason in
+    :func:`augr.delensing_fullsky_jax._l_mesh`."""
+    return jax.make_mesh((n_dev,), ("sims",), axis_types=(jax.sharding.AxisType.Auto,))
+
+
+def _sim_map(
+    body, xs, *, remat: bool, sim_batch: int = 1, consts: tuple = (), shard: bool = False
+):
+    """``lax.map`` over ``body(sim, *consts)``, optionally checkpointed, batched and sharded.
 
     Sibling of :func:`augr.delensing_fullsky_jax._map`, for the per-sim compsep
     body rather than the per-L QE body. ``xs`` is a pytree (the batched
     ``HarmonicSky`` and the noise keys), every leaf carrying the sim axis first.
+
+    ``consts`` are passed to every step *unmapped* -- values that are the same for
+    every sim, e.g. a foreground shared across the ensemble. They are arguments
+    rather than closures for the reason the delensing sibling documents: a value
+    carrying a mesh sharding cannot be closed over inside a later ``shard_map``,
+    so a body that closes over one cannot be sharded later. Note ``jax.vmap`` maps
+    over *every* positional argument by default, so ``consts`` are bound into the
+    step before the vmap rather than passed through it.
 
     ``remat=True`` stores only the per-sim inputs and recomputes the body on the
     backward pass. Reverse mode otherwise retains *every* sim's residuals, and the
@@ -912,8 +1143,14 @@ def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1):
     (``jht.wiener``): under ``vmap`` that loop runs until every lane has
     converged, so the batch costs the max over its members. Default 1.
 
-    ``sim_batch == 1`` is an early return to a plain ``lax.map``, so with
-    ``remat=False`` the trace is exactly the pre-checkpoint one.
+    ``shard=True`` splits the sim axis across :func:`_sim_shard_devices` devices
+    with ``shard_map``; each device runs the same sequential (or batched) map over
+    its slice. Padding goes to a multiple of ``sim_batch * n_dev`` and a padded slot
+    costs a full sim. Anything the body needs that could carry a mesh sharding --
+    i.e. descends from the caller's traced inputs -- must come through ``consts``.
+
+    ``sim_batch == 1`` on one device is an early return to a plain ``lax.map``, so
+    with ``remat=False`` the trace is exactly the pre-checkpoint one.
 
     ``remat`` is read at **trace time** and must be a Python ``bool``, never a
     traced value.
@@ -928,16 +1165,36 @@ def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1):
         raise ValueError("xs carries no arrays to map over.")
     n = leaves[0].shape[0]
 
-    if sim_batch == 1:
-        step = jax.checkpoint(body, prevent_cse=False) if remat else body
+    # Bind consts here, so neither lax.map nor vmap ever sees them as a mapped
+    # argument (vmap's in_axes default would map them along axis 0).
+    def bound(v):
+        return body(v, *consts)
+
+    plain = body if not consts else bound
+
+    n_dev = _sim_shard_devices() if shard else 1
+    if sim_batch == 1 and n_dev == 1:
+        step = jax.checkpoint(plain, prevent_cse=False) if remat else plain
         return jax.lax.map(step, xs)
 
-    # vmap FIRST, checkpoint SECOND: one batch is one recompute unit.
-    step = jax.vmap(body)
-    if remat:
-        step = jax.checkpoint(step, prevent_cse=False)
+    def local_map(x, *cs):
+        """Map over one device's slice; its length is a multiple of ``sim_batch``."""
+        def one(v):
+            return body(v, *cs)
 
-    n_pad = -(-n // sim_batch) * sim_batch
+        # vmap FIRST, checkpoint SECOND: one batch is one recompute unit. The
+        # consts are closed over here, so the vmap never maps them.
+        step = jax.vmap(one) if sim_batch > 1 else one
+        if remat:
+            step = jax.checkpoint(step, prevent_cse=False)
+        if sim_batch == 1:
+            return jax.lax.map(step, x)
+        batched = jax.tree.map(lambda a: a.reshape((-1, sim_batch, *a.shape[1:])), x)
+        out = jax.lax.map(step, batched)
+        return jax.tree.map(lambda a: a.reshape((-1, *a.shape[2:])), out)
+
+    multiple = sim_batch * n_dev
+    n_pad = -(-n // multiple) * multiple
     if n_pad != n:
         # A padded slot costs a full slot; repeat the last sim and trim the
         # output below. Every sim costs the same, so which row is repeated
@@ -945,11 +1202,24 @@ def _sim_map(body, xs, *, remat: bool, sim_batch: int = 1):
         xs = jax.tree.map(
             lambda a: jnp.concatenate([a, jnp.repeat(a[-1:], n_pad - n, axis=0)]), xs
         )
-    batched = jax.tree.map(
-        lambda a: a.reshape((n_pad // sim_batch, sim_batch, *a.shape[1:])), xs
-    )
-    out = jax.lax.map(step, batched)
-    out = jax.tree.map(lambda a: a.reshape((-1, *a.shape[2:])), out)
+    if n_dev == 1:
+        out = local_map(xs, *consts)
+    else:
+        # check_vma=False: with it on, every per-device value is typed "varying over
+        # sims", and kernels that build a value from constants -- jht's recursion
+        # scan carries, ducc's pure_callback VJP outputs -- come out untyped and
+        # are rejected. The body has no collectives and the output is concatenated
+        # over sims, so there is no replication promise for the check to guard.
+        sharded = jax.shard_map(
+            local_map,
+            mesh=_sim_mesh(n_dev),
+            in_specs=(jax.P("sims"), *((jax.P(),) * len(consts))),
+            out_specs=jax.P("sims"),
+            check_vma=False,
+        )
+        # jit: JAX cannot evaluate the body's checkpoint / custom_vjp calls eagerly
+        # inside a shard_map. Under an outer jit this is an inlined call.
+        out = jax.jit(sharded)(xs, *consts)
     return jax.tree.map(lambda a: a[:n], out)
 
 
@@ -971,6 +1241,12 @@ def _mc_cutsky_cov_master(
       weighting and no signal prior at all.
     * **The beam is explicit.** With no ``F_b`` to absorb ``B_c^2`` it goes into
       the coupling matrix, at the common resolution the cleaner delivers.
+    * **``sim_batch > 1`` is structurally safe here**, unlike on the masked-Wiener
+      branch. The caution in :func:`_sim_map` is about vmapping a ``while_loop``
+      CG, which makes a batch cost its slowest lane; this branch's forward traces
+      to **zero** ``while`` primitives (pinned by a test), so batching only trades
+      memory for larger kernels. It still reassociates reductions, so agreement
+      with ``sim_batch=1`` is measured rather than exact.
 
     It consumes the cleaned **B alm**, not ``cleaned_qu()``. That is not a
     micro-optimization: the full cleaned Q/U carries the cleaned *E* as well, and
@@ -994,14 +1270,13 @@ def _mc_cutsky_cov_master(
     ``tests/test_nilc.py``), while ``clean_e=True`` costs a second full
     ``(J, n_band, npix)`` needlet array and its recomposition on every sim.
 
-    That saving is **not** currently available to a caller, and the reason is worth
-    recording: :func:`make_cutsky_mc_context` derives ``var_pix_ref`` from a setup
-    clean whose noise leg calls ``project_e()``, so a ``clean_e=False`` cleaner
-    raises at *context build* regardless of estimator. On this path that setup clean
-    is itself dead work -- ``var_pix_ref`` exists only to build ``inv_noise``, which
-    the masked-Wiener branch consumes and this one does not. Skipping it for
-    ``estimator="master"`` is the change that would unlock both; it is deliberately
-    not made here.
+    That saving **is** available: :func:`make_cutsky_mc_context` skips its
+    ``var_pix_ref`` setup clean entirely for ``estimator="master"`` (leaving
+    ``ctx.var_pix_ref`` and ``ctx.inv_noise`` as ``None``), so a ``clean_e=False``
+    cleaner builds a context on this path. The setup clean was dead work here --
+    ``var_pix_ref`` exists only to build ``inv_noise``, which the masked-Wiener
+    branch consumes and this one does not -- and skipping it also drops one extra
+    sky generation and one full cleaner solve per context build.
     """
     m = ctx.mask if mask is None else jnp.asarray(mask)
     if m is None:
@@ -1026,7 +1301,16 @@ def _mc_cutsky_cov_master(
         beam_bl=beam_bl(ells, common_fwhm),
     )
 
-    def _one(hsky, key):
+    # A shared (rank-3) foreground cannot ride in the mapped pytree -- every leaf
+    # there must carry the sim axis -- so it travels as a scan constant and is
+    # re-attached inside the body. Per-sim compute is therefore unchanged; what
+    # changes is that one sky is stored instead of n_sims copies of it.
+    mapped_skies, shared_fg_alm = _split_shared_fg(ctx.harmonic_skies)
+    fg_consts = () if shared_fg_alm is None else (shared_fg_alm,)
+
+    def _one(hsky, key, w_inv, lens_scale, *shared_fg):
+        if shared_fg:
+            hsky = dataclasses.replace(hsky, fg_eb_alm=shared_fg[0])
         band_sky = beam_harmonic_sky(
             hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin, lens_scale=lens_scale
         )
@@ -1043,11 +1327,16 @@ def _mc_cutsky_cov_master(
         # No second cleaner solve -- project() reuses the stored weights.
         return full, master.bb_from_b_alm(result.project(band_sky.fg_qu))
 
+    # Sharded across every visible device. w_inv and lens_scale ride as consts,
+    # not closures: lens_scale can come out of a CPU-sharded delensing solve, and
+    # shard_map refuses to close over a value that carries a mesh sharding.
     rec, rec_fg = _sim_map(
-        lambda bk: _one(bk[0], bk[1]),
-        (ctx.harmonic_skies, ctx.noise_keys),
+        lambda bk, *cs: _one(bk[0], bk[1], *cs),
+        (mapped_skies, ctx.noise_keys),
         remat=remat,
         sim_batch=sim_batch,
+        consts=(w_inv, lens_scale, *fg_consts),
+        shard=True,
     )
     n_bins = rec.shape[1]
     return CutskyMCTraced(
@@ -1125,8 +1414,10 @@ def mc_cutsky_cov_traced(
     every sim's residuals, and the tape is ``n_sims`` times a per-sim cost growing
     as ``npix`` -- terabytes by nside=1024. Values are bit-identical either way;
     see :func:`_sim_map`. ``sim_batch`` vmaps sims into each step and defaults to 1;
-    on this (masked-Wiener) branch raising it batches a ``while_loop`` CG, so read
-    :func:`_sim_map` before doing so.
+    on the masked-Wiener branch raising it batches a ``while_loop`` CG, so read
+    :func:`_sim_map` before doing so. On the MASTER branch the sim axis is split
+    across every visible device (the GPUs, or ``JAX_NUM_CPU_DEVICES`` on CPU);
+    ``AUGR_SIM_NO_SHARD=1`` opts out. The masked-Wiener branch is not sharded.
 
     The straight-through gradient flows through a *sample* covariance, so it carries
     Monte-Carlo noise -- characterise grad std vs ``n_sims`` before trusting a
@@ -1157,6 +1448,13 @@ def mc_cutsky_cov_traced(
             "path folds its mask into inv_noise at context-build time, so an "
             "override here would be silently ignored."
         )
+    if ctx.inv_noise is None:
+        raise ValueError(
+            "the masked-Wiener path needs ctx.inv_noise, but this context was "
+            "built without it (estimator='master' skips the setup clean that "
+            "derives var_pix_ref). Rebuild with "
+            "make_cutsky_mc_context(estimator='wiener')."
+        )
     bp_kw = dict(
         bin_matrix=ctx.bin_matrix,
         ell_min=ctx.ell_min,
@@ -1166,10 +1464,16 @@ def mc_cutsky_cov_traced(
         tol=ctx.tol,
     )
 
-    def _one(hsky, key):
+    # Same shared-foreground handling as the MASTER branch; see the comment there.
+    mapped_skies, shared_fg_alm = _split_shared_fg(ctx.harmonic_skies)
+    fg_consts = () if shared_fg_alm is None else (shared_fg_alm,)
+
+    def _one(hsky, key, *shared_fg):
         # Beam the (frozen, unbeamed) per-sim harmonic sky in-trace, so the beams flow
         # the gradient. The BandSky static beam field carries the concrete reference
         # (metadata only; assemble_band_maps reads only cmb_qu / fg_qu).
+        if shared_fg:
+            hsky = dataclasses.replace(hsky, fg_eb_alm=shared_fg[0])
         band_sky = beam_harmonic_sky(
             hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin, lens_scale=lens_scale
         )
@@ -1215,10 +1519,11 @@ def mc_cutsky_cov_traced(
     # while_loop runs it until every lane converges -- so `sim_batch > 1` makes each
     # batch cost its slowest member. Raise it only with a measurement.
     rec_full, rec_b, rec_e = _sim_map(
-        lambda bk: _one(bk[0], bk[1]),
-        (ctx.harmonic_skies, ctx.noise_keys),
+        lambda bk, *cs: _one(bk[0], bk[1], *cs),
+        (mapped_skies, ctx.noise_keys),
         remat=remat,
         sim_batch=sim_batch,
+        consts=fg_consts,
     )
 
     transfer = mk.transfer_function(rec_b, ctx.true_bb_binned)

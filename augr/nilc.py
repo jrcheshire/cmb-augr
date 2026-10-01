@@ -48,7 +48,34 @@ import jax.numpy as jnp
 import numpy as np
 
 from .instrument import beam_bl
-from .sht import almxfl, check_band_limit, map2alm, synthesis, synthesis_pol
+from .sht import (
+    almxfl,
+    check_band_limit,
+    get_sht_backend,
+    map2alm,
+    synthesis,
+    synthesis_pol,
+)
+
+# ---------------------------------------------------------------------------
+# per-band transform dispatch
+# ---------------------------------------------------------------------------
+
+
+def _map_transforms(fn, *xs):
+    """Apply ``fn`` along the leading axis of ``xs``: vmapped on jht, looped on ducc.
+
+    On jht the transforms batch natively, so ``vmap`` issues fewer, larger kernels.
+    On ducc each transform is a ``pure_callback`` declared
+    ``vmap_method="sequential"``, so ``vmap`` chains them into one strictly serial
+    scan, whereas a Python loop leaves independent callbacks that XLA can run
+    concurrently. Values and gradients are bit-identical either way.
+    """
+    if get_sht_backend() == "jht":
+        return jax.vmap(fn)(*xs)
+    outs = [fn(*(x[i] for x in xs)) for i in range(xs[0].shape[0])]
+    return jax.tree.map(lambda *o: jnp.stack(o), *outs)
+
 
 # ---------------------------------------------------------------------------
 # cosine needlet bands
@@ -133,13 +160,12 @@ def common_resolution_b_alm(
         common_fwhm_arcmin = jnp.min(beams)
     ells = jnp.arange(lmax + 1, dtype=float)
     bl_common = beam_bl(ells, common_fwhm_arcmin)
-    out = []
-    for qu_b, fwhm_b, p_b in zip(band_qu, beams, ps, strict=True):
+    def _one(qu_b, fwhm_b, p_b):
         eb = map2alm(qu_b, 2, lmax, nside, n_iter)  # (2, Nlm) = (E, B)
-        bl_band = beam_bl(ells, fwhm_b, p_b)
-        ratio = bl_common / jnp.maximum(bl_band, 1e-30)
-        out.append(almxfl(eb[1], ratio, lmax))
-    return jnp.stack(out, axis=0), common_fwhm_arcmin
+        ratio = bl_common / jnp.maximum(beam_bl(ells, fwhm_b, p_b), 1e-30)
+        return almxfl(eb[1], ratio, lmax)
+
+    return _map_transforms(_one, band_qu, beams, ps), common_fwhm_arcmin
 
 
 def common_resolution_eb(
@@ -170,15 +196,13 @@ def common_resolution_eb(
         common_fwhm_arcmin = jnp.min(beams)
     ells = jnp.arange(lmax + 1, dtype=float)
     bl_common = beam_bl(ells, common_fwhm_arcmin)
-    out_e = []
-    out_b = []
-    for qu_b, fwhm_b, p_b in zip(band_qu, beams, ps, strict=True):
+    def _one(qu_b, fwhm_b, p_b):
         eb = map2alm(qu_b, 2, lmax, nside, n_iter)  # (2, Nlm) = (E, B)
-        bl_band = beam_bl(ells, fwhm_b, p_b)
-        ratio = bl_common / jnp.maximum(bl_band, 1e-30)
-        out_e.append(almxfl(eb[0], ratio, lmax))
-        out_b.append(almxfl(eb[1], ratio, lmax))
-    return jnp.stack(out_e, axis=0), jnp.stack(out_b, axis=0), common_fwhm_arcmin
+        ratio = bl_common / jnp.maximum(beam_bl(ells, fwhm_b, p_b), 1e-30)
+        return almxfl(eb[0], ratio, lmax), almxfl(eb[1], ratio, lmax)
+
+    e_alm, b_alm = _map_transforms(_one, band_qu, beams, ps)
+    return e_alm, b_alm, common_fwhm_arcmin
 
 
 # ---------------------------------------------------------------------------
@@ -186,15 +210,53 @@ def common_resolution_eb(
 # ---------------------------------------------------------------------------
 
 
-def needlet_beta(b_alm: jax.Array, needlet_bands: jax.Array, *, lmax: int, nside: int) -> jax.Array:
-    """Common-resolution B alms → needlet coefficient maps, shape ``(J, n_band, npix)``."""
-    beta = []
-    for hj in needlet_bands:
-        per_band = [
-            synthesis(almxfl(alm_b, hj, lmax)[None, :], 0, lmax, nside)[0] for alm_b in b_alm
-        ]
-        beta.append(jnp.stack(per_band, axis=0))
-    return jnp.stack(beta, axis=0)
+def needlet_beta(
+    b_alm: jax.Array,
+    needlet_bands: jax.Array,
+    *,
+    lmax: int,
+    nside: int,
+    batch: int | None = None,
+) -> jax.Array:
+    """Common-resolution B alms → needlet coefficient maps, shape ``(J, n_band, npix)``.
+
+    On jht the ``J * n_band`` transforms are ``vmap``ed: this is the dominant kernel
+    count in the cleaner -- 126 transforms per sim at J=6, n_band=21 -- and the
+    GPU design gradient is launch-bound, not arithmetic-bound (fp64 arithmetic is
+    0.0002-0.011% of runtime), so issuing fewer, larger kernels is the win. On ducc
+    they stay a loop, which lets XLA run the callbacks concurrently; see
+    :func:`_map_transforms`. Values are bit-identical between the two forms.
+
+    ``batch`` chunks the transforms through ``lax.map`` instead of issuing all
+    ``J * n_band`` at once. It buys a flat **1.36x** on the cleaner's working set
+    and **nothing further with width**: measured at nside=64, n_band=21, the
+    transient is 384 MB unchunked and 282 / 282 / 288 / 284 MB at widths 42 / 21 /
+    8 / 4. Chunking at all is the whole saving; how finely is irrelevant. So set it
+    if you want that 1.36x, and leave the width at something coarse.
+
+    What it does NOT do is make high resolution affordable, contrary to what a
+    per-transform-buffer picture would suggest. The transient scales as ``npix``
+    regardless of chunking -- 96.6 MB at nside=32 and 384.1 MB at nside=64, an
+    exact 4x -- and sub-linearly in ``n_band`` (84.8 -> 384.1 MB from 3 to 21
+    bands). XLA is evidently already sharing buffers across the batch. Extrapolated
+    on that npix scaling, nside=2048 needs ~390 GB whether chunked or not, so the
+    lever there is precision or resolution, not batch width.
+
+    (PR #67's batched-SHT curve, where B=32 OOMs at nside=2048, measured standalone
+    ``jht.synthesis`` calls on independent full maps -- a different allocation
+    pattern from vmapped transforms inside one fused graph. It does not transfer.)
+    """
+    # vmap the window rather than indexing a (J, lmax+1) table directly: almxfl is
+    # `alm * fl[ell]`, so a 2-D fl would be gathered along its FIRST axis.
+    windowed = jax.vmap(lambda hj: almxfl(b_alm, hj, lmax))(needlet_bands)
+    n_j, n_band, n_lm = windowed.shape
+    flat = windowed.reshape(n_j * n_band, n_lm)
+
+    def _one(a):
+        return synthesis(a[None, :], 0, lmax, nside)[0]
+
+    maps = _map_transforms(_one, flat) if batch is None else jax.lax.map(_one, flat, batch_size=batch)
+    return maps.reshape(n_j, n_band, -1)
 
 
 def combine_needlets(
@@ -218,11 +280,12 @@ def combine_needlets(
         s = jnp.einsum("jb,jbp->jp", weights, beta)  # global: pixel-constant weights
     else:
         s = jnp.einsum("jbp,jbp->jp", weights, beta)  # localized: per-pixel weights
-    acc = [
-        almxfl(map2alm(s[j][None, :], 0, lmax, nside, n_iter)[0], hj, lmax)
-        for j, hj in enumerate(needlet_bands)
-    ]
-    return jnp.sum(jnp.stack(acc, axis=0), axis=0)
+    acc = _map_transforms(
+        lambda s_j, hj: almxfl(map2alm(s_j[None, :], 0, lmax, nside, n_iter)[0], hj, lmax),
+        s,
+        needlet_bands,
+    )
+    return jnp.sum(acc, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +541,7 @@ class NILCResult:
     cleaned_e_alm: jax.Array | None = None
     weights_e: jax.Array | None = None
     beam_shape_p: jax.Array | None = None
+    needlet_batch: int | None = None
 
     def project(self, passive_band_qu: jax.Array) -> jax.Array:
         """Apply the stored weights to another map set → its cleaned B alm.
@@ -494,7 +558,9 @@ class NILCResult:
             common_fwhm_arcmin=self.common_fwhm_arcmin,
             beam_shape_p=self.beam_shape_p,
         )
-        beta = needlet_beta(b_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside)
+        beta = needlet_beta(
+            b_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside, batch=self.needlet_batch
+        )
         return combine_needlets(
             self.weights,
             beta,
@@ -525,7 +591,9 @@ class NILCResult:
             common_fwhm_arcmin=self.common_fwhm_arcmin,
             beam_shape_p=self.beam_shape_p,
         )
-        beta = needlet_beta(e_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside)
+        beta = needlet_beta(
+            e_alm, self.needlet_bands, lmax=self.lmax, nside=self.nside, batch=self.needlet_batch
+        )
         return combine_needlets(
             self.weights_e,
             beta,
@@ -572,6 +640,7 @@ def nilc_clean(
     ridge: float = 1e-10,
     beam_band_limit: float = 0.1,
     clean_e: bool = False,
+    needlet_batch: int | None = None,
 ) -> NILCResult:
     """Run the differentiable empirical needlet ILC on per-band Q/U maps.
 
@@ -668,14 +737,16 @@ def nilc_clean(
             active=active,
         )
 
-    beta = needlet_beta(b_alm, needlet_bands, lmax=lmax, nside=nside)
+    beta = needlet_beta(b_alm, needlet_bands, lmax=lmax, nside=nside, batch=needlet_batch)
     weights = _weights(beta)
     cleaned = combine_needlets(weights, beta, needlet_bands, lmax=lmax, nside=nside, n_iter=n_iter)
 
     cleaned_e = None
     weights_e = None
     if clean_e:
-        beta_e = needlet_beta(e_alm, needlet_bands, lmax=lmax, nside=nside)
+        beta_e = needlet_beta(
+            e_alm, needlet_bands, lmax=lmax, nside=nside, batch=needlet_batch
+        )
         weights_e = _weights(beta_e)
         cleaned_e = combine_needlets(
             weights_e, beta_e, needlet_bands, lmax=lmax, nside=nside, n_iter=n_iter
@@ -693,4 +764,5 @@ def nilc_clean(
         cleaned_e_alm=cleaned_e,
         weights_e=weights_e,
         beam_shape_p=ps,
+        needlet_batch=needlet_batch,
     )
