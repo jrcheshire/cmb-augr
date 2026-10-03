@@ -98,23 +98,22 @@ Knowing how the modules chain together matters more than any one file:
    exhaustion or non-finite step (no damping yet; if the truth sits
    outside the convergence basin of undamped Gauss-Newton, shrink ΔD
    or richen the fit model).
-   Two solver paths: a per-bin block-diagonal solve (default; valid for
-   the synthetic top-hat / Gaussian binning), and a full
-   `(n_data, n_data)` solve dispatched automatically when
-   `signal_model.has_measured_bpwf` is True (BPWFs typically overlap so
-   the per-bin block structure breaks). Both prewhiten by
-   ``D = sqrt(diag(cov))`` (correlation-matrix trick) and use
-   ``jnp.linalg.solve`` on the well-conditioned cov_white, with a
-   closing ``0.5 * (F + F^T)`` symmetrization. The whitening is a
-   change of variables (``D · cov_w · D = cov``, so the D's pair up
-   into ``J_w``'s and the math is identity); numerically it drops
-   cov's condition number by 10+ orders of magnitude at PICO-class
-   instruments, which both tightens forward F (mpmath-validated to
-   3e-5 rel error at bin 0, vs 6e-3 for plain ``solve(cov, J)``) and
-   makes the autograd-traced backward solve signal-dominated rather
-   than noise-dominated. ``optimize.sigma_r_from_channels`` and
-   ``FisherForecast.sigma`` route through the same primitive, so they
-   agree to fp64 precision at any allocation.
+   Two solver paths. **Per-bin (default; synthetic top-hat / Gaussian
+   binning):** the Knox block is the 4-point function of the bin's
+   channel covariance M_b = S_b + N_b, so cond(Σ_b) = cond(M_b)² --
+   ~1e28 at ℓ = 2 for PICO's 21 channels, beyond fp64. The per-bin path
+   never forms Σ_b; it evaluates the exact identity
+   `J_bᵀ Σ_b⁻¹ J_b = (ν_b/2) Tr[M_b⁻¹ ∂M_b M_b⁻¹ ∂M_b]` as a Gram
+   matrix over a Cholesky factor of the diag-whitened M_b
+   (`fisher._fisher_from_M_blocks`; bias RHS `_jt_cinv_d_from_M_blocks`;
+   inputs from `covariance.bandpower_M_blocks[_from_noise]`). F is PSD
+   by construction and needs only cond(M_b). **Full path** (measured
+   BPWFs or `external_covariance`, where bins couple): prewhiten by
+   ``D = sqrt(diag(cov))`` and ``jnp.linalg.solve`` the
+   `(n_data, n_data)` system (`_fisher_from_full`), then
+   ``0.5 * (F + F^T)``. ``optimize.sigma_r_from_channels`` and
+   ``FisherForecast.sigma`` share the per-bin primitive, so they agree
+   to fp64 precision at any allocation.
 
 5. **`delensing.py` + `wigner.py`.** Optional self-consistent
    iterative QE delensing replacing the `A_lens` parameter.
@@ -531,8 +530,10 @@ convention; naming is `omega_<species>_<quantity>` where species is
 - **`FisherForecast.summary()` diagnostics.** Always reports Knox
   modes per bin and `cond(F)`. Emits WARNING lines when
   `min(ν_b) < 10` (Gaussian-likelihood breakdown at the reionization
-  bump) or `cond(F) > 1e14` (near-degenerate parameters; eigh-clipping
-  may dominate the reported σ's).
+  bump) or `cond(F) > 1e14` (near-degenerate parameters), and reports the smallest
+  eigenvalue of the correlation-normalized F with a WARNING when it is
+  negative (an indefinite F means a failed covariance solve; cond(F)
+  does not catch it).
 - **Beam-deconvolved-noise contract.**
   `bandpower_covariance_blocks_from_noise` /
   `FisherForecast(external_noise_bb=...)` require beam-deconvolved
@@ -548,18 +549,18 @@ convention; naming is `omega_<species>_<quantity>` where species is
   This is the same family of footgun as `requires_external_noise=True`
   on `cleaned_map_instrument`, with the trigger sitting on the signal
   side rather than the instrument side.
-- **`optimize.sigma_r_from_*` vs `FisherForecast.sigma` agree to fp64
-  precision.** Both route through ``fisher._fisher_from_blocks``
-  (prewhiten by ``sqrt(diag(cov_b))``, then ``jnp.linalg.solve`` per
-  bin, then ``0.5 * (F + F^T)``). The previous "few-percent
-  disagreement" caveat was inverted: at PICO-class conditioning
-  (cov_b cond ~10^28 at ell=2), the legacy ``eigh + (s>0)`` clip
-  biased F upward by 5-44% per bin -- it face-valued tiny positive
-  eigenvalues that were fp64 rounding artifacts, contributing
-  fictitious Fisher info via ``s_inv = 1/s`` for ``s ~ 1e-14``.
-  Prewhiten + solve is essentially exact (validated against mpmath @
-  30 dps at bin 0: 3e-5 rel error vs 6e-3 for plain ``solve(cov, J)``;
-  at higher bins both paths are at fp64-noise level).
+- **The per-bin Fisher works in channel space, never on Σ_b.**
+  `_fisher_from_blocks` / `_cinv_d_blocks` (prewhitened solve against the
+  231×231 Knox block) are kept only for external callers. At PICO
+  conditioning they were wrong by 80-260% per element at ℓ = 2-6 and
+  returned an *indefinite* F (min correlation eigenvalue -0.09 at
+  ℓ = 2-300 with delensing) -- σ(r) moved only 0.1%, but the moment /
+  decorrelation σ's were off 2-3× and jumped between neighbouring
+  designs. The earlier mpmath validation checked only F[r,r] of bin 0.
+  The trace form matches an mpmath (45 dps) evaluation of the Σ_b route
+  at PICO ℓ = 2 to 2e-7. Gates: `tests/test_fisher_trace.py`.
+  `optimize.sigma_r_from_*` and `FisherForecast.sigma` both use
+  `_fisher_from_M_blocks` and agree bit-for-bit.
 
 - **JIT vs eager: ~1e-5 wobble at PICO conditioning.** Top-level
   ``jax.jit`` over ``sigma_r_from_channels`` reorders XLA fusion of
@@ -570,14 +571,13 @@ convention; naming is `omega_<species>_<quantity>` where species is
   scan; `tests/test_fisher_stability.py::test_jit_eager_agreement`
   gates at ``rtol=1e-4``.
 
-- **Gradient stability requires prewhitening.** Without it,
-  ``jax.grad`` through ``solve(cov_b, J_b)`` at cov_b cond ~10^28
-  drifts 50-270% per axis between jit and eager (sign flips on most
-  axes), and finite-difference references are uncorrelated with
-  autodiff at any step size. Post-prewhitening: per-axis jit-vs-eager
-  rtol ~1e-3, ``cos(jax.grad, fd) > 0.99`` at h=1e-2, L-BFGS-B
-  converges with success=True and σ_opt < σ_pico under both
-  ``optimize.*`` and ``FisherForecast.sigma``.
+- **Gradient stability.** ``jax.grad`` through a solve against Σ_b at
+  cond ~1e28 is noise-dominated (50-270% per-axis jit-vs-eager drift
+  without whitening). The channel-space Cholesky form differentiates
+  cleanly: `test_fisher_stability.py` finite-difference alignment gives
+  ``cos(jax.grad, fd) = 1.000000`` at h=1e-2, and L-BFGS-B converges
+  with σ_opt < σ_pico under both ``optimize.*`` and
+  ``FisherForecast.sigma``.
 
 ## Measured bandpower window functions
 

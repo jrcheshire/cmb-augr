@@ -38,9 +38,14 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 
-from augr.covariance import bandpower_covariance_blocks_from_noise
+from augr.covariance import bandpower_M_blocks_from_noise, bin_mode_counts
 from augr.delensing import AUTO_N_L_SAMPLE, LensingSpectra, delens_residual_bb
-from augr.fisher import _fisher_from_blocks, _fisher_from_full
+from augr.fisher import (
+    _fisher_from_blocks,
+    _fisher_from_full,
+    _fisher_from_M_blocks,
+    spectra_to_channel_matrix,
+)
 from augr.instrument import (
     Instrument,
     beam_bl,
@@ -486,7 +491,7 @@ def sigma_r_from_channels(
         Scalar sigma(r) -- marginalized Fisher constraint on r.
 
     Note:
-        Uses ``fisher._fisher_from_blocks``, the same primitive as
+        Uses ``fisher._fisher_from_M_blocks``, the same primitive as
         ``FisherForecast.sigma``; the two paths agree to fp64 precision.
     """
     ells = ctx.ells
@@ -535,14 +540,18 @@ def sigma_r_from_channels(
         # Interpolate onto the signal ell grid used by cmb_bb_unbinned.
         delensed_override = jnp.interp(ells, ctx.delens_ls, cl_res)
 
-    # Covariance blocks: (n_bins, n_spec, n_spec)
-    cov_blocks = bandpower_covariance_blocks_from_noise(
-        ctx.signal_model, noise_nls, f_sky, ctx.fiducial_params,
+    # Per-bin channel covariance M_b = S_b + N_b: (n_bins, n_chan, n_chan)
+    M_blocks = bandpower_M_blocks_from_noise(
+        ctx.signal_model, noise_nls, ctx.fiducial_params,
         delensed_bb_override=delensed_override,
     )
+    nu = f_sky * jnp.asarray(bin_mode_counts(ctx.signal_model))
 
-    # Fisher matrix: J^T Sigma^{-1} J via the unified primitive.
-    F = _fisher_from_blocks(ctx.J_blocks, cov_blocks)
+    # Fisher matrix: Σ_b J_bᵀ Σ_b⁻¹ J_b in channel space (same primitive as
+    # FisherForecast.compute).
+    dM_blocks = spectra_to_channel_matrix(
+        ctx.J_blocks.transpose(0, 2, 1), ctx.signal_model.freq_pairs, n_chan)
+    F = _fisher_from_M_blocks(dM_blocks, M_blocks, nu)
 
     # Add priors
     F = F + jnp.diag(ctx.prior_diag)
@@ -706,7 +715,7 @@ def sigma_r_from_design(
 
     Note:
         Delegates to sigma_r_from_channels, which routes through
-        ``fisher._fisher_from_blocks`` -- the same primitive as
+        ``fisher._fisher_from_M_blocks`` -- the same primitive as
         ``FisherForecast.sigma``. The two paths agree to fp64 precision.
     """
     n_det_arr, net_arr, beam_arr = design_to_channels(
