@@ -582,6 +582,173 @@ def test_master_and_wiener_agree_on_sigma_r():
     )
 
 
+# --- foreground-residual leg on the masked-Wiener path ------------------------
+
+
+def _with_fg(ctx, fg_eb_alm):
+    """``ctx`` with a per-sim ``(n_sims, n_band, 2, n_alm)`` foreground attached."""
+    hs = dataclasses.replace(ctx.harmonic_skies, fg_eb_alm=fg_eb_alm)
+    return dataclasses.replace(ctx, harmonic_skies=hs)
+
+
+def _twin_fg(e_alm, b_alm):
+    """A flat-SED (CMB-unit) foreground: the same ``(n_sims, n_alm)`` E/B in every band.
+
+    The cleaner's weights sum to one on a flat SED, so this foreground comes out of
+    the clean exactly as a CMB component would -- which is what makes its residual
+    predictable.
+    """
+    fg = jnp.stack([e_alm, b_alm], axis=1)[:, None]
+    return jnp.broadcast_to(fg, (fg.shape[0], len(FREQS), *fg.shape[2:]))
+
+
+def _isotropic_fg(n_sims, lmax, *, amp=10.0, slope=-3.0):
+    """Independent isotropic B-only foreground per sim: lensing-BB shape, power-law SED.
+
+    Lensing-shaped on purpose: the Wiener transfer is calibrated on that shape, and
+    a sharp-mask Wiener filter couples neighbouring l, so a differently shaped
+    spectrum would carry a genuine (and data-vector-consistent) calibration offset
+    that is not what the cross-estimator check is after. B-only because MASTER reads
+    only the cleaned B, so foreground E->B leakage is a real estimator difference.
+    """
+    import healpy as hp
+
+    _, cl_bb = _priors(lmax)
+    sed = jnp.asarray([(f / 150.0) ** slope for f in FREQS])
+    g = []
+    for s in range(n_sims):
+        np.random.seed(10_000 + s)  # noqa: NPY002 - healpy.synalm uses the global RNG
+        g.append(hp.synalm(np.asarray(cl_bb) * amp, lmax=lmax, new=True))
+    g = jnp.asarray(np.stack(g))
+    fg = jnp.zeros((n_sims, len(FREQS), 2, g.shape[1]), dtype=g.dtype)
+    return fg.at[:, :, 1].set(sed[None, :, None] * g[:, None, :])
+
+
+def test_wiener_fg_residual_leaves_the_data_untouched():
+    """Asking for the leg changes no existing output, and with no foreground it is 0."""
+    cleaner = nilc_cleaner(clean_e=True)
+    ctx = make_cutsky_mc_context(cleaner=cleaner, estimator="wiener", **_ctx_kwargs(6))
+    off = mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner)
+    on = mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner, fg_residual=True)
+    assert off.fg_residual_bandpower is None
+    for name in ("covariance", "debiased_bandpowers", "transfer", "leakage"):
+        assert np.array_equal(np.asarray(getattr(off, name)), np.asarray(getattr(on, name)))
+    np.testing.assert_array_equal(np.asarray(on.fg_residual_bandpower), 0.0)
+
+
+def test_wiener_fg_residual_twins_land_on_the_debias_pieces():
+    """A foreground that IS the sim's own CMB must reproduce the debias legs.
+
+    * **B twin** (foreground = CMB B, E = 0): its cleaned map is the cleaned CMB B,
+      i.e. the transfer leg, so the residual is ``mean(rec_b) / F_b = true_bb_binned``.
+      Measured 2.4e-6 relative (pixel-quadrature E/B mixing, since the CMB maps the
+      transfer leg projects also carry E). Dropping ``/ F_b`` is off by 96%.
+    * **E twin** (foreground = CMB E, B = 0): the residual is the leakage leg on the
+      debiased scale, ``leakage / F_b``. This pins that the E projection is included
+      and that the leakage template is NOT subtracted (doing so is off by 99.6%;
+      dropping the E projection leaves only quadrature, off by ~100%). Measured
+      3.9e-3 relative: the cleaner's B projection of an E-only map carries a
+      quadrature E->B leak (4.6e-5 of the power alone) that adds coherently with the
+      leaked E through the cross term; the E projection alone matches to 2e-7.
+    """
+    cleaner = nilc_cleaner(clean_e=True)
+    ctx = make_cutsky_mc_context(cleaner=cleaner, estimator="wiener", **_ctx_kwargs(6))
+    hs = ctx.harmonic_skies
+    zero = jnp.zeros_like(hs.cmb_b_alm)
+    w = jnp.asarray(W_INV)
+
+    b = mc_cutsky_cov_traced(
+        w, _with_fg(ctx, _twin_fg(zero, hs.cmb_b_alm)), cleaner, fg_residual=True)
+    np.testing.assert_allclose(
+        np.asarray(b.fg_residual_bandpower), np.asarray(ctx.true_bb_binned), rtol=2e-5)
+
+    e = mc_cutsky_cov_traced(
+        w, _with_fg(ctx, _twin_fg(hs.cmb_e_alm, zero)), cleaner, fg_residual=True)
+    np.testing.assert_allclose(
+        np.asarray(e.fg_residual_bandpower),
+        np.asarray(e.leakage / e.transfer),
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.slow
+def test_wiener_and_master_fg_residual_agree_on_an_isotropic_foreground():
+    """On an isotropic foreground both legs measure the full-sky residual power.
+
+    The reference is estimator-free: per sim, the cleaner's own B projection of the
+    foreground maps on the full sky (``alm2cl / B_c^2``, binned). Measured at 30
+    sims (nside=16, 3 bins): Wiener within 1.2% of it, MASTER within 3.8%. The
+    shared realizations make the three strongly correlated, so these offsets are
+    the estimators' extra cut-sky variance, not the ~5% cosmic variance of the
+    reference mean.
+    """
+    from augr.compsep_sims import assemble_band_maps, beam_harmonic_sky
+    from augr.sht import alm2cl
+
+    n_sims = 30
+    kw = _ctx_kwargs(n_sims)
+    lmax = kw["lmax"]
+    fg = _isotropic_fg(n_sims, lmax)
+    cleaner = nilc_cleaner(clean_e=True)
+    w = jnp.asarray(W_INV)
+    res = {}
+    for estimator in ("wiener", "master"):
+        ctx = _with_fg(
+            make_cutsky_mc_context(cleaner=cleaner, estimator=estimator, **kw), fg)
+        res[estimator] = np.asarray(
+            mc_cutsky_cov_traced(w, ctx, cleaner, fg_residual=True).fg_residual_bandpower
+        )
+
+    bf = ctx.beam_fwhm_arcmin
+    bl2 = beam_bl(jnp.arange(lmax + 1, dtype=float), min(bf)) ** 2
+    ref = []
+    for s in range(n_sims):
+        sky = beam_harmonic_sky(
+            jax.tree.map(lambda a, s=s: a[s], ctx.harmonic_skies), bf, None,
+            beam_fwhm_ref=bf)
+        total = assemble_band_maps(
+            sky, w, ctx.hit_map, noise_key=ctx.noise_keys[s],
+            knee_ell=ctx.knee_ell, alpha_knee=ctx.alpha_knee)
+        result = cleaner(total, bf, None, lmax=lmax, nside=ctx.nside)
+        cl = alm2cl(result.project(sky.fg_qu), lmax) / bl2
+        ref.append(np.asarray(mk.bin_spectrum(cl, ctx.bin_matrix, ctx.ell_min)))
+    ref = np.mean(ref, axis=0)
+
+    np.testing.assert_allclose(res["wiener"], ref, rtol=0.04)
+    np.testing.assert_allclose(res["master"], ref, rtol=0.10)
+
+
+@pytest.mark.slow
+def test_wiener_fg_residual_gradient_matches_finite_differences():
+    """d(sum fg_residual)/d(log w_inv) through the Wiener CG matches central FD.
+
+    The residual depends on the noise through the cleaner's weights. Measured at
+    h=1e-3: agreement to 1.1e-7, shrinking as h^2 from 1.1e-5 at h=1e-2.
+    """
+    n_sims = 6
+    kw = _ctx_kwargs(n_sims)
+    cleaner = nilc_cleaner(clean_e=True)
+    ctx = _with_fg(
+        make_cutsky_mc_context(cleaner=cleaner, estimator="wiener", **kw),
+        _isotropic_fg(n_sims, kw["lmax"]),
+    )
+
+    def f(log_w):
+        out = mc_cutsky_cov_traced(jnp.exp(log_w), ctx, cleaner, fg_residual=True)
+        return jnp.sum(out.fg_residual_bandpower) * 1e6
+
+    x0 = jnp.log(jnp.asarray(W_INV))
+    grad = np.asarray(jax.grad(f)(x0))
+    h = 1e-3
+    fd = np.asarray([
+        float((f(x0 + h * jnp.eye(len(W_INV))[i]) - f(x0 - h * jnp.eye(len(W_INV))[i]))
+              / (2 * h))
+        for i in range(len(W_INV))
+    ])
+    assert np.all(fd != 0.0)
+    np.testing.assert_allclose(grad, fd, rtol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Gradient checkpointing and batching on the per-sim scan (_sim_map)
 # ---------------------------------------------------------------------------
