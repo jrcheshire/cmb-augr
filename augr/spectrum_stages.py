@@ -1397,7 +1397,11 @@ def mc_cutsky_cov_traced(
     credit for it in ``Sigma_hat``, so an aperture trade run this way is biased
     against aperture. The companion half of the coupling is the ``SignalModel``'s
     ``delensed_bb`` (:func:`augr.likelihood.from_cutsky.build_cutsky_signal_model`),
-    which must be given the *same* residual so model and sims agree.
+    which must be given the *same* residual so model and sims agree. On the
+    masked-Wiener branch the transfer ``F_b`` is calibrated against the rescaled
+    truth, ``true_bb_binned`` with its lensing part replaced by the residual; that
+    assumes ``true_bb_binned`` is the binned ``spectra.cl_bb(ell, r_in)`` of the
+    context's own spectra.
 
     ``fg_residual`` (default False) adds one extra leg per sim: the cleaner's own
     weights applied to the **foreground-only** maps, giving the MC-mean residual-FG
@@ -1540,7 +1544,15 @@ def mc_cutsky_cov_traced(
         consts=fg_consts,
     )
 
-    transfer = mk.transfer_function(rec_b, ctx.true_bb_binned)
+    # The transfer's denominator is the binned power the sims' B actually carries.
+    # Under cl_bb_res their lensing part is rescaled to the residual, so the full
+    # lensing in true_bb_binned is swapped for lens_scale^2 * C_lens (= the residual).
+    true_b = ctx.true_bb_binned
+    if lens_scale is not None:
+        true_b = true_b + mk.bin_spectrum(
+            (lens_scale**2 - 1.0) * ctx.cl_bb_lens_ref, ctx.bin_matrix, ctx.ell_min
+        )
+    transfer = mk.transfer_function(rec_b, true_b)
     leakage = mk.leakage_template(rec_e)
     debiased = mk.debias_bandpower(rec_full, transfer, leakage)
     cov = mc_bandpower_covariance(debiased, hartlap=True)

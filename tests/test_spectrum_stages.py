@@ -624,6 +624,35 @@ def _isotropic_fg(n_sims, lmax, *, amp=10.0, slope=-3.0):
     return fg.at[:, :, 1].set(sed[None, :, None] * g[:, None, :])
 
 
+def test_wiener_transfer_follows_a_delensing_residual():
+    """A uniform A_L rescale of the sims' lensing B must leave the Wiener transfer alone.
+
+    At r_in=0 a uniform residual ``A_L * C_lens`` scales every sim's CMB B by
+    ``sqrt(A_L)``; the cleaned CMB B scales with it (the ILC has unit CMB response)
+    and the Wiener filter is linear, so ``rec_b`` scales by ``A_L`` exactly and the
+    transfer must not move. Measured 5.3e-6 at A_L=0.1 (pixel-quadrature E/B mixing:
+    the CMB E is not rescaled). Calibrating against the unrescaled truth gives
+    ``A_L * F_b`` -- off by 90% here, and every debiased bandpower 1/A_L too large.
+    At A_L=1 the knob must reproduce the no-delensing forward exactly.
+    """
+    cleaner = nilc_cleaner(clean_e=True)
+    kw = _ctx_kwargs(6)
+    ctx = make_cutsky_mc_context(
+        cleaner=cleaner, estimator="wiener", split_lensing=True, **kw)
+    ells = jnp.arange(kw["lmax"] + 1, dtype=float)
+    lens = jnp.asarray(CMBSpectra().cl_lensing(ells))
+    w = jnp.asarray(W_INV)
+    ref = mc_cutsky_cov_traced(w, ctx, cleaner)
+
+    full = mc_cutsky_cov_traced(w, ctx, cleaner, cl_bb_res=lens, cl_bb_res_ells=ells)
+    assert np.array_equal(np.asarray(full.covariance), np.asarray(ref.covariance))
+
+    delensed = mc_cutsky_cov_traced(
+        w, ctx, cleaner, cl_bb_res=0.1 * lens, cl_bb_res_ells=ells)
+    np.testing.assert_allclose(
+        np.asarray(delensed.transfer), np.asarray(ref.transfer), rtol=5e-5)
+
+
 def test_wiener_fg_residual_leaves_the_data_untouched():
     """Asking for the leg changes no existing output, and with no foreground it is 0."""
     cleaner = nilc_cleaner(clean_e=True)
