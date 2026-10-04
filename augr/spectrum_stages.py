@@ -540,10 +540,11 @@ class CutskyMCTraced(eqx.Module):
     f_sky: float = eqx.field(static=True)
     n_sims: int = eqx.field(static=True)
     # MC-mean BB bandpowers of the cleaner's residual FOREGROUND, i.e. the
-    # cleaner's own weights applied to the foreground-only maps. This is the
-    # unmodelled component the fit does not describe, so it is the Delta-D that
-    # drives the r-bias (eig.delta_r_from_residual). None unless the traced
-    # forward was called with fg_residual=True.
+    # cleaner's own weights applied to the foreground-only maps, on the debiased
+    # scale of mean_bandpower. This is the unmodelled component the fit does not
+    # describe, so it is the Delta-D that drives the r-bias
+    # (eig.delta_r_from_residual). None unless the traced forward was called with
+    # fg_residual=True.
     fg_residual_bandpower: jax.Array | None = None
 
 
@@ -1403,7 +1404,13 @@ def mc_cutsky_cov_traced(
     bandpower on :attr:`CutskyMCTraced.fg_residual_bandpower`. That is the
     unmodelled component the fit does not describe, i.e. the ``Delta D`` that drives
     the r-bias -- see :func:`augr.eig.delta_r_from_residual`. It costs no second
-    cleaner solve (``project`` reuses the stored weights), only one more spectrum.
+    cleaner solve (``project`` reuses the stored weights), only one more spectrum --
+    on the masked-Wiener branch, one more CG solve. The leg matches what each branch's
+    data vector reads: MASTER takes the cleaned B alm, so its residual is the
+    foreground B alone; the masked-Wiener data leg takes the cleaned E *and* B, so
+    its residual includes the foreground E->B leakage the filter lets through (the
+    leakage template removes only the CMB's), and is divided by the transfer ``F_b``
+    so it sits on the debiased scale of ``mean_bandpower``.
 
     The per-sim loop runs through :func:`_sim_map` over the batched
     ``ctx.harmonic_skies`` -- the cleaner body is traced once, so compile is O(1) in
@@ -1435,12 +1442,6 @@ def mc_cutsky_cov_traced(
         return _mc_cutsky_cov_master(
             w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual,
             remat=remat, sim_batch=sim_batch,
-        )
-    if fg_residual:
-        raise NotImplementedError(
-            "fg_residual= is implemented for estimator='master' only. The Wiener "
-            "path would need the residual carried through its transfer/leakage "
-            "debiasing, which MASTER does not have (F_b = 1, leakage = 0)."
         )
     if mask is not None:
         raise ValueError(
@@ -1507,7 +1508,20 @@ def mc_cutsky_cov_traced(
             ctx.cl_bb_prior,
             **bp_kw,
         )
-        return rec_full, rec_b, rec_e
+        if not fg_residual:
+            return rec_full, rec_b, rec_e
+        # The foreground's footprint on rec_full: its cleaned E and B, through the
+        # same filter. The E half is the foreground E->B leakage, which the CMB-E
+        # leakage template does not remove.
+        fg = band_sky.fg_qu
+        rec_fg = cutsky_bb_bandpower(
+            _cleaned_b_qu(result, fg) + _cleaned_e_qu(result, fg),
+            ctx.inv_noise,
+            ctx.cl_ee_prior,
+            ctx.cl_bb_prior,
+            **bp_kw,
+        )
+        return rec_full, rec_b, rec_e, rec_fg
 
     # Sequential scan over the sim axis: the cleaner body is traced ONCE and reused
     # per sim -- O(1) compile in n_sims, scan-accumulated outputs (no live
@@ -1515,10 +1529,10 @@ def mc_cutsky_cov_traced(
     # (leading sim axis on its alm leaves); the map slices it back to a per-sim
     # HarmonicSky that `_one` beams in-trace. Scan rather than vmap is the default
     # here for a reason specific to THIS branch: `cutsky_bb_bandpower` runs a
-    # `while_loop` CG (jht.wiener, maxiter=200) three times per sim, and vmapping a
-    # while_loop runs it until every lane converges -- so `sim_batch > 1` makes each
-    # batch cost its slowest member. Raise it only with a measurement.
-    rec_full, rec_b, rec_e = _sim_map(
+    # `while_loop` CG (jht.wiener, maxiter=200) three times per sim (four under
+    # fg_residual), and vmapping a while_loop runs it until every lane converges --
+    # so `sim_batch > 1` makes each batch cost its slowest member. Raise it only with a measurement.
+    rec_full, rec_b, rec_e, *rec_fg = _sim_map(
         lambda bk, *cs: _one(bk[0], bk[1], *cs),
         (mapped_skies, ctx.noise_keys),
         remat=remat,
@@ -1539,4 +1553,9 @@ def mc_cutsky_cov_traced(
         mean_bandpower=jnp.mean(debiased, axis=0),
         f_sky=ctx.f_sky,
         n_sims=ctx.n_sims,
+        # Divided by F_b but NOT leakage-subtracted: debias's leakage term is the
+        # CMB's, already removed from the data; the foreground's stays in it.
+        fg_residual_bandpower=(
+            jnp.mean(rec_fg[0], axis=0) / transfer if fg_residual else None
+        ),
     )
