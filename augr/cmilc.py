@@ -386,9 +386,16 @@ def cmilc_clean(
             common_fwhm_arcmin=common_fwhm_arcmin,
             beam_shape_p=ps,
         )
-    active = _needlet_channel_mask(
-        needlet_bands, beams, common_fwhm, lmax, beam_band_limit, beam_shape_p=ps
-    )
+    # The mask sets each band's retained constraint count -- a shape -- so it must be
+    # concrete. It depends only on the (concrete) beams, but the common beam above is
+    # jnp.min(beams), which a surrounding trace stages (e.g. the cut-sky MC's per-sim
+    # lax.map); rebuild it from the floats and evaluate the mask eagerly.
+    with jax.ensure_compile_time_eval():
+        active = np.asarray(_needlet_channel_mask(
+            needlet_bands, beams,
+            min(beams) if common_fwhm_arcmin is None else float(common_fwhm_arcmin),
+            lmax, beam_band_limit, beam_shape_p=ps,
+        ))
 
     A = moment_sed_vectors(
         freqs, fiducial=fiducial, moments=moments, bandpasses=bandpasses
