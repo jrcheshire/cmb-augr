@@ -253,6 +253,32 @@ def test_cmilc_cmb_transfer_unity() -> None:
     np.testing.assert_allclose(transfer, 1.0, rtol=2e-3)
 
 
+@pytest.mark.parametrize("localization_fwhm_arcmin", [None, 600.0])
+def test_cmilc_under_jit_matches_eager(localization_fwhm_arcmin) -> None:
+    """cMILC runs inside a trace (the cut-sky MC's per-sim ``lax.map``) and matches eager.
+
+    Under a trace the common beam ``min(beams)`` is staged, but the active-channel
+    mask -- and with it each band's retained constraint count, a shape -- depends
+    only on the concrete beams, so it must still be built eagerly. A high
+    ``beam_band_limit`` makes some channels drop out of the upper bands, so the
+    mask is exercised rather than all-active. Measured max |jit - eager| 2.6e-15
+    (global) / 3.2e-15 (localized) on maps of order 1; eager output is unchanged
+    bit-for-bit by the fix.
+    """
+    nside, lmax = 32, 64
+    _, total, _ = _sim(nside, lmax)
+    kw = dict(lmax=lmax, nside=nside, moments=CMILC06_MOMENTS, clean_e=True,
+              beam_band_limit=0.95, localization_fwhm_arcmin=localization_fwhm_arcmin)
+    eager = cmilc_clean(total, BEAMS, FREQS, **kw)
+    # Inactive channels carry exactly zero weight (all pixels, on the localized path).
+    w = np.asarray(eager.weights).reshape(*np.shape(eager.weights)[:2], -1)
+    assert np.any(np.all(w == 0.0, axis=-1)), "no channel dropped out; mask not exercised"
+    jitted = jax.jit(lambda t: cmilc_clean(t, BEAMS, FREQS, **kw).cleaned_qu())(total)
+    np.testing.assert_allclose(
+        np.asarray(jitted), np.asarray(eager.cleaned_qu()), rtol=0, atol=1e-13
+    )
+
+
 # --- headline science: cMILC nulls the dust moment NILC leaves --------------
 # Builds a realistic PySM d10 sky (spatially-varying β_dust, T_dust) over the network on a
 # cold cache, so it carries `slow` (out of the parallel per-PR gate).

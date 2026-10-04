@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 
 from augr import masking as mk
-from augr.cleaning import nilc_cleaner
+from augr.cleaning import cmilc_cleaner, nilc_cleaner
 from augr.config import cleaned_map_instrument
 from augr.delensing import load_lensing_spectra
 from augr.foregrounds import NullForegroundModel
@@ -622,6 +622,26 @@ def _isotropic_fg(n_sims, lmax, *, amp=10.0, slope=-3.0):
     g = jnp.asarray(np.stack(g))
     fg = jnp.zeros((n_sims, len(FREQS), 2, g.shape[1]), dtype=g.dtype)
     return fg.at[:, :, 1].set(sed[None, :, None] * g[:, None, :])
+
+
+def test_cmilc_runs_in_the_traced_forward():
+    """cMILC cleans inside the per-sim map and passes the CMB with unit response.
+
+    On a shared Wiener filter (one context, so one inv_noise) any unit-CMB-response
+    cleaner leaves the same cleaned CMB B, so cMILC's transfer must equal NILC's.
+    Measured 3e-10. (Each cleaner's *own* context differs by ~4x: the context's
+    var_pix_ref comes from a setup clean, and cMILC's extra constraint leaves more
+    noise, so its filter suppresses more -- a filter setting, not a transfer error.)
+    """
+    ctx = make_cutsky_mc_context(
+        cleaner=nilc_cleaner(clean_e=True), estimator="wiener", **_ctx_kwargs(6))
+    w = jnp.asarray(W_INV)
+    nilc = mc_cutsky_cov_traced(w, ctx, nilc_cleaner(clean_e=True))
+    cmilc = mc_cutsky_cov_traced(
+        w, ctx, cmilc_cleaner(FREQS, moments=("f_dust",), clean_e=True), fg_residual=True)
+    assert np.all(np.isfinite(np.asarray(cmilc.covariance)))
+    np.testing.assert_allclose(
+        np.asarray(cmilc.transfer), np.asarray(nilc.transfer), rtol=3e-9)
 
 
 def test_wiener_transfer_follows_a_delensing_residual():
