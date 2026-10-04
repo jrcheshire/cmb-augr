@@ -7,14 +7,21 @@ where J_b is the Jacobian slice for bin b, Σ_b is the (n_spec, n_spec)
 Knox covariance block for that bin, and P is the diagonal Gaussian prior
 matrix: P_{αα} = 1/σ_prior_α².
 
-The covariance is block-diagonal across ℓ-bins (Knox approximation), so
-rather than inverting the full (n_data, n_data) matrix, we ``solve``
-each small (n_spec, n_spec) block independently.  Per-bin LU/solve is
-O(n_bins × n_spec³) vs O(n_data³) for the full assembly, and validated
-against mpmath ground truth on PICO-class instruments (cov_b cond ~10^28
-at ell=2) -- LU/solve gives the correct Fisher to fp64 precision; an
-``eigh + (s>0)`` clip biases F upward by 5-44% per bin by
-face-valuing tiny positive eigenvalues that are fp64 rounding artifacts.
+The covariance is block-diagonal across ℓ-bins (Knox approximation). Each
+block is the Gaussian 4-point function of the bin's channel covariance M_b,
+Σ_b[(ij),(kl)] = (M_ik M_jl + M_il M_jk)/ν_b, so cond(Σ_b) = cond(M_b)² --
+~1e28 at ℓ = 2 for a PICO-class 21-channel instrument, beyond fp64. The
+per-bin path therefore never forms Σ_b: it uses the exact identity
+
+    J_bᵀ Σ_b⁻¹ J_b = (ν_b/2) Tr[M_b⁻¹ ∂_αM_b M_b⁻¹ ∂_βM_b]
+
+as a Gram matrix over a Cholesky factor of M_b (``_fisher_from_M_blocks``),
+which needs only cond(M_b) and is PSD by construction. Validated against
+mpmath (45 dps) of the Σ_b route at PICO ℓ = 2. The bias right-hand side
+Jᵀ Σ⁻¹ ΔD uses the same form (``_jt_cinv_d_from_M_blocks``).
+
+Measured-BPWF and external-covariance inputs couple bins, so they keep the
+full (n_data, n_data) prewhitened solve (``_fisher_from_full``).
 
 Fixed parameters are removed from the Fisher matrix entirely (their rows
 and columns are dropped before inversion), so they do not contribute to
@@ -31,12 +38,14 @@ import warnings
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.linalg
 import numpy as np
 
 from augr.covariance import (
-    bandpower_covariance_blocks,
-    bandpower_covariance_blocks_from_noise,
     bandpower_covariance_full_from_noise,
+    bandpower_M_blocks,
+    bandpower_M_blocks_from_noise,
+    bin_mode_counts,
 )
 from augr.instrument import ARCMIN_TO_RAD, Instrument, white_noise_power
 from augr.signal import SignalModel, flatten_params
@@ -45,7 +54,12 @@ from augr.signal import SignalModel, flatten_params
 @jax.jit
 def _fisher_from_blocks(J_blocks: jnp.ndarray,
                         cov_blocks: jnp.ndarray) -> jnp.ndarray:
-    """Compute F = sum_b J_b^T Sigma_b^{-1} J_b from per-bin blocks.
+    """Compute F = sum_b J_b^T Sigma_b^{-1} J_b from per-bin Knox covariance blocks.
+
+    Superseded by ``_fisher_from_M_blocks`` for all in-package callers: the
+    solve against Sigma_b (cond = cond(M_b)^2) loses the foreground block at
+    PICO-class conditioning and can return an indefinite F. Kept for
+    external callers that hold only Sigma_b.
 
     Args:
         J_blocks:   (n_bins, n_spec, n_free) -- Jacobian reshaped per bin.
@@ -96,6 +110,98 @@ def _fisher_from_blocks(J_blocks: jnp.ndarray,
     return 0.5 * (F + F.T)
 
 
+def spectra_to_channel_matrix(x: jnp.ndarray, freq_pairs, n_chan: int) -> jnp.ndarray:
+    """Scatter per-spectrum values onto symmetric channel matrices.
+
+    ``x[..., s]`` for ``s`` indexing ``freq_pairs`` (``(i, j)``, ``i <= j``)
+    becomes ``X[..., i, j] = X[..., j, i] = x[..., s]``; shape
+    ``x.shape[:-1] + (n_chan, n_chan)``.
+    """
+    i = np.array([p[0] for p in freq_pairs])
+    j = np.array([p[1] for p in freq_pairs])
+    out = jnp.zeros((*x.shape[:-1], n_chan, n_chan), dtype=x.dtype)
+    out = out.at[..., i, j].set(x)
+    return out.at[..., j, i].set(x)
+
+
+def _whitened_sandwich(M_b: jnp.ndarray, X: jnp.ndarray) -> jnp.ndarray:
+    """``L^-1 X_k L^-T`` for each symmetric ``X_k``, flattened to (n_k, n_chan²).
+
+    ``L`` is the Cholesky factor of ``M_b`` whitened by ``sqrt(diag(M_b))``
+    (the trace below is invariant under that congruence). Then
+    ``Tr[M⁻¹ X_a M⁻¹ X_c] = <A_a, A_c>`` for the returned rows ``A``.
+    """
+    s = 1.0 / jnp.sqrt(jnp.diag(M_b))
+    S = s[:, None] * s[None, :]
+    L = jnp.linalg.cholesky(M_b * S)
+
+    def one(Xk):
+        Y = jax.scipy.linalg.solve_triangular(L, Xk * S, lower=True)
+        return jax.scipy.linalg.solve_triangular(L, Y.T, lower=True).ravel()
+
+    return jax.vmap(one)(X)
+
+
+@jax.jit
+def _fisher_from_M_blocks(dM_blocks: jnp.ndarray,
+                          M_blocks: jnp.ndarray,
+                          nu: jnp.ndarray) -> jnp.ndarray:
+    """Per-bin Knox Fisher from the channel covariance, F = Σ_b (ν_b/2) Tr[M⁻¹∂_aM M⁻¹∂_cM].
+
+    Args:
+        dM_blocks: (n_bins, n_free, n_chan, n_chan) -- ∂M_b/∂θ_a, symmetric
+                   (``spectra_to_channel_matrix`` of the Jacobian blocks).
+        M_blocks:  (n_bins, n_chan, n_chan) -- M_b = S_b + N_b.
+        nu:        (n_bins,) -- modes per bin, f_sky × Σ(2ℓ+1).
+
+    Returns:
+        (n_free, n_free) Fisher matrix, without priors.
+
+    Exactly equal to ``J_bᵀ Σ_b⁻¹ J_b`` with ``Σ_b`` the Knox covariance of
+    the unique cross-spectra (``covariance._knox_blocks``), but conditioned
+    as cond(M_b) instead of cond(Σ_b) = cond(M_b)². At PICO-class
+    conditioning (cond(M_b) ~ 1e14 at ℓ = 2) the ``Σ_b`` solve in
+    ``_fisher_from_blocks`` loses the foreground block entirely and F comes
+    out indefinite; this form is a Gram matrix, so F is PSD by construction.
+    Differentiable (Cholesky + triangular solves).
+    """
+    def one_bin(carry, inputs):
+        dM, M_b, nu_b = inputs
+        A = _whitened_sandwich(M_b, dM)
+        return carry + 0.5 * nu_b * (A @ A.T), None
+
+    n_free = dM_blocks.shape[1]
+    F, _ = jax.lax.scan(one_bin, jnp.zeros((n_free, n_free)),
+                        (dM_blocks, M_blocks, nu))
+    return 0.5 * (F + F.T)
+
+
+@jax.jit
+def _jt_cinv_d_from_M_blocks(dM_blocks: jnp.ndarray,
+                             dD_blocks: jnp.ndarray,
+                             M_blocks: jnp.ndarray,
+                             nu: jnp.ndarray) -> jnp.ndarray:
+    """``u = Σ_b J_bᵀ Σ_b⁻¹ ΔD_b`` via ``(ν_b/2) Tr[M⁻¹ ∂_aM M⁻¹ ΔM]``.
+
+    Args:
+        dM_blocks: (n_bins, n_free, n_chan, n_chan) -- as in ``_fisher_from_M_blocks``.
+        dD_blocks: (n_bins, n_chan, n_chan) -- the residual ΔD_b scattered
+                   onto the channel matrix (``spectra_to_channel_matrix``).
+        M_blocks, nu: as in ``_fisher_from_M_blocks``.
+
+    Returns:
+        (n_free,) -- the bias right-hand side, same conditioning as the Fisher.
+    """
+    def one_bin(carry, inputs):
+        dM, dD, M_b, nu_b = inputs
+        A = _whitened_sandwich(M_b, jnp.concatenate([dM, dD[None]], axis=0))
+        return carry + 0.5 * nu_b * (A[:-1] @ A[-1]), None
+
+    u, _ = jax.lax.scan(one_bin, jnp.zeros(dM_blocks.shape[1]),
+                        (dM_blocks, dD_blocks, M_blocks, nu))
+    return u
+
+
 @jax.jit
 def _fisher_from_full(J: jnp.ndarray,
                       cov: jnp.ndarray) -> jnp.ndarray:
@@ -120,6 +226,9 @@ def _cinv_d_blocks(cov_blocks: jnp.ndarray,
                    dd_blocks: jnp.ndarray) -> jnp.ndarray:
     """Per-bin C^{-1} · ΔD via the same sqrt(diag) prewhitening as
     ``_fisher_from_blocks``.
+
+    Superseded in-package by ``_jt_cinv_d_from_M_blocks`` (same conditioning
+    problem as ``_fisher_from_blocks``); kept for external callers.
 
     Args:
         cov_blocks: (n_bins, n_spec, n_spec) -- per-bin Knox covariance.
@@ -344,29 +453,9 @@ class FisherForecast:
                 self._instrument.f_sky, params)
             F = _fisher_from_full(J, cov_full)
         else:
-            # Per-bin covariance blocks: (n_bins, n_spec, n_spec).
-            # When an external noise spectrum is provided, bypass the
-            # analytic per-channel noise and feed the pre-computed N_ell
-            # directly to the Knox covariance. The f_sky factor still
-            # comes from the Instrument.
-            if self._external_noise_bb is not None:
-                cov_blocks = bandpower_covariance_blocks_from_noise(
-                    self._signal, self._external_noise_bb,
-                    self._instrument.f_sky, params)
-            else:
-                cov_blocks = bandpower_covariance_blocks(
-                    self._signal, self._instrument, params)
-
-            # Reshape J into per-bin blocks: (n_bins, n_spec, n_free)
-            n_spec = len(self._signal.freq_pairs)
-            n_bins = self._signal.n_bins
-            # Data ordering is (spec, bin): data[s * n_bins + b]
-            # Reshape to (n_spec, n_bins, n_free) then transpose to
-            # (n_bins, n_spec, n_free)
-            J_blocks = J.reshape(n_spec, n_bins, -1).transpose(1, 0, 2)
-
-            # F = sum_b J_b^T Sigma_b^{-1} J_b via per-bin Cholesky
-            F = _fisher_from_blocks(J_blocks, cov_blocks)
+            # Per-bin Knox Fisher in channel space (see _fisher_from_M_blocks).
+            M_blocks, nu = self._per_bin_M(params)
+            F = _fisher_from_M_blocks(self._dM_blocks(J), M_blocks, nu)
 
         # Add Gaussian priors
         for name, sigma_prior in self._priors.items():
@@ -379,6 +468,32 @@ class FisherForecast:
         self._fisher_matrix = F
         self._fisher_inverse = None
         return F
+
+    def _per_bin_M(self, params: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """``(M_blocks, nu)`` for the per-bin path: (n_bins, n_chan, n_chan), (n_bins,).
+
+        External noise, when supplied, replaces the analytic per-channel N_ℓ;
+        f_sky always comes from the Instrument.
+        """
+        if self._external_noise_bb is not None:
+            M_blocks = bandpower_M_blocks_from_noise(
+                self._signal, self._external_noise_bb, params)
+        else:
+            M_blocks = bandpower_M_blocks(self._signal, self._instrument, params)
+        nu = self._instrument.f_sky * jnp.asarray(bin_mode_counts(self._signal))
+        return M_blocks, nu
+
+    def _to_bin_channel(self, x: jnp.ndarray) -> jnp.ndarray:
+        """(n_spec * n_bins, ...) data-ordered array -> (n_bins, ..., n_chan, n_chan)."""
+        n_spec, n_bins = self._signal.n_spectra, self._signal.n_bins
+        # Data ordering is (spec, bin): data[s * n_bins + b].
+        xb = jnp.moveaxis(x.reshape((n_spec, n_bins, *x.shape[1:])), 0, -1)
+        return spectra_to_channel_matrix(xb, self._signal.freq_pairs,
+                                         len(self._signal.frequencies))
+
+    def _dM_blocks(self, J: jnp.ndarray) -> jnp.ndarray:
+        """Free-parameter Jacobian (n_data, n_free) -> ∂M_b/∂θ, (n_bins, n_free, n_chan, n_chan)."""
+        return self._to_bin_channel(J)
 
     @property
     def fisher_matrix(self) -> jnp.ndarray:
@@ -400,6 +515,18 @@ class FisherForecast:
         """Marginalized 1-sigma constraint: sqrt((F^-1)_{aa})."""
         idx = self._free_names.index(param)
         return float(jnp.sqrt(self.inverse[idx, idx]))
+
+    def min_correlation_eigenvalue(self) -> float:
+        """Smallest eigenvalue of F normalized to unit diagonal (F_ij / √(F_ii F_jj)).
+
+        Negative means F is indefinite -- impossible for a true Fisher
+        matrix, so it signals a failed covariance solve. Scale-free, unlike
+        the eigenvalues of F itself.
+        """
+        F = np.asarray(self.fisher_matrix)
+        d = np.sqrt(np.abs(np.diag(F)))
+        d[d == 0] = 1.0
+        return float(np.linalg.eigvalsh(F / np.outer(d, d))[0])
 
     def sigma_conditional(self, param: str = "r") -> float:
         """Conditional 1-sigma constraint: 1/sqrt(F_{aa})."""
@@ -504,25 +631,10 @@ class FisherForecast:
             cinv_dd = _cinv_d_full(cov_full, dd)         # (n_data,)
             u = J_free.T @ cinv_dd                        # (n_free,)
         else:
-            # Block-diagonal mode: same dispatch as compute().
-            if self._external_noise_bb is not None:
-                cov_blocks = bandpower_covariance_blocks_from_noise(
-                    self._signal, self._external_noise_bb,
-                    self._instrument.f_sky, params)
-            else:
-                cov_blocks = bandpower_covariance_blocks(
-                    self._signal, self._instrument, params)
-
-            n_spec = len(self._signal.freq_pairs)
-            n_bins = self._signal.n_bins
-            # Data ordering is (spec, bin): match the J reshape in compute().
-            J_blocks = J_free.reshape(n_spec, n_bins,
-                                       -1).transpose(1, 0, 2)
-            dd_blocks = dd.reshape(n_spec, n_bins).T     # (n_bins, n_spec)
-
-            cinv_dd_blocks = _cinv_d_blocks(cov_blocks, dd_blocks)
-            # u = Σ_b J_b^T · C_b^{-1} · ΔD_b.
-            u = jnp.einsum('bsf,bs->f', J_blocks, cinv_dd_blocks)
+            # Block-diagonal mode: same channel-space form as compute().
+            M_blocks, nu = self._per_bin_M(params)
+            u = _jt_cinv_d_from_M_blocks(            # Σ_b J_bᵀ Σ_b⁻¹ ΔD_b
+                self._dM_blocks(J_free), self._to_bin_channel(dd), M_blocks, nu)
 
         delta_theta = self.inverse @ u                   # (n_free,)
         return {name: float(delta_theta[i])
@@ -699,19 +811,10 @@ class FisherForecast:
                     self._signal, self._external_noise_bb,
                     self._instrument.f_sky, params_fid_full)
             )
-            cov_blocks = None
+            M_blocks = nu = None
         else:
-            if self._external_noise_bb is not None:
-                cov_blocks = bandpower_covariance_blocks_from_noise(
-                    self._signal, self._external_noise_bb,
-                    self._instrument.f_sky, params_fid_full)
-            else:
-                cov_blocks = bandpower_covariance_blocks(
-                    self._signal, self._instrument, params_fid_full)
+            M_blocks, nu = self._per_bin_M(params_fid_full)
             cov_full = None
-
-        n_spec = self._signal.n_spectra
-        n_bins = self._signal.n_bins
 
         # Gauss-Newton loop. delta_free is the cumulative Δθ on free params.
         delta_free = jnp.zeros(n_free)
@@ -735,12 +838,10 @@ class FisherForecast:
                 u = J_free_k.T @ cinv_r
                 F_k = _fisher_from_full(J_free_k, cov_full)
             else:
-                J_blocks_k = J_free_k.reshape(n_spec, n_bins,
-                                                -1).transpose(1, 0, 2)
-                r_blocks = r_k.reshape(n_spec, n_bins).T
-                cinv_r_blocks = _cinv_d_blocks(cov_blocks, r_blocks)
-                u = jnp.einsum('bsf,bs->f', J_blocks_k, cinv_r_blocks)
-                F_k = _fisher_from_blocks(J_blocks_k, cov_blocks)
+                dM_k = self._dM_blocks(J_free_k)
+                u = _jt_cinv_d_from_M_blocks(
+                    dM_k, self._to_bin_channel(r_k), M_blocks, nu)
+                F_k = _fisher_from_M_blocks(dM_k, M_blocks, nu)
 
             # (F_k + Λ) δθ = Jᵀ C⁻¹ r_k − Λ·(θ_k − θ_fid)
             step = jnp.linalg.solve(F_k + Lam_diag, u - lam * delta_free)
@@ -930,20 +1031,28 @@ class FisherForecast:
             lines.append(f"  Free parameters:  {self.n_free}")
 
             # Fisher condition number: cond(F) > ~1e14 indicates
-            # near-degenerate parameter directions; the eigh solver
-            # clips non-positive eigenvalues silently, so the sigmas
-            # below may be dominated by numerical regularization rather
-            # than data + priors.
+            # near-degenerate parameter directions, where the sigmas below
+            # may be dominated by numerical noise rather than data + priors.
             try:
                 cond_F = float(jnp.linalg.cond(self._fisher_matrix))
                 cond_line = f"  cond(F):          {cond_F:.2e}"
                 if cond_F > 1e14:
                     cond_line += ("  -- WARNING: near-degenerate "
-                                  "parameters; eigh clipping may "
-                                  "dominate the reported sigmas")
+                                  "parameters; sigmas may be dominated "
+                                  "by numerical noise")
                 lines.append(cond_line)
             except Exception:
                 pass
+
+            # Indefiniteness: a Fisher matrix is PSD, so a negative
+            # eigenvalue of the correlation-normalized F means the
+            # covariance solve failed (cond(F) alone does not flag it).
+            min_eig = self.min_correlation_eigenvalue()
+            eig_line = f"  min eig(corr F):  {min_eig:+.2e}"
+            if min_eig < 0:
+                eig_line += ("  -- WARNING: F is indefinite; marginalized "
+                             "sigmas are not meaningful")
+            lines.append(eig_line)
 
             for p in self._free_names:
                 try:

@@ -366,13 +366,71 @@ def bandpower_covariance_blocks_from_noise(
             "Σ_ℓ W_b(ℓ) W_{b'}(ℓ) (2ℓ+1) and the per-bin block-diagonal "
             "Knox approximation breaks. Use "
             "bandpower_covariance_full_from_noise instead.")
+    M = _build_M_from_noise(signal_model, noise_nls, fiducial_params,
+                            delensed_bb_override=delensed_bb_override)
+    return _knox_blocks(M, signal_model, f_sky)
+
+
+def _build_M_from_noise(signal_model: SignalModel,
+                        noise_nls: jnp.ndarray,
+                        fiducial_params: jnp.ndarray,
+                        delensed_bb_override: jnp.ndarray | None = None
+                        ) -> jnp.ndarray:
+    """Binned M = S + N from a (n_chan, n_ells) noise array, shape (n_chan, n_chan, n_bins)."""
     M = _build_M_signal(signal_model, fiducial_params,
                         delensed_bb_override=delensed_bb_override)
     W = signal_model.bin_matrix
     n_chan = noise_nls.shape[0]
     for i in range(n_chan):
         M = M.at[i, i, :].add(W @ noise_nls[i])
-    return _knox_blocks(M, signal_model, f_sky)
+    return M
+
+
+def bin_mode_counts(signal_model: SignalModel) -> np.ndarray:
+    """Full-sky mode count Σ_{ℓ in b}(2ℓ+1) per bin; ν_b = f_sky × this.
+
+    Static numpy array, so ``f_sky * bin_mode_counts(sm)`` stays traceable
+    when ``f_sky`` is a JAX value.
+    """
+    return np.array([(hi - lo + 1) * (lo + hi + 1)
+                     for lo, hi in signal_model.bin_edges], dtype=float)
+
+
+def bandpower_M_blocks(signal_model: SignalModel,
+                       instrument: Instrument,
+                       fiducial_params: jnp.ndarray) -> jnp.ndarray:
+    """Per-bin channel covariance M_b = S_b + N_b, shape (n_bins, n_chan, n_chan).
+
+    The input to the per-bin Fisher (``fisher._fisher_from_M_blocks``). The
+    Knox covariance of all cross-spectra in bin b is the 4-point function of
+    this matrix (see ``_knox_blocks``), so working with M_b directly needs
+    only cond(M_b), not cond(M_b)².
+    """
+    if signal_model.has_measured_bpwf:
+        raise NotImplementedError(
+            "bandpower_M_blocks requires synthetic (non-overlapping) bins; "
+            "measured BPWFs couple bins. Use bandpower_covariance_full.")
+    return _build_M(signal_model, instrument, fiducial_params).transpose(2, 0, 1)
+
+
+def bandpower_M_blocks_from_noise(signal_model: SignalModel,
+                                  noise_nls: jnp.ndarray,
+                                  fiducial_params: jnp.ndarray,
+                                  delensed_bb_override: jnp.ndarray | None = None
+                                  ) -> jnp.ndarray:
+    """``bandpower_M_blocks`` from a (n_chan, n_ells) noise array (traceable).
+
+    Same noise contract as ``bandpower_covariance_blocks_from_noise``: the
+    noise MUST be beam-deconvolved.
+    """
+    if signal_model.has_measured_bpwf:
+        raise NotImplementedError(
+            "bandpower_M_blocks_from_noise requires synthetic (non-overlapping) "
+            "bins; measured BPWFs couple bins. Use "
+            "bandpower_covariance_full_from_noise.")
+    return _build_M_from_noise(
+        signal_model, noise_nls, fiducial_params,
+        delensed_bb_override=delensed_bb_override).transpose(2, 0, 1)
 
 
 def knox_sigma_from_measured_spectrum(
