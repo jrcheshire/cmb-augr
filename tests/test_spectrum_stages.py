@@ -103,7 +103,8 @@ def test_cutsky_bb_bandpower_shape_finite() -> None:
     assert bool(jnp.all(jnp.isfinite(out)))
 
 
-def _run_mc(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2, workers=1):
+def _run_mc(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2, workers=1,
+            **mc_kw):
     cl_ee, cl_bb = _priors(lmax)
     bm = _bin_matrix(2, ell_max, delta_ell, ell_per_bin_below)
     true_b = mk.bin_spectrum(
@@ -127,6 +128,7 @@ def _run_mc(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_b
         fg_model=None,
         r_in=0.0,
         workers=workers,
+        **mc_kw,
     )
 
 
@@ -193,7 +195,8 @@ def test_purity_null_through_cleaner() -> None:
 # --- differentiable (jax.grad-in-w_inv) cut-sky MC ---------------------------
 
 
-def _traced_setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2):
+def _traced_setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per_bin_below=2,
+                  **ctx_kw):
     """Build a CutskyMCContext + cleaner mirroring _run_mc's tiny CMB-only config."""
     cl_ee, cl_bb = _priors(lmax)
     bm = _bin_matrix(2, ell_max, delta_ell, ell_per_bin_below)
@@ -219,6 +222,7 @@ def _traced_setup(n_sims, *, nside=16, lmax=24, ell_max=24, delta_ell=8, ell_per
         fg_model=None,
         r_in=0.0,
         estimator="wiener",
+        **ctx_kw,
     )
     return ctx, cleaner
 
@@ -314,6 +318,134 @@ def test_traced_cov_jit_matches_eager() -> None:
     cov_eager = cov_of(w0, bf, bp)
     cov_jit = jax.jit(cov_of)(w0, bf, bp)
     np.testing.assert_allclose(np.asarray(cov_jit), np.asarray(cov_eager), rtol=1e-6, atol=1e-30)
+
+
+# --- masked-Wiener preconditioner + convergence check ------------------------
+
+
+def test_wiener_context_builds_the_preconditioner() -> None:
+    """Wiener contexts carry a preconditioner by default; MASTER and opt-out carry none.
+
+    Spin-2 DOFs with ``l <= ell_split`` number ``2((ell_split+1)^2 - 4)``; the default
+    32 exceeds lmax=24 here, so the block is the whole operator.
+    """
+    ctx, cleaner = _traced_setup(6)
+    assert ctx.wiener_precond.low_idx.shape == (2 * (25**2 - 4),)
+    vpr = ctx.var_pix_ref  # skip the setup clean on the rebuilds
+    ctx8, _ = _traced_setup(6, wiener_ell_split=8, var_pix_ref=vpr)
+    assert ctx8.wiener_precond.low_idx.shape == (2 * (9**2 - 4),)
+    off, _ = _traced_setup(6, wiener_precond=False, var_pix_ref=vpr)
+    assert off.wiener_precond is None
+    master = make_cutsky_mc_context(cleaner=cleaner, estimator="master", **_ctx_kwargs(6))
+    assert master.wiener_precond is None
+
+
+def test_traced_wiener_records_convergence_and_raises_when_truncated() -> None:
+    """A truncated solve raises in the traced forward; ``wiener_check=False`` only records.
+
+    ``ell_split=8`` keeps the preconditioned CG genuinely iterative (the default block
+    would be exact at lmax=24). The record-only arm is the anti-vacuity half: it shows
+    the same context really does truncate, so the raise comes from the guard.
+    """
+    ctx, cleaner = _traced_setup(6, wiener_ell_split=8)
+    w = jnp.asarray(W_INV)
+    ok = mc_cutsky_cov_traced(w, ctx, cleaner)
+    assert 0 < float(ok.wiener_max_rel_residual) <= ctx.tol
+    assert 0 < int(ok.wiener_max_n_iter) < ctx.max_iter
+
+    trunc, _ = _traced_setup(6, wiener_ell_split=8, max_iter=3, var_pix_ref=ctx.var_pix_ref)
+    with pytest.raises(RuntimeError, match="did not converge"):
+        np.asarray(mc_cutsky_cov_traced(w, trunc, cleaner).covariance)
+    rec = mc_cutsky_cov_traced(w, trunc, cleaner, wiener_check=False)
+    assert float(rec.wiener_max_rel_residual) > trunc.tol
+    assert int(rec.wiener_max_n_iter) == 3
+
+
+@pytest.mark.slow
+def test_traced_wiener_truncation_raises_under_jit_and_grad() -> None:
+    """The ``eqx.error_if`` guard survives ``jax.jit`` and ``jax.grad``."""
+    import jax
+
+    trunc, cleaner = _traced_setup(6, wiener_ell_split=8, max_iter=3)
+    w = jnp.asarray(W_INV)
+    with pytest.raises(RuntimeError, match="did not converge"):
+        np.asarray(jax.jit(lambda v: mc_cutsky_cov_traced(v, trunc, cleaner).covariance)(w))
+    with pytest.raises(RuntimeError, match="did not converge"):
+        np.asarray(jax.grad(
+            lambda v: jnp.sum(mc_cutsky_cov_traced(v, trunc, cleaner).covariance))(w))
+
+
+@pytest.mark.slow
+def test_eager_mc_records_convergence_and_raises_when_truncated() -> None:
+    """mc_cutsky_bandpowers reports its worst solve, and raises on a truncated one."""
+    res = _run_mc(6, wiener_ell_split=8)
+    assert 0 < res.wiener_max_rel_residual <= 1e-8
+    assert 0 < res.wiener_max_n_iter < 1000
+    with pytest.raises(RuntimeError, match="did not converge"):
+        _run_mc(6, wiener_ell_split=8, max_iter=3, var_pix_ref=res.var_pix_ref)
+
+
+# Two CONVERGED Wiener paths agree only to the CG-tolerance floor (tol 1e-8).
+# Measured in these tests' config as max|a-b| / max|b|: debiased 2.9e-7,
+# covariance 5.1e-7, transfer 3.0e-9, leakage 3.5e-6, sigma(r) gradient 3.6e-7.
+_PRECOND_FLOOR = 1e-5
+
+
+def _max_rel(a, b) -> float:
+    a, b = np.asarray(a), np.asarray(b)
+    return float(np.max(np.abs(a - b)) / np.max(np.abs(b)))
+
+
+@pytest.mark.slow
+def test_preconditioned_forward_matches_the_unpreconditioned_solve() -> None:
+    """The preconditioner changes iteration counts, not the solution.
+
+    Both arms converge (the plain one at ``max_iter=5000``) on the same sims and
+    filter, so they differ only at the CG-tolerance floor.
+    """
+    pc, cleaner = _traced_setup(8, wiener_ell_split=8)
+    plain, _ = _traced_setup(8, wiener_precond=False, max_iter=5000, var_pix_ref=pc.var_pix_ref)
+    w = jnp.asarray(W_INV)
+    a = mc_cutsky_cov_traced(w, pc, cleaner)
+    b = mc_cutsky_cov_traced(w, plain, cleaner)
+    for name in ("debiased_bandpowers", "covariance", "transfer", "leakage"):
+        assert _max_rel(getattr(a, name), getattr(b, name)) < _PRECOND_FLOOR, name
+    # 44 vs 201 iterations measured: the preconditioner must actually be doing work.
+    assert int(a.wiener_max_n_iter) < int(b.wiener_max_n_iter) // 2
+
+
+@pytest.mark.slow
+def test_preconditioned_gradient_matches_and_backward_solves_converge() -> None:
+    """jax.grad of sigma(r) agrees with and without the preconditioner, and at 5x budget.
+
+    jht reports nothing about the backward pass's transpose solves, and they need
+    more iterations than the forward ones (capping at the forward need, 44, moves the
+    gradient by 1.2e-9). If they needed more than ``max_iter`` the gradient would move
+    when the budget grows; bitwise equality at 1000 vs 5000 shows they converged
+    inside the default.
+    """
+    import jax
+
+    from augr.optimize import make_optimization_context, sigma_r_from_external_cov
+
+    pc, cleaner = _traced_setup(8, wiener_ell_split=8)
+    vpr = pc.var_pix_ref
+    plain, _ = _traced_setup(8, wiener_precond=False, max_iter=5000, var_pix_ref=vpr)
+    big, _ = _traced_setup(8, wiener_ell_split=8, max_iter=5000, var_pix_ref=vpr)
+    opt_ctx = make_optimization_context(
+        cleaned_map_instrument(f_sky=0.6), NullForegroundModel(), CMBSpectra(),
+        {"r": 0.0, "A_lens": 1.0}, priors={}, fixed_params=[], ell_min=2, ell_max=24,
+        delta_ell=8, ell_per_bin_below=2,
+    )
+
+    def grad_for(ctx):
+        return np.asarray(jax.grad(lambda w: sigma_r_from_external_cov(
+            mc_cutsky_cov_traced(w, ctx, cleaner).covariance, opt_ctx))(jnp.asarray(W_INV)))
+
+    g = grad_for(pc)
+    assert np.all(np.isfinite(g))
+    assert _max_rel(g, grad_for(plain)) < _PRECOND_FLOOR
+    assert np.array_equal(g, grad_for(big))
 
 
 # --- MASTER estimator path ---------------------------------------------------

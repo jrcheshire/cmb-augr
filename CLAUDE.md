@@ -693,7 +693,10 @@ wrong.
   only records). The worst residual and iteration count are on
   `CutskyMC` / `CutskyMCTraced.wiener_max_rel_residual` / `wiener_max_n_iter`.
 - The backward pass's transpose solves use the same preconditioner and budget
-  and report nothing.
+  and report nothing, and they need more iterations than the forward ones
+  (nside 16: capping at the forward need moves the gradient by 1.2e-9), so
+  keep `max_iter` well above the recorded forward `wiener_max_n_iter`. Gate:
+  the gradient is bitwise identical at budget 1000 and 5000.
 - Two converged solutions agree only to the tolerance floor: at tol 1e-8 the
   per-ℓ bandpowers of one nside 16 / lmax 24 sim differ by 1e-8 – 5e-5
   relative between a preconditioned and a plain solve (largest on the E-only
