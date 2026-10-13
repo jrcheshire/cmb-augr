@@ -450,7 +450,9 @@ def _symmetrize_inplace(a: np.ndarray, block: int = 2048) -> None:
             a[jj, ii] = u.T
 
 
-def wiener_normal_matrix(inv_noise: jax.Array, *, nside: int, lmax: int, batch: int = 64) -> np.ndarray:
+def wiener_normal_matrix(
+    inv_noise: jax.Array, *, nside: int, lmax: int, batch: int = 64, verbose: bool = False
+) -> np.ndarray:
     """Dense spin-2 normal matrix ``A = T Sᵀ diag(N⁻¹) S T⁻¹`` of the masked-Wiener solve.
 
     ``(n_dof, n_dof)`` float64 in jht's real-DOF x-space (``[E, B]``, ℓ < 2 dropped;
@@ -458,8 +460,10 @@ def wiener_normal_matrix(inv_noise: jax.Array, *, nside: int, lmax: int, batch: 
     vectors at a time and symmetrized. Input to :func:`wiener_bb_response`. Costs
     ``n_dof`` operator applications and ``8 n_dof²`` bytes: 74,490 and 44 GB at lmax 192.
     ``A`` is linear in ``inv_noise``, so a uniform-hits filter at a different
-    ``var_pix_ref`` needs no rebuild (``wiener_bb_response(scale=)``).
+    ``var_pix_ref`` needs no rebuild (``wiener_bb_response(scale=)``). ``verbose`` prints
+    the column rate and ETA about every 5%.
     """
+    import time
     jht = _require_jht()
     nside, lmax, batch = int(nside), int(lmax), int(batch)
     n = int(jht.n_dof(lmax, 2))
@@ -477,8 +481,16 @@ def wiener_normal_matrix(inv_noise: jax.Array, *, nside: int, lmax: int, batch: 
         return jax.vmap(apply)(units)
 
     out = np.empty((n, n))
-    for s in range(0, n, batch):
+    starts = range(0, n, batch)
+    every = max(1, len(starts) // 20)
+    t0 = time.perf_counter()
+    for i, s in enumerate(starts):
         out[s : s + batch] = np.asarray(rows(s))[: n - s]  # A e_j is row j (A = Aᵀ)
+        if verbose and (i + 1) % every == 0:
+            done = min(s + batch, n)
+            dt = time.perf_counter() - t0
+            print(f"wiener_normal_matrix: {done}/{n} columns, {dt / done * 1e3:.1f} ms/column, "
+                  f"ETA {dt / done * (n - done) / 60:.1f} min", flush=True)
     _symmetrize_inplace(out)
     return out
 
@@ -492,6 +504,7 @@ def wiener_bb_response(
     scale: float = 1.0,
     overwrite: bool = False,
     block: int = 2048,
+    verbose: bool = False,
 ) -> np.ndarray:
     """Exact B→B response ``K`` ``(lmax+1, lmax+1)`` of the converged masked-Wiener estimator.
 
@@ -506,9 +519,18 @@ def wiener_bb_response(
     The B prior must be positive on ℓ = 2..lmax. NumPy/LAPACK, not traced: about
     ``n_dof³/3`` flops, and ``8 n_dof²`` bytes for the factor (``overwrite=True`` factors
     ``normal`` in place, which must then be C-contiguous) plus ``2 n_dof²`` for the BB
-    inverse. Use as a measured bandpower window via :func:`debiased_window`.
+    inverse. Use as a measured bandpower window via :func:`debiased_window`. ``verbose``
+    prints the time of each stage.
     """
+    import time
+
     from scipy.linalg import lapack
+
+    t0 = time.perf_counter()
+
+    def stage(name):
+        if verbose:
+            print(f"wiener_bb_response: {name} done at {time.perf_counter() - t0:.0f} s", flush=True)
 
     lmax = int(lmax)
     ell = _dof_ell(lmax)
@@ -534,10 +556,13 @@ def wiener_bb_response(
 
     # m is symmetric and C-ordered, so m.T is the same matrix in Fortran order: LAPACK
     # factors it in place.
+    stage("M + I")
     chol, info = lapack.dpotrf(m.T, lower=1, overwrite_a=1, clean=0)
+    stage("dpotrf")
     if info != 0:
         raise np.linalg.LinAlgError(f"dpotrf failed (info={info}): M + I is not positive definite")
     inv_bb, info = lapack.dpotri(chol[n_e:, n_e:], lower=1, overwrite_c=1)
+    stage("dpotri")
     if info != 0:
         raise np.linalg.LinAlgError(f"dpotri failed (info={info})")
 
@@ -556,6 +581,7 @@ def wiener_bb_response(
     d = np.zeros(lmax + 1)
     np.add.at(d, ell_b, (1.0 - np.diagonal(inv_bb)) ** 2)
     s_sum = t + t.T - np.diag(d)
+    stage("accumulate")
 
     ells = np.arange(lmax + 1)
     ok = ells >= 2
