@@ -30,6 +30,12 @@ sim sets separate the two corrections cleanly: B-only inputs carry no E, so
 ``F_b`` is leakage-free; E-only inputs carry no B, so the recovered power is
 pure leakage.
 
+The debias assumes the filter is a fixed linear operator, which holds only for
+a **converged** solve: a truncated CG leaves a data-dependent filter.
+:func:`wiener_preconditioner` makes convergence affordable, and
+``return_info=True`` is the only way to see a truncated solve (the
+:mod:`augr.spectrum_stages` MC drivers use both and raise on truncation).
+
 Conventions
 -----------
 * **Signal prior fixed at r=0** (LCDM): ``C_EE`` = lensed EE, ``C_BB`` = lensing
