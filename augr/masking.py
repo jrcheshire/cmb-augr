@@ -36,6 +36,14 @@ a **converged** solve: a truncated CG leaves a data-dependent filter.
 ``return_info=True`` is the only way to see a truncated solve (the
 :mod:`augr.spectrum_stages` MC drivers use both and raise on truncation).
 
+**The per-bin debias is exact only for the lensing shape it is calibrated on.** The
+sharp-mask filter couples ℓ, so a spectrum of another shape (the tensor, for
+``∂/∂r``) is mis-scaled by ``F_b``. Model the estimator with its exact response instead:
+:func:`wiener_normal_matrix` → :func:`wiener_bb_response` (``K``, dense, NumPy/LAPACK)
+→ :func:`debiased_window` (``W``, a measured bandpower window with ``J_r = W @
+C_tensor``). :func:`analytic_transfer` is the noise-free ``F_b`` from ``K``, a check
+against the MC.
+
 Conventions
 -----------
 * **Signal prior fixed at r=0** (LCDM): ``C_EE`` = lensed EE, ``C_BB`` = lensing
@@ -408,3 +416,203 @@ def debias_bandpower(rec_binned: jax.Array, transfer: jax.Array, leakage: jax.Ar
     multiplicative filter suppression plus the additive E→B leakage).
     """
     return (jnp.asarray(rec_binned) - jnp.asarray(leakage)) / jnp.asarray(transfer)
+
+
+# ---------------------------------------------------------------------------
+# exact bandpower window: the filter's dense B→B response
+# ---------------------------------------------------------------------------
+
+
+def _dof_ell(lmax: int) -> np.ndarray:
+    """Multipole of each spin-2 real DOF in jht's ``[E, B]`` layout (length ``n_dof``)."""
+    import healpy as hp
+
+    jht = _require_jht()
+    ell, m = hp.Alm.getlm(int(lmax))
+    unit = np.where(m > 0, 1.0 + 1.0j, 1.0 + 0.0j)
+
+    def to_real(v):
+        return np.asarray(jht.alm_to_real(jnp.asarray(np.stack([v, v])), int(lmax), spin=2))
+
+    return np.rint(to_real(ell * unit) / to_real(unit)).astype(int)
+
+
+def _symmetrize_inplace(a: np.ndarray, block: int = 2048) -> None:
+    """``a <- (a + aᵀ)/2`` block by block, without a full-size temporary."""
+    n = a.shape[0]
+    for i in range(0, n, block):
+        ii = slice(i, i + block)
+        a[ii, ii] = 0.5 * (a[ii, ii] + a[ii, ii].T)
+        for j in range(i + block, n, block):
+            jj = slice(j, j + block)
+            u = 0.5 * (a[ii, jj] + a[jj, ii].T)
+            a[ii, jj] = u
+            a[jj, ii] = u.T
+
+
+def wiener_normal_matrix(inv_noise: jax.Array, *, nside: int, lmax: int, batch: int = 64) -> np.ndarray:
+    """Dense spin-2 normal matrix ``A = T Sᵀ diag(N⁻¹) S T⁻¹`` of the masked-Wiener solve.
+
+    ``(n_dof, n_dof)`` float64 in jht's real-DOF x-space (``[E, B]``, ℓ < 2 dropped;
+    ``n_dof = jht.n_dof(lmax, 2)``), built by applying the operator to ``batch`` unit
+    vectors at a time and symmetrized. Input to :func:`wiener_bb_response`. Costs
+    ``n_dof`` operator applications and ``8 n_dof²`` bytes: 74,490 and 44 GB at lmax 192.
+    ``A`` is linear in ``inv_noise``, so a uniform-hits filter at a different
+    ``var_pix_ref`` needs no rebuild (``wiener_bb_response(scale=)``).
+    """
+    jht = _require_jht()
+    nside, lmax, batch = int(nside), int(lmax), int(batch)
+    n = int(jht.n_dof(lmax, 2))
+    w = jnp.asarray(inv_noise)[None, :]
+
+    def apply(x):
+        a = jht.real_to_alm(x, lmax, spin=2)
+        mp = w * jht.synthesis(a, nside, lmax, spin=2)
+        return jht.alm_to_real(jht.adjoint_synthesis(mp, nside, lmax, spin=2), lmax, spin=2)
+
+    @jax.jit
+    def rows(start):
+        idx = start + jnp.arange(batch)
+        units = (idx[:, None] == jnp.arange(n)[None, :]).astype(jnp.float64)
+        return jax.vmap(apply)(units)
+
+    out = np.empty((n, n))
+    for s in range(0, n, batch):
+        out[s : s + batch] = np.asarray(rows(s))[: n - s]  # A e_j is row j (A = Aᵀ)
+    _symmetrize_inplace(out)
+    return out
+
+
+def wiener_bb_response(
+    normal: np.ndarray,
+    cl_ee_prior: jax.Array,
+    cl_bb_prior: jax.Array,
+    *,
+    lmax: int,
+    scale: float = 1.0,
+    overwrite: bool = False,
+    block: int = 2048,
+) -> np.ndarray:
+    """Exact B→B response ``K`` ``(lmax+1, lmax+1)`` of the converged masked-Wiener estimator.
+
+    ``E[Ĉ_ℓ'^BB] = Σ_ℓ K[ℓ', ℓ] C_ℓ^BB`` for a noise-free B-only map with spectrum
+    ``C^BB`` at the filter input (beamed, like the priors), where ``Ĉ^BB`` is
+    :func:`masked_wiener_bb` with the same ``N⁻¹`` and priors. ``normal`` is
+    :func:`wiener_normal_matrix`; ``scale`` multiplies it (``N⁻¹ -> scale·N⁻¹``).
+
+    With ``M = P (scale·A) P`` and ``P = diag(√C_prior)`` the map-to-alm operator is
+    ``P [I − (M+I)⁻¹] P⁻¹``; its BB block needs only ``[(M+I)⁻¹]_BB``, which is
+    ``(L_BB L_BBᵀ)⁻¹`` from the Cholesky factor of ``M + I`` (B is the trailing half).
+    The B prior must be positive on ℓ = 2..lmax. NumPy/LAPACK, not traced: about
+    ``n_dof³/3`` flops, and ``8 n_dof²`` bytes for the factor (``overwrite=True`` factors
+    ``normal`` in place, which must then be C-contiguous) plus ``2 n_dof²`` for the BB
+    inverse. Use as a measured bandpower window via :func:`debiased_window`.
+    """
+    from scipy.linalg import lapack
+
+    lmax = int(lmax)
+    ell = _dof_ell(lmax)
+    n = ell.size
+    if np.shape(normal) != (n, n):
+        raise ValueError(f"normal must be ({n}, {n}) for lmax={lmax}, got {np.shape(normal)}")
+    n_e = n // 2
+    cl_ee = np.clip(np.asarray(cl_ee_prior, dtype=np.float64)[: lmax + 1], 0.0, None)
+    cl_bb = np.asarray(cl_bb_prior, dtype=np.float64)[: lmax + 1]
+    if np.any(cl_bb[2:] <= 0.0):
+        raise ValueError("cl_bb_prior must be positive on ell = 2..lmax (the response divides by it)")
+    pw = np.sqrt(np.concatenate([cl_ee[ell[:n_e]], cl_bb[ell[n_e:]]]))
+
+    if overwrite:
+        m = normal
+        if not (isinstance(m, np.ndarray) and m.dtype == np.float64 and m.flags.c_contiguous):
+            raise ValueError("overwrite=True needs a C-contiguous float64 ndarray")
+    else:
+        m = np.array(normal, dtype=np.float64, order="C")
+    for s in range(0, n, block):
+        m[s : s + block] *= (float(scale) * pw[s : s + block, None]) * pw[None, :]
+    m.flat[:: n + 1] += 1.0
+
+    # m is symmetric and C-ordered, so m.T is the same matrix in Fortran order: LAPACK
+    # factors it in place.
+    chol, info = lapack.dpotrf(m.T, lower=1, overwrite_a=1, clean=0)
+    if info != 0:
+        raise np.linalg.LinAlgError(f"dpotrf failed (info={info}): M + I is not positive definite")
+    inv_bb, info = lapack.dpotri(chol[n_e:, n_e:], lower=1, overwrite_c=1)
+    if info != 0:
+        raise np.linalg.LinAlgError(f"dpotri failed (info={info})")
+
+    # S[ℓ', ℓ] = Σ_{d'∈ℓ', d∈ℓ} G²_{d'd}, G = I − inv_bb, from the lower triangle only:
+    # S = T + Tᵀ − D, T the d' >= d part, D the diagonal (counted in both).
+    ell_b = ell[n_e:]
+    n_b = ell_b.size
+    hot = np.zeros((n_b, lmax + 1))
+    hot[np.arange(n_b), ell_b] = 1.0
+    t = np.zeros((lmax + 1, lmax + 1))
+    for s in range(0, n_b, block):
+        e = min(s + block, n_b)
+        g = -np.tril(inv_bb[s:e, :e], k=s)
+        g[np.arange(e - s), np.arange(s, e)] += 1.0
+        t += hot[s:e].T @ ((g * g) @ hot[:e])
+    d = np.zeros(lmax + 1)
+    np.add.at(d, ell_b, (1.0 - np.diagonal(inv_bb)) ** 2)
+    s_sum = t + t.T - np.diag(d)
+
+    ells = np.arange(lmax + 1)
+    ok = ells >= 2
+    ratio = np.zeros((lmax + 1, lmax + 1))
+    ratio[np.ix_(ok, ok)] = cl_bb[ok][:, None] / cl_bb[ok][None, :]
+    return s_sum * ratio / (2.0 * ells + 1.0)[:, None]
+
+
+def debiased_window(
+    K: np.ndarray,
+    bin_matrix: jax.Array,
+    ell_min: int,
+    *,
+    common_fwhm_arcmin: float,
+    transfer: jax.Array,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bandpower window of the debiased Wiener bandpowers: ``(W, ells)``.
+
+    ``W[b, ℓ] = Σ_ℓ' bin_matrix[b, ℓ'] K[ℓ', ℓ] B_c,ℓ² / F_b``, so ``E[debiased_b] = W @ C``
+    for a beam-free input B spectrum ``C`` on ``ells = ell_min..lmax`` (wider than the
+    bins: power above the last bin still leaks in). ``K`` is :func:`wiener_bb_response`;
+    ``transfer`` must be the ``F_b`` that debiased the data, so ``J_r = W @ C_tensor``
+    and the covariance share it. Feeds ``SignalModel(bandpower_window=W,
+    bandpower_window_ells=ells)`` with ``ell_max = lmax``.
+    """
+    from .instrument import beam_bl
+
+    k = np.asarray(K)
+    lmax = k.shape[0] - 1
+    bm = np.asarray(bin_matrix)
+    n_ells = bm.shape[1]
+    ells = np.arange(int(ell_min), lmax + 1)
+    bl2 = np.asarray(beam_bl(jnp.asarray(ells, dtype=float), float(common_fwhm_arcmin))) ** 2
+    rows = bm @ k[int(ell_min) : int(ell_min) + n_ells, int(ell_min) :]
+    return rows * bl2[None, :] / np.asarray(transfer)[:, None], ells
+
+
+def analytic_transfer(
+    K: np.ndarray,
+    bin_matrix: jax.Array,
+    ell_min: int,
+    *,
+    common_fwhm_arcmin: float,
+    true_cl_bb: jax.Array,
+) -> np.ndarray:
+    """Noise-free ``F_b = bin(K B_c² C) / bin(C)`` -- the exact counterpart of the MC transfer.
+
+    ``true_cl_bb`` is the beam-free input B spectrum on ℓ = 0..lmax, the same truth the
+    MC :func:`transfer_function` divides by. A check on ``K`` against the MC; the debias
+    itself keeps the MC ``F_b``.
+    """
+    from .instrument import beam_bl
+
+    k = np.asarray(K)
+    lmax = k.shape[0] - 1
+    cl = np.asarray(true_cl_bb, dtype=np.float64)[: lmax + 1]
+    bl2 = np.asarray(beam_bl(jnp.arange(lmax + 1, dtype=float), float(common_fwhm_arcmin))) ** 2
+    rec = k @ (bl2 * cl)
+    num = np.asarray(bin_spectrum(rec, bin_matrix, ell_min))
+    return num / np.asarray(bin_spectrum(cl, bin_matrix, ell_min))

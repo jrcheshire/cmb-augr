@@ -152,6 +152,41 @@ def test_mc_cutsky_bandpowers_shapes_and_covariance() -> None:
     assert np.all(np.isfinite(res.transfer)) and np.all(res.transfer > 0)
     assert res.f_sky == pytest.approx(0.6, abs=0.02)
     assert res.var_pix_ref > 0
+    assert res.rec_transfer.shape == (12, n_bins)
+
+
+@pytest.mark.slow
+def test_analytic_transfer_matches_the_mc_transfer() -> None:
+    """``masking.analytic_transfer`` from the exact ``K`` == the NILC MC transfer ``F_b``.
+
+    ``K`` is built for the run's own filter (``var_pix_ref``, B_c-beamed priors, mask,
+    uniform hits), so this checks that the cleaned CMB-B reaches the filter at unit gain
+    and that ``K``, the beam and the truth follow the MC's conventions. Per-bin z from
+    the per-sim ``rec_transfer`` spread. Measured at 16 sims: |z| <= 1.32 with ``K``;
+    5.8-8.6 with ``K``'s diagonal (the mutation). Gates |z| < 3.5 and max |z| > 5.
+    """
+    lmax, nside, n_sims = 24, 16, 16
+    res = _run_mc(n_sims)
+    cl_ee, cl_bb = _priors(lmax)
+    bc = float(min(BEAMS))
+    invn = mk.inv_noise_map(jnp.ones(12 * nside**2), res.var_pix_ref,
+                            mask=mk.galactic_mask(nside, 0.6))
+    K = mk.wiener_bb_response(
+        mk.wiener_normal_matrix(invn, nside=nside, lmax=lmax),
+        beamed_prior(cl_ee, bc, lmax), beamed_prior(cl_bb, bc, lmax), lmax=lmax,
+    )
+    bm = _bin_matrix(2, 24, 8, 2)
+    c_true = np.clip(np.asarray(CMBSpectra().cl_bb(jnp.arange(lmax + 1, dtype=float), 0.0)), 0.0, None)
+    per_sim = res.rec_transfer / np.asarray(mk.bin_spectrum(c_true, bm, 2))[None, :]
+    np.testing.assert_allclose(per_sim.mean(0), res.transfer, rtol=1e-12)
+    err = per_sim.std(0, ddof=1) / np.sqrt(n_sims)
+
+    def z(kernel):
+        f = mk.analytic_transfer(kernel, bm, 2, common_fwhm_arcmin=bc, true_cl_bb=c_true)
+        return (f - res.transfer) / err
+
+    assert np.max(np.abs(z(K))) < 3.5
+    assert np.max(np.abs(z(np.diag(np.diag(K))))) > 5.0
 
 
 @pytest.mark.slow
