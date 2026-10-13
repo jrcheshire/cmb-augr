@@ -30,6 +30,12 @@ sim sets separate the two corrections cleanly: B-only inputs carry no E, so
 ``F_b`` is leakage-free; E-only inputs carry no B, so the recovered power is
 pure leakage.
 
+The debias assumes the filter is a fixed linear operator, which holds only for
+a **converged** solve: a truncated CG leaves a data-dependent filter.
+:func:`wiener_preconditioner` makes convergence affordable, and
+``return_info=True`` is the only way to see a truncated solve (the
+:mod:`augr.spectrum_stages` MC drivers use both and raise on truncation).
+
 Conventions
 -----------
 * **Signal prior fixed at r=0** (LCDM): ``C_EE`` = lensed EE, ``C_BB`` = lensing
@@ -74,7 +80,7 @@ def _require_jht():
             "ships with the masking extra. Install it with:\n"
             "    pip install 'cmb-augr[masking]'\n"
             "or, in the development env:\n"
-            "    pixi add --pypi 'jaxht>=0.1.2'"
+            "    pixi add --pypi 'jaxht>=0.4.0'"
         ) from exc
 
 
@@ -243,6 +249,34 @@ def inv_noise_map(
 # ---------------------------------------------------------------------------
 
 
+def wiener_preconditioner(
+    inv_noise: jax.Array,
+    cl_ee_prior: jax.Array,
+    cl_bb_prior: jax.Array,
+    *,
+    nside: int,
+    lmax: int,
+    ell_split: int | None = 32,
+):
+    """``jht.WienerPreconditioner`` for :func:`masked_wiener_eb_alm` at fixed ``N⁻¹`` and prior.
+
+    Spin-2 wrapper of ``jht.wiener_preconditioner``: ℓ-diagonal ``1 + C_ℓ n̄``, with the
+    exact operator block on ``ℓ ≤ ell_split`` (``None`` = diagonal only). It changes the
+    iteration count, not the solution. Build eagerly, once per ``(inv_noise, prior)``;
+    the block costs ``2((ell_split+1)² − 4)`` operator applications (2170 at 32, ~3 min
+    at nside 128).
+    """
+    jht = _require_jht()
+    return jht.wiener_preconditioner(
+        (jnp.asarray(cl_ee_prior), jnp.asarray(cl_bb_prior)),
+        int(nside),
+        int(lmax),
+        spin=2,
+        inv_noise=jnp.asarray(inv_noise),
+        ell_split=ell_split,
+    )
+
+
 def masked_wiener_eb_alm(
     qu_map: jax.Array,
     inv_noise: jax.Array,
@@ -251,15 +285,22 @@ def masked_wiener_eb_alm(
     *,
     nside: int,
     lmax: int,
-    max_iter: int = 200,
+    max_iter: int = 1000,
     tol: float = 1e-8,
-) -> jax.Array:
+    precond=None,
+    return_info: bool = False,
+):
     """Wiener-filtered E/B alm from a masked Q/U map → ``(2, K)`` ``[E, B]``.
 
     Solves ``(SᵀN⁻¹S + C⁻¹) a = SᵀN⁻¹ m`` (jht's prior-whitened CG). The signal
     prior is fixed at r=0: ``cl_ee_prior`` = lensed EE, ``cl_bb_prior`` = lensing
     BB (each ``(lmax+1,)``). ``inv_noise`` ``(npix,)`` must have the mask folded
     in (see :func:`inv_noise_map`).
+
+    ``precond`` is a :func:`wiener_preconditioner` built for the same ``inv_noise``
+    and priors. ``return_info=True`` also returns ``jht.SolveInfo(n_iter,
+    rel_residual)``; ``rel_residual > tol`` means the solve stopped at ``max_iter``
+    unconverged, which nothing else reports.
     """
     jht = _require_jht()
     cl_ee = jnp.asarray(cl_ee_prior)
@@ -273,6 +314,8 @@ def masked_wiener_eb_alm(
         inv_noise=jnp.asarray(inv_noise),
         max_iter=max_iter,
         tol=tol,
+        precond=precond,
+        return_info=return_info,
     )
 
 
@@ -284,18 +327,21 @@ def masked_wiener_bb(
     *,
     nside: int,
     lmax: int,
-    max_iter: int = 200,
+    max_iter: int = 1000,
     tol: float = 1e-8,
-) -> jax.Array:
+    precond=None,
+    return_info: bool = False,
+):
     """Raw per-ℓ ``C_ℓ^{BB}`` (length ``lmax+1``) of the Wiener-filtered map.
 
     This is the **filter-suppressed, leakage-contaminated** B power — apply
     :func:`transfer_function` and subtract :func:`leakage_template` (via
     :func:`debias_bandpower`) for an unbiased estimate. Differentiable in the
-    map and the noise level.
+    map and the noise level. ``precond`` / ``return_info`` as in
+    :func:`masked_wiener_eb_alm` (``return_info`` gives ``(cl, SolveInfo)``).
     """
     jht = _require_jht()
-    eb_alm = masked_wiener_eb_alm(
+    out = masked_wiener_eb_alm(
         qu_map,
         inv_noise,
         cl_ee_prior,
@@ -304,8 +350,12 @@ def masked_wiener_bb(
         lmax=lmax,
         max_iter=max_iter,
         tol=tol,
+        precond=precond,
+        return_info=return_info,
     )
-    return jht.bandpower(eb_alm, int(lmax), spin=2)[1]  # C_BB channel
+    eb_alm, info = out if return_info else (out, None)
+    cl_bb = jht.bandpower(eb_alm, int(lmax), spin=2)[1]  # C_BB channel
+    return (cl_bb, info) if return_info else cl_bb
 
 
 def bin_spectrum(cl: jax.Array, bin_matrix: jax.Array, ell_min: int) -> jax.Array:

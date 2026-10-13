@@ -152,6 +152,53 @@ def test_masked_wiener_bb_shape_finite():
     assert bool(jnp.all(jnp.isfinite(cl)))
 
 
+def _small_wiener_problem(nside=16, lmax=24):
+    npix = hp.nside2npix(nside)
+    cl_ee = jnp.ones(lmax + 1).at[:2].set(0.0) * 1e-2
+    cl_bb = jnp.ones(lmax + 1).at[:2].set(0.0) * 1e-3
+    qu = jnp.asarray(np.random.default_rng(1).standard_normal((2, npix)))
+    invn = mk.inv_noise_map(jnp.ones(npix), 1.0, mask=mk.galactic_mask(nside, 0.6))
+    return qu, invn, cl_ee, cl_bb, dict(nside=nside, lmax=lmax)
+
+
+def test_masked_wiener_default_call_is_the_stock_jht_solve():
+    """With no precond / return_info the call is jht's stock-``cg`` path, bitwise."""
+    import jht
+
+    qu, invn, cl_ee, cl_bb, kw = _small_wiener_problem()
+    ours = mk.masked_wiener_eb_alm(qu, invn, cl_ee, cl_bb, **kw)
+    stock = jht.wiener(qu, (cl_ee, cl_bb), kw["nside"], kw["lmax"], spin=2,
+                       inv_noise=invn, max_iter=1000, tol=1e-8)
+    assert bool(jnp.array_equal(ours, stock))
+
+
+def test_masked_wiener_return_info_reports_a_truncated_solve():
+    """``max_iter=3`` stops unconverged and says so; the jht stopping rule is ``rel <= tol``."""
+    qu, invn, cl_ee, cl_bb, kw = _small_wiener_problem()
+    _alm, info = mk.masked_wiener_eb_alm(qu, invn, cl_ee, cl_bb, max_iter=3,
+                                         return_info=True, **kw)
+    assert int(info.n_iter) == 3
+    assert float(info.rel_residual) > 1e-8
+    cl, info = mk.masked_wiener_bb(qu, invn, cl_ee, cl_bb, return_info=True, **kw)
+    assert cl.shape == (kw["lmax"] + 1,)
+    assert float(info.rel_residual) <= 1e-8 and int(info.n_iter) < 1000
+
+
+def test_wiener_preconditioner_low_block_size():
+    """The exact block covers the spin-2 DOFs with ``l <= ell_split``: ``2((l_s+1)^2 - 4)``."""
+    qu, invn, cl_ee, cl_bb, kw = _small_wiener_problem()
+    p8 = mk.wiener_preconditioner(invn, cl_ee, cl_bb, ell_split=8, **kw)
+    assert p8.low_idx.shape == (2 * (9**2 - 4),)
+    assert p8.low_inv.shape == (154, 154)
+    diag = mk.wiener_preconditioner(invn, cl_ee, cl_bb, ell_split=None, **kw)
+    assert diag.low_idx.shape == (0,)
+    # ell_split >= lmax: the block is the whole operator, so the PCG finishes at once.
+    full = mk.wiener_preconditioner(invn, cl_ee, cl_bb, ell_split=kw["lmax"], **kw)
+    _alm, info = mk.masked_wiener_eb_alm(qu, invn, cl_ee, cl_bb, precond=full,
+                                         return_info=True, **kw)
+    assert int(info.n_iter) <= 2
+
+
 # ---------------------------------------------------------------------------
 # slow: science checkpoints  (tolerances set from the nside=256 validation run)
 # ---------------------------------------------------------------------------

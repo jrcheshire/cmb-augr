@@ -105,6 +105,9 @@ class CutskyMC:
         populated by :func:`mc_cutsky_bandpowers`. Lets a caller cross-debias one
         ensemble's raw recs with another ensemble's frozen ``transfer`` / ``leakage``
         (e.g. an SBC train/test split — see ``augr.sbc``).
+    wiener_max_rel_residual, wiener_max_n_iter
+        Worst final CG relative residual and largest iteration count over every
+        masked-Wiener solve in the ensemble (see :func:`mc_cutsky_bandpowers`).
     """
 
     debiased_bandpowers: np.ndarray
@@ -116,6 +119,8 @@ class CutskyMC:
     n_sims: int
     var_pix_ref: float
     rec_full: np.ndarray | None = None
+    wiener_max_rel_residual: float | None = None
+    wiener_max_n_iter: int | None = None
 
 
 def beamed_prior(cl: jax.Array, common_fwhm_arcmin: float, lmax: int) -> jax.Array:
@@ -139,17 +144,21 @@ def cutsky_bb_bandpower(
     ell_min: int,
     nside: int,
     lmax: int,
-    max_iter: int = 200,
+    max_iter: int = 1000,
     tol: float = 1e-8,
-) -> jax.Array:
+    precond=None,
+    return_info: bool = False,
+):
     """Raw binned ``C_b^{BB}`` of one cleaned Q/U map via the masked-Wiener estimator.
 
     Thin compose of :func:`augr.masking.masked_wiener_bb` (filter-suppressed,
     leakage-contaminated per-ℓ B power) and :func:`augr.masking.bin_spectrum`. The
     debias (:func:`augr.masking.debias_bandpower`) is applied at the ensemble level by
-    :func:`mc_cutsky_bandpowers`.
+    :func:`mc_cutsky_bandpowers`. ``precond`` / ``return_info`` pass through to
+    :func:`augr.masking.masked_wiener_eb_alm`; ``return_info`` gives ``(binned,
+    SolveInfo)``.
     """
-    cl = mk.masked_wiener_bb(
+    out = mk.masked_wiener_bb(
         cleaned_qu,
         inv_noise,
         cl_ee_prior,
@@ -158,8 +167,31 @@ def cutsky_bb_bandpower(
         lmax=int(lmax),
         max_iter=max_iter,
         tol=tol,
+        precond=precond,
+        return_info=return_info,
     )
-    return mk.bin_spectrum(cl, bin_matrix, ell_min)
+    if return_info:
+        cl, info = out
+        return mk.bin_spectrum(cl, bin_matrix, ell_min), info
+    return mk.bin_spectrum(out, bin_matrix, ell_min)
+
+
+_WIENER_LEGS = ("data", "transfer (CMB B)", "leakage (CMB E)", "fg_residual")
+
+
+def _wiener_unconverged(n_iter, rel_residual, max_iter: int, tol: float):
+    """True where a CG solve stopped at ``max_iter`` with its residual still above ``tol``."""
+    return (n_iter >= max_iter) & (rel_residual > tol)
+
+
+def _build_wiener_precond(inv_noise, cl_ee_prior, cl_bb_prior, *, nside, lmax, enabled, ell_split):
+    """The masked-Wiener preconditioner, or ``None`` when ``enabled`` is False."""
+    if not enabled:
+        return None
+    return mk.wiener_preconditioner(
+        inv_noise, cl_ee_prior, cl_bb_prior, nside=int(nside), lmax=int(lmax),
+        ell_split=ell_split,
+    )
 
 
 def _cleaned_b_qu(result, band_qu: jax.Array) -> jax.Array:
@@ -243,11 +275,17 @@ def _one_sim(bundle: dict, seed: int):
     lmax, nside = bundle["lmax"], bundle["nside"]
     result = cleaner(total, beams, lmax=lmax, nside=nside)
     priors = (bundle["inv_noise"], bundle["cl_ee_prior"], bundle["cl_bb_prior"])
-    bp_kw = bundle["bp_kw"]
-    rec_full = cutsky_bb_bandpower(result.cleaned_qu(), *priors, **bp_kw)
-    rec_b = cutsky_bb_bandpower(_cleaned_b_qu(result, sky.cmb_qu), *priors, **bp_kw)
-    rec_e = cutsky_bb_bandpower(_cleaned_e_qu(result, sky.cmb_qu), *priors, **bp_kw)
-    return np.asarray(rec_full), np.asarray(rec_b), np.asarray(rec_e)
+    bp_kw = dict(bundle["bp_kw"], return_info=True)
+    legs = (
+        result.cleaned_qu(),
+        _cleaned_b_qu(result, sky.cmb_qu),
+        _cleaned_e_qu(result, sky.cmb_qu),
+    )
+    out = [cutsky_bb_bandpower(qu, *priors, **bp_kw) for qu in legs]
+    recs = tuple(np.asarray(rec) for rec, _ in out)
+    n_iter = np.array([int(info.n_iter) for _, info in out])
+    rel = np.array([float(info.rel_residual) for _, info in out])
+    return (*recs, n_iter, rel)
 
 
 def mc_cutsky_bandpowers(
@@ -272,11 +310,13 @@ def mc_cutsky_bandpowers(
     var_pix_ref: float | None = None,
     knee_ell: jax.Array | None = None,
     alpha_knee: float = 1.0,
-    max_iter: int = 200,
+    max_iter: int = 1000,
     tol: float = 1e-8,
     workers: int = 1,
     spectra: CMBSpectra | None = None,
     bandpasses=None,
+    wiener_precond: bool = True,
+    wiener_ell_split: int | None = 32,
 ) -> CutskyMC:
     """Run the cut-sky masked-Wiener MC ensemble → debiased bandpowers + covariance.
 
@@ -332,6 +372,15 @@ def mc_cutsky_bandpowers(
     bandpasses
         Optional per-band ``Bandpass`` to bandpass-integrate the foreground sims
         (match the cleaner's color-corrected SEDs); ``None`` → monochromatic.
+    max_iter, tol
+        Masked-Wiener CG budget and relative-residual tolerance. Any solve that ends
+        at ``max_iter`` above ``tol`` raises ``RuntimeError``: an unconverged filter
+        depends on the data and biases the debias.
+    wiener_precond, wiener_ell_split
+        Build :func:`augr.masking.wiener_preconditioner` once (exact block on
+        ``ℓ ≤ wiener_ell_split``; ``None`` = diagonal only) and use it in every solve.
+        It changes iteration counts, not the solution; the block costs
+        ``2((ell_split+1)² − 4)`` operator applications (~3 min at nside 128).
     """
     spectra = CMBSpectra() if spectra is None else spectra
     freqs_ghz = tuple(float(f) for f in freqs_ghz)
@@ -369,6 +418,10 @@ def mc_cutsky_bandpowers(
         var_pix_ref = float(jnp.mean((cn[0] ** 2 + cn[1] ** 2)[obs]) / 2.0)
 
     inv_noise = mk.inv_noise_map(hit_map, var_pix_ref, mask=mask)
+    precond = _build_wiener_precond(
+        inv_noise, cl_ee_prior, cl_bb_prior, nside=nside, lmax=lmax,
+        enabled=wiener_precond, ell_split=wiener_ell_split,
+    )
 
     bp_kw = dict(
         bin_matrix=jnp.asarray(bin_matrix),
@@ -377,6 +430,7 @@ def mc_cutsky_bandpowers(
         lmax=int(lmax),
         max_iter=max_iter,
         tol=tol,
+        precond=precond,
     )
 
     bundle = {
@@ -400,6 +454,17 @@ def mc_cutsky_bandpowers(
     rec_full = jnp.asarray(np.stack([o[0] for o in out], axis=0))
     rec_b = jnp.asarray(np.stack([o[1] for o in out], axis=0))
     rec_e = jnp.asarray(np.stack([o[2] for o in out], axis=0))
+    n_iter = np.stack([o[3] for o in out], axis=0)  # (n_sims, 3 legs)
+    rel = np.stack([o[4] for o in out], axis=0)
+    bad = np.asarray(_wiener_unconverged(n_iter, rel, max_iter, tol))
+    if bad.any():
+        i, leg = (int(x) for x in np.argwhere(bad)[0])
+        raise RuntimeError(
+            f"masked-Wiener CG did not converge: {int(bad.sum())} of {bad.size} solves "
+            f"hit max_iter={max_iter} above tol={tol:g} (first: sim seed {seeds[i]}, "
+            f"{_WIENER_LEGS[leg]} leg, rel_residual {rel[i, leg]:.2e}). Raise max_iter "
+            f"or enable wiener_precond."
+        )
 
     transfer = mk.transfer_function(rec_b, jnp.asarray(true_bb_binned))
     leakage = mk.leakage_template(rec_e)
@@ -416,6 +481,8 @@ def mc_cutsky_bandpowers(
         n_sims=int(n_sims),
         var_pix_ref=float(var_pix_ref),
         rec_full=np.asarray(rec_full),
+        wiener_max_rel_residual=float(rel.max()),
+        wiener_max_n_iter=int(n_iter.max()),
     )
 
 
@@ -514,6 +581,9 @@ class CutskyMCContext(eqx.Module):
     # rescale in mc_cutsky_cov_traced(cl_bb_res=...): the sims carry full lensing B,
     # and sqrt(C_res / C_lens) turns that into the design's residual in-trace.
     cl_bb_lens_ref: jax.Array | None = None
+    # ``jht.WienerPreconditioner`` for the masked-Wiener solves (built once for
+    # ``inv_noise`` and the priors); ``None`` on MASTER or when disabled.
+    wiener_precond: tuple | None = None
     estimator: str = eqx.field(static=True, default="master")
     lmax_mask: int | None = eqx.field(static=True, default=None)
     # Derived eagerly from bin_matrix (a traced leaf, so it cannot be read
@@ -546,6 +616,10 @@ class CutskyMCTraced(eqx.Module):
     # (eig.delta_r_from_residual). None unless the traced forward was called with
     # fg_residual=True.
     fg_residual_bandpower: jax.Array | None = None
+    # Worst final CG relative residual / largest iteration count over every
+    # masked-Wiener solve in the ensemble. None on the MASTER branch.
+    wiener_max_rel_residual: jax.Array | None = None
+    wiener_max_n_iter: jax.Array | None = None
 
 
 def make_cutsky_mc_context(
@@ -573,7 +647,7 @@ def make_cutsky_mc_context(
     fg_eb_alm: jax.Array | None = None,
     knee_ell: jax.Array | None = None,
     alpha_knee: float = 1.0,
-    max_iter: int = 200,
+    max_iter: int = 1000,
     tol: float = 1e-8,
     spectra: CMBSpectra | None = None,
     bandpasses=None,
@@ -582,6 +656,8 @@ def make_cutsky_mc_context(
     lmax_mask: int | None = None,
     split_lensing: bool = False,
     share_fg: bool = True,
+    wiener_precond: bool = True,
+    wiener_ell_split: int | None = 32,
 ) -> CutskyMCContext:
     """Eager precompute for the differentiable cut-sky MC.
 
@@ -638,6 +714,14 @@ def make_cutsky_mc_context(
     still drawn from ``base_seed``, so the ensemble matches a generated one exactly.
     ``fg_model`` is not read when it is supplied; the caller checks the cache's
     ``fg_model``. Exclusive with ``harmonic_skies``.
+
+    ``wiener_precond`` / ``wiener_ell_split`` (Wiener path only): build
+    :func:`augr.masking.wiener_preconditioner` once for ``inv_noise`` and the priors
+    (exact block on ``ℓ ≤ wiener_ell_split``; ``None`` = diagonal only). It changes
+    iteration counts, not the solution; the block costs ``2((ell_split+1)² − 4)``
+    operator applications (~3 min at nside 128), paid per context and so per cleaner
+    (``inv_noise`` carries the cleaner's ``var_pix_ref``). ``max_iter`` / ``tol`` are
+    the CG budget; :func:`mc_cutsky_cov_traced` raises on any unconverged solve.
     """
     # The inverse-noise filter -- and hence var_pix_ref and the setup clean that
     # derives it -- exists only for the masked-Wiener estimator. MASTER never
@@ -761,6 +845,10 @@ def make_cutsky_mc_context(
     inv_noise = (
         mk.inv_noise_map(hit_map, var_pix_ref, mask=mask) if needs_inv_noise else None
     )
+    wiener_pc = _build_wiener_precond(
+        inv_noise, cl_ee_prior, cl_bb_prior, nside=nside, lmax=lmax,
+        enabled=needs_inv_noise and wiener_precond, ell_split=wiener_ell_split,
+    )
 
     return CutskyMCContext(
         harmonic_skies=harmonic_skies,
@@ -789,6 +877,7 @@ def make_cutsky_mc_context(
             if harmonic_skies.cmb_b_lens_alm is not None
             else None
         ),
+        wiener_precond=wiener_pc,
         estimator=str(estimator),
         lmax_mask=None if lmax_mask is None else int(lmax_mask),
         master_bin_edges=(_edges_from_bin_matrix(bin_matrix, ell_min)
@@ -1365,6 +1454,7 @@ def mc_cutsky_cov_traced(
     fg_residual: bool = False,
     remat: bool = True,
     sim_batch: int = 1,
+    wiener_check: bool = True,
 ) -> CutskyMCTraced:
     """Differentiable cut-sky MC bandpower covariance as a function of ``w_inv`` (and beams).
 
@@ -1430,6 +1520,14 @@ def mc_cutsky_cov_traced(
     across every visible device (the GPUs, or ``JAX_NUM_CPU_DEVICES`` on CPU);
     ``AUGR_SIM_NO_SHARD=1`` opts out. The masked-Wiener branch is not sharded.
 
+    On the masked-Wiener branch every solve uses ``ctx.wiener_precond`` and reports
+    its convergence: :attr:`CutskyMCTraced.wiener_max_rel_residual` /
+    ``wiener_max_n_iter``. With ``wiener_check=True`` (default) a solve that ends at
+    ``ctx.max_iter`` above ``ctx.tol`` raises (``eqx.error_if``; works under ``jit``
+    and ``grad``, and fires at the first offending sim). ``wiener_check=False`` only
+    records. The backward pass's transpose solves run with the same preconditioner and
+    budget but report nothing.
+
     The straight-through gradient flows through a *sample* covariance, so it carries
     Monte-Carlo noise -- characterise grad std vs ``n_sims`` before trusting a
     descent step.
@@ -1467,6 +1565,8 @@ def mc_cutsky_cov_traced(
         lmax=ctx.lmax,
         max_iter=ctx.max_iter,
         tol=ctx.tol,
+        precond=ctx.wiener_precond,
+        return_info=True,
     )
 
     # Same shared-foreground handling as the MASTER branch; see the comment there.
@@ -1491,41 +1591,36 @@ def mc_cutsky_cov_traced(
             alpha_knee=ctx.alpha_knee,
         )
         result = cleaner(total, bf, bp, lmax=ctx.lmax, nside=ctx.nside)
-        rec_full = cutsky_bb_bandpower(
+        legs = [
             result.cleaned_qu(),
-            ctx.inv_noise,
-            ctx.cl_ee_prior,
-            ctx.cl_bb_prior,
-            **bp_kw,
-        )
-        rec_b = cutsky_bb_bandpower(
             _cleaned_b_qu(result, band_sky.cmb_qu),
-            ctx.inv_noise,
-            ctx.cl_ee_prior,
-            ctx.cl_bb_prior,
-            **bp_kw,
-        )
-        rec_e = cutsky_bb_bandpower(
             _cleaned_e_qu(result, band_sky.cmb_qu),
-            ctx.inv_noise,
-            ctx.cl_ee_prior,
-            ctx.cl_bb_prior,
-            **bp_kw,
-        )
-        if not fg_residual:
-            return rec_full, rec_b, rec_e
-        # The foreground's footprint on rec_full: its cleaned E and B, through the
-        # same filter. The E half is the foreground E->B leakage, which the CMB-E
-        # leakage template does not remove.
-        fg = band_sky.fg_qu
-        rec_fg = cutsky_bb_bandpower(
-            _cleaned_b_qu(result, fg) + _cleaned_e_qu(result, fg),
-            ctx.inv_noise,
-            ctx.cl_ee_prior,
-            ctx.cl_bb_prior,
-            **bp_kw,
-        )
-        return rec_full, rec_b, rec_e, rec_fg
+        ]
+        if fg_residual:
+            # The foreground's footprint on rec_full: its cleaned E and B, through the
+            # same filter. The E half is the foreground E->B leakage, which the CMB-E
+            # leakage template does not remove.
+            fg = band_sky.fg_qu
+            legs.append(_cleaned_b_qu(result, fg) + _cleaned_e_qu(result, fg))
+        out = [
+            cutsky_bb_bandpower(
+                qu, ctx.inv_noise, ctx.cl_ee_prior, ctx.cl_bb_prior, **bp_kw
+            )
+            for qu in legs
+        ]
+        recs = tuple(rec for rec, _ in out)
+        n_iter = jnp.stack([info.n_iter for _, info in out])
+        rel = jnp.stack([info.rel_residual for _, info in out])
+        if wiener_check:
+            recs = eqx.error_if(
+                recs,
+                jnp.any(_wiener_unconverged(n_iter, rel, ctx.max_iter, ctx.tol)),
+                "masked-Wiener CG did not converge (a solve hit ctx.max_iter above "
+                "ctx.tol). Raise max_iter, enable wiener_precond in "
+                "make_cutsky_mc_context, or pass wiener_check=False to only record "
+                "it in wiener_max_rel_residual.",
+            )
+        return (*recs, jnp.max(rel), jnp.max(n_iter))
 
     # Sequential scan over the sim axis: the cleaner body is traced ONCE and reused
     # per sim -- O(1) compile in n_sims, scan-accumulated outputs (no live
@@ -1533,16 +1628,17 @@ def mc_cutsky_cov_traced(
     # (leading sim axis on its alm leaves); the map slices it back to a per-sim
     # HarmonicSky that `_one` beams in-trace. Scan rather than vmap is the default
     # here for a reason specific to THIS branch: `cutsky_bb_bandpower` runs a
-    # `while_loop` CG (jht.wiener, maxiter=200) three times per sim (four under
+    # `while_loop` CG (jht.wiener, run to convergence) three times per sim (four under
     # fg_residual), and vmapping a while_loop runs it until every lane converges --
     # so `sim_batch > 1` makes each batch cost its slowest member. Raise it only with a measurement.
-    rec_full, rec_b, rec_e, *rec_fg = _sim_map(
+    *recs, rel_max, n_iter_max = _sim_map(
         lambda bk, *cs: _one(bk[0], bk[1], *cs),
         (mapped_skies, ctx.noise_keys),
         remat=remat,
         sim_batch=sim_batch,
         consts=fg_consts,
     )
+    rec_full, rec_b, rec_e, *rec_fg = recs
 
     # The transfer's denominator is the binned power the sims' B actually carries.
     # Under cl_bb_res their lensing part is rescaled to the residual, so the full
@@ -1570,4 +1666,6 @@ def mc_cutsky_cov_traced(
         fg_residual_bandpower=(
             jnp.mean(rec_fg[0], axis=0) / transfer if fg_residual else None
         ),
+        wiener_max_rel_residual=jnp.max(rel_max),
+        wiener_max_n_iter=jnp.max(n_iter_max),
     )

@@ -670,6 +670,39 @@ identity and nothing is lost. `forecast_from_spectra` accepts
 `bandpower_window=` / `bandpower_window_ells=` and threads them through.
 
 
+## Masked-Wiener solves are preconditioned and must converge
+
+Every masked-Wiener solve (`masking.masked_wiener_eb_alm`, via
+`spectrum_stages.cutsky_bb_bandpower`) is jht's CG on the prior-whitened
+system. jax's stock `cg` reports nothing, and at nside 128 / lmax 192 on
+Planck GAL20 / GAL70 a 200-iteration budget stops at relative residual
+1.2e-4 / 7.8e-4 (1e-8 needs 616 / 971 plain iterations). An unconverged filter
+depends on the data, so the debias and any response matrix built from it are
+wrong.
+
+- `make_cutsky_mc_context(estimator="wiener")` and `mc_cutsky_bandpowers` build
+  `masking.wiener_preconditioner` once (`wiener_precond=True`,
+  `wiener_ell_split=32`: ℓ-diagonal plus the exact ℓ ≤ 32 block, 241 / 267
+  iterations at that config). It changes iteration counts, not the solution.
+  The block costs `2((ell_split+1)² − 4)` operator applications (~3 min at
+  nside 128), per context and so per cleaner, since `inv_noise` carries the
+  cleaner's `var_pix_ref`.
+- `max_iter` defaults to 1000, `tol` to 1e-8. A solve ending at `max_iter`
+  above `tol` raises: `RuntimeError` on the eager path, `eqx.error_if` in
+  `mc_cutsky_cov_traced` (works under `jit` / `grad`; `wiener_check=False`
+  only records). The worst residual and iteration count are on
+  `CutskyMC` / `CutskyMCTraced.wiener_max_rel_residual` / `wiener_max_n_iter`.
+- The backward pass's transpose solves use the same preconditioner and budget
+  and report nothing, and they need more iterations than the forward ones
+  (nside 16: capping at the forward need moves the gradient by 1.2e-9), so
+  keep `max_iter` well above the recorded forward `wiener_max_n_iter`. Gate:
+  the gradient is bitwise identical at budget 1000 and 5000.
+- Two converged solutions agree only to the tolerance floor: at tol 1e-8 the
+  per-ℓ bandpowers of one nside 16 / lmax 24 sim differ by 1e-8 – 5e-5
+  relative between a preconditioned and a plain solve (largest on the E-only
+  leakage leg, where C_BB is tiny). Gates comparing two Wiener paths must sit
+  above that floor or tighten `tol`.
+
 ## MASTER pseudo-Cℓ on an apodized mask (`augr/pseudo_cl.py`)
 
 Cut-sky BB bandpowers for an *already cleaned* map, with the mask's mode
