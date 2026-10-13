@@ -253,7 +253,10 @@ def test_cmilc_cmb_transfer_unity() -> None:
     np.testing.assert_allclose(transfer, 1.0, rtol=2e-3)
 
 
-@pytest.mark.parametrize("localization_fwhm_arcmin", [None, 600.0])
+# The localized arm's jit compile alone runs 150-180+ s on the 2-core CI runner.
+@pytest.mark.parametrize(
+    "localization_fwhm_arcmin", [None, pytest.param(600.0, marks=pytest.mark.slow)]
+)
 def test_cmilc_under_jit_matches_eager(localization_fwhm_arcmin) -> None:
     """cMILC runs inside a trace (the cut-sky MC's per-sim ``lax.map``) and matches eager.
 
