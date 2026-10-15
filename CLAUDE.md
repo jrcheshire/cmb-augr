@@ -702,6 +702,27 @@ wrong.
   relative between a preconditioned and a plain solve (largest on the E-only
   leakage leg, where C_BB is tiny). Gates comparing two Wiener paths must sit
   above that floor or tighten `tol`.
+- **The r-Jacobian needs the exact window, not `bin_matrix @ C_tensor`.** The
+  debias divides by one per-bin `F_b` calibrated on the lensing shape, but the
+  sharp-mask filter couples ℓ. JPL CRN injections (nside 128, Planck GAL masks)
+  measured σ(r) ~160x looser than the top-hat Jacobian at GAL20 and 1.3-1.7x at
+  GAL70, for NILC and cMILC06 alike. `masking.wiener_normal_matrix` (dense `A`,
+  `n_dof` operator applications, `8 n_dof²` bytes: 44 GB at lmax 192) →
+  `wiener_bb_response` (`K`, one Cholesky of `P A P + I` plus the inverse of its
+  trailing B block; `scale=` reuses one `A` across `var_pix_ref`, since `A` is
+  linear in `N⁻¹`) → `debiased_window` (`W = bin K B_c² / F_b` with the *same*
+  MC `F_b` that debiased the data, so `J_r = W @ C_tensor`). Use an explicit
+  Jacobian (or `SignalModel(bandpower_window=W, ell_max=lmax)` with
+  `external_covariance`) -- not for a bandpower-space A_res template, which
+  `SignalModel` would push through `W` a second time. `CutskyMC` /
+  `CutskyMCTraced.rec_transfer` give the per-sim transfer leg for MC errors.
+  Gates: `tests/test_masking.py` (dense vs `jht.wiener`, `K` vs direct CG
+  columns, MC mean of a power law) and
+  `test_spectrum_stages.py::test_analytic_transfer_matches_the_mc_transfer`, each
+  with a diagonal-`K` mutation that fails. Their MC checks must assert the
+  solves converged: `masked_wiener_bb` reports truncation only via
+  `return_info`, and at high S/N (cond 4.6e7 at nside 16) plain CG needs
+  ~15,500 iterations.
 
 ## MASTER pseudo-Cℓ on an apodized mask (`augr/pseudo_cl.py`)
 

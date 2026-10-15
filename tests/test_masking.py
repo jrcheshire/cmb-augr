@@ -200,6 +200,153 @@ def test_wiener_preconditioner_low_block_size():
 
 
 # ---------------------------------------------------------------------------
+# exact bandpower window (dense B→B response)
+# ---------------------------------------------------------------------------
+# nside 16 / lmax 24 (n_dof 1242), lensing priors, non-uniform hits, binary f_sky 0.6
+# mask. var_pix 1e-5 puts the filter mid-way between noise- and signal-dominated
+# (diag K 0.03-0.29 at l = 2..7, off-diagonal mass ~0.4 of the diagonal), so the
+# l-coupling the window exists for is large. Margins measured 2026-10-13.
+
+_WNS, _WLMAX, _WVAR = 16, 24, 1e-5
+
+
+@pytest.fixture(scope="module")
+def dense_window():
+    ls = load_lensing_spectra()
+    cl_ee = jnp.clip(ls.cl_ee_len[: _WLMAX + 1], 0.0, None)
+    cl_bb = jnp.clip(ls.cl_bb_len[: _WLMAX + 1], 0.0, None)
+    hits = jnp.asarray(np.linspace(1.0, 3.0, hp.nside2npix(_WNS)))
+    invn = mk.inv_noise_map(hits, _WVAR, mask=mk.galactic_mask(_WNS, 0.6))
+    normal = mk.wiener_normal_matrix(invn, nside=_WNS, lmax=_WLMAX)
+    K = mk.wiener_bb_response(normal, cl_ee, cl_bb, lmax=_WLMAX)
+    return invn, cl_ee, cl_bb, normal, K
+
+
+def test_wiener_normal_matrix_reproduces_the_jht_wiener_mean(dense_window):
+    """``P (P A P + I)⁻¹ P b`` from the dense ``A`` == ``jht.wiener`` on a random map.
+
+    Checks the operator, the DOF layout and the per-DOF ℓ index at once. Measured
+    4.4e-12 (max|Δx| / max|x|) against a tol-1e-13 CG solve; gate 1e-10.
+    """
+    import jht
+
+    invn, cl_ee, cl_bb, normal, _K = dense_window
+    npix = hp.nside2npix(_WNS)
+    qu = jnp.asarray(np.random.default_rng(3).standard_normal((2, npix)))
+    ell = mk._dof_ell(_WLMAX)
+    n_e = ell.size // 2
+    pw = np.sqrt(np.concatenate([np.asarray(cl_ee)[ell[:n_e]], np.asarray(cl_bb)[ell[n_e:]]]))
+    b = np.asarray(jht.alm_to_real(
+        jht.adjoint_synthesis(invn[None, :] * qu, _WNS, _WLMAX, spin=2), _WLMAX, spin=2))
+    x_dense = pw * np.linalg.solve(pw[:, None] * normal * pw[None, :] + np.eye(ell.size), pw * b)
+    alm = jht.wiener(qu, (cl_ee, cl_bb), _WNS, _WLMAX, spin=2, inv_noise=invn, tol=1e-13,
+                     max_iter=5000)
+    x_cg = np.asarray(jht.alm_to_real(alm, _WLMAX, spin=2))
+    assert np.max(np.abs(x_dense - x_cg)) / np.max(np.abs(x_cg)) < 1e-10
+
+
+@pytest.mark.parametrize("l0", [2, 9])
+def test_wiener_bb_response_matches_direct_cg_solves(dense_window, l0):
+    """``K[:, l0]`` == output B power summed over CG solves of every unit B DOF at ``l0``.
+
+    An independent path: no dense algebra, no prior-ratio formula. Measured 2.0e-11
+    (l0=2) and 3.5e-13 (l0=9), max|ΔK| / max|K[:, l0]|; gate 1e-9.
+    """
+    import jht
+
+    invn, cl_ee, cl_bb, _normal, K = dense_window
+    ell = mk._dof_ell(_WLMAX)
+    n_e = ell.size // 2
+    col = np.zeros(_WLMAX + 1)
+    for d in np.flatnonzero(ell[n_e:] == l0):
+        unit = np.zeros(ell.size)
+        unit[n_e + d] = 1.0
+        qu = jht.synthesis(jht.real_to_alm(jnp.asarray(unit), _WLMAX, spin=2), _WNS, _WLMAX, spin=2)
+        out, info = jht.wiener(qu, (cl_ee, cl_bb), _WNS, _WLMAX, spin=2, inv_noise=invn,
+                               tol=1e-13, max_iter=20000, return_info=True)
+        assert float(info.rel_residual) <= 1e-13
+        col += np.asarray(jht.bandpower(out, _WLMAX, spin=2)[1])
+    assert np.max(np.abs(K[:, l0] - col)) / np.max(np.abs(col)) < 1e-9
+
+
+def test_wiener_bb_response_scale_matches_scaled_noise(dense_window):
+    """``K(A(N⁻¹), scale=s)`` == ``K(A(s·N⁻¹))``: one normal matrix serves every ``var_pix_ref``.
+
+    Measured 4.1e-15; gate 1e-12.
+    """
+    invn, cl_ee, cl_bb, normal, _K = dense_window
+    s = 3.7
+    k_scaled = mk.wiener_bb_response(normal, cl_ee, cl_bb, lmax=_WLMAX, scale=s)
+    normal_s = mk.wiener_normal_matrix(invn * s, nside=_WNS, lmax=_WLMAX)
+    k_direct = mk.wiener_bb_response(normal_s, cl_ee, cl_bb, lmax=_WLMAX)
+    assert np.max(np.abs(k_scaled - k_direct)) / np.max(np.abs(k_direct)) < 1e-12
+
+
+def test_debiased_window_reproduces_its_calibration_spectrum(dense_window):
+    """With ``transfer`` = the analytic ``F_b`` at ``C``, ``W @ C`` == ``bin(C)``.
+
+    Algebra, but it pins the ℓ offsets between ``bin_matrix`` (from ``ell_min``), ``K``
+    (from 0) and ``W`` (from ``ell_min`` to lmax). Measured 2e-16; gate 1e-12.
+    """
+    _invn, _ee, cl_bb, _normal, K = dense_window
+    edges = _make_bin_edges(2, 20, 2, 5)
+    bm, _ = _build_bin_matrix(np.arange(2, 21), edges, "tophat")
+    c = np.asarray(cl_bb) * 1.3
+    F = mk.analytic_transfer(K, bm, 2, common_fwhm_arcmin=60.0, true_cl_bb=c)
+    W, ells = mk.debiased_window(K, bm, 2, common_fwhm_arcmin=60.0, transfer=F)
+    assert ells[0] == 2 and ells[-1] == _WLMAX and W.shape == (bm.shape[0], _WLMAX - 1)
+    ratio = (W @ c[ells]) / np.asarray(mk.bin_spectrum(c, bm, 2))
+    assert np.max(np.abs(ratio - 1.0)) < 1e-12
+
+
+def test_wiener_bb_response_rejects_a_zero_bb_prior(dense_window):
+    """The ``P⁻¹`` form needs ``C_BB > 0`` on ℓ = 2..lmax."""
+    _invn, cl_ee, cl_bb, normal, _K = dense_window
+    with pytest.raises(ValueError, match="positive"):
+        mk.wiener_bb_response(normal, cl_ee, cl_bb.at[7].set(0.0), lmax=_WLMAX)
+
+
+@pytest.mark.slow
+def test_wiener_bb_response_predicts_the_mc_mean(dense_window):
+    """Mean raw Wiener BB of noise-free B-only sims == ``K @ C`` for a non-lensing ``C``.
+
+    The truth is a power law (not the lensing shape the prior carries), drawn with
+    ``healpy.synalm``, so neither the DOF-variance convention nor the spectrum comes
+    from ``K``'s own construction. Every solve is checked converged: at higher S/N
+    (var 1e-7, cond(M+I) 4.6e7) plain CG needs ~15,500 iterations and a silently
+    truncated solve fails this test. Measured over ℓ = 2..24 with 48 sims: χ²/dof 1.07
+    with ``K``, 36.5 with ``K``'s diagonal (the mutation); gates < 2 and > 10.
+    """
+    import jax
+    import jht
+
+    invn, cl_ee, cl_bb, _normal, K = dense_window
+    ell = np.arange(_WLMAX + 1)
+    c = np.where(ell >= 2, 1e-6 * (np.maximum(ell, 2) / 10.0) ** -1.0, 0.0)
+    n_sims = 48
+    alms = []
+    for i in range(n_sims):
+        np.random.seed(1000 + i)  # noqa: NPY002 - healpy.synalm uses the global RNG
+        alms.append(hp.synalm(c, lmax=_WLMAX, new=True))
+    b = jnp.asarray(np.array(alms))
+    qu = jax.vmap(lambda a: jht.synthesis(jnp.stack([jnp.zeros_like(a), a]), _WNS, _WLMAX, spin=2))(b)
+    solve = jax.jit(jax.vmap(lambda q: mk.masked_wiener_bb(
+        q, invn, cl_ee, cl_bb, nside=_WNS, lmax=_WLMAX, tol=1e-10, max_iter=20000,
+        return_info=True)))
+    recs, info = solve(qu)
+    assert float(jnp.max(info.rel_residual)) <= 1e-10
+    recs = np.asarray(recs)
+    mean, err = recs.mean(0), recs.std(0, ddof=1) / np.sqrt(n_sims)
+
+    def chi2_dof(pred):
+        z = (mean - pred)[2:] / err[2:]
+        return float(np.mean(z**2))
+
+    assert chi2_dof(K @ c) < 2.0
+    assert chi2_dof(np.diag(K) * c) > 10.0
+
+
+# ---------------------------------------------------------------------------
 # slow: science checkpoints  (tolerances set from the nside=256 validation run)
 # ---------------------------------------------------------------------------
 

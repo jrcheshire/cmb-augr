@@ -105,6 +105,10 @@ class CutskyMC:
         populated by :func:`mc_cutsky_bandpowers`. Lets a caller cross-debias one
         ensemble's raw recs with another ensemble's frozen ``transfer`` / ``leakage``
         (e.g. an SBC train/test split — see ``augr.sbc``).
+    rec_transfer
+        The per-sim RAW transfer-leg bandpowers ``(n_sims, n_bins)`` (cleaned CMB-B
+        through the filter) whose mean over ``true_bb_binned`` is :attr:`transfer`;
+        gives the transfer's MC error. Populated by :func:`mc_cutsky_bandpowers`.
     wiener_max_rel_residual, wiener_max_n_iter
         Worst final CG relative residual and largest iteration count over every
         masked-Wiener solve in the ensemble (see :func:`mc_cutsky_bandpowers`).
@@ -119,6 +123,7 @@ class CutskyMC:
     n_sims: int
     var_pix_ref: float
     rec_full: np.ndarray | None = None
+    rec_transfer: np.ndarray | None = None
     wiener_max_rel_residual: float | None = None
     wiener_max_n_iter: int | None = None
 
@@ -481,6 +486,7 @@ def mc_cutsky_bandpowers(
         n_sims=int(n_sims),
         var_pix_ref=float(var_pix_ref),
         rec_full=np.asarray(rec_full),
+        rec_transfer=np.asarray(rec_b),
         wiener_max_rel_residual=float(rel.max()),
         wiener_max_n_iter=int(n_iter.max()),
     )
@@ -620,6 +626,9 @@ class CutskyMCTraced(eqx.Module):
     # masked-Wiener solve in the ensemble. None on the MASTER branch.
     wiener_max_rel_residual: jax.Array | None = None
     wiener_max_n_iter: jax.Array | None = None
+    # Per-sim raw transfer-leg bandpowers (n_sims, n_bins), whose mean over the truth
+    # is `transfer` (its MC error). None on the MASTER branch.
+    rec_transfer: jax.Array | None = None
 
 
 def make_cutsky_mc_context(
@@ -1668,4 +1677,5 @@ def mc_cutsky_cov_traced(
         ),
         wiener_max_rel_residual=jnp.max(rel_max),
         wiener_max_n_iter=jnp.max(n_iter_max),
+        rec_transfer=rec_b,
     )
