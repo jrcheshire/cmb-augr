@@ -59,6 +59,7 @@ from . import masking as mk
 from .cleaning import Cleaner
 from .compsep_sims import (
     HarmonicSky,
+    _beam_fg_eb,
     assemble_band_maps,
     beam_harmonic_sky,
     fg_model_is_static,
@@ -629,6 +630,14 @@ class CutskyMCTraced(eqx.Module):
     # Per-sim raw transfer-leg bandpowers (n_sims, n_bins), whose mean over the truth
     # is `transfer` (its MC error). None on the MASTER branch.
     rec_transfer: jax.Array | None = None
+    # Per-sim residual-foreground bandpowers (n_sims, n_bins) on the same debiased
+    # scale; their mean is fg_residual_bandpower. Masked-Wiener branch, fg_residual.
+    fg_residual_per_sim: jax.Array | None = None
+    # The residual split by PySM component when the context carries fg_comp_eb_alm:
+    # mean (n_comp, n_bins) and per-sim (n_sims, n_comp, n_bins), debiased scale. For
+    # two components the cross is (total - first - second) / 2.
+    fg_residual_components: jax.Array | None = None
+    fg_residual_components_per_sim: jax.Array | None = None
 
 
 def make_cutsky_mc_context(
@@ -667,6 +676,8 @@ def make_cutsky_mc_context(
     share_fg: bool = True,
     wiener_precond: bool = True,
     wiener_ell_split: int | None = 32,
+    fg_comp_eb_alm=None,
+    fg_seed_offset: int | None = None,
 ) -> CutskyMCContext:
     """Eager precompute for the differentiable cut-sky MC.
 
@@ -731,6 +742,23 @@ def make_cutsky_mc_context(
     operator applications (~3 min at nside 128), paid per context and so per cleaner
     (``inv_noise`` carries the cleaner's ``var_pix_ref``). ``max_iter`` / ``tol`` are
     the CG budget; :func:`mc_cutsky_cov_traced` raises on any unconverged solve.
+
+    ``fg_comp_eb_alm`` (optional): the foreground split by PySM component, from
+    :func:`augr.compsep_sims.fg_eb_alm_components`. Either one shared stack
+    ``(n_comp, n_band, 2, n_alm)`` (a static preset) or a per-sim one
+    ``(n_sims + 1, n_comp, n_band, 2, n_alm)`` whose last entry is the setup-clean
+    sim's (``base_seed + n_sims``). The sims' total foreground is its component sum,
+    and ``mc_cutsky_cov_traced(fg_residual=True)`` then reports one residual per
+    component. ``fg_model`` is not read. Exclusive with ``fg_eb_alm`` and
+    ``harmonic_skies``.
+
+    ``fg_seed_offset`` (optional, generated foregrounds only): draw each sim's
+    foreground at ``fg_seed = seed + fg_seed_offset`` instead of the CMB seed. The CMB
+    draws reseed numpy's global RNG with ``seed``, ``seed + 1`` and ``seed + 2``, which
+    are the very seeds a preset's first stochastic component gets at offset 0 (see
+    :func:`augr.compsep_sims._component_seeds`) -- so without an offset, ``d11``'s
+    small scales replay the CMB's random draws. ``None`` (default) keeps that legacy
+    seeding, so earlier ``s6`` / ``d10s6`` ensembles reproduce.
     """
     # The inverse-noise filter -- and hence var_pix_ref and the setup clean that
     # derives it -- exists only for the masked-Wiener estimator. MASTER never
@@ -753,7 +781,24 @@ def make_cutsky_mc_context(
     if fg_eb_alm is not None and harmonic_skies is not None:
         raise ValueError("pass fg_eb_alm or harmonic_skies, not both.")
     shared_fg = None
-    if fg_eb_alm is not None:
+    shared_comp = None
+    per_sim_comp = None
+    if fg_comp_eb_alm is not None:
+        if fg_eb_alm is not None or harmonic_skies is not None:
+            raise ValueError("fg_comp_eb_alm is exclusive with fg_eb_alm and harmonic_skies.")
+        comp = np.asarray(fg_comp_eb_alm)
+        tail = (len(freqs_ghz), 2, alm_size(int(lmax)))
+        if comp.ndim == 4 and comp.shape[1:] == tail:
+            shared_comp = jnp.asarray(comp)
+            shared_fg = jnp.sum(shared_comp, axis=0)
+        elif comp.ndim == 5 and comp.shape[2:] == tail and comp.shape[0] == int(n_sims) + 1:
+            per_sim_comp = comp
+        else:
+            raise ValueError(
+                f"fg_comp_eb_alm has shape {comp.shape}; expected (n_comp, *{tail}) or "
+                f"(n_sims + 1 = {int(n_sims) + 1}, n_comp, *{tail})."
+            )
+    elif fg_eb_alm is not None:
         shared_fg = jnp.asarray(fg_eb_alm)
         expected = (len(freqs_ghz), 2, alm_size(int(lmax)))
         if tuple(shared_fg.shape) != expected:
@@ -771,6 +816,8 @@ def make_cutsky_mc_context(
             freqs_ghz, fg_model, int(lmax), int(nside), bandpasses=bandpasses
         )
 
+    supplied_fg = shared_fg is not None or per_sim_comp is not None
+
     def _hsky(seed: int, *, attach_fg: bool = True) -> HarmonicSky:
         sky = harmonic_sky(
             freqs_ghz,
@@ -778,14 +825,21 @@ def make_cutsky_mc_context(
             r_in=float(r_in),
             nside=int(nside),
             lmax=int(lmax),
-            fg_model=fg_model if shared_fg is None else None,
+            fg_model=None if supplied_fg else fg_model,
             cmb_seed=int(seed),
+            fg_seed=None if fg_seed_offset is None else int(seed) + int(fg_seed_offset),
             cl_ee=cl_ee,
             bandpasses=bandpasses,
             split_lensing=split_lensing,
         )
         if shared_fg is not None and attach_fg:
-            sky = dataclasses.replace(sky, fg_eb_alm=shared_fg)
+            sky = dataclasses.replace(sky, fg_eb_alm=shared_fg, fg_comp_eb_alm=shared_comp)
+        if per_sim_comp is not None and attach_fg:
+            j = int(seed) - int(base_seed)  # the setup sim is j = n_sims, the last entry
+            comp_j = jnp.asarray(per_sim_comp[j])
+            sky = dataclasses.replace(
+                sky, fg_eb_alm=jnp.sum(comp_j, axis=0), fg_comp_eb_alm=comp_j
+            )
         return sky
 
     if harmonic_skies is None:
@@ -797,7 +851,14 @@ def make_cutsky_mc_context(
         _hsky_tuple = tuple(_hsky(s, attach_fg=False) for s in seeds)
         harmonic_skies = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *_hsky_tuple)
         if shared_fg is not None:
-            harmonic_skies = dataclasses.replace(harmonic_skies, fg_eb_alm=shared_fg)
+            harmonic_skies = dataclasses.replace(
+                harmonic_skies, fg_eb_alm=shared_fg, fg_comp_eb_alm=shared_comp
+            )
+        if per_sim_comp is not None:
+            comp = jnp.asarray(per_sim_comp[: int(n_sims)])
+            harmonic_skies = dataclasses.replace(
+                harmonic_skies, fg_eb_alm=jnp.sum(comp, axis=1), fg_comp_eb_alm=comp
+            )
         noise_keys = jnp.stack([jax.random.PRNGKey(int(s)) for s in seeds], axis=0)
     else:
         # Precomputed FG sky ensemble -- e.g. loaded from a sky cache (save_sky_cache /
@@ -936,6 +997,12 @@ def save_sky_cache(path, ctx: CutskyMCContext, *, fg_model, base_seed: int = 0) 
     deterministic d1s1 template).
     """
     hs = ctx.harmonic_skies
+    if hs.fg_comp_eb_alm is not None:
+        raise NotImplementedError(
+            "save_sky_cache does not store per-component foregrounds "
+            "(fg_comp_eb_alm); save fg_eb_alm_components' output instead and pass it "
+            "back as make_cutsky_mc_context(fg_comp_eb_alm=...)."
+        )
     blob = dict(
         cmb_b_alm=np.asarray(hs.cmb_b_alm),
         noise_keys=np.asarray(ctx.noise_keys),
@@ -1168,7 +1235,28 @@ def share_constant_fg(hsky: HarmonicSky, *, strict: bool = True) -> HarmonicSky:
             f"PySM preset (a *Realization component, e.g. d10s6 / s6); those must "
             f"keep the per-sim ensemble."
         )
-    return dataclasses.replace(hsky, fg_eb_alm=fg[0])
+    out = dataclasses.replace(hsky, fg_eb_alm=fg[0])
+    comp = hsky.fg_comp_eb_alm
+    if comp is not None and jnp.asarray(comp).ndim == 5:
+        # The components of a constant total are constant too (they are drawn from
+        # the same seeds); collapse them alongside, and refuse if they are not.
+        comp = jnp.asarray(comp)
+        if float(jnp.max(jnp.abs(comp - comp[0:1]))) != 0.0:
+            raise ValueError(
+                "fg_eb_alm is constant across sims but fg_comp_eb_alm is not; the "
+                "components do not belong to this total."
+            )
+        out = dataclasses.replace(out, fg_comp_eb_alm=comp[0])
+    return out
+
+
+def _split_shared_fg_comp(hsky: HarmonicSky) -> tuple[HarmonicSky, jax.Array | None]:
+    """:func:`_split_shared_fg` for ``fg_comp_eb_alm``: peel off a shared (rank-4)
+    component stack; a per-sim (rank-5) one stays in the mapped pytree."""
+    comp = hsky.fg_comp_eb_alm
+    if comp is None or jnp.asarray(comp).ndim == 5:
+        return hsky, None
+    return dataclasses.replace(hsky, fg_comp_eb_alm=None), jnp.asarray(comp)
 
 
 def _split_shared_fg(hsky: HarmonicSky) -> tuple[HarmonicSky, jax.Array | None]:
@@ -1550,6 +1638,17 @@ def mc_cutsky_cov_traced(
     # Delensing design knob: rescale the sims' lensing B to this design's residual.
     lens_scale = _lens_scale(ctx, cl_bb_res, cl_bb_res_ells)
     if ctx.estimator == "master":
+        if ctx.harmonic_skies.fg_comp_eb_alm is not None:
+            if fg_residual:
+                raise NotImplementedError(
+                    "per-component foreground residuals are implemented on the "
+                    "masked-Wiener branch only."
+                )
+            # Unread here; drop it so a shared (rank-4) stack cannot be mapped as sims.
+            ctx = dataclasses.replace(
+                ctx,
+                harmonic_skies=dataclasses.replace(ctx.harmonic_skies, fg_comp_eb_alm=None),
+            )
         return _mc_cutsky_cov_master(
             w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual,
             remat=remat, sim_batch=sim_batch,
@@ -1580,14 +1679,18 @@ def mc_cutsky_cov_traced(
 
     # Same shared-foreground handling as the MASTER branch; see the comment there.
     mapped_skies, shared_fg_alm = _split_shared_fg(ctx.harmonic_skies)
-    fg_consts = () if shared_fg_alm is None else (shared_fg_alm,)
+    mapped_skies, shared_comp_alm = _split_shared_fg_comp(mapped_skies)
+    has_comp = ctx.harmonic_skies.fg_comp_eb_alm is not None
+    fg_consts = tuple(c for c in (shared_fg_alm, shared_comp_alm) if c is not None)
+    n_shared_fg = int(shared_fg_alm is not None)
 
-    def _one(hsky, key, *shared_fg):
+    def _one(hsky, key, *consts):
         # Beam the (frozen, unbeamed) per-sim harmonic sky in-trace, so the beams flow
         # the gradient. The BandSky static beam field carries the concrete reference
         # (metadata only; assemble_band_maps reads only cmb_qu / fg_qu).
-        if shared_fg:
-            hsky = dataclasses.replace(hsky, fg_eb_alm=shared_fg[0])
+        if n_shared_fg:
+            hsky = dataclasses.replace(hsky, fg_eb_alm=consts[0])
+        comp = consts[n_shared_fg] if len(consts) > n_shared_fg else hsky.fg_comp_eb_alm
         band_sky = beam_harmonic_sky(
             hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin, lens_scale=lens_scale
         )
@@ -1611,6 +1714,12 @@ def mc_cutsky_cov_traced(
             # leakage template does not remove.
             fg = band_sky.fg_qu
             legs.append(_cleaned_b_qu(result, fg) + _cleaned_e_qu(result, fg))
+            if has_comp:
+                # Each component through the same stored weights (project is linear in
+                # its input, so the component maps sum to the total's cleaned map).
+                for c in range(comp.shape[0]):
+                    fg_c = _beam_fg_eb(comp[c], bf, ctx.lmax, ctx.nside, beam_shape_p=bp)
+                    legs.append(_cleaned_b_qu(result, fg_c) + _cleaned_e_qu(result, fg_c))
         out = [
             cutsky_bb_bandpower(
                 qu, ctx.inv_noise, ctx.cl_ee_prior, ctx.cl_bb_prior, **bp_kw
@@ -1661,6 +1770,17 @@ def mc_cutsky_cov_traced(
     leakage = mk.leakage_template(rec_e)
     debiased = mk.debias_bandpower(rec_full, transfer, leakage)
     cov = mc_bandpower_covariance(debiased, hartlap=True)
+    fg_per_sim = fg_mean = comp_per_sim = comp_mean = None
+    if fg_residual:
+        fg_per_sim = rec_fg[0] / transfer
+        # Mean of the raw leg, then / F_b: the original order of operations, so the
+        # total stays bit-identical to the pre-component output. The components follow
+        # the same order, so (total - a - b) / 2 is formed from like quantities.
+        fg_mean = jnp.mean(rec_fg[0], axis=0) / transfer
+        if has_comp:
+            raw = jnp.stack(rec_fg[1:], axis=1)
+            comp_per_sim = raw / transfer
+            comp_mean = jnp.mean(raw, axis=0) / transfer
 
     return CutskyMCTraced(
         covariance=cov,
@@ -1672,10 +1792,11 @@ def mc_cutsky_cov_traced(
         n_sims=ctx.n_sims,
         # Divided by F_b but NOT leakage-subtracted: debias's leakage term is the
         # CMB's, already removed from the data; the foreground's stays in it.
-        fg_residual_bandpower=(
-            jnp.mean(rec_fg[0], axis=0) / transfer if fg_residual else None
-        ),
+        fg_residual_bandpower=fg_mean,
         wiener_max_rel_residual=jnp.max(rel_max),
         wiener_max_n_iter=jnp.max(n_iter_max),
         rec_transfer=rec_b,
+        fg_residual_per_sim=fg_per_sim,
+        fg_residual_components=comp_mean,
+        fg_residual_components_per_sim=comp_per_sim,
     )
