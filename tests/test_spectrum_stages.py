@@ -769,7 +769,7 @@ def _twin_fg(e_alm, b_alm):
     return jnp.broadcast_to(fg, (fg.shape[0], len(FREQS), *fg.shape[2:]))
 
 
-def _isotropic_fg(n_sims, lmax, *, amp=10.0, slope=-3.0):
+def _isotropic_fg(n_sims, lmax, *, amp=10.0, slope=-3.0, seed0=10_000):
     """Independent isotropic B-only foreground per sim: lensing-BB shape, power-law SED.
 
     Lensing-shaped on purpose: the Wiener transfer is calibrated on that shape, and
@@ -784,7 +784,7 @@ def _isotropic_fg(n_sims, lmax, *, amp=10.0, slope=-3.0):
     sed = jnp.asarray([(f / 150.0) ** slope for f in FREQS])
     g = []
     for s in range(n_sims):
-        np.random.seed(10_000 + s)  # noqa: NPY002 - healpy.synalm uses the global RNG
+        np.random.seed(seed0 + s)  # noqa: NPY002 - healpy.synalm uses the global RNG
         g.append(hp.synalm(np.asarray(cl_bb) * amp, lmax=lmax, new=True))
     g = jnp.asarray(np.stack(g))
     fg = jnp.zeros((n_sims, len(FREQS), 2, g.shape[1]), dtype=g.dtype)
@@ -885,6 +885,158 @@ def test_wiener_fg_residual_twins_land_on_the_debias_pieces():
         np.asarray(e.leakage / e.transfer),
         rtol=1e-2,
     )
+
+
+def _component_run(comps, n_sims, *, var_pix_ref=None):
+    """Wiener forward with ``fg_residual=True`` on a per-sim component stack."""
+    cleaner = nilc_cleaner(clean_e=True)
+    ctx = make_cutsky_mc_context(
+        cleaner=cleaner, estimator="wiener", var_pix_ref=var_pix_ref,
+        fg_comp_eb_alm=comps, **_ctx_kwargs(n_sims))
+    return ctx, mc_cutsky_cov_traced(jnp.asarray(W_INV), ctx, cleaner, fg_residual=True)
+
+
+def test_fg_components_leave_every_existing_output_unchanged():
+    """A component stack is the summed foreground plus extra legs, nothing else.
+
+    Against the same sims carrying the component sum as a plain foreground (and the
+    same var_pix_ref), every pre-existing output is bit-identical -- measured exact.
+    The component means match the per-sim legs' mean to 2e-16 (summation order).
+    """
+    n = 6
+    lmax = _ctx_kwargs(n)["lmax"]
+    dust = _isotropic_fg(n + 1, lmax, slope=1.5)
+    sync = _isotropic_fg(n + 1, lmax, slope=-3.0, seed0=77_000)
+    comps = jnp.stack([dust, sync], axis=1)
+    ctx, comp = _component_run(comps, n)
+
+    cleaner = nilc_cleaner(clean_e=True)
+    plain = make_cutsky_mc_context(
+        cleaner=cleaner, estimator="wiener", var_pix_ref=ctx.var_pix_ref, **_ctx_kwargs(n))
+    ref = mc_cutsky_cov_traced(
+        jnp.asarray(W_INV), _with_fg(plain, comps[:n].sum(axis=1)), cleaner, fg_residual=True)
+    for name in ("covariance", "debiased_bandpowers", "transfer", "leakage",
+                 "fg_residual_bandpower", "fg_residual_per_sim"):
+        assert np.array_equal(np.asarray(getattr(comp, name)), np.asarray(getattr(ref, name))), name
+    assert ref.fg_residual_components is None
+    assert comp.fg_residual_components.shape == (2, comp.transfer.shape[0])
+    np.testing.assert_allclose(
+        np.asarray(comp.fg_residual_components),
+        np.asarray(comp.fg_residual_components_per_sim).mean(axis=0), rtol=1e-13)
+
+
+def test_fg_component_legs_are_linear_in_the_foreground():
+    """Exact limits of the split, which a mis-wired leg cannot satisfy.
+
+    * One component zero: the other's leg IS the total leg and the zero leg is 0
+      (bitwise -- identical input maps, identical solves).
+    * Two identical components g: the total is the leg of 2g, which a converged
+      linear filter returns as exactly 4x the leg of g, so the cross
+      (total - a - b)/2 equals the auto. Measured exact / 2e-16. Wiring a component
+      leg to the total (or to the other component) breaks the first; dropping the
+      E projection from one side breaks the second.
+    """
+    n = 6
+    lmax = _ctx_kwargs(n)["lmax"]
+    g = _isotropic_fg(n + 1, lmax, slope=1.5)
+
+    _, z = _component_run(jnp.stack([g, jnp.zeros_like(g)], axis=1), n)
+    tot = np.asarray(z.fg_residual_per_sim)
+    legs = np.asarray(z.fg_residual_components_per_sim)
+    assert np.array_equal(tot, legs[:, 0])
+    np.testing.assert_array_equal(legs[:, 1], 0.0)
+
+    _, same = _component_run(jnp.stack([g, g], axis=1), n)
+    tot = np.asarray(same.fg_residual_per_sim)
+    legs = np.asarray(same.fg_residual_components_per_sim)
+    np.testing.assert_allclose(tot, 4.0 * legs[:, 0], rtol=1e-12)
+    np.testing.assert_allclose(0.5 * (tot - legs[:, 0] - legs[:, 1]), legs[:, 0], rtol=1e-12)
+
+
+@pytest.mark.slow
+def test_fg_component_cross_of_independent_components_is_consistent_with_zero():
+    """Independent isotropic components have zero expected cross residual.
+
+    Per-bin t-statistic of the per-sim cross (total - a - b)/2 at 12 sims: measured
+    -1.8 / -0.7 / -0.2; gated at |t| < 4. Identical components (the mutation) give
+    cross == auto exactly, i.e. an unbounded t.
+    """
+    n = 12
+    lmax = _ctx_kwargs(n)["lmax"]
+    dust = _isotropic_fg(n + 1, lmax, slope=1.5)
+    sync = _isotropic_fg(n + 1, lmax, slope=-3.0, seed0=77_000)
+    _, r = _component_run(jnp.stack([dust, sync], axis=1), n)
+    legs = np.asarray(r.fg_residual_components_per_sim)
+    cross = 0.5 * (np.asarray(r.fg_residual_per_sim) - legs[:, 0] - legs[:, 1])
+    t = cross.mean(axis=0) / (cross.std(axis=0, ddof=1) / np.sqrt(n))
+    assert np.all(np.abs(t) < 4.0), t
+
+
+def test_fg_seed_offset_reaches_the_foreground_draw(monkeypatch):
+    """Generated foregrounds are drawn at seed + offset, the setup sim included.
+
+    The CMB reseeds numpy with seed, seed+1, seed+2 -- the first stochastic
+    component's seeds at offset 0 -- so the offset is what decorrelates a d11
+    realization from its sim's CMB. Recorded at the call, without PySM.
+    """
+    import augr.spectrum_stages as ss
+
+    seen = []
+    real = ss.harmonic_sky
+
+    def spy(*args, **kw):
+        seen.append((kw["cmb_seed"], kw["fg_seed"]))
+        return real(*args, **{**kw, "fg_model": None})
+
+    monkeypatch.setattr(ss, "harmonic_sky", spy)
+    monkeypatch.setattr(ss, "fg_model_is_static", lambda m: False)
+    kw = {**_ctx_kwargs(4), "base_seed": 100, "fg_model": "d11s6"}
+    ss.make_cutsky_mc_context(
+        cleaner=nilc_cleaner(clean_e=True), estimator="wiener", fg_seed_offset=10_000_000, **kw)
+    assert seen == [(s, s + 10_000_000) for s in range(100, 105)]
+
+    seen.clear()
+    ss.make_cutsky_mc_context(cleaner=nilc_cleaner(clean_e=True), estimator="wiener", **kw)
+    assert seen == [(s, None) for s in range(100, 105)]
+
+
+def test_fg_component_context_shapes_and_guards():
+    """Shared and per-sim stacks land on the right ranks; misuse raises."""
+    n = 6
+    kw = _ctx_kwargs(n)
+    lmax = kw["lmax"]
+    cleaner = nilc_cleaner(clean_e=True)
+    g = _isotropic_fg(n + 1, lmax)
+
+    shared = jnp.stack([g[0], 2.0 * g[0]], axis=0)  # (n_comp, n_band, 2, n_alm)
+    ctx = make_cutsky_mc_context(
+        cleaner=cleaner, estimator="wiener", fg_comp_eb_alm=shared, **kw)
+    assert ctx.harmonic_skies.fg_comp_eb_alm.ndim == 4
+    assert ctx.harmonic_skies.fg_eb_alm.ndim == 3
+    np.testing.assert_array_equal(
+        np.asarray(ctx.harmonic_skies.fg_eb_alm), np.asarray(shared.sum(axis=0)))
+
+    # A per-sim stack that does not vary collapses to the shared form.
+    const = jnp.broadcast_to(shared, (n + 1, *shared.shape))
+    ctx_c = make_cutsky_mc_context(
+        cleaner=cleaner, estimator="wiener", var_pix_ref=ctx.var_pix_ref,
+        fg_comp_eb_alm=const, **kw)
+    assert ctx_c.harmonic_skies.fg_comp_eb_alm.ndim == 4
+
+    with pytest.raises(ValueError, match="fg_comp_eb_alm has shape"):
+        make_cutsky_mc_context(
+            cleaner=cleaner, estimator="wiener", fg_comp_eb_alm=const[:n], **kw)
+    with pytest.raises(ValueError, match="exclusive"):
+        make_cutsky_mc_context(
+            cleaner=cleaner, estimator="wiener", fg_comp_eb_alm=shared,
+            fg_eb_alm=shared[0], **kw)
+
+    master = make_cutsky_mc_context(
+        cleaner=cleaner, estimator="master", fg_comp_eb_alm=shared, **kw)
+    with pytest.raises(NotImplementedError, match="masked-Wiener"):
+        mc_cutsky_cov_traced(jnp.asarray(W_INV), master, cleaner, fg_residual=True)
+    out = mc_cutsky_cov_traced(jnp.asarray(W_INV), master, cleaner)
+    assert np.all(np.isfinite(np.asarray(out.covariance)))
 
 
 @pytest.mark.slow

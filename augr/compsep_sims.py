@@ -56,7 +56,7 @@ from . import units
 from .bandpass import Bandpass
 from .instrument import beam_bl
 from .noise_sims import correlated_noise_maps, noise_maps
-from .sht import almxfl, check_band_limit, synthesis
+from .sht import alm_size, almxfl, check_band_limit, synthesis
 from .spectra import CMBSpectra
 
 # PySM preset-string combinations. d1s1 is the simple baseline (matches the
@@ -78,6 +78,12 @@ _FG_PRESETS: dict[str, tuple[str, ...]] = {
     # (the hypothesized D_min driver).
     "d10": ("d10",),
     "s6": ("s6",),
+    # A complexity ladder for template-vs-truth mismatch studies: d11 is d10's
+    # single-MBB GNILC dust with stochastic small scales (and s6 the same for s5's
+    # synchrotron); d12 is the six-layer MKD dust (line-of-sight SED mixing) and s7
+    # adds spectral curvature to s5.
+    "d11s6": ("d11", "s6"),
+    "d12s7": ("d12", "s7"),
 }
 
 
@@ -186,6 +192,12 @@ class HarmonicSky(eqx.Module):
         reaches the Monte-Carlo covariance (see
         :func:`augr.spectrum_stages.mc_cutsky_cov_traced` ``cl_bb_res=``). The
         tensor part is the implied difference ``cmb_b_alm - cmb_b_lens_alm``.
+    fg_comp_eb_alm
+        The foreground split by PySM component, shape ``(n_comp, n_band, 2, n_alm)``
+        (see :func:`fg_eb_alm_components`), or ``None`` (default). It sums to
+        ``fg_eb_alm`` and is read only by the cut-sky residual leg
+        (:func:`augr.spectrum_stages.mc_cutsky_cov_traced` ``fg_residual=True``), which
+        then reports one residual per component.
     """
 
     freqs_ghz: tuple[float, ...] = eqx.field(static=True)
@@ -196,6 +208,7 @@ class HarmonicSky(eqx.Module):
     fg_eb_alm: jax.Array | None
     cmb_e_alm: jax.Array | None = None
     cmb_b_lens_alm: jax.Array | None = None
+    fg_comp_eb_alm: jax.Array | None = None
 
     @property
     def n_band(self) -> int:
@@ -349,19 +362,32 @@ def _seeded_component_config(fg_model: str, fg_seed: int) -> dict:
     """
     from pysm3.sky import PRESET_MODELS
 
-    seed0 = int(fg_seed) % (2**31)  # keep inside numpy's [0, 2**32) seed range
     config: dict[str, dict] = {}
     for k, preset in enumerate(_FG_PRESETS[fg_model]):
         cfg = copy.deepcopy(PRESET_MODELS[preset])
         if "Realization" in cfg.get("class", ""):
-            # Offset per component so two stochastic components never share a seed
-            # (none do in the current presets, but a future dust-realization preset
-            # would). PowerLawRealization reads seeds[0:2]; a 3rd is for a future
-            # ModifiedBlackBodyRealization and is harmlessly ignored otherwise.
-            base = (seed0 + 1000 * k) % (2**31)
-            cfg["seeds"] = [base, base + 1, base + 2]
+            cfg["seeds"] = _component_seeds(fg_seed, k)
         config[preset] = cfg
     return config
+
+
+def _component_seeds(fg_seed: int, k: int) -> list[int]:
+    """Seeds of the ``k``-th component of a preset at ``fg_seed``.
+
+    Offset per component so two stochastic components never share a seed (``d11s6``
+    has two). ``ModifiedBlackBodyRealization`` reads all three; ``PowerLawRealization``
+    reads ``seeds[0:2]`` and ignores the third.
+    """
+    base = (int(fg_seed) % (2**31) + 1000 * int(k)) % (2**31)
+    return [base, base + 1, base + 2]
+
+
+# Attributes a PySM *Realization component sets from ``draw_realization``, in the
+# order it returns them (pysm3 3.4: dust_realization.py / power_law_realization.py).
+_REALIZATION_FIELDS: dict[str, tuple[str, ...]] = {
+    "ModifiedBlackBodyRealization": ("I_ref", "Q_ref", "U_ref", "mbb_index", "mbb_temperature"),
+    "PowerLawRealization": ("I_ref", "Q_ref", "U_ref", "pl_index"),
+}
 
 
 def _emission_iqu_mono(sky, nu_ghz: float, u) -> np.ndarray:
@@ -514,6 +540,84 @@ def static_fg_eb_alm(
             "foreground differs per sim and cannot be generated once."
         )
     return _fg_eb_alm(tuple(freqs_ghz), fg_model, lmax, nside, fg_seed=0, bandpasses=bandpasses)
+
+
+def fg_eb_alm_components(
+    freqs_ghz: tuple[float, ...],
+    fg_model: str,
+    lmax: int,
+    nside: int,
+    *,
+    fg_seeds: Sequence[int],
+    bandpasses: Sequence[Bandpass | None] | None = None,
+) -> np.ndarray:
+    """Per-component foreground E/B alm, ``(n_seeds, n_comp, n_band, 2, n_alm)``.
+
+    One entry per PySM component of ``fg_model``, in :data:`_FG_PRESETS` order (dust
+    then synchrotron for the two-component presets), each analyzed exactly as
+    :func:`_fg_eb_alm` analyzes the total. Summed over the component axis it equals
+    ``_fg_eb_alm(..., fg_seed=s)`` to round-off: the components keep the seeds they
+    get inside the combined preset (:func:`_component_seeds`), so a stochastic
+    component's realization is the one the total carries.
+
+    Feeds ``make_cutsky_mc_context(fg_comp_eb_alm=...)``, whose cleaner residual leg
+    then splits into dust, synchrotron and (from the total) their cross.
+
+    Each component is constructed once; a ``*Realization`` component is then redrawn
+    per seed with its own ``draw_realization`` rather than rebuilt, which skips
+    re-reading its templates (d11's Galactic-plane file alone is 161 MB) for every
+    sim. Static components are evaluated once and repeated. Returns numpy, since a
+    200-sim ensemble at nside 128 is ~2 GB that should stay on the host until the
+    context takes it. Requires pysm3.
+    """
+    import healpy as hp
+
+    if fg_model not in _FG_PRESETS:
+        raise ValueError(f"unknown fg_model {fg_model!r}; expected one of {sorted(_FG_PRESETS)}")
+    if bandpasses is not None and len(bandpasses) != len(freqs_ghz):
+        raise ValueError(
+            f"bandpasses (len {len(bandpasses)}) must match freqs_ghz (len {len(freqs_ghz)})."
+        )
+    fg_seeds = [int(s) for s in fg_seeds]
+    if not fg_seeds:
+        raise ValueError("fg_seeds is empty.")
+    pysm3, u = _require_pysm()
+    presets = _FG_PRESETS[fg_model]
+    config = _seeded_component_config(fg_model, fg_seeds[0])
+    n_alm = alm_size(int(lmax))
+    out = np.empty(
+        (len(fg_seeds), len(presets), len(freqs_ghz), 2, n_alm), dtype=np.complex128
+    )
+
+    def analyze(sky) -> np.ndarray:
+        eb = np.empty((len(freqs_ghz), 2, n_alm), dtype=np.complex128)
+        for i, nu in enumerate(freqs_ghz):
+            bp = None if bandpasses is None else bandpasses[i]
+            if bp is None or bp.is_monochromatic:
+                iqu = _emission_iqu_mono(sky, nu, u)
+            else:
+                iqu = _emission_iqu_bandpass(sky, bp, u)
+            _alm_t, eb[i, 0], eb[i, 1] = hp.map2alm(iqu, lmax=lmax, pol=True)
+        return eb
+
+    for k, preset in enumerate(presets):
+        cls = config[preset].get("class", "")
+        sky = pysm3.Sky(nside=int(nside), component_config={preset: config[preset]})
+        if "Realization" not in cls:
+            out[:, k] = analyze(sky)[None]
+            continue
+        if cls not in _REALIZATION_FIELDS:
+            raise NotImplementedError(f"no redraw recipe for PySM class {cls!r}")
+        comp = sky.components[0]
+        for j, seed in enumerate(fg_seeds):
+            if j > 0:
+                drawn = comp.draw_realization(
+                    config[preset].get("synalm_lmax"), _component_seeds(seed, k)
+                )
+                for name, value in zip(_REALIZATION_FIELDS[cls], drawn, strict=True):
+                    setattr(comp, name, value)
+            out[j, k] = analyze(sky)
+    return out
 
 
 def _beam_fg_eb(

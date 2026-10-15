@@ -260,6 +260,51 @@ def test_seeded_component_config_does_not_mutate_presets() -> None:
     assert "seeds" not in PRESET_MODELS["s6"]
 
 
+def test_component_seeds_are_the_combined_presets_seeds() -> None:
+    """Per-component generation reuses the seeds each component has in the preset.
+
+    Also pins the collision ``fg_seed_offset`` exists for: at offset 0, d11 (the
+    first component of d11s6) gets [s, s+1, s+2], the seeds the CMB draws reseed
+    numpy with (B lensing, E, B tensor).
+    """
+    pytest.importorskip("pysm3")
+    from augr.compsep_sims import _component_seeds, _seeded_component_config
+
+    for s in (0, 7, 123_456):
+        cfg = _seeded_component_config("d11s6", s)
+        assert cfg["d11"]["seeds"] == _component_seeds(s, 0) == [s, s + 1, s + 2]
+        assert cfg["s6"]["seeds"] == _component_seeds(s, 1)
+        assert set(cfg["s6"]["seeds"]).isdisjoint(cfg["d11"]["seeds"])
+
+
+@pytest.mark.slow
+def test_fg_components_sum_to_the_total_and_redraw_bitwise() -> None:
+    """Components sum to the combined preset's foreground; a redraw is a fresh build.
+
+    Sum vs ``_fg_eb_alm`` measured 1.5e-16 (d1s1) and <= 2.2e-16 (d11s6) relative
+    to the largest alm; gated at 1e-14. The redraw (construct once, then
+    ``draw_realization`` per seed) is bit-identical to building at that seed, which
+    is what catches a wrong field order in ``_REALIZATION_FIELDS``.
+    """
+    pytest.importorskip("pysm3")
+    from augr.compsep_sims import _fg_eb_alm, fg_eb_alm_components
+
+    freqs, lmax, nside = (30.0, 95.0, 150.0, 220.0, 353.0), 24, 16
+    comps = fg_eb_alm_components(freqs, "d1s1", lmax, nside, fg_seeds=[0])
+    total = np.asarray(_fg_eb_alm(freqs, "d1s1", lmax, nside, fg_seed=0))
+    assert comps.shape == (1, 2, len(freqs), 2, total.shape[-1])
+    np.testing.assert_allclose(comps[0].sum(axis=0), total, rtol=0, atol=1e-14 * np.abs(total).max())
+
+    seeds = [5, 6]
+    drawn = fg_eb_alm_components(freqs, "d11s6", lmax, nside, fg_seeds=seeds)
+    fresh = fg_eb_alm_components(freqs, "d11s6", lmax, nside, fg_seeds=[6])
+    assert np.array_equal(drawn[1], fresh[0])
+    assert not np.array_equal(drawn[0], drawn[1])
+    total6 = np.asarray(_fg_eb_alm(freqs, "d11s6", lmax, nside, fg_seed=6))
+    np.testing.assert_allclose(
+        drawn[1].sum(axis=0), total6, rtol=0, atol=1e-14 * np.abs(total6).max())
+
+
 @pytest.mark.slow
 def test_s6_realization_reproducible_and_seed_varying() -> None:
     """s6 small scales are bit-identical at a fixed fg_seed and differ across seeds.

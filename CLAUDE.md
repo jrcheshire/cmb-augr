@@ -724,6 +724,20 @@ wrong.
   `return_info`, and at high S/N (cond 4.6e7 at nside 16) plain CG needs
   ~15,500 iterations.
 
+- **Per-component residuals.** `compsep_sims.fg_eb_alm_components` gives the
+  foreground split by PySM component (`(n_seeds, n_comp, n_band, 2, n_alm)`; the
+  components keep their seeds from the combined preset, so they sum to
+  `_fg_eb_alm` to ~2e-16, and `*Realization` components are redrawn rather than
+  rebuilt). Pass it as `make_cutsky_mc_context(fg_comp_eb_alm=...)` -- shared, or
+  per-sim with `n_sims + 1` entries (the last is the setup clean's) -- and
+  `mc_cutsky_cov_traced(fg_residual=True)` adds one Wiener leg per component through
+  the stored weights (`fg_residual_components` + per-sim; the two-component cross is
+  `(total - a - b) / 2`). Wiener only. **Generated stochastic foregrounds need
+  `fg_seed_offset`:** the CMB draws reseed numpy with `seed`, `seed+1`, `seed+2`,
+  exactly a preset's first stochastic component's seeds at offset 0, so `d11s6`
+  without an offset correlates d11's small scales with the sim's CMB. `None` keeps
+  the legacy seeding (earlier `s6` / `d10s6` ensembles reproduce).
+
 ## MASTER pseudo-Cℓ on an apodized mask (`augr/pseudo_cl.py`)
 
 Cut-sky BB bandpowers for an *already cleaned* map, with the mask's mode
