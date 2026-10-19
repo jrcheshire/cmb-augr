@@ -89,6 +89,37 @@ def test_inv_noise_map_mask_and_hits():
     assert float(jnp.max(inv2[::2])) == 0.0
 
 
+def test_var_pix_ref_uniform_hits_is_the_plain_mean():
+    """Uniform hits: bitwise the observed-pixel mean of (Q² + U²)/2 (pre-hits behaviour)."""
+    nside = 16
+    npix = hp.nside2npix(nside)
+    mask = mk.gal_cut_mask(nside, 30.0)
+    qu = jnp.asarray(np.random.default_rng(3).standard_normal((2, npix)) * 1.7)
+    obs = jnp.asarray(mask) > 0
+    plain = float(jnp.mean((qu[0] ** 2 + qu[1] ** 2)[obs]) / 2.0)
+    assert mk.var_pix_ref_from_noise(qu, jnp.ones(npix), mask) == plain
+
+
+def test_var_pix_ref_recovers_the_max_exposure_level():
+    """Noise drawn at ``σ²(p) = v · max(H)/H(p)`` on the L2 envelope returns ``v``.
+
+    That is :func:`inv_noise_map`'s convention, so the filter's ``N⁻¹`` matches the noise.
+    Measured at nside 32 / 30° cut (6272 pixels) over 200 seeds: estimate/v mean 0.9997,
+    std 0.013, max |dev| 0.036. The observed-pixel mean (the pre-fix estimate) gives
+    4.6-4.8x. Gate |estimate/v - 1| < 0.07 (~5 sigma).
+    """
+    from augr.hit_maps import l2_hit_map
+
+    nside = 32
+    hits = np.asarray(l2_hit_map(nside), dtype=float)
+    mask = mk.gal_cut_mask(nside, 30.0)
+    v = 2.0
+    sig2 = v * hits.max() / hits
+    qu = jnp.asarray(np.random.default_rng(0).standard_normal((2, hits.size)) * np.sqrt(sig2))
+    est = mk.var_pix_ref_from_noise(qu, jnp.asarray(hits), mask)
+    assert abs(est / v - 1.0) < 0.07
+
+
 # ---------------------------------------------------------------------------
 # fast: binning + debias algebra
 # ---------------------------------------------------------------------------

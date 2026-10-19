@@ -413,15 +413,14 @@ def mc_cutsky_bandpowers(
         bandpasses=bandpasses,
     )
 
-    # var_pix_ref: per-pixel noise variance of a representative cleaned map (filter
-    # knob). Derived from one setup clean's cleaned-noise map over observed pixels.
+    # var_pix_ref: the cleaned-map noise variance at the maximum-exposure pixel (filter
+    # knob, inv_noise_map's convention), from one setup clean's cleaned-noise map.
     if var_pix_ref is None:
         sky0, total0 = _build_sim(base_seed + n_sims, **sim_kw)
         res0 = cleaner(total0, beam_fwhm_arcmin, lmax=lmax, nside=nside)
         noise0 = total0 - sky0.cmb_qu - sky0.fg_qu
         cn = _cleaned_b_qu(res0, noise0) + _cleaned_e_qu(res0, noise0)
-        obs = jnp.asarray(mask) > 0
-        var_pix_ref = float(jnp.mean((cn[0] ** 2 + cn[1] ** 2)[obs]) / 2.0)
+        var_pix_ref = mk.var_pix_ref_from_noise(cn, hit_map, mask)
 
     inv_noise = mk.inv_noise_map(hit_map, var_pix_ref, mask=mask)
     precond = _build_wiener_precond(
@@ -909,8 +908,7 @@ def make_cutsky_mc_context(
         res0 = cleaner(total0, beam_fwhm_arcmin, beam_shape_p, lmax=lmax, nside=nside)
         noise0 = total0 - sky0.cmb_qu - sky0.fg_qu
         cn = _cleaned_b_qu(res0, noise0) + _cleaned_e_qu(res0, noise0)
-        obs = jnp.asarray(mask) > 0
-        var_pix_ref = float(jnp.mean((cn[0] ** 2 + cn[1] ** 2)[obs]) / 2.0)
+        var_pix_ref = mk.var_pix_ref_from_noise(cn, hit_map, mask)
 
     inv_noise = (
         mk.inv_noise_map(hit_map, var_pix_ref, mask=mask) if needs_inv_noise else None

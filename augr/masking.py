@@ -252,6 +252,32 @@ def inv_noise_map(
     return inv
 
 
+def var_pix_ref_from_noise(
+    noise_qu: jax.Array, hit_map: jax.Array, mask: jax.Array
+) -> float:
+    """``var_pix_ref`` [μK²] for :func:`inv_noise_map` from a noise Q/U realization.
+
+    Each observed pixel's ``(Q² + U²)/2`` is scaled by ``H(p)/max(H)`` before averaging,
+    so a noise map with ``σ²(p) = v · max(H)/H(p)`` returns ``v`` -- the level at the
+    maximum-exposure pixel, which is what :func:`inv_noise_map` expects. Under uniform
+    hits the scale is exactly 1 and this is the plain observed-pixel mean.
+
+    Parameters
+    ----------
+    noise_qu
+        Noise-only Q/U maps ``(2, npix)`` (e.g. a cleaned-noise realization).
+    hit_map
+        Relative exposure ``(npix,)``, the one passed to :func:`inv_noise_map`.
+    mask
+        Binary/weight mask ``(npix,)``; pixels with ``mask <= 0`` or zero hits are
+        excluded.
+    """
+    h = jnp.asarray(hit_map)
+    obs = (jnp.asarray(mask) > 0) & (h > 0)
+    p = (noise_qu[0] ** 2 + noise_qu[1] ** 2) * (h / jnp.max(h))
+    return float(jnp.mean(p[obs]) / 2.0)
+
+
 # ---------------------------------------------------------------------------
 # masked-Wiener B-mode estimator
 # ---------------------------------------------------------------------------
