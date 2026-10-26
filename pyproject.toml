@@ -111,6 +111,11 @@ cmb-augr = { path = ".", editable = true }
 [tool.pixi.feature.host.target.osx-arm64.dependencies]
 camb = "*"
 namaster = "*"
+# Apple Accelerate, not conda-forge's default OpenBLAS: osx-arm64 OpenBLAS 0.3.32 crashes
+# in multithreaded Cholesky above n ~ 32,000 (the dense masked-Wiener factor is 74,490 at
+# lmax 192) and corrupts large LAPACK calls issued concurrently from several threads.
+# Accelerate factors n = 74,490 in 329 s on an M4 Max, and the concurrent calls are exact.
+libblas = { version = "*", build = "*accelerate" }
 
 [tool.pixi.feature.host.target.linux-64.dependencies]
 camb = "*"
