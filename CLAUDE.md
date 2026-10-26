@@ -761,13 +761,18 @@ wrong.
     leg) and `eqx.error_if` fires above `tol`: ~1e-15 for the right filter, 0.06-1.1 for a
     factor built at another mask, hit map or `var_pix_ref`. `wiener_max_n_iter` is 0;
     `wiener_check=False` leaves the residual NaN.
-  - **Not sharded over logical CPU devices.** conda-forge's OpenBLAS is an OpenMP build,
-    and large LAPACK calls issued concurrently from several threads come back wrong:
-    a 1242-DOF triangular solve (and `jnp.linalg.solve`) sharded over 2-4
-    `JAX_NUM_CPU_DEVICES` was off by 1e8-1e40, exact under `OMP_NUM_THREADS=1`; small
-    solves (the cleaner's ILC weights) are below OpenBLAS's threading threshold and
-    unaffected. `spectrum_stages._DENSE_SHARD_CPU` keeps the dense branch unsharded on
-    CPU; the tests flip it under `OMP_NUM_THREADS=1`.
+  - **Not sharded over logical CPU devices.** They share one thread pool, so it buys
+    nothing, and it issues large LAPACK calls concurrently from several threads: under
+    osx-arm64 OpenBLAS 0.3.32 a 1242-DOF triangular solve (and `jnp.linalg.solve`)
+    sharded over 2-4 `JAX_NUM_CPU_DEVICES` was off by 1e8-1e40 (exact under
+    `OMP_NUM_THREADS=1`; small solves such as the cleaner's ILC weights sit below
+    OpenBLAS's threading threshold). `spectrum_stages._DENSE_SHARD_CPU` keeps the dense
+    branch unsharded on CPU; the tests flip it under `OMP_NUM_THREADS=1`.
+  - **osx-arm64 uses Apple Accelerate** (`libblas` pinned to the `*accelerate` build).
+    The same OpenBLAS segfaults in multithreaded `dpotrf` above n ~ 32,000 (both its
+    openmp and pthreads builds), so it cannot factor the lmax-192 filter at all;
+    Accelerate factors n = 74,490 in 329 s on an M4 Max and gets the concurrent calls
+    right. Linux keeps OpenBLAS (pthreads builds; the 74,490 factor runs on Vista gg).
 
 ## MASTER pseudo-Cℓ on an apodized mask (`augr/pseudo_cl.py`)
 

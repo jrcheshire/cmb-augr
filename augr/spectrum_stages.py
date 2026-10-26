@@ -1855,13 +1855,12 @@ def _wiener_legs(ctx, cleaner, bf, bp, lens_scale, fg_residual, has_comp, hsky, 
     return legs
 
 
-# OpenMP builds of OpenBLAS (conda-forge's default) return garbage from large LAPACK calls
-# made concurrently from several threads, which is what sharding over JAX_NUM_CPU_DEVICES
-# does: on osx-arm64 OpenBLAS 0.3.32 a 1242-DOF triangular solve sharded over 2-4 logical
-# CPU devices was off by 1e8-1e40, and jnp.linalg.solve likewise (exact under
-# OMP_NUM_THREADS=1; matmul unaffected). Logical CPU devices share one thread pool anyway,
-# so the dense branch shards over accelerators only. Tests flip this, under
-# OMP_NUM_THREADS=1, to exercise the sharded path on CPU.
+# Logical CPU devices share one thread pool, so sharding the dense branch over
+# JAX_NUM_CPU_DEVICES buys nothing -- and it issues large LAPACK calls concurrently from
+# several threads, which osx-arm64 OpenBLAS 0.3.32 got wrong (a sharded 1242-DOF triangular
+# solve off by 1e8-1e40; exact under OMP_NUM_THREADS=1 or Accelerate, which the osx-arm64
+# env now uses). Other BLAS builds are unchecked, so the dense branch shards over
+# accelerators only. Tests flip this, under OMP_NUM_THREADS=1, to exercise the sharded path.
 _DENSE_SHARD_CPU = False
 
 
