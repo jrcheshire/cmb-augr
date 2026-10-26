@@ -238,8 +238,9 @@ Knowing how the modules chain together matters more than any one file:
    sims per step on each device. It passes `check_vma=False` to `shard_map`,
    because jht's recursion-scan carries and ducc's `pure_callback` VJP outputs
    are built from constants and fail the varying-axis type check. Values match one
-   device to ~1e-15 (`test_sharded_sim_axis_matches_one_device`). The
-   masked-Wiener branch is not sharded.
+   device to ~1e-15 (`test_sharded_sim_axis_matches_one_device`). The CG
+   masked-Wiener branch is not sharded; the dense one is, on accelerators only (see
+   "Dense direct solve" below).
 
    **N₀ validation status (2026-05-07).** Validated against `plancklens`
    at the LiteBIRD-PTEP fiducial in `scripts/n0_validation/`:
@@ -737,6 +738,36 @@ wrong.
   exactly a preset's first stochastic component's seeds at offset 0, so `d11s6`
   without an offset correlates d11's small scales with the sim's CMB. `None` keeps
   the legacy seeding (earlier `s6` / `d10s6` ensembles reproduce).
+
+- **Dense direct solve (`wiener_solver="dense"`).** At nside 128 / lmax 192 the CG
+  solves are 99% of the per-sim forward (6 legs x 333-568 iterations x ~98 ms on an
+  M4 Max: 211-264 s/sim; the cleaner and leg projections are ~1.7 s). The system is
+  `(M + I) y = P b` with `M = P (A / var_pix_ref) P` and `A` the **unit-noise**
+  `wiener_normal_matrix`, so `masking.wiener_factor` factors it once (host LAPACK, or
+  `on_device=True` for the GPU) and `masked_wiener_eb_alm_dense` solves every leg of a
+  sim with two triangular solves. `make_cutsky_mc_context(wiener_solver="dense",
+  wiener_normal=A or "A.npy")` probes `A` against the matrix-free operator
+  (`normal_matrix_mismatch` < `tol`) before factoring and builds no preconditioner;
+  `mc_cutsky_cov_traced` then allows `sim_batch > 1`. Cost: `8 n_dof²` bytes per copy
+  of `A` (44 GB at lmax 192, ~140 GB at 256, as `lmax⁴`) and `n_dof³/3` flops once, so
+  it serves low-ℓ filters. Same filter: against CG the gap is the CG's own error, falling
+  ~100x per 100x in `tol` to <= 3.9e-13 at tol 1e-14 (fixture), gradient 2.5e-14.
+  - **Pass the factor as an argument, never close over it.** JAX 0.10 compiles a
+    closed-over array into the executable as a constant (a 44 GB constant). The dense
+    branch hands the factor to one `jax.jit` as an argument; a caller that jits around
+    `mc_cutsky_cov_traced` must pass the context as an argument too.
+  - **The check is a re-evaluated residual.** With `wiener_check=True` each solve's
+    `‖(M + I) y − P b‖ / ‖P b‖` is recomputed with the matrix-free operator (one apply per
+    leg) and `eqx.error_if` fires above `tol`: ~1e-15 for the right filter, 0.06-1.1 for a
+    factor built at another mask, hit map or `var_pix_ref`. `wiener_max_n_iter` is 0;
+    `wiener_check=False` leaves the residual NaN.
+  - **Not sharded over logical CPU devices.** conda-forge's OpenBLAS is an OpenMP build,
+    and large LAPACK calls issued concurrently from several threads come back wrong:
+    a 1242-DOF triangular solve (and `jnp.linalg.solve`) sharded over 2-4
+    `JAX_NUM_CPU_DEVICES` was off by 1e8-1e40, exact under `OMP_NUM_THREADS=1`; small
+    solves (the cleaner's ILC weights) are below OpenBLAS's threading threshold and
+    unaffected. `spectrum_stages._DENSE_SHARD_CPU` keeps the dense branch unsharded on
+    CPU; the tests flip it under `OMP_NUM_THREADS=1`.
 
 ## MASTER pseudo-Cℓ on an apodized mask (`augr/pseudo_cl.py`)
 
