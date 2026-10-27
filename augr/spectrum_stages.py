@@ -1863,6 +1863,32 @@ def _wiener_legs(ctx, cleaner, bf, bp, lens_scale, fg_residual, has_comp, hsky, 
 # accelerators only. Tests flip this, under OMP_NUM_THREADS=1, to exercise the sharded path.
 _DENSE_SHARD_CPU = False
 
+# Decades of the residual reported by the dense check: the message is static under jit,
+# so the residual is bucketed (index 0 is NaN / inf, then [1e-16, 1e-15), ..., >= 1e2).
+_RESIDUAL_DECADES = np.arange(-16, 3)
+
+
+def _dense_residual_bad(rel, tol: float):
+    """True above ``tol`` or non-finite (``rel > tol`` alone lets a NaN through)."""
+    return ~(rel <= tol)
+
+
+def _residual_decade(rel):
+    """Index of ``rel``'s decade into :func:`_dense_residual_msgs` (0 if non-finite)."""
+    k = jnp.clip(jnp.floor(jnp.log10(rel)), _RESIDUAL_DECADES[0], _RESIDUAL_DECADES[-1])
+    idx = (k - _RESIDUAL_DECADES[0]).astype(jnp.int32) + 1
+    return jnp.where(jnp.isfinite(rel), idx, 0)
+
+
+def _dense_residual_msgs(tol: float) -> tuple[str, ...]:
+    """Messages for the dense residual check, one per :func:`_residual_decade` index."""
+    head = "dense masked-Wiener solve has a residual "
+    tail = (f" (tol {tol:g}): the factor does not describe ctx.inv_noise (built for another "
+            "mask, hit map or var_pix_ref?), or the solve itself failed.")
+    spans = [f"in [1e{k}, 1e{k + 1})" for k in _RESIDUAL_DECADES[:-1]]
+    spans.append(f">= 1e{_RESIDUAL_DECADES[-1]}")
+    return (head + "that is NaN or inf" + tail, *(head + s + tail for s in spans))
+
 
 def _mc_cutsky_cov_wiener_dense(
     w_inv, ctx, cleaner, bf, bp, lens_scale, fg_residual, *, remat, sim_batch, wiener_check
@@ -1897,14 +1923,11 @@ def _mc_cutsky_cov_wiener_dense(
         binned, info = out if wiener_check else (out, None)
         recs = tuple(binned[i] for i in range(len(legs)))
         if wiener_check:
-            recs = eqx.error_if(
-                recs,
-                jnp.any(info.rel_residual > ctx.tol),
-                "dense masked-Wiener solve has a residual above ctx.tol: the factor does "
-                "not describe ctx.inv_noise (built for another mask, hit map or "
-                "var_pix_ref?).",
-            )
             rel_max = jnp.max(info.rel_residual)
+            recs = eqx.branched_error_if(
+                recs, _dense_residual_bad(rel_max, ctx.tol), _residual_decade(rel_max),
+                _dense_residual_msgs(ctx.tol),
+            )
         else:
             rel_max = jnp.asarray(jnp.nan)
         return (*recs, rel_max, jnp.zeros((), jnp.int32))

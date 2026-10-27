@@ -711,16 +711,18 @@ def analytic_transfer(
 class WienerFactor(eqx.Module):
     """Cholesky factor of the prior-whitened masked-Wiener system, from :func:`wiener_factor`.
 
-    ``chol`` factors ``M + I``, ``M = P (A / var_pix_ref) P`` (``A`` the unit-noise
-    :func:`wiener_normal_matrix`, ``P = diag(pw)``, ``pw`` the per-DOF ``√C_prior``):
-    lower-triangular when ``lower``, else upper with ``M + I = cholᵀ chol``; the other
-    triangle is zero. A pytree whose arrays are leaves: hand it to a jitted function as an
-    argument, since a closed-over array is compiled in as a constant.
+    ``chol_t`` is the **transpose** of the lower Cholesky factor ``L`` of ``M + I``
+    (``M + I = L Lᵀ``, ``M = P (A / var_pix_ref) P``, ``A`` the unit-noise
+    :func:`wiener_normal_matrix`, ``P = diag(pw)``, ``pw`` the per-DOF ``√C_prior``); the
+    other triangle is zero. Stored transposed because the triangular solvers (LAPACK,
+    cuBLAS) take column-major input: ``chol_t.T`` reaches them without a copy, where ``L``
+    itself would be copied (``8 n_dof²`` bytes, 44 GB at lmax 192) on every solve. A pytree
+    whose arrays are leaves: hand it to a jitted function as an argument, since a
+    closed-over array is compiled in as a constant.
     """
 
-    chol: jax.Array
+    chol_t: jax.Array
     pw: jax.Array
-    lower: bool = eqx.field(static=True)
     var_pix_ref: float = eqx.field(static=True)
     lmax: int = eqx.field(static=True)
 
@@ -757,11 +759,10 @@ def wiener_factor(
             normal, cl_ee_prior, cl_bb_prior, lmax=lmax, scale=scale, overwrite=overwrite,
             block=block, clean=True,
         )
-        # chol is the Fortran-ordered lower factor; its transpose is the C-ordered upper.
-        upper = jnp.asarray(chol.T)
+        # chol is the Fortran-ordered L, so chol.T is C-ordered Lᵀ: no copy on the host.
+        chol_t = jnp.asarray(chol.T)
         del chol
-        return WienerFactor(upper, jnp.asarray(pw), lower=False,
-                            var_pix_ref=float(var_pix_ref), lmax=lmax)
+        return WienerFactor(chol_t, jnp.asarray(pw), var_pix_ref=float(var_pix_ref), lmax=lmax)
 
     ell = _dof_ell(lmax)
     n = ell.size
@@ -774,24 +775,24 @@ def wiener_factor(
         return (a * (scale * pw[:, None]) * pw[None, :]).at[idx, idx].add(1.0)
 
     m = jax.jit(whiten, donate_argnums=0)(jnp.array(normal, dtype=jnp.float64), pw)
-    chol = jax.jit(jnp.linalg.cholesky, donate_argnums=0)(m)
-    if not bool(jnp.all(jnp.isfinite(jnp.diagonal(chol)))):
+    # Transposing inside the Cholesky's jit costs no extra buffer (measured on CPU).
+    chol_t = jax.jit(lambda m: jnp.linalg.cholesky(m).T, donate_argnums=0)(m)
+    if not bool(jnp.all(jnp.isfinite(jnp.diagonal(chol_t)))):
         raise np.linalg.LinAlgError("device Cholesky failed: M + I is not positive definite")
-    return WienerFactor(chol, pw, lower=True, var_pix_ref=float(var_pix_ref), lmax=lmax)
+    return WienerFactor(chol_t, pw, var_pix_ref=float(var_pix_ref), lmax=lmax)
 
 
 def _dense_solve(factor: WienerFactor, b: jax.Array) -> jax.Array:
-    """``(M + I)⁻¹`` applied to each row of ``b`` ``(n_rhs, n_dof)``: two triangular solves."""
+    """``(M + I)⁻¹`` applied to each row of ``b`` ``(n_rhs, n_dof)``: two triangular solves.
+
+    ``factor.chol_t.T`` is ``L`` in the solvers' column-major layout, so neither solve
+    copies the factor (``tests/test_masking.py`` gates the compiled scratch size).
+    """
     from jax.scipy.linalg import solve_triangular
 
-    c = jax.lax.stop_gradient(factor.chol)
-    rhs = b.T
-    if factor.lower:
-        z = solve_triangular(c, rhs, lower=True)
-        y = solve_triangular(c, z, lower=True, trans="T")
-    else:
-        z = solve_triangular(c, rhs, lower=False, trans="T")
-        y = solve_triangular(c, z, lower=False)
+    low = jax.lax.stop_gradient(factor.chol_t).T
+    z = solve_triangular(low, b.T, lower=True)
+    y = solve_triangular(low, z, lower=True, trans="T")
     return y.T
 
 

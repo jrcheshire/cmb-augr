@@ -523,8 +523,8 @@ def test_dense_context_carries_a_factor_and_validates_its_inputs(tmp_path) -> No
     path = tmp_path / "normal.npy"
     np.save(path, normal)
     from_path, _ = _traced_setup(6, wiener_solver="dense", wiener_normal=str(path), **kw)
-    assert np.array_equal(np.asarray(from_path.wiener_factor.chol),
-                          np.asarray(ctx.wiener_factor.chol))
+    assert np.array_equal(np.asarray(from_path.wiener_factor.chol_t),
+                          np.asarray(ctx.wiener_factor.chol_t))
     assert np.array_equal(np.load(path), normal)  # the caller's array was not touched
 
     with pytest.raises(ValueError, match="'cg' or 'dense'"):
@@ -567,15 +567,30 @@ def test_dense_forward_matches_the_converged_cg() -> None:
 
 
 def test_dense_forward_raises_on_a_filter_it_was_not_built_for() -> None:
-    """The residual guard fires when ``inv_noise`` and the factor disagree; with
-    ``wiener_check=False`` nothing is checked and the residual reads NaN."""
+    """The residual guard fires when ``inv_noise`` and the factor disagree, naming the
+    residual's decade; with ``wiener_check=False`` nothing is checked and the residual
+    reads NaN. (NaN firing is covered at function level in ``test_dense_residual_decades``.)"""
     ctx, cleaner, _kw = _dense_setup(6)
     bad = dataclasses.replace(ctx, inv_noise=2.0 * ctx.inv_noise)
     w = jnp.asarray(W_INV)
-    with pytest.raises(RuntimeError, match=r"residual above ctx\.tol"):
+    with pytest.raises(RuntimeError, match=r"residual in \[1e-1, 1e0\) \(tol 1e-08\)"):
         np.asarray(mc_cutsky_cov_traced(w, bad, cleaner).covariance)
     rec = mc_cutsky_cov_traced(w, bad, cleaner, wiener_check=False)
     assert np.isnan(float(rec.wiener_max_rel_residual))
+
+
+def test_dense_residual_decades() -> None:
+    """Each residual maps to the message naming its decade, non-finite to the NaN one; the
+    check fires above ``tol`` and on NaN."""
+    from augr.spectrum_stages import _dense_residual_bad, _dense_residual_msgs, _residual_decade
+
+    bad = [bool(_dense_residual_bad(jnp.asarray(r), 1e-8)) for r in (1e-9, 1e-8, 2e-8, np.nan)]
+    assert bad == [False, False, True, True]
+    msgs = _dense_residual_msgs(1e-8)
+    for rel, span in [(3e-16, "[1e-16, 1e-15)"), (2e-7, "[1e-7, 1e-6)"), (0.5, "[1e-1, 1e0)"),
+                      (1.0, "[1e0, 1e1)"), (1e5, ">= 1e2"), (1e-20, "[1e-16, 1e-15)"),
+                      (np.nan, "NaN or inf"), (np.inf, "NaN or inf")]:
+        assert span in msgs[int(_residual_decade(jnp.asarray(rel)))], (rel, span)
 
 
 @pytest.mark.slow

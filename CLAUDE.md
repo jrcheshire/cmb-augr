@@ -758,9 +758,15 @@ wrong.
     `mc_cutsky_cov_traced` must pass the context as an argument too.
   - **The check is a re-evaluated residual.** With `wiener_check=True` each solve's
     `‖(M + I) y − P b‖ / ‖P b‖` is recomputed with the matrix-free operator (one apply per
-    leg) and `eqx.error_if` fires above `tol`: ~1e-15 for the right filter, 0.06-1.1 for a
+    leg) and `eqx.branched_error_if` fires above `tol` or on a NaN, naming the residual's
+    decade (the message is static under `jit`): ~1e-15 for the right filter, 0.06-1.1 for a
     factor built at another mask, hit map or `var_pix_ref`. `wiener_max_n_iter` is 0;
     `wiener_check=False` leaves the residual NaN.
+  - **The factor is stored transposed (`WienerFactor.chol_t = Lᵀ`).** LAPACK and cuBLAS
+    triangular solves take column-major input, so a row-major `L` is copied in front of
+    every solve (`8 n_dof²`: the 41 GiB allocation that, with the autotuner's buffers, ran a
+    GB200 out of memory in Vista job 1102023). `chol_t.T` reaches them as a free layout
+    change; `test_dense_solve_does_not_copy_the_factor` gates the compiled scratch.
   - **Not sharded over logical CPU devices.** They share one thread pool, so it buys
     nothing, and it issues large LAPACK calls concurrently from several threads: under
     osx-arm64 OpenBLAS 0.3.32 a 1242-DOF triangular solve (and `jnp.linalg.solve`)
