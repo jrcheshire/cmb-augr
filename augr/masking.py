@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import itertools
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -476,6 +477,22 @@ def _symmetrize_inplace(a: np.ndarray, block: int = 2048) -> None:
             a[jj, ii] = u.T
 
 
+def _normal_apply(x, w, nside: int, lmax: int):
+    """``A x = T Sᵀ diag(w) S T⁻¹ x`` on one real-DOF vector; ``w`` is ``(1, npix)``."""
+    jht = _require_jht()
+    a = jht.real_to_alm(x, lmax, spin=2)
+    mp = w * jht.synthesis(a, nside, lmax, spin=2)
+    return jht.alm_to_real(jht.adjoint_synthesis(mp, nside, lmax, spin=2), lmax, spin=2)
+
+
+def _prior_pw(cl_ee_prior, cl_bb_prior, ell: np.ndarray, lmax: int) -> np.ndarray:
+    """Per-DOF ``√C_prior`` in the ``[E, B]`` layout; 0 where the prior is not positive (as jht)."""
+    n_e = ell.size // 2
+    cl_ee = np.clip(np.asarray(cl_ee_prior, dtype=np.float64)[: lmax + 1], 0.0, None)
+    cl_bb = np.clip(np.asarray(cl_bb_prior, dtype=np.float64)[: lmax + 1], 0.0, None)
+    return np.sqrt(np.concatenate([cl_ee[ell[:n_e]], cl_bb[ell[n_e:]]]))
+
+
 def wiener_normal_matrix(
     inv_noise: jax.Array, *, nside: int, lmax: int, batch: int = 64, verbose: bool = False
 ) -> np.ndarray:
@@ -495,16 +512,11 @@ def wiener_normal_matrix(
     n = int(jht.n_dof(lmax, 2))
     w = jnp.asarray(inv_noise)[None, :]
 
-    def apply(x):
-        a = jht.real_to_alm(x, lmax, spin=2)
-        mp = w * jht.synthesis(a, nside, lmax, spin=2)
-        return jht.alm_to_real(jht.adjoint_synthesis(mp, nside, lmax, spin=2), lmax, spin=2)
-
     @jax.jit
     def rows(start):
         idx = start + jnp.arange(batch)
         units = (idx[:, None] == jnp.arange(n)[None, :]).astype(jnp.float64)
-        return jax.vmap(apply)(units)
+        return jax.vmap(lambda x: _normal_apply(x, w, nside, lmax))(units)
 
     out = np.empty((n, n))
     starts = range(0, n, batch)
@@ -519,6 +531,47 @@ def wiener_normal_matrix(
                   f"ETA {dt / done * (n - done) / 60:.1f} min", flush=True)
     _symmetrize_inplace(out)
     return out
+
+
+def _whitened_cholesky(
+    normal, cl_ee_prior, cl_bb_prior, *, lmax, scale, overwrite, block, clean, stage=None
+):
+    """Host LAPACK Cholesky of ``M + I``, ``M = P (scale·A) P``: ``(chol, pw, ell)``.
+
+    ``chol`` is the Fortran-ordered lower factor (``clean=False`` leaves the input's
+    values above the diagonal), ``pw`` the per-DOF ``√C_prior`` (0 where the prior is
+    not positive, as in jht), ``ell`` the per-DOF multipole. ``overwrite=True`` factors
+    ``normal`` in place (C-contiguous float64 only), otherwise a copy.
+    """
+    from scipy.linalg import lapack
+
+    lmax = int(lmax)
+    ell = _dof_ell(lmax)
+    n = ell.size
+    if np.shape(normal) != (n, n):
+        raise ValueError(f"normal must be ({n}, {n}) for lmax={lmax}, got {np.shape(normal)}")
+    pw = _prior_pw(cl_ee_prior, cl_bb_prior, ell, lmax)
+
+    if overwrite:
+        m = normal
+        if not (isinstance(m, np.ndarray) and m.dtype == np.float64 and m.flags.c_contiguous):
+            raise ValueError("overwrite=True needs a C-contiguous float64 ndarray")
+    else:
+        m = np.array(normal, dtype=np.float64, order="C")
+    for s in range(0, n, block):
+        m[s : s + block] *= (float(scale) * pw[s : s + block, None]) * pw[None, :]
+    m.flat[:: n + 1] += 1.0
+
+    # m is symmetric and C-ordered, so m.T is the same matrix in Fortran order: LAPACK
+    # factors it in place.
+    if stage is not None:
+        stage("M + I")
+    chol, info = lapack.dpotrf(m.T, lower=1, overwrite_a=1, clean=int(clean))
+    if stage is not None:
+        stage("dpotrf")
+    if info != 0:
+        raise np.linalg.LinAlgError(f"dpotrf failed (info={info}): M + I is not positive definite")
+    return chol, pw, ell
 
 
 def wiener_bb_response(
@@ -559,34 +612,14 @@ def wiener_bb_response(
             print(f"wiener_bb_response: {name} done at {time.perf_counter() - t0:.0f} s", flush=True)
 
     lmax = int(lmax)
-    ell = _dof_ell(lmax)
-    n = ell.size
-    if np.shape(normal) != (n, n):
-        raise ValueError(f"normal must be ({n}, {n}) for lmax={lmax}, got {np.shape(normal)}")
-    n_e = n // 2
-    cl_ee = np.clip(np.asarray(cl_ee_prior, dtype=np.float64)[: lmax + 1], 0.0, None)
     cl_bb = np.asarray(cl_bb_prior, dtype=np.float64)[: lmax + 1]
     if np.any(cl_bb[2:] <= 0.0):
         raise ValueError("cl_bb_prior must be positive on ell = 2..lmax (the response divides by it)")
-    pw = np.sqrt(np.concatenate([cl_ee[ell[:n_e]], cl_bb[ell[n_e:]]]))
-
-    if overwrite:
-        m = normal
-        if not (isinstance(m, np.ndarray) and m.dtype == np.float64 and m.flags.c_contiguous):
-            raise ValueError("overwrite=True needs a C-contiguous float64 ndarray")
-    else:
-        m = np.array(normal, dtype=np.float64, order="C")
-    for s in range(0, n, block):
-        m[s : s + block] *= (float(scale) * pw[s : s + block, None]) * pw[None, :]
-    m.flat[:: n + 1] += 1.0
-
-    # m is symmetric and C-ordered, so m.T is the same matrix in Fortran order: LAPACK
-    # factors it in place.
-    stage("M + I")
-    chol, info = lapack.dpotrf(m.T, lower=1, overwrite_a=1, clean=0)
-    stage("dpotrf")
-    if info != 0:
-        raise np.linalg.LinAlgError(f"dpotrf failed (info={info}): M + I is not positive definite")
+    chol, _pw, ell = _whitened_cholesky(
+        normal, cl_ee_prior, cl_bb, lmax=lmax, scale=scale, overwrite=overwrite, block=block,
+        clean=False, stage=stage,
+    )
+    n_e = ell.size // 2
     inv_bb, info = lapack.dpotri(chol[n_e:, n_e:], lower=1, overwrite_c=1)
     stage("dpotri")
     if info != 0:
@@ -668,3 +701,195 @@ def analytic_transfer(
     rec = k @ (bl2 * cl)
     num = np.asarray(bin_spectrum(rec, bin_matrix, ell_min))
     return num / np.asarray(bin_spectrum(cl, bin_matrix, ell_min))
+
+
+# ---------------------------------------------------------------------------
+# dense direct solve: one Cholesky per filter in place of a CG per map
+# ---------------------------------------------------------------------------
+
+
+class WienerFactor(eqx.Module):
+    """Cholesky factor of the prior-whitened masked-Wiener system, from :func:`wiener_factor`.
+
+    ``chol_t`` is the **transpose** of the lower Cholesky factor ``L`` of ``M + I``
+    (``M + I = L Lᵀ``, ``M = P (A / var_pix_ref) P``, ``A`` the unit-noise
+    :func:`wiener_normal_matrix`, ``P = diag(pw)``, ``pw`` the per-DOF ``√C_prior``); the
+    other triangle is zero. Stored transposed because the triangular solvers (LAPACK,
+    cuBLAS) take column-major input: ``chol_t.T`` reaches them without a copy, where ``L``
+    itself would be copied (``8 n_dof²`` bytes, 44 GB at lmax 192) on every solve. A pytree
+    whose arrays are leaves: hand it to a jitted function as an argument, since a
+    closed-over array is compiled in as a constant.
+    """
+
+    chol_t: jax.Array
+    pw: jax.Array
+    var_pix_ref: float = eqx.field(static=True)
+    lmax: int = eqx.field(static=True)
+
+
+def wiener_factor(
+    normal,
+    cl_ee_prior,
+    cl_bb_prior,
+    *,
+    lmax: int,
+    var_pix_ref: float,
+    on_device: bool = False,
+    overwrite: bool = False,
+    block: int = 2048,
+) -> WienerFactor:
+    """Factor the masked-Wiener system once, for :func:`masked_wiener_eb_alm_dense`.
+
+    ``normal`` is :func:`wiener_normal_matrix` at **unit** noise
+    (``inv_noise_map(hits, 1.0, mask=...)``). ``A`` is linear in ``N⁻¹``, so the filter of
+    ``inv_noise_map(hits, var_pix_ref, mask=...)`` is ``A / var_pix_ref``. The priors are
+    the (beamed) ones the CG path takes.
+
+    ``on_device=False`` factors on the host with LAPACK (in place under ``overwrite=True``,
+    which needs a C-contiguous float64 ndarray) and copies the factor to the default JAX
+    device. It is the route on every backend: the LAPACK threads follow
+    ``OPENBLAS_NUM_THREADS`` / ``OMP_NUM_THREADS``, so set them in a batch job that pins
+    ``OMP_NUM_THREADS=1`` (n_dof 74,490: 161 s on 144 Grace cores, 3374 s on one).
+    ``on_device=True`` moves ``normal`` to the default device and factors there
+    (transiently ~2-3 copies of ``A`` in device memory). **It is wrong on GB200 at lmax
+    192:** JAX 0.10.1's GPU Cholesky of a synthetic SPD matrix is exact at n = 47,000 and
+    off by 1.5e-1 at n = 74,490, from the first row block on (Vista job 1105246). Either
+    way the cost is ``n_dof³/3`` flops and ``8 n_dof²`` bytes per copy -- 44 GB at lmax
+    192, ~140 GB at lmax 256. Memory grows as ``lmax⁴``, so this serves low-ℓ filters.
+    """
+    lmax = int(lmax)
+    scale = 1.0 / float(var_pix_ref)
+    if not on_device:
+        chol, pw, _ell = _whitened_cholesky(
+            normal, cl_ee_prior, cl_bb_prior, lmax=lmax, scale=scale, overwrite=overwrite,
+            block=block, clean=True,
+        )
+        # chol is the Fortran-ordered L, so chol.T is C-ordered Lᵀ: no copy on the host.
+        chol_t = jnp.asarray(chol.T)
+        del chol
+        return WienerFactor(chol_t, jnp.asarray(pw), var_pix_ref=float(var_pix_ref), lmax=lmax)
+
+    ell = _dof_ell(lmax)
+    n = ell.size
+    if np.shape(normal) != (n, n):
+        raise ValueError(f"normal must be ({n}, {n}) for lmax={lmax}, got {np.shape(normal)}")
+    pw = jnp.asarray(_prior_pw(cl_ee_prior, cl_bb_prior, ell, lmax))
+    idx = jnp.arange(n)
+
+    def whiten(a, pw):
+        return (a * (scale * pw[:, None]) * pw[None, :]).at[idx, idx].add(1.0)
+
+    m = jax.jit(whiten, donate_argnums=0)(jnp.array(normal, dtype=jnp.float64), pw)
+    # Transposing inside the Cholesky's jit costs no extra buffer (measured on CPU).
+    chol_t = jax.jit(lambda m: jnp.linalg.cholesky(m).T, donate_argnums=0)(m)
+    if not bool(jnp.all(jnp.isfinite(jnp.diagonal(chol_t)))):
+        raise np.linalg.LinAlgError("device Cholesky failed: M + I is not positive definite")
+    return WienerFactor(chol_t, pw, var_pix_ref=float(var_pix_ref), lmax=lmax)
+
+
+def _dense_solve(factor: WienerFactor, b: jax.Array) -> jax.Array:
+    """``(M + I)⁻¹`` applied to each row of ``b`` ``(n_rhs, n_dof)``: two triangular solves.
+
+    ``factor.chol_t.T`` is ``L`` in the solvers' column-major layout, so neither solve
+    copies the factor (``tests/test_masking.py`` gates the compiled scratch size).
+    """
+    from jax.scipy.linalg import solve_triangular
+
+    low = jax.lax.stop_gradient(factor.chol_t).T
+    z = solve_triangular(low, b.T, lower=True)
+    y = solve_triangular(low, z, lower=True, trans="T")
+    return y.T
+
+
+def masked_wiener_eb_alm_dense(
+    qu_maps: jax.Array,
+    inv_noise: jax.Array,
+    factor: WienerFactor,
+    *,
+    nside: int,
+    lmax: int,
+    return_info: bool = False,
+):
+    """Wiener-filtered E/B alm of a stack of Q/U maps from a :func:`wiener_factor`.
+
+    The direct counterpart of :func:`masked_wiener_eb_alm`: the same system, solved for all
+    maps at once by two triangular solves. ``qu_maps`` is ``(n, 2, npix)`` (or one
+    ``(2, npix)`` map) → ``(n, 2, K)`` (or ``(2, K)``). ``inv_noise`` must be the filter the
+    factor encodes, ``inv_noise_map(hits, factor.var_pix_ref, mask=...)``. Differentiable
+    in the maps; the factor is held fixed.
+
+    ``return_info=True`` also returns ``jht.SolveInfo`` with ``n_iter`` 0 and the relative
+    residual ``‖(M + I) y − P b‖ / ‖P b‖`` re-evaluated with the matrix-free operator (one
+    extra operator application per map). That check does not use the factor, so a factor
+    built for another mask, hit map or ``var_pix_ref`` shows up as an O(1) residual.
+    """
+    jht = _require_jht()
+    nside, lmax = int(nside), int(lmax)
+    if lmax != factor.lmax:
+        raise ValueError(f"factor was built at lmax={factor.lmax}, not {lmax}")
+    qu = jnp.asarray(qu_maps)
+    single = qu.ndim == 2
+    legs = qu[None] if single else qu
+    w = jnp.asarray(inv_noise)[None, :]
+    pw = factor.pw
+
+    def rhs(m):
+        return pw * jht.alm_to_real(jht.adjoint_synthesis(w * m, nside, lmax, spin=2), lmax, spin=2)
+
+    b = jax.vmap(rhs)(legs)
+    y = _dense_solve(factor, b)
+    alm = jax.vmap(lambda v: jht.real_to_alm(pw * v, lmax, spin=2))(y)
+    alm = alm[0] if single else alm
+    if not return_info:
+        return alm
+    r = jax.vmap(lambda v: pw * _normal_apply(pw * v, w, nside, lmax) + v)(y) - b
+    bn = jnp.linalg.norm(b, axis=1)
+    rel = jnp.linalg.norm(r, axis=1) / jnp.where(bn > 0, bn, 1.0)
+    rel = rel[0] if single else rel
+    info = jht.SolveInfo(n_iter=jnp.zeros_like(rel, dtype=jnp.int32), rel_residual=rel)
+    return alm, info
+
+
+def masked_wiener_bb_dense(
+    qu_maps: jax.Array,
+    inv_noise: jax.Array,
+    factor: WienerFactor,
+    *,
+    nside: int,
+    lmax: int,
+    return_info: bool = False,
+):
+    """Raw per-ℓ ``C_ℓ^{BB}`` of each Wiener-filtered map, via :func:`masked_wiener_eb_alm_dense`.
+
+    ``(n, lmax+1)`` for a ``(n, 2, npix)`` stack, ``(lmax+1,)`` for one map; the same
+    filter-suppressed, leakage-contaminated power as :func:`masked_wiener_bb`.
+    """
+    jht = _require_jht()
+    out = masked_wiener_eb_alm_dense(
+        qu_maps, inv_noise, factor, nside=nside, lmax=lmax, return_info=return_info
+    )
+    eb_alm, info = out if return_info else (out, None)
+
+    def bb(a):
+        return jht.bandpower(a, int(lmax), spin=2)[1]
+
+    cl = bb(eb_alm) if eb_alm.ndim == 2 else jax.vmap(bb)(eb_alm)
+    return (cl, info) if return_info else cl
+
+
+def normal_matrix_mismatch(normal, inv_noise: jax.Array, *, nside: int, lmax: int,
+                           seed: int = 0) -> float:
+    """``‖A v − op(v)‖ / ‖op(v)‖`` for one random ``v``: does ``normal`` describe ``inv_noise``?
+
+    ``op`` is the matrix-free normal operator of ``inv_noise``, the one
+    :func:`wiener_normal_matrix` samples column by column, so a matrix built for another
+    mask or hit map, or at another noise scale, gives O(1). One matrix-vector product and
+    one operator application.
+    """
+    nside, lmax = int(nside), int(lmax)
+    n = np.shape(normal)[0]
+    v = np.random.default_rng(seed).standard_normal(n)
+    av = np.asarray(normal @ v) if isinstance(normal, np.ndarray) else np.asarray(
+        jnp.asarray(normal) @ jnp.asarray(v))
+    ov = np.asarray(_normal_apply(jnp.asarray(v), jnp.asarray(inv_noise)[None, :], nside, lmax))
+    return float(np.linalg.norm(av - ov) / np.linalg.norm(ov))

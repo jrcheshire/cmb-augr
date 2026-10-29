@@ -378,6 +378,143 @@ def test_wiener_bb_response_predicts_the_mc_mean(dense_window):
 
 
 # ---------------------------------------------------------------------------
+# dense direct solve (wiener_factor / masked_wiener_eb_alm_dense)
+# ---------------------------------------------------------------------------
+# Same problem as the window fixture, but A at UNIT noise (the factor's input).
+# Margins measured 2026-10-25 (dense vs CG and the copy gate 2026-10-27).
+
+
+@pytest.fixture(scope="module")
+def dense_solve():
+    ls = load_lensing_spectra()
+    cl_ee = jnp.clip(ls.cl_ee_len[: _WLMAX + 1], 0.0, None)
+    cl_bb = jnp.clip(ls.cl_bb_len[: _WLMAX + 1], 0.0, None)
+    npix = hp.nside2npix(_WNS)
+    hits = jnp.asarray(np.linspace(1.0, 3.0, npix))
+    mask = mk.galactic_mask(_WNS, 0.6)
+    unit = mk.inv_noise_map(hits, 1.0, mask=mask)
+    normal = mk.wiener_normal_matrix(unit, nside=_WNS, lmax=_WLMAX)
+    invn = mk.inv_noise_map(hits, _WVAR, mask=mask)
+    qu = jnp.asarray(np.random.default_rng(3).standard_normal((3, 2, npix)))
+    return dict(cl_ee=cl_ee, cl_bb=cl_bb, hits=hits, mask=mask, unit=unit, normal=normal,
+                invn=invn, qu=qu)
+
+
+def _real(alm):
+    import jax
+    import jht
+
+    return np.asarray(jax.vmap(lambda a: jht.alm_to_real(a, _WLMAX, spin=2))(alm))
+
+
+@pytest.mark.parametrize("on_device", [False, True])
+def test_dense_wiener_matches_the_jht_wiener_mean(dense_solve, on_device):
+    """The direct solve == ``jht.wiener`` (tol 1e-13) on a stack of maps, both factor routes.
+
+    Measured 4.0e-12 (host LAPACK) / 3.6e-12 (device) as max|Δx| / max|x|; gate 1e-10. A
+    factor cut to its diagonal (the mutation) is off by 1.0.
+    """
+    import jht
+
+    d = dense_solve
+    f = mk.wiener_factor(d["normal"], d["cl_ee"], d["cl_bb"], lmax=_WLMAX, var_pix_ref=_WVAR,
+                         on_device=on_device)
+    assert not np.any(np.tril(np.asarray(f.chol_t), -1))  # Lᵀ: upper-triangular
+    dense = mk.masked_wiener_eb_alm_dense(d["qu"], d["invn"], f, nside=_WNS, lmax=_WLMAX)
+    cg = jnp.stack([jht.wiener(q, (d["cl_ee"], d["cl_bb"]), _WNS, _WLMAX, spin=2,
+                               inv_noise=d["invn"], tol=1e-13, max_iter=20000) for q in d["qu"]])
+    x_cg = _real(cg)
+    assert np.max(np.abs(_real(dense) - x_cg)) / np.max(np.abs(x_cg)) < 1e-10
+
+    diag = mk.WienerFactor(jnp.diag(jnp.diagonal(f.chol_t)), f.pw, var_pix_ref=_WVAR,
+                           lmax=_WLMAX)
+    bad = mk.masked_wiener_eb_alm_dense(d["qu"], d["invn"], diag, nside=_WNS, lmax=_WLMAX)
+    assert np.max(np.abs(_real(bad) - x_cg)) / np.max(np.abs(x_cg)) > 0.1
+
+
+def test_dense_solve_does_not_copy_the_factor(dense_solve):
+    """The compiled solve's scratch is far below one copy of the factor (``8 n_dof²``).
+
+    The triangular solvers take column-major input, so a row-major ``L`` handed to them is
+    copied on every solve -- 41 GiB at nside 128 / lmax 192, which ran a GB200 out of
+    memory. Gated on ``memory_analysis().temp_size_in_bytes`` as a fraction of ``8 n_dof²``:
+    measured 0.0048 for :func:`_dense_solve`, 1.0048 for the control (the same two
+    solves on a row-major ``L``, the pre-fix layout), at n_dof 1242. Gates 0.1 and 0.9.
+    """
+    import jax
+    from jax.scipy.linalg import solve_triangular
+
+    d = dense_solve
+    f = mk.wiener_factor(d["normal"], d["cl_ee"], d["cl_bb"], lmax=_WLMAX, var_pix_ref=_WVAR)
+    n = f.chol_t.shape[0]
+    b = jnp.ones((6, n))
+
+    def scratch(fn, *args):
+        temp = jax.jit(fn).lower(*args).compile().memory_analysis().temp_size_in_bytes
+        return temp / (8 * n * n)
+
+    def row_major(low, b):
+        z = solve_triangular(low, b.T, lower=True)
+        return solve_triangular(low, z, lower=True, trans="T").T
+
+    assert scratch(mk._dense_solve, f, b) < 0.1
+    assert scratch(row_major, jnp.asarray(np.asarray(f.chol_t).T.copy()), b) > 0.9
+
+
+def test_dense_wiener_single_map_and_bandpower_shapes(dense_solve):
+    """One ``(2, npix)`` map gives the stacked row (to 8.5e-15, not bitwise: a different
+    solve shape); ``masked_wiener_bb_dense`` returns ``(n, lmax+1)`` / ``(lmax+1,)``."""
+    d = dense_solve
+    f = mk.wiener_factor(d["normal"], d["cl_ee"], d["cl_bb"], lmax=_WLMAX, var_pix_ref=_WVAR)
+    many = mk.masked_wiener_eb_alm_dense(d["qu"], d["invn"], f, nside=_WNS, lmax=_WLMAX)
+    one = mk.masked_wiener_eb_alm_dense(d["qu"][1], d["invn"], f, nside=_WNS, lmax=_WLMAX)
+    assert one.shape == many.shape[1:]
+    assert float(jnp.max(jnp.abs(one - many[1])) / jnp.max(jnp.abs(many[1]))) < 1e-12
+    cl = mk.masked_wiener_bb_dense(d["qu"], d["invn"], f, nside=_WNS, lmax=_WLMAX)
+    assert cl.shape == (3, _WLMAX + 1)
+    assert mk.masked_wiener_bb_dense(d["qu"][0], d["invn"], f, nside=_WNS,
+                                     lmax=_WLMAX).shape == (_WLMAX + 1,)
+    with pytest.raises(ValueError, match="lmax"):
+        mk.masked_wiener_eb_alm_dense(d["qu"], d["invn"], f, nside=_WNS, lmax=_WLMAX - 1)
+
+
+def test_dense_wiener_residual_flags_a_factor_for_another_filter(dense_solve):
+    """The re-evaluated residual is ~1e-15 for the factor's own filter and O(1) for another.
+
+    Measured: own filter <= 2.9e-15; var_pix_ref x2 0.50, a GAL50 mask 0.056-0.12,
+    uniform hits 0.70-1.09. Gates 1e-12 and 1e-3, both far from ``tol`` = 1e-8.
+    """
+    d = dense_solve
+    f = mk.wiener_factor(d["normal"], d["cl_ee"], d["cl_bb"], lmax=_WLMAX, var_pix_ref=_WVAR)
+
+    def rel(w):
+        _a, info = mk.masked_wiener_eb_alm_dense(d["qu"], w, f, nside=_WNS, lmax=_WLMAX,
+                                                 return_info=True)
+        assert np.all(np.asarray(info.n_iter) == 0)
+        return np.asarray(info.rel_residual)
+
+    assert np.all(rel(d["invn"]) < 1e-12)
+    others = (
+        mk.inv_noise_map(d["hits"], 2 * _WVAR, mask=d["mask"]),
+        mk.inv_noise_map(d["hits"], _WVAR, mask=mk.galactic_mask(_WNS, 0.5)),
+        mk.inv_noise_map(jnp.ones_like(d["hits"]), _WVAR, mask=d["mask"]),
+    )
+    for w in others:
+        assert np.all(rel(w) > 1e-3)
+
+
+def test_normal_matrix_mismatch_tells_the_right_matrix_from_a_wrong_one(dense_solve):
+    """4.3e-16 for the matrix's own operator; 0.50 at 2x the noise, 0.32 on a GAL50 mask.
+    Gates 1e-12 and 0.1."""
+    d = dense_solve
+    kw = dict(nside=_WNS, lmax=_WLMAX)
+    assert mk.normal_matrix_mismatch(d["normal"], d["unit"], **kw) < 1e-12
+    assert mk.normal_matrix_mismatch(d["normal"], 2.0 * d["unit"], **kw) > 0.1
+    other = mk.inv_noise_map(d["hits"], 1.0, mask=mk.galactic_mask(_WNS, 0.5))
+    assert mk.normal_matrix_mismatch(d["normal"], other, **kw) > 0.1
+
+
+# ---------------------------------------------------------------------------
 # slow: science checkpoints  (tolerances set from the nside=256 validation run)
 # ---------------------------------------------------------------------------
 

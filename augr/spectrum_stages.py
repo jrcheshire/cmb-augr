@@ -182,6 +182,32 @@ def cutsky_bb_bandpower(
     return mk.bin_spectrum(out, bin_matrix, ell_min)
 
 
+def cutsky_bb_bandpower_dense(
+    cleaned_qu_legs: jax.Array,
+    inv_noise: jax.Array,
+    factor: mk.WienerFactor,
+    *,
+    bin_matrix: jax.Array,
+    ell_min: int,
+    nside: int,
+    lmax: int,
+    return_info: bool = False,
+):
+    """Raw binned ``C_b^{BB}`` of a stack of cleaned Q/U maps ``(n, 2, npix)`` → ``(n, n_bins)``.
+
+    :func:`cutsky_bb_bandpower` with the direct solve
+    (:func:`augr.masking.masked_wiener_bb_dense`): every map in one pair of triangular
+    solves. ``return_info`` gives ``(binned, SolveInfo)`` with per-map residuals.
+    """
+    out = mk.masked_wiener_bb_dense(
+        cleaned_qu_legs, inv_noise, factor, nside=int(nside), lmax=int(lmax),
+        return_info=return_info,
+    )
+    cl, info = out if return_info else (out, None)
+    binned = jax.vmap(lambda c: mk.bin_spectrum(c, bin_matrix, ell_min))(cl)
+    return (binned, info) if return_info else binned
+
+
 _WIENER_LEGS = ("data", "transfer (CMB B)", "leakage (CMB E)", "fg_residual")
 
 
@@ -588,8 +614,14 @@ class CutskyMCContext(eqx.Module):
     # and sqrt(C_res / C_lens) turns that into the design's residual in-trace.
     cl_bb_lens_ref: jax.Array | None = None
     # ``jht.WienerPreconditioner`` for the masked-Wiener solves (built once for
-    # ``inv_noise`` and the priors); ``None`` on MASTER or when disabled.
+    # ``inv_noise`` and the priors); ``None`` on MASTER, when disabled, or under the
+    # dense solver.
     wiener_precond: tuple | None = None
+    # ``masking.WienerFactor`` of the filter when ``wiener_solver == "dense"`` (``n_dof²``
+    # floats: 44 GB at lmax 192). Pass the context to a jitted caller as an argument,
+    # never close over it: a closed-over array is compiled in as a constant.
+    wiener_factor: mk.WienerFactor | None = None
+    wiener_solver: str = eqx.field(static=True, default="cg")
     estimator: str = eqx.field(static=True, default="master")
     lmax_mask: int | None = eqx.field(static=True, default=None)
     # Derived eagerly from bin_matrix (a traced leaf, so it cannot be read
@@ -677,6 +709,9 @@ def make_cutsky_mc_context(
     wiener_ell_split: int | None = 32,
     fg_comp_eb_alm=None,
     fg_seed_offset: int | None = None,
+    wiener_solver: str = "cg",
+    wiener_normal=None,
+    wiener_factor_on_device: bool = False,
 ) -> CutskyMCContext:
     """Eager precompute for the differentiable cut-sky MC.
 
@@ -758,6 +793,21 @@ def make_cutsky_mc_context(
     :func:`augr.compsep_sims._component_seeds`) -- so without an offset, ``d11``'s
     small scales replay the CMB's random draws. ``None`` (default) keeps that legacy
     seeding, so earlier ``s6`` / ``d10s6`` ensembles reproduce.
+
+    ``wiener_solver`` (Wiener path only): ``"cg"`` (default) solves every map with jht's
+    preconditioned CG; ``"dense"`` factors the filter once (:func:`augr.masking.wiener_factor`)
+    and solves each sim's legs with two triangular solves -- the same filter to the CG
+    tolerance, ~100x faster per sim at nside 128, and batchable / shardable over sims.
+    It needs ``wiener_normal``: the **unit-noise** :func:`augr.masking.wiener_normal_matrix`
+    for this mask and hit map (``inv_noise_map(hit_map, 1.0, mask=mask)``), as an array
+    or a ``.npy`` path. A path is loaded and factored in place; an array is copied, so
+    peak memory is two ``A``-sized arrays. Before factoring, ``A`` is probed against the
+    matrix-free operator (:func:`augr.masking.normal_matrix_mismatch`, must be below
+    ``tol``) so a matrix for another mask or hit map is refused. The factor is built on
+    the host on every backend and copied to the default device, where the solves run;
+    ``wiener_factor_on_device=True`` factors on the device instead, which is wrong on
+    GB200 at lmax 192 (see :func:`augr.masking.wiener_factor`). The
+    preconditioner is not built under ``"dense"``.
     """
     # The inverse-noise filter -- and hence var_pix_ref and the setup clean that
     # derives it -- exists only for the masked-Wiener estimator. MASTER never
@@ -765,6 +815,17 @@ def make_cutsky_mc_context(
     # is also what lets a clean_e=False cleaner build a context at all, since the
     # clean's noise leg calls project_e().
     needs_inv_noise = str(estimator) != "master"
+    if wiener_solver not in ("cg", "dense"):
+        raise ValueError(f"wiener_solver must be 'cg' or 'dense', got {wiener_solver!r}")
+    dense = wiener_solver == "dense"
+    if dense and not needs_inv_noise:
+        raise ValueError("wiener_solver='dense' applies to estimator='wiener' only")
+    if dense and wiener_normal is None:
+        raise ValueError(
+            "wiener_solver='dense' needs wiener_normal: the unit-noise "
+            "masking.wiener_normal_matrix(inv_noise_map(hit_map, 1.0, mask=mask)) of this "
+            "mask and hit map, as an array or a .npy path"
+        )
     spectra = CMBSpectra() if spectra is None else spectra
     freqs_ghz = tuple(float(f) for f in freqs_ghz)
     beam_fwhm_arcmin = tuple(float(b) for b in beam_fwhm_arcmin)
@@ -915,8 +976,25 @@ def make_cutsky_mc_context(
     )
     wiener_pc = _build_wiener_precond(
         inv_noise, cl_ee_prior, cl_bb_prior, nside=nside, lmax=lmax,
-        enabled=needs_inv_noise and wiener_precond, ell_split=wiener_ell_split,
+        enabled=needs_inv_noise and wiener_precond and not dense, ell_split=wiener_ell_split,
     )
+    factor = None
+    if dense:
+        from_path = isinstance(wiener_normal, (str, os.PathLike))
+        normal = np.load(wiener_normal) if from_path else wiener_normal
+        unit = mk.inv_noise_map(hit_map, 1.0, mask=mask)
+        mismatch = mk.normal_matrix_mismatch(normal, unit, nside=nside, lmax=lmax)
+        if not mismatch < tol:
+            raise ValueError(
+                f"wiener_normal does not describe this mask / hit map at unit noise: "
+                f"|A v - op(v)| / |op(v)| = {mismatch:.2e} (tol {tol:g})"
+            )
+        on_device = bool(wiener_factor_on_device)
+        factor = mk.wiener_factor(
+            normal, cl_ee_prior, cl_bb_prior, lmax=lmax, var_pix_ref=var_pix_ref,
+            on_device=on_device, overwrite=from_path and not on_device,
+        )
+        del normal
 
     return CutskyMCContext(
         harmonic_skies=harmonic_skies,
@@ -946,6 +1024,8 @@ def make_cutsky_mc_context(
             else None
         ),
         wiener_precond=wiener_pc,
+        wiener_factor=factor,
+        wiener_solver=str(wiener_solver),
         estimator=str(estimator),
         lmax_mask=None if lmax_mask is None else int(lmax_mask),
         master_bin_edges=(_edges_from_bin_matrix(bin_matrix, ell_min)
@@ -1613,15 +1693,18 @@ def mc_cutsky_cov_traced(
     on the masked-Wiener branch raising it batches a ``while_loop`` CG, so read
     :func:`_sim_map` before doing so. On the MASTER branch the sim axis is split
     across every visible device (the GPUs, or ``JAX_NUM_CPU_DEVICES`` on CPU);
-    ``AUGR_SIM_NO_SHARD=1`` opts out. The masked-Wiener branch is not sharded.
+    ``AUGR_SIM_NO_SHARD=1`` opts out. The masked-Wiener branch is safe to batch only under
+    ``ctx.wiener_solver == "dense"``, and is then sharded across accelerators (not logical
+    CPU devices).
 
-    On the masked-Wiener branch every solve uses ``ctx.wiener_precond`` and reports
+    On the masked-Wiener branch every CG solve uses ``ctx.wiener_precond`` and reports
     its convergence: :attr:`CutskyMCTraced.wiener_max_rel_residual` /
     ``wiener_max_n_iter``. With ``wiener_check=True`` (default) a solve that ends at
     ``ctx.max_iter`` above ``ctx.tol`` raises (``eqx.error_if``; works under ``jit``
     and ``grad``, and fires at the first offending sim). ``wiener_check=False`` only
     records. The backward pass's transpose solves run with the same preconditioner and
-    budget but report nothing.
+    budget but report nothing. Under the dense solver the check is the re-evaluated
+    residual of each direct solve (see :func:`_mc_cutsky_cov_wiener_dense`).
 
     The straight-through gradient flows through a *sample* covariance, so it carries
     Monte-Carlo noise -- characterise grad std vs ``n_sims`` before trusting a
@@ -1664,6 +1747,11 @@ def mc_cutsky_cov_traced(
             "derives var_pix_ref). Rebuild with "
             "make_cutsky_mc_context(estimator='wiener')."
         )
+    if ctx.wiener_solver == "dense":
+        return _mc_cutsky_cov_wiener_dense(
+            w_inv, ctx, cleaner, bf, bp, lens_scale, fg_residual,
+            remat=remat, sim_batch=sim_batch, wiener_check=wiener_check,
+        )
     bp_kw = dict(
         bin_matrix=ctx.bin_matrix,
         ell_min=ctx.ell_min,
@@ -1683,41 +1771,12 @@ def mc_cutsky_cov_traced(
     n_shared_fg = int(shared_fg_alm is not None)
 
     def _one(hsky, key, *consts):
-        # Beam the (frozen, unbeamed) per-sim harmonic sky in-trace, so the beams flow
-        # the gradient. The BandSky static beam field carries the concrete reference
-        # (metadata only; assemble_band_maps reads only cmb_qu / fg_qu).
         if n_shared_fg:
             hsky = dataclasses.replace(hsky, fg_eb_alm=consts[0])
         comp = consts[n_shared_fg] if len(consts) > n_shared_fg else hsky.fg_comp_eb_alm
-        band_sky = beam_harmonic_sky(
-            hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin, lens_scale=lens_scale
+        legs = _wiener_legs(
+            ctx, cleaner, bf, bp, lens_scale, fg_residual, has_comp, hsky, key, w_inv, comp
         )
-        total = assemble_band_maps(
-            band_sky,
-            w_inv,
-            ctx.hit_map,
-            noise_key=key,
-            knee_ell=ctx.knee_ell,
-            alpha_knee=ctx.alpha_knee,
-        )
-        result = cleaner(total, bf, bp, lmax=ctx.lmax, nside=ctx.nside)
-        legs = [
-            result.cleaned_qu(),
-            _cleaned_b_qu(result, band_sky.cmb_qu),
-            _cleaned_e_qu(result, band_sky.cmb_qu),
-        ]
-        if fg_residual:
-            # The foreground's footprint on rec_full: its cleaned E and B, through the
-            # same filter. The E half is the foreground E->B leakage, which the CMB-E
-            # leakage template does not remove.
-            fg = band_sky.fg_qu
-            legs.append(_cleaned_b_qu(result, fg) + _cleaned_e_qu(result, fg))
-            if has_comp:
-                # Each component through the same stored weights (project is linear in
-                # its input, so the component maps sum to the total's cleaned map).
-                for c in range(comp.shape[0]):
-                    fg_c = _beam_fg_eb(comp[c], bf, ctx.lmax, ctx.nside, beam_shape_p=bp)
-                    legs.append(_cleaned_b_qu(result, fg_c) + _cleaned_e_qu(result, fg_c))
         out = [
             cutsky_bb_bandpower(
                 qu, ctx.inv_noise, ctx.cl_ee_prior, ctx.cl_bb_prior, **bp_kw
@@ -1754,6 +1813,144 @@ def mc_cutsky_cov_traced(
         sim_batch=sim_batch,
         consts=fg_consts,
     )
+    return _wiener_traced_outputs(ctx, lens_scale, fg_residual, has_comp, recs, rel_max,
+                                  n_iter_max)
+
+
+def _wiener_legs(ctx, cleaner, bf, bp, lens_scale, fg_residual, has_comp, hsky, key, w_inv,
+                 comp):
+    """One sim's cleaned Q/U legs for the masked-Wiener estimator: data, CMB-B, CMB-E, and
+    under ``fg_residual`` the foreground (and per-component) footprints."""
+    # Beam the (frozen, unbeamed) per-sim harmonic sky in-trace, so the beams flow
+    # the gradient. The BandSky static beam field carries the concrete reference
+    # (metadata only; assemble_band_maps reads only cmb_qu / fg_qu).
+    band_sky = beam_harmonic_sky(
+        hsky, bf, bp, beam_fwhm_ref=ctx.beam_fwhm_arcmin, lens_scale=lens_scale
+    )
+    total = assemble_band_maps(
+        band_sky,
+        w_inv,
+        ctx.hit_map,
+        noise_key=key,
+        knee_ell=ctx.knee_ell,
+        alpha_knee=ctx.alpha_knee,
+    )
+    result = cleaner(total, bf, bp, lmax=ctx.lmax, nside=ctx.nside)
+    legs = [
+        result.cleaned_qu(),
+        _cleaned_b_qu(result, band_sky.cmb_qu),
+        _cleaned_e_qu(result, band_sky.cmb_qu),
+    ]
+    if fg_residual:
+        # The foreground's footprint on rec_full: its cleaned E and B, through the
+        # same filter. The E half is the foreground E->B leakage, which the CMB-E
+        # leakage template does not remove.
+        fg = band_sky.fg_qu
+        legs.append(_cleaned_b_qu(result, fg) + _cleaned_e_qu(result, fg))
+        if has_comp:
+            # Each component through the same stored weights (project is linear in
+            # its input, so the component maps sum to the total's cleaned map).
+            for c in range(comp.shape[0]):
+                fg_c = _beam_fg_eb(comp[c], bf, ctx.lmax, ctx.nside, beam_shape_p=bp)
+                legs.append(_cleaned_b_qu(result, fg_c) + _cleaned_e_qu(result, fg_c))
+    return legs
+
+
+# Logical CPU devices share one thread pool, so sharding the dense branch over
+# JAX_NUM_CPU_DEVICES buys nothing -- and it issues large LAPACK calls concurrently from
+# several threads, which osx-arm64 OpenBLAS 0.3.32 got wrong (a sharded 1242-DOF triangular
+# solve off by 1e8-1e40; exact under OMP_NUM_THREADS=1 or Accelerate, which the osx-arm64
+# env now uses). Other BLAS builds are unchecked, so the dense branch shards over
+# accelerators only. Tests flip this, under OMP_NUM_THREADS=1, to exercise the sharded path.
+_DENSE_SHARD_CPU = False
+
+# Decades of the residual reported by the dense check: the message is static under jit,
+# so the residual is bucketed (index 0 is NaN / inf, then [1e-16, 1e-15), ..., >= 1e2).
+_RESIDUAL_DECADES = np.arange(-16, 3)
+
+
+def _dense_residual_bad(rel, tol: float):
+    """True above ``tol`` or non-finite (``rel > tol`` alone lets a NaN through)."""
+    return ~(rel <= tol)
+
+
+def _residual_decade(rel):
+    """Index of ``rel``'s decade into :func:`_dense_residual_msgs` (0 if non-finite)."""
+    k = jnp.clip(jnp.floor(jnp.log10(rel)), _RESIDUAL_DECADES[0], _RESIDUAL_DECADES[-1])
+    idx = (k - _RESIDUAL_DECADES[0]).astype(jnp.int32) + 1
+    return jnp.where(jnp.isfinite(rel), idx, 0)
+
+
+def _dense_residual_msgs(tol: float) -> tuple[str, ...]:
+    """Messages for the dense residual check, one per :func:`_residual_decade` index."""
+    head = "dense masked-Wiener solve has a residual "
+    tail = (f" (tol {tol:g}): the factor does not describe ctx.inv_noise (built for another "
+            "mask, hit map or var_pix_ref?), or the solve itself failed.")
+    spans = [f"in [1e{k}, 1e{k + 1})" for k in _RESIDUAL_DECADES[:-1]]
+    spans.append(f">= 1e{_RESIDUAL_DECADES[-1]}")
+    return (head + "that is NaN or inf" + tail, *(head + s + tail for s in spans))
+
+
+def _mc_cutsky_cov_wiener_dense(
+    w_inv, ctx, cleaner, bf, bp, lens_scale, fg_residual, *, remat, sim_batch, wiener_check
+) -> CutskyMCTraced:
+    """Masked-Wiener branch of :func:`mc_cutsky_cov_traced` under ``ctx.wiener_solver == "dense"``.
+
+    The legs are those of the CG branch; each sim solves all of them at once against
+    ``ctx.wiener_factor``. With no ``while_loop`` left, ``sim_batch`` batches sims, and on
+    an accelerator the sim axis is sharded across the visible devices (not over logical
+    CPU devices: see ``_DENSE_SHARD_CPU``). The factor,
+    ``inv_noise``, ``w_inv`` and ``lens_scale`` enter one ``jax.jit`` as arguments: a
+    closed-over factor would be compiled in as a constant. ``wiener_check`` re-evaluates
+    each solve's residual with the matrix-free operator and raises above ``ctx.tol``;
+    without it ``wiener_max_rel_residual`` is NaN. ``wiener_max_n_iter`` is 0.
+    """
+    mapped_skies, shared_fg_alm = _split_shared_fg(ctx.harmonic_skies)
+    mapped_skies, shared_comp_alm = _split_shared_fg_comp(mapped_skies)
+    has_comp = ctx.harmonic_skies.fg_comp_eb_alm is not None
+    fg_consts = tuple(c for c in (shared_fg_alm, shared_comp_alm) if c is not None)
+    n_shared_fg = int(shared_fg_alm is not None)
+    kw = dict(bin_matrix=ctx.bin_matrix, ell_min=ctx.ell_min, nside=ctx.nside, lmax=ctx.lmax,
+              return_info=wiener_check)
+
+    def _one(hsky, key, w_inv, lens_scale, inv_noise, factor, *consts):
+        if n_shared_fg:
+            hsky = dataclasses.replace(hsky, fg_eb_alm=consts[0])
+        comp = consts[n_shared_fg] if len(consts) > n_shared_fg else hsky.fg_comp_eb_alm
+        legs = _wiener_legs(
+            ctx, cleaner, bf, bp, lens_scale, fg_residual, has_comp, hsky, key, w_inv, comp
+        )
+        out = cutsky_bb_bandpower_dense(jnp.stack(legs), inv_noise, factor, **kw)
+        binned, info = out if wiener_check else (out, None)
+        recs = tuple(binned[i] for i in range(len(legs)))
+        if wiener_check:
+            rel_max = jnp.max(info.rel_residual)
+            recs = eqx.branched_error_if(
+                recs, _dense_residual_bad(rel_max, ctx.tol), _residual_decade(rel_max),
+                _dense_residual_msgs(ctx.tol),
+            )
+        else:
+            rel_max = jnp.asarray(jnp.nan)
+        return (*recs, rel_max, jnp.zeros((), jnp.int32))
+
+    shard = jax.default_backend() != "cpu" or _DENSE_SHARD_CPU
+
+    def run(xs, *consts):
+        return _sim_map(
+            lambda bk, *cs: _one(bk[0], bk[1], *cs), xs, remat=remat, sim_batch=sim_batch,
+            consts=consts, shard=shard,
+        )
+
+    *recs, rel_max, n_iter_max = jax.jit(run)(
+        (mapped_skies, ctx.noise_keys), w_inv, lens_scale, ctx.inv_noise, ctx.wiener_factor,
+        *fg_consts,
+    )
+    return _wiener_traced_outputs(ctx, lens_scale, fg_residual, has_comp, recs, rel_max,
+                                  n_iter_max)
+
+
+def _wiener_traced_outputs(ctx, lens_scale, fg_residual, has_comp, recs, rel_max, n_iter_max):
+    """Debias the per-sim Wiener legs and pack :class:`CutskyMCTraced` (both solvers)."""
     rec_full, rec_b, rec_e, *rec_fg = recs
 
     # The transfer's denominator is the binned power the sims' B actually carries.

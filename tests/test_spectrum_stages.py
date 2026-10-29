@@ -12,6 +12,7 @@ Map work needs jht (the [masking] extra) and ducc0 (the SHTs).
 from __future__ import annotations
 
 import dataclasses
+import functools
 import os
 
 import numpy as np
@@ -481,6 +482,173 @@ def test_preconditioned_gradient_matches_and_backward_solves_converge() -> None:
     assert np.all(np.isfinite(g))
     assert _max_rel(g, grad_for(plain)) < _PRECOND_FLOOR
     assert np.array_equal(g, grad_for(big))
+
+
+# --- masked-Wiener dense direct solve ----------------------------------------
+#
+# _traced_setup's binary GAL60 mask with non-uniform hits and a two-component
+# isotropic foreground, so every leg (data, CMB-B, CMB-E, FG total, per component)
+# goes through the solve. The CG reference iterates for real (ell_split=8) to tol 1e-12.
+# Margins measured 2026-10-25.
+
+_DENSE_NS, _DENSE_LMAX = 16, 24
+
+
+@functools.lru_cache(maxsize=1)
+def _dense_inputs(n_sims):
+    hits = jnp.asarray(np.linspace(1.0, 3.0, 12 * _DENSE_NS**2))
+    comps = jnp.stack([_isotropic_fg(n_sims + 1, _DENSE_LMAX, slope=1.5),
+                       _isotropic_fg(n_sims + 1, _DENSE_LMAX, slope=-3.0, seed0=77_000)], axis=1)
+    unit = mk.inv_noise_map(hits, 1.0, mask=mk.galactic_mask(_DENSE_NS, 0.6))
+    normal = mk.wiener_normal_matrix(unit, nside=_DENSE_NS, lmax=_DENSE_LMAX)
+    return hits, comps, normal
+
+
+def _dense_setup(n_sims, **ctx_kw):
+    """(dense ctx, cleaner, kwargs that rebuild the same sims and filter for a CG twin)."""
+    hits, comps, normal = _dense_inputs(n_sims)
+    kw = dict(hit_map=hits, fg_comp_eb_alm=comps)
+    ctx, cleaner = _traced_setup(n_sims, wiener_solver="dense", wiener_normal=normal, **kw,
+                                 **ctx_kw)
+    return ctx, cleaner, dict(kw, var_pix_ref=ctx.var_pix_ref)
+
+
+def test_dense_context_carries_a_factor_and_validates_its_inputs(tmp_path) -> None:
+    """A dense context holds the factor (no preconditioner) for its own ``var_pix_ref``; a
+    ``.npy`` path gives the same factor bit for bit; bad configurations are refused."""
+    ctx, cleaner, kw = _dense_setup(6)
+    assert ctx.wiener_solver == "dense" and ctx.wiener_precond is None
+    assert ctx.wiener_factor.var_pix_ref == ctx.var_pix_ref
+    _hits, _comps, normal = _dense_inputs(6)
+    path = tmp_path / "normal.npy"
+    np.save(path, normal)
+    from_path, _ = _traced_setup(6, wiener_solver="dense", wiener_normal=str(path), **kw)
+    assert np.array_equal(np.asarray(from_path.wiener_factor.chol_t),
+                          np.asarray(ctx.wiener_factor.chol_t))
+    assert np.array_equal(np.load(path), normal)  # the caller's array was not touched
+
+    with pytest.raises(ValueError, match="'cg' or 'dense'"):
+        _traced_setup(6, wiener_solver="direct", **kw)
+    with pytest.raises(ValueError, match="needs wiener_normal"):
+        _traced_setup(6, wiener_solver="dense", **kw)
+    with pytest.raises(ValueError, match="does not describe"):
+        _traced_setup(6, wiener_solver="dense", wiener_normal=2.0 * normal, **kw)
+    with pytest.raises(ValueError, match="estimator='wiener' only"):
+        make_cutsky_mc_context(cleaner=cleaner, estimator="master", wiener_solver="dense",
+                               wiener_normal=normal, **_ctx_kwargs(6))
+
+
+def test_dense_context_factors_on_the_host_on_a_gpu_backend(monkeypatch) -> None:
+    """A dense context factors on the host even when the default backend is a GPU, whose
+    Cholesky is wrong at lmax 192 (Vista job 1105246); the device route stays opt-in."""
+    calls = []
+    real = mk.wiener_factor
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs["on_device"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mk, "wiener_factor", spy)
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    hits, comps, normal = _dense_inputs(6)
+    kw = dict(hit_map=hits, fg_comp_eb_alm=comps, wiener_solver="dense", wiener_normal=normal)
+    host, _ = _traced_setup(6, **kw)
+    _traced_setup(6, wiener_factor_on_device=True, var_pix_ref=host.var_pix_ref, **kw)
+    assert calls == [False, True]
+
+
+_DENSE_OUTPUTS = ("debiased_bandpowers", "covariance", "transfer", "leakage",
+                  "fg_residual_bandpower", "fg_residual_components", "rec_transfer")
+
+
+@pytest.mark.slow
+def test_dense_forward_matches_the_converged_cg() -> None:
+    """Every output of the dense forward == the CG forward at tol 1e-14, same sims and filter.
+
+    The gap is the CG's own error: it falls ~100x per 100x in tol (leakage 6.8e-7, 1.2e-8,
+    7.2e-11, 3.9e-13 at tol 1e-8..1e-14). At tol 1e-14 measured max|Δ| / max|ref| <= 3.9e-13
+    (leakage; covariance 2.6e-13, debiased 5.0e-14); gate 1e-10. The tol-1e-10 arm (debiased
+    5.0e-10) shows the comparison resolves CG error.
+    """
+    ctx, cleaner, kw = _dense_setup(6)
+    w = jnp.asarray(W_INV)
+    a = mc_cutsky_cov_traced(w, ctx, cleaner, fg_residual=True)
+    assert int(a.wiener_max_n_iter) == 0 and float(a.wiener_max_rel_residual) < 1e-12
+    cg, _ = _traced_setup(6, wiener_ell_split=8, tol=1e-14, max_iter=50000, **kw)
+    b = mc_cutsky_cov_traced(w, cg, cleaner, fg_residual=True)
+    assert int(b.wiener_max_n_iter) > 5
+    for name in _DENSE_OUTPUTS:
+        assert _max_rel(getattr(a, name), getattr(b, name)) < 1e-10, name
+    loose, _ = _traced_setup(6, wiener_ell_split=8, tol=1e-10, max_iter=50000, **kw)
+    c = mc_cutsky_cov_traced(w, loose, cleaner, fg_residual=True)
+    tight_gap = _max_rel(a.debiased_bandpowers, b.debiased_bandpowers)
+    assert _max_rel(a.debiased_bandpowers, c.debiased_bandpowers) > 10 * tight_gap
+
+
+def test_dense_forward_raises_on_a_filter_it_was_not_built_for() -> None:
+    """The residual guard fires when ``inv_noise`` and the factor disagree, naming the
+    residual's decade; with ``wiener_check=False`` nothing is checked and the residual
+    reads NaN. (NaN firing is covered at function level in ``test_dense_residual_decades``.)"""
+    ctx, cleaner, _kw = _dense_setup(6)
+    bad = dataclasses.replace(ctx, inv_noise=2.0 * ctx.inv_noise)
+    w = jnp.asarray(W_INV)
+    with pytest.raises(RuntimeError, match=r"residual in \[1e-1, 1e0\) \(tol 1e-08\)"):
+        np.asarray(mc_cutsky_cov_traced(w, bad, cleaner).covariance)
+    rec = mc_cutsky_cov_traced(w, bad, cleaner, wiener_check=False)
+    assert np.isnan(float(rec.wiener_max_rel_residual))
+
+
+def test_dense_residual_decades() -> None:
+    """Each residual maps to the message naming its decade, non-finite to the NaN one; the
+    check fires above ``tol`` and on NaN."""
+    from augr.spectrum_stages import _dense_residual_bad, _dense_residual_msgs, _residual_decade
+
+    bad = [bool(_dense_residual_bad(jnp.asarray(r), 1e-8)) for r in (1e-9, 1e-8, 2e-8, np.nan)]
+    assert bad == [False, False, True, True]
+    msgs = _dense_residual_msgs(1e-8)
+    for rel, span in [(3e-16, "[1e-16, 1e-15)"), (2e-7, "[1e-7, 1e-6)"), (0.5, "[1e-1, 1e0)"),
+                      (1.0, "[1e0, 1e1)"), (1e5, ">= 1e2"), (1e-20, "[1e-16, 1e-15)"),
+                      (np.nan, "NaN or inf"), (np.inf, "NaN or inf")]:
+        assert span in msgs[int(_residual_decade(jnp.asarray(rel)))], (rel, span)
+
+
+@pytest.mark.slow
+def test_dense_gradient_matches_the_converged_cg() -> None:
+    """``jax.grad`` of sigma(r) in ``w_inv``: dense vs CG at tol 1e-14. Measured 2.5e-14
+    (1.7e-11 at tol 1e-12, 1.2e-9 at 1e-10: the CG's error); gate 1e-11."""
+    from augr.optimize import make_optimization_context, sigma_r_from_external_cov
+
+    ctx, cleaner, kw = _dense_setup(8)
+    cg, _ = _traced_setup(8, wiener_ell_split=8, tol=1e-14, max_iter=50000, **kw)
+    opt_ctx = make_optimization_context(
+        cleaned_map_instrument(f_sky=0.6), NullForegroundModel(), CMBSpectra(),
+        {"r": 0.0, "A_lens": 1.0}, priors={}, fixed_params=[], ell_min=2, ell_max=24,
+        delta_ell=8, ell_per_bin_below=2,
+    )
+
+    def grad_for(c):
+        return np.asarray(jax.grad(lambda w: sigma_r_from_external_cov(
+            mc_cutsky_cov_traced(w, c, cleaner).covariance, opt_ctx))(jnp.asarray(W_INV)))
+
+    g = grad_for(ctx)
+    assert np.all(np.isfinite(g)) and np.any(g != 0.0)
+    assert _max_rel(g, grad_for(cg)) < 1e-11
+
+
+@pytest.mark.slow
+def test_dense_sim_batch_agrees_with_the_unbatched_map() -> None:
+    """``sim_batch`` 2 / 3 on the dense branch, values and gradient. Measured <= 5.0e-15
+    (leakage) and 2.1e-15 (gradient); gate 1e-12."""
+    ctx, cleaner, _kw = _dense_setup(6)
+    w = jnp.asarray(W_INV)
+    ref = mc_cutsky_cov_traced(w, ctx, cleaner, fg_residual=True)
+    g_ref = jax.grad(lambda v: _sq_cov(v, ctx, cleaner))(w)
+    for b in (2, 3):
+        got = mc_cutsky_cov_traced(w, ctx, cleaner, fg_residual=True, sim_batch=b)
+        for name in ("debiased_bandpowers", "covariance", "leakage", "fg_residual_components"):
+            assert _max_rel(getattr(got, name), getattr(ref, name)) < 1e-12, (b, name)
+        g = jax.grad(lambda v, bb=b: _sq_cov(v, ctx, cleaner, sim_batch=bb))(w)
+        assert _max_rel(g, g_ref) < 1e-12, b
 
 
 # --- MASTER estimator path ---------------------------------------------------
@@ -1312,6 +1480,21 @@ mode = os.environ["AUGR_TEST_MODE"]
 
 w = jnp.asarray(T.W_INV)
 out = {}
+if os.environ.get("AUGR_TEST_DENSE_SHARD"):
+    import augr.spectrum_stages as ss
+    ss._DENSE_SHARD_CPU = True
+if mode == "dense":
+    dctx, dcleaner, _kw = T._dense_setup(6)
+    for b in (1, 3):
+        def f(ww, bb=b):
+            return T._sq_cov(ww, dctx, dcleaner, remat=True, sim_batch=bb)
+        out[f"sharded{b}"] = np.array(int("shard_map" in str(jax.make_jaxpr(f)(w))))
+        res = mc_cutsky_cov_traced(w, dctx, dcleaner, remat=True, sim_batch=b, fg_residual=True)
+        out[f"cov{b}"] = np.asarray(res.covariance)
+        out[f"fgc{b}"] = np.asarray(res.fg_residual_components)
+        out[f"grad{b}"] = np.asarray(jax.grad(f)(w))
+    np.savez(sys.argv[1], **out)
+    sys.exit(0)
 ctx, cleaner = T._master_setup(6)
 for b in (1, 3):
     def f(ww, bb=b):
@@ -1325,23 +1508,34 @@ if mode == "trace":
     wctx, wcleaner = T._traced_setup(6)
     txt = str(jax.make_jaxpr(lambda ww: T._sq_cov(ww, wctx, wcleaner))(w))
     out["wiener_sharded"] = np.array(int("shard_map" in txt))
+    dctx, dcleaner, _kw = T._dense_setup(6)
+    txt = str(jax.make_jaxpr(lambda ww: T._sq_cov(ww, dctx, dcleaner))(w))
+    out["dense_sharded"] = np.array(int("shard_map" in txt))
 np.savez(sys.argv[1], **out)
 '''
 
 
-def _shard_child(tmp_path, tag, *, devices, backend="ducc", mode="run", opt_out=False):
-    """Run ``_SHARD_CHILD`` under ``devices`` CPU devices; return its npz."""
+def _shard_child(tmp_path, tag, *, devices, backend="ducc", mode="run", opt_out=False,
+                 dense_shard=False):
+    """Run ``_SHARD_CHILD`` under ``devices`` CPU devices; return its npz.
+
+    ``dense_shard`` forces the dense Wiener branch to shard on CPU, under
+    ``OMP_NUM_THREADS=1`` (see ``spectrum_stages._DENSE_SHARD_CPU``).
+    """
     import subprocess
     import sys
 
     script = tmp_path / "shard_child.py"
     script.write_text(_SHARD_CHILD)
     npz = tmp_path / f"{tag}.npz"
-    env = {k: v for k, v in os.environ.items() if k != "AUGR_SIM_NO_SHARD"}
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("AUGR_SIM_NO_SHARD", "AUGR_TEST_DENSE_SHARD")}
     env.update(JAX_NUM_CPU_DEVICES=str(devices), AUGR_TEST_BACKEND=backend,
                AUGR_TEST_MODE=mode)
     if opt_out:
         env["AUGR_SIM_NO_SHARD"] = "1"
+    if dense_shard:
+        env.update(AUGR_TEST_DENSE_SHARD="1", OMP_NUM_THREADS="1")
     proc = subprocess.run(
         [sys.executable, str(script), str(npz), os.path.dirname(os.path.abspath(__file__))],
         capture_output=True, text=True, timeout=900, env=env,
@@ -1350,16 +1544,45 @@ def _shard_child(tmp_path, tag, *, devices, backend="ducc", mode="run", opt_out=
     return np.load(npz)
 
 
-def test_master_sim_axis_is_sharded_and_wiener_is_not(tmp_path) -> None:
-    """Trace-only, 4 CPU devices: a live ``shard_map`` on MASTER, none on Wiener.
+def test_master_is_sharded_and_wiener_is_not_on_cpu(tmp_path) -> None:
+    """Trace-only, 4 CPU devices: a live ``shard_map`` on MASTER; none on the CG Wiener
+    branch (its ``while_loop`` makes a batch cost its slowest member) nor, on CPU, the
+    dense one (concurrent LAPACK under OpenMP OpenBLAS, ``_DENSE_SHARD_CPU``) unless forced.
 
     Values cannot tell a sharded map from an unsharded one (they agree to ~1e-15),
-    so liveness is checked on the trace. The Wiener branch stays unsharded: its
-    body was never measured under sharding.
+    so liveness is checked on the trace.
     """
     out = _shard_child(tmp_path, "trace", devices=4, mode="trace")
     assert out["sharded1"] == 1 and out["sharded3"] == 1, "MASTER sim map not sharded"
-    assert out["wiener_sharded"] == 0, "masked-Wiener sim map picked up a shard_map"
+    assert out["wiener_sharded"] == 0, "CG masked-Wiener sim map picked up a shard_map"
+    assert out["dense_sharded"] == 0, "dense masked-Wiener sharded over CPU devices"
+    forced = _shard_child(tmp_path, "trace_forced", devices=4, mode="trace", dense_shard=True)
+    assert forced["dense_sharded"] == 1, "forced dense masked-Wiener sim map not sharded"
+
+
+@pytest.mark.slow
+def test_dense_wiener_sharded_matches_one_device(tmp_path) -> None:
+    """Dense branch forced onto 4 CPU devices (``OMP_NUM_THREADS=1``), values (incl. the FG
+    components) and gradient, at ``sim_batch`` 1 and 3.
+
+    Against the one-device path in the same child env (``AUGR_SIM_NO_SHARD=1``): exact on
+    values, 2.3e-16 on one gradient. Against this process (default OpenBLAS threading,
+    which reorders the solve's sums): <= 8.4e-15. Both gated at 1e-12 as for MASTER.
+    """
+    ctx, cleaner, _kw = _dense_setup(6)
+    w = jnp.asarray(W_INV)
+    sharded = _shard_child(tmp_path, "dense", devices=4, mode="dense", dense_shard=True)
+    optout = _shard_child(tmp_path, "dense_optout", devices=4, mode="dense", opt_out=True,
+                          dense_shard=True)
+    for b in (1, 3):
+        res = mc_cutsky_cov_traced(w, ctx, cleaner, remat=True, sim_batch=b, fg_residual=True)
+        grad = np.asarray(jax.grad(
+            lambda ww, bb=b: _sq_cov(ww, ctx, cleaner, remat=True, sim_batch=bb))(w))
+        assert sharded[f"sharded{b}"] == 1 and optout[f"sharded{b}"] == 0, b
+        for key, ref in ((f"cov{b}", res.covariance), (f"fgc{b}", res.fg_residual_components),
+                         (f"grad{b}", grad)):
+            np.testing.assert_allclose(sharded[key], optout[key], rtol=1e-12, atol=0.0)
+            np.testing.assert_allclose(optout[key], np.asarray(ref), rtol=1e-12, atol=0.0)
 
 
 @pytest.mark.slow
