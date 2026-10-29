@@ -711,7 +711,7 @@ def make_cutsky_mc_context(
     fg_seed_offset: int | None = None,
     wiener_solver: str = "cg",
     wiener_normal=None,
-    wiener_factor_on_device: bool | None = None,
+    wiener_factor_on_device: bool = False,
 ) -> CutskyMCContext:
     """Eager precompute for the differentiable cut-sky MC.
 
@@ -803,8 +803,10 @@ def make_cutsky_mc_context(
     or a ``.npy`` path. A path is loaded and factored in place; an array is copied, so
     peak memory is two ``A``-sized arrays. Before factoring, ``A`` is probed against the
     matrix-free operator (:func:`augr.masking.normal_matrix_mismatch`, must be below
-    ``tol``) so a matrix for another mask or hit map is refused. ``wiener_factor_on_device``
-    factors on the default JAX device (``None`` = when it is not the CPU). The
+    ``tol``) so a matrix for another mask or hit map is refused. The factor is built on
+    the host on every backend and copied to the default device, where the solves run;
+    ``wiener_factor_on_device=True`` factors on the device instead, which is wrong on
+    GB200 at lmax 192 (see :func:`augr.masking.wiener_factor`). The
     preconditioner is not built under ``"dense"``.
     """
     # The inverse-noise filter -- and hence var_pix_ref and the setup clean that
@@ -987,8 +989,7 @@ def make_cutsky_mc_context(
                 f"wiener_normal does not describe this mask / hit map at unit noise: "
                 f"|A v - op(v)| / |op(v)| = {mismatch:.2e} (tol {tol:g})"
             )
-        on_device = (jax.default_backend() != "cpu" if wiener_factor_on_device is None
-                     else bool(wiener_factor_on_device))
+        on_device = bool(wiener_factor_on_device)
         factor = mk.wiener_factor(
             normal, cl_ee_prior, cl_bb_prior, lmax=lmax, var_pix_ref=var_pix_ref,
             on_device=on_device, overwrite=from_path and not on_device,

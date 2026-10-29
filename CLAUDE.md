@@ -767,6 +767,15 @@ wrong.
     every solve (`8 n_dof²`: the 41 GiB allocation that, with the autotuner's buffers, ran a
     GB200 out of memory in Vista job 1102023). `chol_t.T` reaches them as a free layout
     change; `test_dense_solve_does_not_copy_the_factor` gates the compiled scratch.
+  - **The factor is built on the host on every backend; the solves run on the device.**
+    JAX 0.10.1's GPU Cholesky on GB200 is wrong at lmax 192 (Vista job 1105246): a synthetic
+    SPD matrix factors to 2.5e-15 at n = 47,000 but 1.5e-1 at n = 74,490, bad from the first
+    row block (no edge at row `2³¹/n`), and the real filter to 4e-4; whitening on the device
+    matches the host to 1.3e-16, so the factorization itself is at fault. The host factor is exact (1.9e-15) and takes
+    161 s on a gb node **with `OPENBLAS_NUM_THREADS` set** -- TACC batch jobs pin
+    `OMP_NUM_THREADS=1`, which the pthreads OpenBLAS falls back to (3374 s).
+    `wiener_factor_on_device=True` keeps the device route opt-in;
+    `test_dense_context_factors_on_the_host_on_a_gpu_backend` gates the default.
   - **Not sharded over logical CPU devices.** They share one thread pool, so it buys
     nothing, and it issues large LAPACK calls concurrently from several threads: under
     osx-arm64 OpenBLAS 0.3.32 a 1242-DOF triangular solve (and `jnp.linalg.solve`)

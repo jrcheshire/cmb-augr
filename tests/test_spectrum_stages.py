@@ -538,6 +538,25 @@ def test_dense_context_carries_a_factor_and_validates_its_inputs(tmp_path) -> No
                                wiener_normal=normal, **_ctx_kwargs(6))
 
 
+def test_dense_context_factors_on_the_host_on_a_gpu_backend(monkeypatch) -> None:
+    """A dense context factors on the host even when the default backend is a GPU, whose
+    Cholesky is wrong at lmax 192 (Vista job 1105246); the device route stays opt-in."""
+    calls = []
+    real = mk.wiener_factor
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs["on_device"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mk, "wiener_factor", spy)
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    hits, comps, normal = _dense_inputs(6)
+    kw = dict(hit_map=hits, fg_comp_eb_alm=comps, wiener_solver="dense", wiener_normal=normal)
+    host, _ = _traced_setup(6, **kw)
+    _traced_setup(6, wiener_factor_on_device=True, var_pix_ref=host.var_pix_ref, **kw)
+    assert calls == [False, True]
+
+
 _DENSE_OUTPUTS = ("debiased_bandpowers", "covariance", "transfer", "leakage",
                   "fg_residual_bandpower", "fg_residual_components", "rec_transfer")
 

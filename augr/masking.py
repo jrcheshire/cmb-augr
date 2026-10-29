@@ -747,10 +747,15 @@ def wiener_factor(
 
     ``on_device=False`` factors on the host with LAPACK (in place under ``overwrite=True``,
     which needs a C-contiguous float64 ndarray) and copies the factor to the default JAX
-    device. ``on_device=True`` moves ``normal`` to the default device and factors there
-    (the GPU path; transiently ~2-3 copies of ``A`` in device memory). Either way the cost
-    is ``n_dof³/3`` flops and ``8 n_dof²`` bytes per copy -- 44 GB at lmax 192, ~140 GB at
-    lmax 256. Memory grows as ``lmax⁴``, so this serves low-ℓ filters.
+    device. It is the route on every backend: the LAPACK threads follow
+    ``OPENBLAS_NUM_THREADS`` / ``OMP_NUM_THREADS``, so set them in a batch job that pins
+    ``OMP_NUM_THREADS=1`` (n_dof 74,490: 161 s on 144 Grace cores, 3374 s on one).
+    ``on_device=True`` moves ``normal`` to the default device and factors there
+    (transiently ~2-3 copies of ``A`` in device memory). **It is wrong on GB200 at lmax
+    192:** JAX 0.10.1's GPU Cholesky of a synthetic SPD matrix is exact at n = 47,000 and
+    off by 1.5e-1 at n = 74,490, from the first row block on (Vista job 1105246). Either
+    way the cost is ``n_dof³/3`` flops and ``8 n_dof²`` bytes per copy -- 44 GB at lmax
+    192, ~140 GB at lmax 256. Memory grows as ``lmax⁴``, so this serves low-ℓ filters.
     """
     lmax = int(lmax)
     scale = 1.0 / float(var_pix_ref)
