@@ -738,6 +738,11 @@ wrong.
   exactly a preset's first stochastic component's seeds at offset 0, so `d11s6`
   without an offset correlates d11's small scales with the sim's CMB. `None` keeps
   the legacy seeding (earlier `s6` / `d10s6` ensembles reproduce).
+  **CO is line emission** (`d1s1a2co3`, `d12s7a2co3`): PySM's `COLines` emits only at
+  a line's exact frequency, so grid sampling misses it. `_emission_iqu_bandpass` adds
+  each in-grid line exactly (matches PySM's own integrator to 4e-16,
+  `test_co_lines_bandpass_matches_pysm`), and a single-frequency evaluation of such a
+  sky raises rather than silently dropping CO.
 
 - **Dense direct solve (`wiener_solver="dense"`).** At nside 128 / lmax 192 the CG
   solves are 99% of the per-sim forward (6 legs x 333-568 iterations x ~98 ms on an

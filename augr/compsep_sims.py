@@ -84,6 +84,12 @@ _FG_PRESETS: dict[str, tuple[str, ...]] = {
     # adds spectral curvature to s5.
     "d11s6": ("d11", "s6"),
     "d12s7": ("d12", "s7"),
+    # The same plus polarized AME (a2: two spinning-dust components, 2% polarized
+    # along the dust angles) and CO (co3: the 1-0, 2-1, 3-2 lines, 0.1% polarized,
+    # with high-latitude clouds). All static. CO is line emission: these skies need
+    # a finite bandpass in every band (see _emission_iqu_bandpass).
+    "d1s1a2co3": ("d1", "s1", "a2", "co3"),
+    "d12s7a2co3": ("d12", "s7", "a2", "co3"),
 }
 
 
@@ -390,8 +396,25 @@ _REALIZATION_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _is_line_component(comp) -> bool:
+    """True for PySM line emission (``COLines``): delta lines, no monochromatic value."""
+    from pysm3.models import COLines
+
+    return isinstance(comp, COLines)
+
+
 def _emission_iqu_mono(sky, nu_ghz: float, u) -> np.ndarray:
-    """Monochromatic PySM emission at ``nu_ghz`` → ``(3, npix)`` μK_CMB."""
+    """Monochromatic PySM emission at ``nu_ghz`` → ``(3, npix)`` μK_CMB.
+
+    Raises for a sky with line emission: PySM's ``COLines`` emits only when the
+    requested frequency equals a line frequency exactly, so a band-centre (or any
+    single-frequency) evaluation silently drops it. Give such a sky a bandpass.
+    """
+    if any(_is_line_component(c) for c in sky.components):
+        raise ValueError(
+            "this sky has line emission (PySM COLines), which has no monochromatic "
+            "value; integrate it over a finite Bandpass."
+        )
     emission = sky.get_emission(nu_ghz * u.GHz)
     emission = emission.to(u.uK_CMB, equivalencies=u.cmb_equivalencies(nu_ghz * u.GHz))
     return np.asarray(emission.value, dtype=np.float64)
@@ -420,18 +443,36 @@ def _emission_iqu_bandpass(sky, bp: Bandpass, u) -> np.ndarray:
 
     via the trapezoidal rule. Using the identical kernel guarantees the sky the
     cleaners see is consistent with cMILC's color-corrected deprojection SEDs.
+
+    Line emission (PySM ``COLines``) is a delta in ν, which grid sampling misses.
+    Each line inside the grid enters exactly, as PySM's own bandpass integrator
+    weights it: its μK_RJ template times ``w(ν_l)·ν_l²`` (linear interpolation of
+    ``w·ν²`` on the grid), over the same ``∫ g dν``.
     """
     nu = np.asarray(bp.nu_ghz, dtype=np.float64)
-    g = (
-        np.asarray(bp.weights, dtype=np.float64)
-        * nu**2
-        * np.asarray(units.rj_to_cmb(nu), dtype=np.float64)
-    )
+    w = np.asarray(bp.weights, dtype=np.float64)
+    g = w * nu**2 * np.asarray(units.rj_to_cmb(nu), dtype=np.float64)
     coef = _trapz_weights(nu) * g
+    lines = [c for c in sky.components if _is_line_component(c)]
     acc = None
-    for nu_i, c_i in zip(nu, coef, strict=True):
-        m = _emission_iqu_mono(sky, float(nu_i), u)
-        acc = c_i * m if acc is None else acc + c_i * m
+    if len(lines) < len(sky.components):
+        if lines:
+            pysm3, _ = _require_pysm()
+            cont = [c for c in sky.components if not _is_line_component(c)]
+            sky = pysm3.Sky(nside=sky.nside, component_objects=cont)
+        for nu_i, c_i in zip(nu, coef, strict=True):
+            m = _emission_iqu_mono(sky, float(nu_i), u)
+            acc = c_i * m if acc is None else acc + c_i * m
+    for comp in lines:
+        for nu_l in (comp.line_frequency[k].to_value(u.GHz) for k in comp.lines):
+            if not nu[0] <= nu_l <= nu[-1]:
+                continue
+            # A single-frequency request at nu_l returns exactly that line, unit weight.
+            m = np.asarray(comp.get_emission(nu_l * u.GHz).to_value(u.uK_RJ), dtype=np.float64)
+            m = np.interp(nu_l, nu, w * nu**2) * m
+            acc = m if acc is None else acc + m
+    if acc is None:  # only lines, none inside the grid
+        acc = np.zeros((3, 12 * int(sky.nside) ** 2))
     return acc / coef.sum()
 
 
