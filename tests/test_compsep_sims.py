@@ -306,6 +306,77 @@ def test_fg_components_sum_to_the_total_and_redraw_bitwise() -> None:
 
 
 @pytest.mark.slow
+def test_co_lines_bandpass_matches_pysm() -> None:
+    """The delta-line path reproduces PySM's own bandpass integration of ``co3``.
+
+    PySM 3.4.2's integrator calls ``np.trapz`` (removed in numpy 2.0), shimmed here
+    for the reference only. Measured max relative error <= 3.7e-16 in I, Q, U across
+    a line well inside a band (223 GHz), lines on soft edges (129, 268 GHz) and a
+    hard top-hat (108 GHz); gated at 1e-14. A band holding no line is exactly zero.
+    """
+    pysm3 = pytest.importorskip("pysm3")
+    import pysm3.units as u
+    from pysm3.sky import PRESET_MODELS
+
+    from augr.compsep_sims import _emission_iqu_bandpass
+
+    nside = 16
+    ours_sky = pysm3.Sky(nside=nside, component_config={"co3": dict(PRESET_MODELS["co3"])})
+    ref_sky = pysm3.Sky(nside=nside, component_config={"co3": dict(PRESET_MODELS["co3"])},
+                        output_unit="uK_CMB")
+    had_trapz = hasattr(np, "trapz")
+    if not had_trapz:
+        np.trapz = np.trapezoid  # noqa: NPY201  (shim PySM's removed call)
+    try:
+        for bp in (Bandpass.smooth_tophat(223.0, 0.25, n_quad=51, grid_half_width=0.25),
+                   Bandpass.smooth_tophat(268.0, 0.25, n_quad=51, grid_half_width=0.25),
+                   Bandpass.smooth_tophat(129.0, 0.25, n_quad=51, grid_half_width=0.25),
+                   Bandpass.tophat(108.0, 0.25, n_quad=64)):
+            ours = _emission_iqu_bandpass(ours_sky, bp, u)
+            ref = ref_sky.get_emission(
+                np.asarray(bp.nu_ghz) * u.GHz, weights=np.asarray(bp.weights)).value
+            for i in range(3):
+                assert np.abs(ref[i]).max() > 0
+                np.testing.assert_allclose(ours[i], ref[i], rtol=0,
+                                           atol=1e-14 * np.abs(ref[i]).max())
+    finally:
+        if not had_trapz:
+            del np.trapz  # noqa: NPY201  (remove the shim)
+    none = Bandpass.smooth_tophat(155.0, 0.25, n_quad=51, grid_half_width=0.25)
+    assert not np.any(_emission_iqu_bandpass(ours_sky, none, u))
+
+
+@pytest.mark.slow
+def test_line_emission_without_a_bandpass_raises() -> None:
+    """A sky with CO has no single-frequency value: band-centre evaluation raises."""
+    pytest.importorskip("pysm3")
+    with pytest.raises(ValueError, match="line emission"):
+        pysm_fg_iqu((223.0,), "d1s1a2co3", 16)
+    with pytest.raises(ValueError, match="line emission"):
+        pysm_fg_iqu((223.0,), "d1s1a2co3", 16, bandpasses=[Bandpass.monochromatic(223.0)])
+
+
+@pytest.mark.slow
+def test_ame_co_components_sum_to_the_total() -> None:
+    """``d1s1a2co3`` is static, splits into four components that sum to the total
+    under a bandpass, and its CO component is exactly zero in a band with no line."""
+    pytest.importorskip("pysm3")
+    from augr.compsep_sims import _fg_eb_alm, fg_eb_alm_components
+
+    assert fg_model_is_static("d1s1a2co3") and fg_model_is_static("d12s7a2co3")
+    freqs, lmax, nside = (30.0, 155.0, 223.0), 24, 16
+    bps = [Bandpass.smooth_tophat(f, 0.25, n_quad=51, grid_half_width=0.25) for f in freqs]
+    comps = fg_eb_alm_components(freqs, "d1s1a2co3", lmax, nside, fg_seeds=[0], bandpasses=bps)
+    total = np.asarray(_fg_eb_alm(freqs, "d1s1a2co3", lmax, nside, bandpasses=bps))
+    assert comps.shape == (1, 4, len(freqs), 2, total.shape[-1])
+    np.testing.assert_allclose(comps[0].sum(axis=0), total, rtol=0,
+                               atol=1e-14 * np.abs(total).max())
+    co = comps[0, 3]
+    assert not np.any(co[0]) and not np.any(co[1]) and np.any(co[2])
+    assert np.any(comps[0, 2, 0])  # AME is there at 30 GHz
+
+
+@pytest.mark.slow
 def test_s6_realization_reproducible_and_seed_varying() -> None:
     """s6 small scales are bit-identical at a fixed fg_seed and differ across seeds.
 
