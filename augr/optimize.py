@@ -301,6 +301,7 @@ def make_optimization_context(
     delens_fullsky: bool = True,
     delens_n_L_sample: int | str | None = AUTO_N_L_SAMPLE,
     delens_l_batch: int = 1,
+    depth_f_sky: float | None = None,
     **signal_kwargs,
 ) -> OptimizationContext:
     """One-time setup for differentiable sigma(r) optimization.
@@ -338,6 +339,12 @@ def make_optimization_context(
         delens_l_batch:  full-sky only; L values vmapped into each step of the
                          per-L map (default 1). Wall-clock knob only; trace-time
                          constant, like ``delens_remat``.
+        depth_f_sky:     Sky fraction the integration time is spread over for the
+                         delensing reference noise (delens only). Default ``None`` =
+                         ``instrument.f_sky``. Pass the same value given to
+                         :func:`sigma_r_from_channels` so the reference matches the
+                         per-eval noise (e.g. 1.0 for a full-sky L2 survey analysed
+                         on a smaller mask).
         **signal_kwargs: Passed to SignalModel (ell_min, ell_max, delta_ell,
                          ell_per_bin_below, delensed_bb, etc.)
 
@@ -378,7 +385,8 @@ def make_optimization_context(
                          if delens_ls is None else delens_ls)
         delens_nl_bb0 = _combined_white_nl_bb(
             n_det, net, beam, eta, delens_ells_arr,
-            instrument.mission_duration_years, instrument.f_sky)
+            instrument.mission_duration_years,
+            instrument.f_sky if depth_f_sky is None else depth_f_sky)
         delens_cl_bb_res0 = _delens_from_combined_bb(
             lensing_spectra, delens_nl_bb0, delens_ls_arr,
             delens_l_max_qe, delens_n_iter, delens_remat,
@@ -468,6 +476,7 @@ def sigma_r_from_channels(
     f_sky: float = 0.7,
     knee_ell: jnp.ndarray | float = 0.0,
     alpha_knee: jnp.ndarray | float = 1.0,
+    depth_f_sky: float | None = None,
 ) -> jnp.ndarray:
     """Differentiable sigma(r) as a function of channel-level instrument params.
 
@@ -484,9 +493,13 @@ def sigma_r_from_channels(
         eta_total:   Total efficiency per channel, shape (n_chan,).
         ctx:         Pre-computed OptimizationContext.
         mission_years: Mission duration [years].
-        f_sky:       Sky fraction.
+        f_sky:       Sky fraction of the analysis (Knox mode count).
         knee_ell:    1/f knee multipole (scalar or per-channel).
         alpha_knee:  1/f spectral index (scalar or per-channel).
+        depth_f_sky: Sky fraction the integration time is spread over (map depth,
+                     including the delensing noise). Default ``None`` = ``f_sky``.
+                     A full-sky L2 survey analysed on a mask takes ``1.0`` here and
+                     the mask's fraction in ``f_sky``.
 
     Returns:
         Scalar sigma(r) -- marginalized Fisher constraint on r.
@@ -497,6 +510,7 @@ def sigma_r_from_channels(
     """
     ells = ctx.ells
     n_chan = n_det.shape[0]
+    f_depth = f_sky if depth_f_sky is None else depth_f_sky
 
     # Broadcast scalar knee_ell / alpha_knee to per-channel arrays
     knee_arr = jnp.broadcast_to(jnp.asarray(knee_ell), (n_chan,))
@@ -512,7 +526,7 @@ def sigma_r_from_channels(
                 eta_total[i],
                 ells,
                 mission_years,
-                f_sky,
+                f_depth,
                 knee_arr[i],
                 alpha_arr[i],
             )
@@ -528,7 +542,7 @@ def sigma_r_from_channels(
         # and nl_tt = nl_bb/2 are applied inside _delens_from_combined_bb.
         nl_bb_del = _combined_white_nl_bb(
             n_det, net, beam_fwhm, eta_total, ctx.delens_ells,
-            mission_years, f_sky)
+            mission_years, f_depth)
         if ctx.delens_mode == "recompute":
             cl_res = _delens_from_combined_bb(
                 ctx.lensing_spectra, nl_bb_del, ctx.delens_ls,
@@ -702,6 +716,7 @@ def sigma_r_from_design(
     extra_loading=None,
     thermal: ThermalSpec | None = None,
     fractional_bandwidth: float = 0.25,
+    depth_f_sky: float | None = None,
 ) -> jnp.ndarray:
     """Differentiable sigma(r) from telescope design parameters.
 
@@ -733,6 +748,7 @@ def sigma_r_from_design(
                          when ``net_override`` is supplied.
         thermal:         Photon-noise loading model; see :func:`design_to_channels`.
         fractional_bandwidth: Band top-hat width in the NET integral (default 0.25).
+        depth_f_sky:     Map-depth sky fraction; see :func:`sigma_r_from_channels`.
 
     Returns:
         Scalar sigma(r).
@@ -770,4 +786,5 @@ def sigma_r_from_design(
         f_sky,
         knee_ell,
         alpha_knee,
+        depth_f_sky,
     )

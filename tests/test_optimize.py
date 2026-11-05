@@ -35,6 +35,9 @@ from augr.signal import SignalModel, flatten_params
 from augr.spectra import CMBSpectra
 from augr.telescope import count_pixels, count_pixels_continuous
 
+# Measured 2026-11-05 on the simple_probe fixture: the depth identity holds bit-for-bit.
+DEPTH_IDENTITY_RTOL = 1e-12
+
 # -----------------------------------------------------------------------
 # Fixtures
 # -----------------------------------------------------------------------
@@ -171,6 +174,27 @@ class TestSigmaRConsistency:
         )
 
         np.testing.assert_allclose(float(sigma_opt), sigma_ref, rtol=0.05)
+
+
+class TestDepthFsky:
+    """``depth_f_sky`` sets the map depth; ``f_sky`` only the Knox mode count."""
+
+    def _sigma(self, ctx, **kw):
+        return float(sigma_r_from_channels(ctx.n_det, ctx.net, ctx.beam, ctx.eta, ctx, **kw))
+
+    def test_default_is_f_sky(self, ctx):
+        a = self._sigma(ctx, mission_years=5.0, f_sky=0.6)
+        b = self._sigma(ctx, mission_years=5.0, f_sky=0.6, depth_f_sky=0.6)
+        assert a == b
+
+    def test_depth_enters_only_the_noise(self, ctx):
+        """Noise power ~ depth_f_sky / mission_years, so full-sky depth over 5 yr
+        equals mask-tied depth over 5 * 0.6 = 3 yr at the same mode count."""
+        full_depth = self._sigma(ctx, mission_years=5.0, f_sky=0.6, depth_f_sky=1.0)
+        equiv = self._sigma(ctx, mission_years=3.0, f_sky=0.6)
+        assert full_depth == pytest.approx(equiv, rel=DEPTH_IDENTITY_RTOL)
+        # and full-sky depth is shallower than mask-tied depth
+        assert full_depth > self._sigma(ctx, mission_years=5.0, f_sky=0.6)
 
 
 # -----------------------------------------------------------------------
@@ -525,6 +549,26 @@ class TestDelensedDesignForward:
         np.testing.assert_allclose(fd, ad, rtol=1e-3)
 
     @pytest.mark.slow
+    def test_depth_f_sky_reaches_the_delensing_reference(self, instrument, lensing):
+        """A full-sky-depth design evaluated on a smaller analysis mask: the
+        linearized reference must be built at the same depth, so linearized ==
+        recompute at the reference design. A reference built at the mask's
+        f_sky instead would leave nl_bb - nl_bb0 != 0 there."""
+        sig_kw = dict(ell_min=2, ell_max=60, delta_ell=10, ell_per_bin_below=10)
+        dkw = dict(delens_l_max_qe=200, delens_n_iter=2,
+                   delens_ls=jnp.arange(2, 61, dtype=float), depth_f_sky=1.0)
+        ctxs = {mode: make_optimization_context(
+                    **self._common(instrument), delens=mode,
+                    lensing_spectra=lensing, **dkw, **sig_kw)
+                for mode in ("recompute", "linearized")}
+        s = {mode: float(sigma_r_from_channels(
+                 c.n_det, c.net, c.beam, c.eta, c,
+                 mission_years=instrument.mission_duration_years,
+                 f_sky=instrument.f_sky, depth_f_sky=1.0))
+             for mode, c in ctxs.items()}
+        assert instrument.f_sky != 1.0
+        np.testing.assert_allclose(s["linearized"], s["recompute"], rtol=1e-9)
+
     def test_linearized_matches_recompute_at_reference(self, instrument, lensing):
         """linearized == recompute at the reference (nl_bb - nl_bb0 = 0), and
         its gradient is finite. Uses a small ell range so the jacrev precompute
