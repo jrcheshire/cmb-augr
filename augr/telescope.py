@@ -117,17 +117,22 @@ class FocalPlaneSpec:
 class ThermalSpec:
     """Thermal loading model for photon noise calculation.
 
-    Single effective emissivity model: the telescope contributes
-    ε × B(T_tel) to the optical loading on each detector.
+    The telescope contributes ε × n_BE(T_tel) to each detector's photon
+    occupation, plus ε_i × n_BE(T_i) for every entry of ``extra_stages``
+    (e.g. a passively cooled primary as the main term and an actively
+    cooled secondary / aperture-stop spillover as an extra stage).
 
     Attributes:
         T_telescope_K: Telescope physical temperature [K].
         emissivity: Effective emissivity of warm optics (dimensionless).
         eta_optical: End-to-end optical efficiency from sky to detector.
+        extra_stages: Additional ``(T_K, emissivity)`` graybody terms added
+            on top of the main telescope term. Default ``()``.
     """
     T_telescope_K: float = 4.0
     emissivity: float = 0.01
     eta_optical: float = 0.35
+    extra_stages: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -253,14 +258,16 @@ def photon_noise_net_jax(
     eta_optical: float = 0.35,
     n_quad: int = 512,
     extra_loading: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
+    extra_stages: tuple[tuple[float, float], ...] = (),
 ) -> jnp.ndarray:
     """JAX-traceable photon-noise NET [μK√s].
 
     Same physics as photon_noise_net() but uses jnp instead of np, enabling
-    differentiation w.r.t. telescope thermal/optical parameters. The
-    optional ``extra_loading`` callable must be jnp-traceable for autodiff
-    to work end-to-end. See photon_noise_net() for the full docstring,
-    including how ``extra_loading`` enters n_total.
+    differentiation w.r.t. telescope thermal/optical parameters (including
+    the ``extra_stages`` temperatures and emissivities). The optional
+    ``extra_loading`` callable must be jnp-traceable for autodiff to work
+    end-to-end. See photon_noise_net() for the full docstring, including
+    how ``extra_loading`` and ``extra_stages`` enter n_total.
     """
     nu_center_hz = nu_ghz * 1e9
     delta_nu_hz = fractional_bandwidth * nu_center_hz
@@ -283,6 +290,8 @@ def photon_noise_net_jax(
     # telescope's own emission term gets `emissivity` instead.
     sky_occ = n_cmb if extra_loading is None else n_cmb + extra_loading(nu)
     n_total = eta_optical * sky_occ + emissivity * n_tel
+    for T_stage, eps_stage in extra_stages:
+        n_total = n_total + eps_stage / jnp.expm1(h * nu / (k * T_stage))
 
     integrand_nep2 = 2.0 * h**2 * nu**2 * n_total * (1.0 + n_total)
     nep_squared = 2.0 * jnp.trapezoid(integrand_nep2, nu)
@@ -309,6 +318,7 @@ def photon_noise_net(
     eta_optical: float = 0.35,
     n_quad: int = 512,
     extra_loading: Callable[[np.ndarray], np.ndarray] | None = None,
+    extra_stages: tuple[tuple[float, float], ...] = (),
 ) -> float:
     """Photon-noise-limited single-detector temperature NET [μK√s].
 
@@ -360,6 +370,13 @@ def photon_noise_net(
             in Hz) and added to ``n_cmb`` before multiplication by
             ``eta_optical``. Default ``None`` reproduces the no-extra-
             loading L2 baseline.
+        extra_stages: Additional telescope-side graybody terms
+            ``((T_K, emissivity), ...)``, each adding
+            ``emissivity * n_BE(T_K)`` to n_total alongside the main
+            ``emissivity * n_BE(T_telescope)`` term (not multiplied by
+            ``eta_optical``). Use for a multi-temperature optical chain,
+            e.g. a passively cooled primary plus an actively cooled
+            secondary and aperture-stop spillover. Default ``()``.
 
     Returns:
         NET in μK√s.
@@ -386,6 +403,8 @@ def photon_noise_net(
     # telescope's own emission term gets `emissivity` instead.
     sky_occ = n_cmb if extra_loading is None else n_cmb + extra_loading(nu)
     n_total = eta_optical * sky_occ + emissivity * n_tel
+    for T_stage, eps_stage in extra_stages:
+        n_total = n_total + eps_stage / np.expm1(h * nu / (k * T_stage))
 
     # Photon NEP² (single spatial mode: AΩ = λ² = (c/ν)²)
     # NEP² = 2 × ∫ (AΩ/c²) × 2h²ν⁴ × n(1+n) dν
@@ -468,6 +487,7 @@ def to_instrument(design: TelescopeDesign) -> Instrument:
                 emissivity=th.emissivity,
                 eta_optical=th.eta_optical,
                 extra_loading=band.extra_loading,
+                extra_stages=th.extra_stages,
             )
             channels.append(Channel(
                 nu_ghz=band.nu_ghz,

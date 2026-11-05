@@ -266,6 +266,50 @@ class TestPhotonNoiseNet:
         # baseline (no leakage between calls via mutable state).
         assert photon_noise_net(90.0) == net_90_without
 
+    def test_extra_stages_empty_is_baseline(self):
+        """``extra_stages=()`` is bit-identical to the single-stage default."""
+        for nu in (30.0, 150.0, 600.0):
+            assert photon_noise_net(nu, extra_stages=()) == photon_noise_net(nu)
+
+    def test_extra_stage_at_telescope_temperature_adds_emissivity(self):
+        """A stage at T_telescope is the same as raising the main emissivity."""
+        for nu in (40.0, 150.0, 600.0):
+            split = photon_noise_net(nu, T_telescope=17.0, emissivity=0.010,
+                                     extra_stages=((17.0, 0.005),))
+            merged = photon_noise_net(nu, T_telescope=17.0, emissivity=0.015)
+            assert split == pytest.approx(merged, rel=1e-13)
+
+    def test_two_temperature_chain_matches_textbook_net(self):
+        """17 K primary + 4.5 K stage against an independent single-mode NET.
+
+        Textbook single-polarization photon NET in K sqrt(s):
+        NEP^2 = 2 Int h^2 nu^2 n (1 + n) dnu, dP/dT = Int h nu eta dn_cmb/dT dnu,
+        NET = NEP / (sqrt(2) dP/dT), with n = eta n_cmb + sum_i eps_i n_BE(T_i).
+        """
+        h, k, t_cmb = H_PLANCK, K_BOLTZMANN, 2.7255
+        eta, stages = 0.4, ((17.0, 0.015), (4.5, 0.17))
+        for nu0 in (20.0, 150.0, 400.0, 800.0):
+            nu = np.linspace(nu0 * 1e9 * 0.875, nu0 * 1e9 * 1.125, 20001)
+            n = eta / np.expm1(h * nu / (k * t_cmb))
+            for t_s, e_s in stages:
+                n = n + e_s / np.expm1(h * nu / (k * t_s))
+            nep = np.sqrt(2.0 * np.trapezoid(h**2 * nu**2 * n * (1.0 + n), nu))
+            x = h * nu / (k * t_cmb)
+            dndt = (h * nu / (k * t_cmb**2)) * np.exp(x) / np.expm1(x) ** 2
+            dpdt = np.trapezoid(h * nu * eta * dndt, nu)
+            expect = nep / (np.sqrt(2.0) * dpdt) * 1e6
+            got = photon_noise_net(nu0, 0.25, T_telescope=17.0, emissivity=0.015,
+                                   eta_optical=eta, n_quad=20001,
+                                   extra_stages=((4.5, 0.17),))
+            assert got == pytest.approx(expect, rel=1e-12)
+
+    def test_extra_stage_raises_net(self):
+        """Adding a cold stage can only add loading, so NET rises."""
+        base = photon_noise_net(150.0, T_telescope=17.0, emissivity=0.015)
+        cold = photon_noise_net(150.0, T_telescope=17.0, emissivity=0.015,
+                                extra_stages=((4.5, 0.17),))
+        assert cold > base
+
 
 # ---------------------------------------------------------------------------
 # Data structure validation
@@ -369,6 +413,23 @@ class TestToInstrument:
         inst = to_instrument(probe_design())
         freqs = [ch.nu_ghz for ch in inst.channels]
         assert freqs == sorted(freqs)
+
+    def test_thermal_extra_stages_reach_the_net(self):
+        """ThermalSpec.extra_stages is threaded into every channel's NET."""
+        thermal = ThermalSpec(T_telescope_K=17.0, emissivity=0.015, eta_optical=0.4,
+                              extra_stages=((4.5, 0.17),))
+        design = TelescopeDesign(
+            focal_plane=FocalPlaneSpec(aperture_m=1.4, f_number=1.42, fp_diameter_m=0.4),
+            thermal=thermal,
+            pixel_groups=(PixelGroup(bands=(BandSpec(90.0),), area_fraction=0.5),
+                          PixelGroup(bands=(BandSpec(600.0),), area_fraction=0.5)),
+        )
+        for ch in to_instrument(design).channels:
+            expect = photon_noise_net(ch.nu_ghz, 0.25, T_telescope=17.0, emissivity=0.015,
+                                      eta_optical=0.4, extra_stages=((4.5, 0.17),))
+            assert ch.net_per_detector == expect
+            assert ch.net_per_detector > photon_noise_net(
+                ch.nu_ghz, 0.25, T_telescope=17.0, emissivity=0.015, eta_optical=0.4)
 
     def test_fractional_bandwidth_persisted(self):
         """to_instrument carries the BandSpec fractional bandwidth onto Channel."""

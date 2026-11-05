@@ -14,15 +14,27 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from augr.config import galactic_extra_loading
 from augr.design_packing import PackingDesignSpec
 from augr.optimize import design_to_channels
 from augr.telescope import (
+    BandSpec,
+    FocalPlaneSpec,
+    PixelGroup,
+    TelescopeDesign,
+    ThermalSpec,
     beam_fwhm_arcmin,
     count_pixels_continuous,
     hex_cell_area,
     horn_diameter,
     photon_noise_net_jax,
+    to_instrument,
 )
+
+# Measured 2026-11-05 on the fixtures below: jax-vs-numpy NET <= 5.6e-16 (with and
+# without Galactic loading); grad-vs-central-FD 5.6e-11 at h = 1e-5.
+NET_NP_JAX_RTOL = 1e-13
+NET_GRAD_FD_RTOL = 1e-9
 
 FREQS_PER_GROUP = (
     (20.0,),
@@ -123,6 +135,59 @@ def test_design_to_channels_differentiable():
     )(fracs)
     assert np.all(np.isfinite(np.asarray(g_frac)))
     assert np.any(np.asarray(g_frac) > 0.0)
+
+
+def test_default_thermal_is_thermalspec_default():
+    """``thermal=None`` is bit-identical to an explicit ``ThermalSpec()``."""
+    fracs = jnp.asarray(np.full(len(FREQS_PER_GROUP), 1.0 / len(FREQS_PER_GROUP)))
+    _, net_none, _ = design_to_channels(APERTURE, F_NUMBER, FP_DIAMETER, fracs, FREQS_PER_GROUP)
+    _, net_spec, _ = design_to_channels(APERTURE, F_NUMBER, FP_DIAMETER, fracs, FREQS_PER_GROUP,
+                                        thermal=ThermalSpec())
+    assert np.array_equal(np.asarray(net_none), np.asarray(net_spec))
+
+
+@pytest.mark.parametrize("galactic", [False, True])
+def test_design_to_channels_net_matches_to_instrument(galactic):
+    """Non-default thermal stack + bandwidth + Galactic loading: same NET as to_instrument.
+
+    PICO-like optics with a two-temperature chain (17 K primary, 4.5 K secondary/stop),
+    eta 0.40 and 20% bands. ``to_instrument`` is the numpy reference path.
+    """
+    thermal = ThermalSpec(T_telescope_K=17.0, emissivity=0.015, eta_optical=0.40,
+                          extra_stages=((4.5, 0.17),))
+    extra = galactic_extra_loading() if galactic else None
+    freqs = ((15.0,), (90.0,), (350.0,), (900.0,))
+    fracs = jnp.asarray([0.4, 0.3, 0.2, 0.1])
+    _, net, beam = design_to_channels(1.4, 1.42, 0.4, fracs, freqs, thermal=thermal,
+                                      fractional_bandwidth=0.20, extra_loading=extra)
+    design = TelescopeDesign(
+        focal_plane=FocalPlaneSpec(aperture_m=1.4, f_number=1.42, fp_diameter_m=0.4),
+        thermal=thermal,
+        pixel_groups=tuple(
+            PixelGroup(bands=(BandSpec(f[0], fractional_bandwidth=0.20, extra_loading=extra),),
+                       area_fraction=float(a))
+            for f, a in zip(freqs, fracs, strict=True)
+        ),
+    )
+    ref = to_instrument(design).channels  # sorted by frequency == freqs order here
+    for i, ch in enumerate(ref):
+        assert float(net[i]) == pytest.approx(ch.net_per_detector, rel=NET_NP_JAX_RTOL)
+        assert float(beam[i]) == pytest.approx(ch.beam_fwhm_arcmin, rel=1e-12)
+
+
+def test_net_gradient_in_cold_stage_emissivity():
+    """The NET is differentiable in an extra stage's emissivity and matches FD."""
+    def f(eps):
+        th = ThermalSpec(T_telescope_K=17.0, emissivity=0.015, eta_optical=0.40,
+                         extra_stages=((4.5, eps),))
+        return design_to_channels(1.4, 1.42, 0.4, jnp.asarray([1.0]), ((150.0,),),
+                                  thermal=th)[1][0]
+
+    g = float(jax.grad(f)(0.17))
+    h = 1e-5
+    fd = (float(f(0.17 + h)) - float(f(0.17 - h))) / (2 * h)
+    assert g > 0.0
+    assert g == pytest.approx(fd, rel=NET_GRAD_FD_RTOL)
 
 
 def test_net_override_bypasses_photon_noise():

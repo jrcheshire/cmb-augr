@@ -664,6 +664,8 @@ def physical_design_objective(
     bias_w: float | None = None,
     remat: bool = True,
     sim_batch: int = 1,
+    thermal=None,
+    fractional_bandwidth: float = 0.25,
 ):
     """Cost-constrained EIG objective from the physical horn-packing design knobs.
 
@@ -685,6 +687,10 @@ def physical_design_objective(
     band's photon-noise NET, so the submm groups (e.g. 615 GHz) reflect dust
     loading. Ignored when ``net_override`` is supplied.
 
+    ``thermal`` (:class:`augr.telescope.ThermalSpec`, default ``None`` = 4 K / 1% /
+    eta 0.35) and ``fractional_bandwidth`` (default 0.25) set the photon-noise NET;
+    see :func:`augr.optimize.design_to_channels`.
+
     ``delens`` (optional) is forwarded to :func:`design_objective` -- see there. It
     matters most on this entry point: ``design`` carries the aperture, and delensing
     is one of the two channels through which aperture buys sigma(r).
@@ -704,6 +710,8 @@ def physical_design_objective(
         illumination_factor=illumination_factor,
         packing_efficiency=packing_efficiency,
         extra_loading=extra_loading,
+        thermal=thermal,
+        fractional_bandwidth=fractional_bandwidth,
     )
     freqs_flat = tuple(float(f) for grp in freqs_per_group for f in grp)
     n_chan = len(freqs_flat)

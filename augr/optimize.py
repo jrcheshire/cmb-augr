@@ -54,6 +54,7 @@ from augr.instrument import (
 )
 from augr.signal import SignalModel, flatten_params
 from augr.telescope import (
+    ThermalSpec,
     beam_fwhm_arcmin,
     count_pixels_continuous,
     horn_diameter,
@@ -605,6 +606,8 @@ def design_to_channels(
     illumination_factor: float = 1.22,
     packing_efficiency: float = 0.80,
     extra_loading=None,
+    thermal: ThermalSpec | None = None,
+    fractional_bandwidth: float = 0.25,
 ):
     """Differentiable telescope design -> per-channel ``(n_det, net, beam)``.
 
@@ -637,12 +640,21 @@ def design_to_channels(
                          every band's photon-noise NET. Ignored when
                          ``net_override`` is supplied. Default ``None``
                          reproduces the no-Galactic-loading baseline.
+        thermal:         :class:`augr.telescope.ThermalSpec` for the photon-noise NET
+                         (telescope temperature / emissivity, ``eta_optical``,
+                         ``extra_stages``). Default ``None`` = ``ThermalSpec()``
+                         (4 K, 1%, eta 0.35), the same loading :func:`to_instrument`
+                         uses for a default design. Ignored when ``net_override`` is
+                         supplied.
+        fractional_bandwidth: Delta nu / nu of every band's top-hat in the NET
+                         integral (default 0.25).
 
     Returns:
         ``(n_det, net, beam)``, each ``(n_chan,)`` in flattened ``freqs_per_group`` order.
         Differentiable in ``aperture_m``, ``f_number``, ``area_fractions`` (and
         ``net_override`` if given).
     """
+    th = ThermalSpec() if thermal is None else thermal
     a_fp = jnp.pi * (fp_diameter_m / 2.0) ** 2
     n_det_list, beam_list, net_list = [], [], []
     chan_idx = 0
@@ -659,7 +671,15 @@ def design_to_channels(
             if net_override is not None:
                 net_list.append(net_override[chan_idx])
             else:
-                net_list.append(photon_noise_net_jax(nu, extra_loading=extra_loading))
+                net_list.append(photon_noise_net_jax(
+                    nu,
+                    fractional_bandwidth=fractional_bandwidth,
+                    T_telescope=th.T_telescope_K,
+                    emissivity=th.emissivity,
+                    eta_optical=th.eta_optical,
+                    extra_loading=extra_loading,
+                    extra_stages=th.extra_stages,
+                ))
             chan_idx += 1
     return jnp.stack(n_det_list), jnp.stack(net_list), jnp.stack(beam_list)
 
@@ -680,6 +700,8 @@ def sigma_r_from_design(
     knee_ell: jnp.ndarray | float = 0.0,
     alpha_knee: jnp.ndarray | float = 1.0,
     extra_loading=None,
+    thermal: ThermalSpec | None = None,
+    fractional_bandwidth: float = 0.25,
 ) -> jnp.ndarray:
     """Differentiable sigma(r) from telescope design parameters.
 
@@ -709,6 +731,8 @@ def sigma_r_from_design(
                          every band's photon-noise NET. Default ``None``
                          reproduces the no-Galactic-loading baseline. Ignored
                          when ``net_override`` is supplied.
+        thermal:         Photon-noise loading model; see :func:`design_to_channels`.
+        fractional_bandwidth: Band top-hat width in the NET integral (default 0.25).
 
     Returns:
         Scalar sigma(r).
@@ -728,6 +752,8 @@ def sigma_r_from_design(
         illumination_factor=illumination_factor,
         packing_efficiency=packing_efficiency,
         extra_loading=extra_loading,
+        thermal=thermal,
+        fractional_bandwidth=fractional_bandwidth,
     )
 
     eta_arr = (
