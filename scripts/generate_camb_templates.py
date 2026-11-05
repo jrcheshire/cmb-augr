@@ -45,7 +45,10 @@ def generate_templates(outdir: str = OUTDIR, ell_max: int = ELL_MAX) -> None:
     pars.set_cosmology(H0=67.4, ombh2=0.0224, omch2=0.120, tau=0.054)
     pars.InitPower.set_params(As=2.1e-9, ns=0.965, r=0)
     pars.WantTensors = False
-    pars.set_for_lmax(ell_max, lens_potential_accuracy=1)
+    # Lensed BB at l <= 500 is sourced by E and phi modes far above 500: CAMB run
+    # with set_for_lmax(500) under-computes it by 8-10% at l <= 300. Use the
+    # delensing set's settings so the two lensed-BB spectra agree.
+    pars.set_for_lmax(ELL_MAX_DELENSING, lens_potential_accuracy=2)
     pars.Want_CMB_lensing = True
 
     results = camb.get_results(pars)

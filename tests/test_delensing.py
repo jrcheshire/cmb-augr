@@ -190,30 +190,68 @@ class TestLensingKernel:
 # -----------------------------------------------------------------------
 
 class TestResidualLimits:
-    def test_no_reconstruction(self, spectra):
-        """If N_0 → ∞, residual should equal full lensing BB.
+    @pytest.mark.parametrize("backend", ["flat", "fullsky_jax"])
+    @pytest.mark.parametrize("with_wee", [False, True])
+    def test_no_reconstruction_is_camb_lensed_bb(self, spectra, backend, with_wee):
+        """N_0 → ∞: the residual is exactly CAMB's lensed BB, whatever the kernel range.
 
-        Uses L_max=2000 to capture most of the lensing power. Residual
-        still ~1-2% low due to flat-sky approx + L_max truncation.
+        The kernel spans only l_E <= l_max and L <= max(Ls); lensing B power
+        sourced above that is unremovable, not absent. A residual built as
+        ``K @ C_pp`` minus the template fell 11-12% short of CAMB at l_max=1000.
+        Measured 2026-11-05: exact (0.0) on both backends, with and without W_EE.
         """
+        from augr.delensing_fullsky_jax import residual_cl_bb_fullsky_jax
         ls = jnp.arange(5, 100, dtype=float)
-        Ls = jnp.arange(2, 2001, dtype=float)
-        n0_huge = jnp.ones_like(Ls) * 1e30
-        res = residual_cl_bb(ls, Ls, spectra, n0_huge, l_max=2000, n_phi=96)
-        cl_bb_camb = _interp_at(spectra.cl_bb_len, ls)
-        ratio = res / cl_bb_camb
-        # Flat-sky kernel + L_max truncation: within ~5%
-        np.testing.assert_allclose(ratio, 1.0, atol=0.05)
+        Ls = jnp.arange(2, 1001, dtype=float)
+        n0_huge = jnp.full(Ls.shape, 1e30)
+        nl_ee = jnp.full_like(spectra.cl_ee_unl, 5e-5) if with_wee else None
+        if backend == "flat":
+            res = residual_cl_bb(ls, Ls, spectra, n0_huge, l_max=1000, n_phi=64, nl_ee=nl_ee)
+        else:
+            res = residual_cl_bb_fullsky_jax(ls, Ls, spectra, n0_huge, 2, 1000, nl_ee=nl_ee)
+        np.testing.assert_allclose(np.asarray(res), np.asarray(_interp_at(spectra.cl_bb_len, ls)),
+                                   rtol=1e-12)
 
-    def test_perfect_reconstruction(self, spectra):
-        """If N_0 → 0, residual should vanish."""
+    @pytest.mark.parametrize("backend", ["flat", "fullsky_jax"])
+    def test_only_the_unremovable_tail_differs_from_kernel_eq12(self, spectra, backend):
+        """The residual equals the kernel-only Smith+ 2012 Eq. 12,
+        ``K @ [C_pp (1 - W_pp)] + (K - K_WEE) @ [C_pp W_pp]``, plus the
+        noise-independent tail ``C_BB^len - K @ C_pp``. Measured 1.4e-14.
+        """
+        from augr.delensing_fullsky_jax import (
+            lensing_kernel_fullsky_jax,
+            residual_cl_bb_fullsky_jax,
+        )
+        ls = jnp.arange(5, 100, dtype=float)
+        Ls = jnp.arange(2, 1001, dtype=float)
+        cpp = _interp_at(spectra.cl_pp, Ls)
+        n0 = cpp * 0.5
+        w_pp = cpp / (cpp + n0)
+        nl_ee = jnp.full_like(spectra.cl_ee_unl, 5e-5)
+        w_ee = spectra.cl_ee_unl / (spectra.cl_ee_unl + nl_ee)
+        if backend == "flat":
+            kern = lambda **k: lensing_kernel(ls, Ls, spectra, 2, 1000, 64, **k)  # noqa: E731
+            res = residual_cl_bb(ls, Ls, spectra, n0, l_max=1000, n_phi=64, nl_ee=nl_ee)
+        else:
+            kern = lambda **k: lensing_kernel_fullsky_jax(ls, Ls, spectra, 2, 1000, **k)  # noqa: E731
+            res = residual_cl_bb_fullsky_jax(ls, Ls, spectra, n0, 2, 1000, nl_ee=nl_ee)
+        K, K_wee = kern(), kern(w_ee=w_ee)
+        kernel_eq12 = K @ (cpp * (1.0 - w_pp)) + (K - K_wee) @ (cpp * w_pp)
+        tail = _interp_at(spectra.cl_bb_len, ls) - K @ cpp
+        np.testing.assert_allclose(np.asarray(res - kernel_eq12), np.asarray(tail), rtol=1e-12)
+        assert float(jnp.min(tail)) > 0.0  # the truncated kernel under-counts lensing
+
+    def test_perfect_reconstruction_leaves_only_the_unremovable_tail(self, spectra):
+        """N_0 → 0 (W_EE = 1) removes everything the kernel spans, leaving exactly
+        the lensing sourced above its range: ``C_BB^len - K @ C_pp``. At kernel range
+        1000 that is ~11% of the lensed BB. Measured 1.5e-11 at N_0 = 1e-30."""
         ls = jnp.arange(5, 100, dtype=float)
         Ls = jnp.arange(2, 1001, dtype=float)
         n0_zero = jnp.ones_like(Ls) * 1e-30
         res = residual_cl_bb(ls, Ls, spectra, n0_zero, l_max=1000, n_phi=64)
-        cl_bb_camb = _interp_at(spectra.cl_bb_len, ls)
-        # Residual should be << full lensing
-        assert float(jnp.max(res / cl_bb_camb)) < 0.01
+        K = lensing_kernel(ls, Ls, spectra, 2, 1000, 64)
+        tail = _interp_at(spectra.cl_bb_len, ls) - K @ _interp_at(spectra.cl_pp, Ls)
+        np.testing.assert_allclose(np.asarray(res), np.asarray(tail), rtol=1e-9)
 
     def test_w_ee_1_matches_exact_at_signal_dominated_noise(self, spectra):
         """W_EE=1 (nl_ee=None) should match the exact W_EE formula to high
@@ -1543,12 +1581,12 @@ class TestFullSkyBatchAgreement:
         assert np.all(np.isfinite(g1)) and np.any(g1 != 0.0)
         np.testing.assert_allclose(gB, g1, rtol=self.GRAD_RTOL, atol=0.0)
 
-    def test_l_batch_reaches_both_kernel_calls_in_the_residual(self, spectra, noise):
-        """``residual_cl_bb_fullsky_jax`` forwards l_batch to K *and* K_wee.
+    def test_l_batch_reaches_every_kernel_call_in_the_residual(self, spectra, noise):
+        """``residual_cl_bb_fullsky_jax`` forwards l_batch to its kernel call(s).
 
-        The W_EE-weighted kernel is a second call with its own default, so a
-        half-threaded knob would leave the expensive one sequential and still
-        return the right answer.
+        The residual needs only the W_EE-weighted kernel; a knob not threaded
+        to it would leave the expensive sweep sequential and still return the
+        right answer.
         """
         from unittest import mock
 
@@ -1563,7 +1601,7 @@ class TestFullSkyBatchAgreement:
                                                             real(*a, **k))[1]):
             dj.residual_cl_bb_fullsky_jax(ls, Ls, spectra, n0, 2, 60,
                                           nl_ee=noise["ee"], l_batch=4, remat=True)
-        assert seen == [4, 4], seen
+        assert seen and all(b == 4 for b in seen), seen
 
 
 class TestFullSkyDeviceSharding:
