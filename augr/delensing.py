@@ -1429,16 +1429,20 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
 
     The full Smith+ 2012 formula is
         C_l^{BB,res} ∝ ∫ [1 - W_EE(ℓ_E) W_φφ(L)] C_EE(ℓ_E) C_φφ(L) × (kernel)
-    with W_EE(ℓ) = C_EE / (C_EE + N_EE) and W_φφ(L) = C_φφ / (C_φφ + N_0).
-    This factors as
-        C_l^{BB,res} = K @ [C_φφ (1 - W_φφ)] + (K - K_WEE) @ [C_φφ W_φφ]
-    where K is the standard kernel and K_WEE carries an extra W_EE(ℓ_E)
-    factor inside the C_EE integrand.  The first term is the "simple"
-    W_EE=1 approximation; the second is the correction that becomes
-    non-negligible when the E map is not signal-dominated.
+    with W_EE(ℓ) = C_EE / (C_EE + N_EE) and W_φφ(L) = C_φφ / (C_φφ + N_0),
+    i.e. the lensed BB minus the power of the delensing template:
+        C_l^{BB,res} = C_l^{BB,len} - K_WEE @ [C_φφ W_φφ]
+    where K_WEE is the first-order lensing kernel with an extra W_EE(ℓ_E)
+    factor inside the C_EE integrand. The lensed BB is CAMB's
+    (``spectra.cl_bb_len``), not the kernel's first-order ``K @ C_φφ``:
+    the kernel only spans ℓ_E <= l_max and L <= max(Ls), and lensing B
+    power sourced above that range cannot be removed but is still there
+    (``K @ C_φφ`` falls short of CAMB by 3.5% at l_max = max(Ls) = 1500,
+    0.7% at 3000). With no reconstruction (N_0 -> inf) the residual is
+    exactly CAMB's lensed BB.
 
-    When nl_ee is None we use the W_EE=1 simplification
-        C_l^{BB,res} = K @ [C_φφ N_0 / (C_φφ + N_0)]
+    When nl_ee is None we use the W_EE=1 simplification (K_WEE -> K)
+        C_l^{BB,res} = C_l^{BB,len} - K @ [C_φφ W_φφ]
     which is fine for space missions (C_EE/N_EE ~ 10²-10³ at the
     lensing peak) but optimistic for ground experiments.
 
@@ -1466,27 +1470,16 @@ def residual_cl_bb(ls: jnp.ndarray, Ls: jnp.ndarray,
 
     cl_pp_at_L = _interp_at(spectra.cl_pp, Ls)
     w_pp = cl_pp_at_L / (cl_pp_at_L + n0_mv)
-    cl_pp_res = cl_pp_at_L * (1.0 - w_pp)           # = C_φφ N_0 / (C_φφ + N_0)
+    cl_bb_len = _interp_at(spectra.cl_bb_len, jnp.asarray(ls, dtype=float))
 
-    if nl_ee is None:
-        K = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
-                           fullsky=fullsky, remat=remat)
-        return K @ cl_pp_res
-
-    # Exact Smith+ 2012 Eq. 12: build K_WEE with the extra W_EE(ℓ_E)
-    # factor and add the W_EE-correction term. K and K_WEE are
-    # computed sequentially in the parent process; each one's per-L
-    # sweep dispatches to the module-level ProcessPool that saturates
-    # all cores via ``_per_L_map``. Outer cross-call threading was
-    # tried and abandoned -- it oversubscribes against the per-L pool.
-    cl_ee = spectra.cl_ee_unl
-    nl_ee_arr = jnp.asarray(nl_ee)
-    w_ee = cl_ee / (cl_ee + nl_ee_arr)
-    K = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
-                       fullsky=fullsky, remat=remat)
-    K_wee = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
-                           fullsky=fullsky, w_ee=w_ee, remat=remat)
-    return K @ cl_pp_res + (K - K_wee) @ (cl_pp_at_L * w_pp)
+    w_ee = None
+    if nl_ee is not None:
+        # Exact Smith+ 2012 Eq. 12: the template kernel carries W_EE(ℓ_E).
+        cl_ee = spectra.cl_ee_unl
+        w_ee = cl_ee / (cl_ee + jnp.asarray(nl_ee))
+    K_tmpl = lensing_kernel(ls, Ls, spectra, l_min, l_max, n_phi,
+                            fullsky=fullsky, w_ee=w_ee, remat=remat)
+    return cl_bb_len - K_tmpl @ (cl_pp_at_L * w_pp)
 
 
 # -----------------------------------------------------------------------
