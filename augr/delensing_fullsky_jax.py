@@ -540,20 +540,19 @@ def residual_cl_bb_fullsky_jax(ls, Ls, spectra: LensingSpectra, n0_mv,
                                l_min: int = 2, l_max: int = 3000,
                                *, nl_ee=None, l_batch: int = 1,
                                remat: bool = True) -> jnp.ndarray:
-    """jnp full-sky residual lensing BB (Smith+ 2012 Eq. 12). Mirrors ``residual_cl_bb``."""
+    """jnp full-sky residual lensing BB (Smith+ 2012 Eq. 12). Mirrors ``residual_cl_bb``.
+
+    CAMB's lensed BB minus the delensing template's power, so the residual is
+    exactly ``spectra.cl_bb_len`` with no reconstruction (see ``residual_cl_bb``).
+    """
     cl_pp_at_L = _interp_at(spectra.cl_pp, Ls)
     w_pp = cl_pp_at_L / (cl_pp_at_L + n0_mv)
-    cl_pp_res = cl_pp_at_L * (1.0 - w_pp)
+    cl_bb_len = _interp_at(spectra.cl_bb_len, jnp.asarray(np.asarray(ls), dtype=float))
 
-    if nl_ee is None:
-        K = lensing_kernel_fullsky_jax(ls, Ls, spectra, l_min, l_max,
-                                       l_batch=l_batch, remat=remat)
-        return K @ cl_pp_res
-
-    cl_ee = spectra.cl_ee_unl
-    w_ee = cl_ee / (cl_ee + jnp.asarray(nl_ee))
-    K = lensing_kernel_fullsky_jax(ls, Ls, spectra, l_min, l_max,
-                                   l_batch=l_batch, remat=remat)
-    K_wee = lensing_kernel_fullsky_jax(ls, Ls, spectra, l_min, l_max, w_ee=w_ee,
-                                       l_batch=l_batch, remat=remat)
-    return K @ cl_pp_res + (K - K_wee) @ (cl_pp_at_L * w_pp)
+    w_ee = None
+    if nl_ee is not None:
+        cl_ee = spectra.cl_ee_unl
+        w_ee = cl_ee / (cl_ee + jnp.asarray(nl_ee))
+    K_tmpl = lensing_kernel_fullsky_jax(ls, Ls, spectra, l_min, l_max, w_ee=w_ee,
+                                        l_batch=l_batch, remat=remat)
+    return cl_bb_len - K_tmpl @ (cl_pp_at_L * w_pp)

@@ -85,3 +85,14 @@ def test_interpolation_at_integer_ells(spectra):
     for i, ell in enumerate([50, 100, 150]):
         raw_val = raw[raw[:, 0] == ell, 1][0]
         assert abs(float(cl_lens_interp[i]) - raw_val) / (raw_val + 1e-30) < 1e-4
+
+
+def test_lensing_template_matches_delensing_lensed_bb(spectra):
+    """The signal-model lensing template and the delensing set's lensed BB are one
+    spectrum (both CAMB at set_for_lmax(5000)). A template run at lmax 500 was 8-10%
+    low at l <= 300. Measured 6.4e-7 (6-digit file precision)."""
+    from augr.delensing import _interp_at, load_lensing_spectra
+
+    ells = jnp.arange(2, 501, dtype=float)
+    ref = _interp_at(load_lensing_spectra().cl_bb_len, ells)
+    np.testing.assert_allclose(np.asarray(spectra.cl_lensing(ells)), np.asarray(ref), rtol=5e-6)
