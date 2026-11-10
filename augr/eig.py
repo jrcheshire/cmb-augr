@@ -498,6 +498,7 @@ def design_objective(
     remat: bool = True,
     sim_batch: int = 1,
     depth_f_sky: float | None = None,
+    bias_residual: str = "fg",
 ):
     """Cost-constrained Bayesian-design objective to MINIMIZE.
 
@@ -568,6 +569,13 @@ def design_objective(
     Nothing in the quadrature form decreases in ``sigma``, so the mechanism is gone.
     See :func:`augr.cost.total_error_r`.
 
+    ``bias_residual`` picks the ``Delta D``: ``"fg"`` (default) is the foreground through
+    the cleaner's weights; ``"unmodelled"`` (MASTER only) adds the blind ILC's
+    chance-correlation cross terms, which suppress the cleaned CMB at the reionization
+    bump in proportion to the band count (see :func:`augr.spectrum_stages.
+    mc_cutsky_cov_traced`, ``residual=``). Without it the bias term cannot see what a
+    near-empty band costs.
+
     Requires an ``mc_ctx`` built with a foreground model; against a foreground-free
     ensemble there is no residual to bias anything and it raises rather than silently
     contributing zero.
@@ -621,6 +629,7 @@ def design_objective(
         fg_residual=bias_w is not None,
         remat=remat,
         sim_batch=sim_batch,
+        **({} if bias_residual == "fg" else {"residual": bias_residual}),
     )
     util = _utility(
         traced.covariance,
@@ -641,9 +650,9 @@ def design_objective(
         # effective error sqrt(sigma^2 + bias_w*dr^2) generalizes it in place. At
         # bias_w=0 the two agree analytically; `None` keeps the old expression exactly,
         # so the no-bias path stays byte-identical rather than round-tripping a sqrt.
-        delta_r = delta_r_from_residual(
-            traced.covariance, traced.fg_residual_bandpower, opt_ctx
-        )
+        delta_d = (traced.fg_residual_bandpower if bias_residual == "fg"
+                   else traced.unmodelled_bandpower)
+        delta_r = delta_r_from_residual(traced.covariance, delta_d, opt_ctx)
         sigma_r = sigma_r_from_posterior_fisher(traced.covariance, opt_ctx)
         util = jnp.log(sigma_prior_r) - jnp.log(
             total_error_r(sigma_r, delta_r, bias_w=bias_w)
@@ -680,6 +689,7 @@ def physical_design_objective(
     thermal=None,
     fractional_bandwidth: float = 0.25,
     depth_f_sky: float | None = None,
+    bias_residual: str = "fg",
 ):
     """Cost-constrained EIG objective from the physical horn-packing design knobs.
 
@@ -705,7 +715,8 @@ def physical_design_objective(
     eta 0.35) and ``fractional_bandwidth`` (default 0.25) set the photon-noise NET;
     see :func:`augr.optimize.design_to_channels`.
 
-    ``depth_f_sky`` is forwarded to :func:`design_objective` -- see there.
+    ``depth_f_sky`` and ``bias_residual`` are forwarded to :func:`design_objective` --
+    see there.
 
     ``delens`` (optional) is forwarded to :func:`design_objective` -- see there. It
     matters most on this entry point: ``design`` carries the aperture, and delensing
@@ -762,4 +773,5 @@ def physical_design_objective(
         remat=remat,
         sim_batch=sim_batch,
         depth_f_sky=depth_f_sky,
+        bias_residual=bias_residual,
     )

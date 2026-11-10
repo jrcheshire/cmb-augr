@@ -778,7 +778,7 @@ def test_design_objective_bias_term_bites_on_a_real_residual() -> None:
 
 @pytest.mark.slow
 def test_physical_design_objective_forwards_delens_and_bias_term() -> None:
-    """The physical entry point forwards delens=, bias_w= and depth_f_sky= unchanged.
+    """The physical entry point forwards delens=, bias_w=, depth_f_sky= and bias_residual=.
 
     Both are pure kwarg passthroughs, but this is the entry point the EIG driver
     actually calls (it is the one that takes aperture), so a forwarding typo would
@@ -810,6 +810,7 @@ def test_physical_design_objective_forwards_delens_and_bias_term() -> None:
     shared = dict(
         mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner, cost_model=cm,
         budget=1.0e12, delens=coupling, bias_w=3.0, depth_f_sky=1.0,
+        bias_residual="unmodelled",
     )
 
     got = float(physical_design_objective(
@@ -867,3 +868,33 @@ def test_design_objective_depth_f_sky_is_the_depth_coupling() -> None:
     rescaled = obj(eta * f_mask)
     np.testing.assert_allclose(full, rescaled, rtol=RTOL_DEPTH, atol=0.0)
     assert abs(full - default) > 1e-3 * abs(default)
+
+
+def test_design_objective_bias_residual_unmodelled() -> None:
+    """bias_residual: "fg" is the default bitwise; "unmodelled" moves the value and its
+    gradient matches a central finite difference.
+
+    The FD runs along a global detector-count rescale ``n_det * exp(t)``. Measured
+    plateau (2026-11-10, this config): relative error 9.9e-6 / 8.0e-7 / 3.0e-7 / 1.7e-6
+    at h = 1e-2 / 3e-3 / 1e-3 / 1e-4 -- truncation falls as h^2 until roundoff takes
+    over -- so h = 1e-3 at rtol 1e-5 holds ~30x margin.
+    """
+    mc_ctx, opt_ctx, cleaner = _setup(6, fg_model="d1s1")
+    kw = dict(mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner, cost_model=CostModel(),
+              budget=1.0e12, freqs_ghz=FREQS, bias_w=1.0)
+
+    def obj(t, **extra):
+        return design_objective(
+            jnp.asarray(N_DET) * jnp.exp(t), jnp.asarray(NET), jnp.asarray(ETA),
+            MISSION_YEARS, jnp.asarray(BEAMS), jnp.ones(len(BEAMS)), **kw, **extra)
+
+    legacy = float(obj(0.0))
+    assert float(obj(0.0, bias_residual="fg")) == legacy
+    unmod = float(obj(0.0, bias_residual="unmodelled"))
+    assert np.isfinite(unmod) and abs(unmod - legacy) > 1e-4 * abs(legacy)
+
+    g = float(jax.grad(lambda t: obj(t, bias_residual="unmodelled"))(0.0))
+    h = 1e-3
+    fd = (float(obj(h, bias_residual="unmodelled"))
+          - float(obj(-h, bias_residual="unmodelled"))) / (2 * h)
+    np.testing.assert_allclose(g, fd, rtol=1e-5)

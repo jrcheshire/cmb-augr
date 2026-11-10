@@ -450,3 +450,105 @@ def test_fg_residual_leg_is_exactly_zero_without_foregrounds() -> None:
     np.testing.assert_array_equal(
         np.asarray(on.mean_bandpower), np.asarray(off.mean_bandpower)
     )
+
+
+# --- residual="unmodelled": the blind ILC's chance-correlation loss ----------------
+
+
+def _chance_setup(n_band, n_sims, base_seed=0, nside=16, lmax=24):
+    """Noise-only MASTER context with n_band equal-beam, equal-noise bands (no PySM)."""
+    cl_ee, cl_bb = _priors(lmax)
+    bm = _bin_matrix(2, lmax, 8, 2)
+    true_b = mk.bin_spectrum(
+        jnp.clip(CMBSpectra().cl_bb(jnp.arange(lmax + 1, dtype=float), 0.0), 0.0, None), bm, 2
+    )
+    freqs = tuple(float(f) for f in np.geomspace(60.0, 300.0, n_band))
+    w_inv = w_inv_from_noise_design(
+        jnp.full(n_band, 300.0), jnp.full(n_band, 50.0), jnp.full(n_band, 0.5), 4.0, 0.6
+    )
+    cleaner = nilc_cleaner(clean_e=False, ridge=1e-18)
+    ctx = make_cutsky_mc_context(
+        cleaner=cleaner, freqs_ghz=freqs, beam_fwhm_arcmin=(30.0,) * n_band,
+        w_inv=np.asarray(w_inv), nside=nside, lmax=lmax, mask=mk.galactic_mask(nside, 0.6),
+        cl_ee=cl_ee, cl_bb_prior_unbeamed=cl_bb, bin_matrix=bm, ell_min=2,
+        true_bb_binned=true_b, n_sims=n_sims, base_seed=base_seed, fg_model=None, r_in=0.0,
+    )
+    return ctx, cleaner, w_inv, true_b
+
+
+def test_unmodelled_residual_matches_an_independent_per_sim_split() -> None:
+    """unmodelled == mean(C_full - C(cmb) - C(noise)), recomputed outside the forward.
+
+    The test rebuilds each sim from the public pieces (beam, assemble, clean, project,
+    MASTER) and forms the split itself, so a forward that dropped or doubled a leg fails
+    it. With no foreground the residual leg is exactly zero, so the whole unmodelled
+    bandpower is the chance term.
+    """
+    from augr.instrument import beam_bl
+    from augr.pseudo_cl_jax import MasterBBJax
+    from augr.spectrum_stages import assemble_band_maps, beam_harmonic_sky
+
+    ctx, cleaner, w_inv, _ = _chance_setup(4, 6)
+    tr = mc_cutsky_cov_traced(w_inv, ctx, cleaner, fg_residual=True, residual="unmodelled")
+    np.testing.assert_array_equal(np.asarray(tr.fg_residual_bandpower), 0.0)
+    np.testing.assert_array_equal(np.asarray(tr.chance_bandpower),
+                                  np.asarray(tr.unmodelled_bandpower))
+
+    ells = jnp.arange(ctx.lmax + 1, dtype=float)
+    master = MasterBBJax.build(
+        ctx.mask, bin_edges=ctx.master_bin_edges, nside=ctx.nside, lmax=ctx.lmax,
+        lmax_mask=ctx.lmax_mask, beam_bl=beam_bl(ells, min(ctx.beam_fwhm_arcmin)),
+    )
+    split = []
+    for i in range(ctx.n_sims):
+        hsky = jax.tree_util.tree_map(lambda x, i=i: x[i], ctx.harmonic_skies)
+        sky = beam_harmonic_sky(hsky, ctx.beam_fwhm_arcmin, ctx.beam_shape_p,
+                                beam_fwhm_ref=ctx.beam_fwhm_arcmin)
+        total = assemble_band_maps(sky, w_inv, ctx.hit_map, noise_key=ctx.noise_keys[i])
+        res = cleaner(total, ctx.beam_fwhm_arcmin, ctx.beam_shape_p, lmax=ctx.lmax,
+                      nside=ctx.nside)
+        full = master.bb_from_b_alm(res.cleaned_b_alm)
+        c_cmb = master.bb_from_b_alm(res.project(sky.cmb_qu))
+        c_noise = master.bb_from_b_alm(res.project(total - sky.cmb_qu))
+        split.append(np.asarray(full - c_cmb - c_noise))
+    np.testing.assert_allclose(np.asarray(tr.unmodelled_bandpower), np.mean(split, axis=0),
+                               rtol=1e-10, atol=0.0)
+    np.testing.assert_allclose(np.asarray(tr.mean_bandpower),
+                               np.asarray(mc_cutsky_cov_traced(w_inv, ctx, cleaner).mean_bandpower),
+                               rtol=0.0, atol=0.0)
+
+
+def test_residual_fg_default_is_unchanged() -> None:
+    """residual='fg' is the legacy leg bitwise, and carries no unmodelled fields."""
+    ctx, cleaner, w_inv, _ = _chance_setup(3, 6)
+    legacy = mc_cutsky_cov_traced(w_inv, ctx, cleaner, fg_residual=True)
+    explicit = mc_cutsky_cov_traced(w_inv, ctx, cleaner, fg_residual=True, residual="fg")
+    for a in ("covariance", "mean_bandpower", "fg_residual_bandpower"):
+        np.testing.assert_array_equal(np.asarray(getattr(legacy, a)),
+                                      np.asarray(getattr(explicit, a)))
+    assert legacy.unmodelled_bandpower is None and legacy.chance_bandpower is None
+    with pytest.raises(ValueError, match="residual must be"):
+        mc_cutsky_cov_traced(w_inv, ctx, cleaner, fg_residual=True, residual="total")
+    import dataclasses
+
+    with pytest.raises(NotImplementedError, match="MASTER branch only"):
+        mc_cutsky_cov_traced(w_inv, dataclasses.replace(ctx, estimator="wiener"), cleaner,
+                             fg_residual=True, residual="unmodelled")
+
+
+def test_chance_loss_is_negative_and_grows_with_band_count() -> None:
+    """The ILC's chance-correlation loss at the lowest bin is negative and scales with
+    the band count, ~(n_band - 1) / n_modes.
+
+    Measured in this config (2026-11-10, four independent 64-sim ensembles): chance /
+    C_true at bin 0 is -0.05 +/- 0.03 at 3 bands and -0.24 +/- 0.02 at 12; their
+    difference is 0.194 +/- 0.027 (sd over ensembles). The 0.08 threshold sits ~4 sd
+    below the measured mean and ~3 sd above zero.
+    """
+    loss = {}
+    for n_band in (3, 12):
+        ctx, cleaner, w_inv, true_b = _chance_setup(n_band, 64, base_seed=10_000)
+        tr = mc_cutsky_cov_traced(w_inv, ctx, cleaner, fg_residual=True, residual="unmodelled")
+        loss[n_band] = float(tr.chance_bandpower[0] / true_b[0])
+    assert loss[12] < -0.1
+    assert loss[3] - loss[12] > 0.08

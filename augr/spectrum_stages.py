@@ -669,6 +669,12 @@ class CutskyMCTraced(eqx.Module):
     # two components the cross is (total - first - second) / 2.
     fg_residual_components: jax.Array | None = None
     fg_residual_components_per_sim: jax.Array | None = None
+    # MASTER branch, residual="unmodelled": the MC-mean bandpower the fit does not model,
+    # C_full - C(cmb) - C(noise) through the cleaner's own weights, i.e. the foreground
+    # residual plus every chance-correlation cross term (cmb x noise, cmb x fg,
+    # noise x fg); and that cross-term part alone, unmodelled - fg_residual_bandpower.
+    unmodelled_bandpower: jax.Array | None = None
+    chance_bandpower: jax.Array | None = None
 
 
 def make_cutsky_mc_context(
@@ -1490,7 +1496,7 @@ def _sim_map(
 
 def _mc_cutsky_cov_master(
     w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual, *,
-    remat: bool = True, sim_batch: int = 1,
+    remat: bool = True, sim_batch: int = 1, residual: str = "fg",
 ) -> CutskyMCTraced:
     """MASTER branch of :func:`mc_cutsky_cov_traced`.
 
@@ -1590,7 +1596,16 @@ def _mc_cutsky_cov_master(
         # The cleaner's OWN weights applied to the foreground-only maps: what
         # survives cleaning, in the same estimator and bins as the data vector.
         # No second cleaner solve -- project() reuses the stored weights.
-        return full, master.bb_from_b_alm(result.project(band_sky.fg_qu))
+        c_fg = master.bb_from_b_alm(result.project(band_sky.fg_qu))
+        if residual == "fg":
+            return full, c_fg
+        # C_full is bilinear in the band maps, so subtracting the two pieces the
+        # analysis models -- the CMB and the noise, each through the same weights --
+        # leaves the foreground residual plus every chance-correlation cross term.
+        c_cmb = master.bb_from_b_alm(result.project(band_sky.cmb_qu))
+        noise_qu = total - band_sky.cmb_qu - band_sky.fg_qu
+        c_noise = master.bb_from_b_alm(result.project(noise_qu))
+        return full, jnp.stack([c_fg, full - c_cmb - c_noise])
 
     # Sharded across every visible device. w_inv and lens_scale ride as consts,
     # not closures: lens_scale can come out of a CPU-sharded delensing solve, and
@@ -1604,6 +1619,12 @@ def _mc_cutsky_cov_master(
         shard=True,
     )
     n_bins = rec.shape[1]
+    fg_mean = unmodelled = chance = None
+    if fg_residual and residual == "fg":
+        fg_mean = jnp.mean(rec_fg, axis=0)
+    elif fg_residual:
+        fg_mean, unmodelled = jnp.mean(rec_fg, axis=0)
+        chance = unmodelled - fg_mean
     return CutskyMCTraced(
         covariance=mc_bandpower_covariance(rec, hartlap=True),
         debiased_bandpowers=rec,
@@ -1612,7 +1633,9 @@ def _mc_cutsky_cov_master(
         mean_bandpower=jnp.mean(rec, axis=0),
         f_sky=ctx.f_sky,
         n_sims=ctx.n_sims,
-        fg_residual_bandpower=jnp.mean(rec_fg, axis=0) if fg_residual else None,
+        fg_residual_bandpower=fg_mean,
+        unmodelled_bandpower=unmodelled,
+        chance_bandpower=chance,
     )
 
 
@@ -1630,6 +1653,7 @@ def mc_cutsky_cov_traced(
     remat: bool = True,
     sim_batch: int = 1,
     wiener_check: bool = True,
+    residual: str = "fg",
 ) -> CutskyMCTraced:
     """Differentiable cut-sky MC bandpower covariance as a function of ``w_inv`` (and beams).
 
@@ -1681,6 +1705,17 @@ def mc_cutsky_cov_traced(
     leakage template removes only the CMB's), and is divided by the transfer ``F_b``
     so it sits on the debiased scale of ``mean_bandpower``.
 
+    ``residual`` (default ``"fg"``, read only under ``fg_residual``) selects what counts
+    as unmodelled. ``"unmodelled"`` (MASTER branch only) adds two more projections per
+    sim, the CMB-only and noise-only maps through the same weights, and reports
+    ``unmodelled_bandpower = mean(C_full - C(cmb) - C(noise))``: the foreground residual
+    plus the chance-correlation cross terms a blind ILC creates by fitting its weights to
+    the data it cleans. That loss runs ~(n_band - 1) / n_modes per needlet band, so it is
+    largest at the reionization bump and is paid in full by a near-empty band.
+    ``chance_bandpower`` is the cross-term part alone. The convention is that the
+    analysis models the CMB and the noise power through the weights exactly; everything
+    else is bias. ``fg_residual_bandpower`` keeps its meaning.
+
     The per-sim loop runs through :func:`_sim_map` over the batched
     ``ctx.harmonic_skies`` -- the cleaner body is traced once, so compile is O(1) in
     ``n_sims`` and the scan accumulates outputs instead of holding an
@@ -1718,6 +1753,14 @@ def mc_cutsky_cov_traced(
     bp = ctx.beam_shape_p if beam_p is None else beam_p
     # Delensing design knob: rescale the sims' lensing B to this design's residual.
     lens_scale = _lens_scale(ctx, cl_bb_res, cl_bb_res_ells)
+    if residual not in ("fg", "unmodelled"):
+        raise ValueError(f"residual must be 'fg' or 'unmodelled', got {residual!r}")
+    if residual == "unmodelled" and ctx.estimator != "master":
+        raise NotImplementedError(
+            "residual='unmodelled' is implemented on the MASTER branch only: the "
+            "masked-Wiener data leg is transfer-debiased E+B, so its bilinear split "
+            "needs its own derivation."
+        )
     if ctx.estimator == "master":
         if ctx.harmonic_skies.fg_comp_eb_alm is not None:
             if fg_residual:
@@ -1732,7 +1775,7 @@ def mc_cutsky_cov_traced(
             )
         return _mc_cutsky_cov_master(
             w_inv, ctx, cleaner, bf, bp, mask, lens_scale, fg_residual,
-            remat=remat, sim_batch=sim_batch,
+            remat=remat, sim_batch=sim_batch, residual=residual,
         )
     if mask is not None:
         raise ValueError(
