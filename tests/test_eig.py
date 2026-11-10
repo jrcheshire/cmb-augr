@@ -898,3 +898,40 @@ def test_design_objective_bias_residual_unmodelled() -> None:
     fd = (float(obj(h, bias_residual="unmodelled"))
           - float(obj(-h, bias_residual="unmodelled"))) / (2 * h)
     np.testing.assert_allclose(g, fd, rtol=1e-5)
+
+
+def test_design_objective_bias_residual_separate() -> None:
+    """"separate" adds the FG and chance biases in quadrature; "unmodelled" nets them.
+
+    Delta r is linear in Delta D, so Delta r_unmodelled = Delta r_fg + Delta r_chance
+    exactly; the three modes' totals then fix |Delta r_fg| and |Delta r_chance|, and
+    |Delta r_unmodelled| must be their sum or difference. Measured to 6e-15 (2026-11-10,
+    opposite signs: the chance term cancels part of the FG bias, which is why
+    "separate" exists). The gradient's FD plateau matches the "unmodelled" one
+    (2.4e-7 at h = 1e-3), so the same rtol holds.
+    """
+    mc_ctx, opt_ctx, cleaner = _setup(6, fg_model="d1s1")
+    kw = dict(mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner, cost_model=CostModel(),
+              budget=1.0e12, freqs_ghz=FREQS, sigma_prior_r=1.0)
+
+    def obj(t, mode, w=1.0):
+        return design_objective(
+            jnp.asarray(N_DET) * jnp.exp(t), jnp.asarray(NET), jnp.asarray(ETA),
+            MISSION_YEARS, jnp.asarray(BEAMS), jnp.ones(len(BEAMS)), **kw,
+            bias_w=w, bias_residual=mode)
+
+    sigma = np.exp(float(obj(0.0, "fg", 0.0)))
+    tot = {m: np.exp(float(obj(0.0, m))) for m in ("fg", "unmodelled", "separate")}
+    dr_fg = np.sqrt(tot["fg"] ** 2 - sigma**2)
+    dr_ch = np.sqrt(tot["separate"] ** 2 - tot["fg"] ** 2)
+    dr_un = np.sqrt(tot["unmodelled"] ** 2 - sigma**2)
+    assert dr_ch > 0.0
+    assert min(abs(dr_un - (dr_fg + dr_ch)), abs(dr_un - abs(dr_fg - dr_ch))) < 1e-10 * dr_un
+    assert tot["separate"] > max(tot["fg"], tot["unmodelled"])
+
+    g = float(jax.grad(lambda t: obj(t, "separate"))(0.0))
+    h = 1e-3
+    fd = (float(obj(h, "separate")) - float(obj(-h, "separate"))) / (2 * h)
+    np.testing.assert_allclose(g, fd, rtol=1e-5)
+    with pytest.raises(ValueError, match="bias_residual must be"):
+        obj(0.0, "net")

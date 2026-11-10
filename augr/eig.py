@@ -569,12 +569,20 @@ def design_objective(
     Nothing in the quadrature form decreases in ``sigma``, so the mechanism is gone.
     See :func:`augr.cost.total_error_r`.
 
-    ``bias_residual`` picks the ``Delta D``: ``"fg"`` (default) is the foreground through
-    the cleaner's weights; ``"unmodelled"`` (MASTER only) adds the blind ILC's
-    chance-correlation cross terms, which suppress the cleaned CMB at the reionization
-    bump in proportion to the band count (see :func:`augr.spectrum_stages.
-    mc_cutsky_cov_traced`, ``residual=``). Without it the bias term cannot see what a
-    near-empty band costs.
+    ``bias_residual`` picks the ``Delta D``:
+
+    * ``"fg"`` (default): the foreground through the cleaner's weights.
+    * ``"unmodelled"`` (MASTER only): that plus the blind ILC's chance-correlation cross
+      terms (see :func:`augr.spectrum_stages.mc_cutsky_cov_traced`, ``residual=``), i.e.
+      the net mean shift of a pipeline that does no ILC-bias correction. The cross terms
+      are negative and grow with the band count: they remove CMB at the reionization
+      bump *and* hide foreground (noise x fg anti-correlation), so they partly cancel
+      the foreground residual -- an optimizer can then buy a small net bias by adding
+      bands.
+    * ``"separate"`` (MASTER only): no cancellation. ``Delta r`` is computed from the
+      foreground residual and from the cross terms separately and both enter in
+      quadrature, ``sqrt(sigma^2 + bias_w*(Delta r_fg^2 + Delta r_chance^2))``, so
+      neither effect can hide the other.
 
     Requires an ``mc_ctx`` built with a foreground model; against a foreground-free
     ensemble there is no residual to bias anything and it raises rather than silently
@@ -595,6 +603,9 @@ def design_objective(
     Returns ``-utility + budget_penalty`` (a minimization scalar): descent maximizes EIG
     while staying on the affordable side of the budget surface.
     """
+    if bias_residual not in ("fg", "unmodelled", "separate"):
+        raise ValueError(
+            f"bias_residual must be 'fg', 'unmodelled' or 'separate', got {bias_residual!r}")
     if depth_f_sky is not None:
         f_sky_noise = depth_f_sky
     elif mask is None:
@@ -629,7 +640,7 @@ def design_objective(
         fg_residual=bias_w is not None,
         remat=remat,
         sim_batch=sim_batch,
-        **({} if bias_residual == "fg" else {"residual": bias_residual}),
+        **({} if bias_residual == "fg" else {"residual": "unmodelled"}),
     )
     util = _utility(
         traced.covariance,
@@ -650,13 +661,22 @@ def design_objective(
         # effective error sqrt(sigma^2 + bias_w*dr^2) generalizes it in place. At
         # bias_w=0 the two agree analytically; `None` keeps the old expression exactly,
         # so the no-bias path stays byte-identical rather than round-tripping a sqrt.
-        delta_d = (traced.fg_residual_bandpower if bias_residual == "fg"
-                   else traced.unmodelled_bandpower)
-        delta_r = delta_r_from_residual(traced.covariance, delta_d, opt_ctx)
         sigma_r = sigma_r_from_posterior_fisher(traced.covariance, opt_ctx)
-        util = jnp.log(sigma_prior_r) - jnp.log(
-            total_error_r(sigma_r, delta_r, bias_w=bias_w)
-        )
+        if bias_residual == "separate":
+            dr_fg = delta_r_from_residual(
+                traced.covariance, traced.fg_residual_bandpower, opt_ctx)
+            dr_chance = delta_r_from_residual(
+                traced.covariance, traced.chance_bandpower, opt_ctx)
+            # Nested rather than sqrt(dr_fg^2 + dr_chance^2): the inner sqrt is of
+            # sigma^2 + ... > 0, so the gradient stays finite at a zero bias.
+            total = total_error_r(
+                total_error_r(sigma_r, dr_fg, bias_w=bias_w), dr_chance, bias_w=bias_w)
+        else:
+            delta_d = (traced.fg_residual_bandpower if bias_residual == "fg"
+                       else traced.unmodelled_bandpower)
+            total = total_error_r(sigma_r, delta_r_from_residual(
+                traced.covariance, delta_d, opt_ctx), bias_w=bias_w)
+        util = jnp.log(sigma_prior_r) - jnp.log(total)
     return -util + budget_penalty(cost, budget, penalty_weight)
 
 
