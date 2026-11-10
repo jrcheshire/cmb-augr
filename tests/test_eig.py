@@ -64,6 +64,7 @@ N_DET = (200.0, 400.0, 200.0)
 NET = (60.0, 50.0, 80.0)
 ETA = (0.5, 0.5, 0.5)
 MISSION_YEARS = 4.0
+RTOL_DEPTH = 1e-12  # measured 4.2e-14 (depth_f_sky=1 vs eta rescale, delens + bias on)
 
 
 def _opt_ctx(ell_max=24, delta_ell=8, ell_per_bin_below=2):
@@ -777,7 +778,7 @@ def test_design_objective_bias_term_bites_on_a_real_residual() -> None:
 
 @pytest.mark.slow
 def test_physical_design_objective_forwards_delens_and_bias_term() -> None:
-    """The physical entry point forwards delens= and bias_w= unchanged.
+    """The physical entry point forwards delens=, bias_w= and depth_f_sky= unchanged.
 
     Both are pure kwarg passthroughs, but this is the entry point the EIG driver
     actually calls (it is the one that takes aperture), so a forwarding typo would
@@ -808,7 +809,7 @@ def test_physical_design_objective_forwards_delens_and_bias_term() -> None:
     )
     shared = dict(
         mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner, cost_model=cm,
-        budget=1.0e12, delens=coupling, bias_w=3.0,
+        budget=1.0e12, delens=coupling, bias_w=3.0, depth_f_sky=1.0,
     )
 
     got = float(physical_design_objective(
@@ -828,3 +829,41 @@ def test_physical_design_objective_forwards_delens_and_bias_term() -> None:
     ))
     np.testing.assert_allclose(got, expected, rtol=1e-12)
     assert np.isfinite(got)
+
+
+def test_design_objective_depth_f_sky_is_the_depth_coupling() -> None:
+    """depth_f_sky replaces the mask's f_sky in map depth AND delensing noise, nothing else.
+
+    Noise enters both as ``f_sky / eta``, so ``depth_f_sky=1`` must equal leaving it unset
+    with ``eta`` scaled by the context's f_sky. The comparison runs with delensing and the
+    bias term on, so a path that missed either noise consumer would fail it. Passing the
+    context's own f_sky must reproduce the default bitwise, and full-sky depth must
+    actually change the value (else the equivalence is vacuous).
+    """
+    mc_ctx, opt_ctx, cleaner = _setup(6, split_lensing=True, fg_model="d1s1")
+    f_mask = float(mc_ctx.f_sky)
+    assert 0.0 < f_mask < 0.99
+    n_det, net, eta = jnp.asarray(N_DET), jnp.asarray(NET), jnp.asarray(ETA)
+    beams = jnp.asarray(BEAMS)
+    coupling = DelensCoupling.build(
+        lensing_spectra=load_lensing_spectra(),
+        n_det=n_det, net=net, beam=beams, eta=eta,
+        mission_years=MISSION_YEARS, f_sky=1.0,
+        l_max_qe=500, n_iter=2, ls=jnp.arange(2, 30, dtype=float),
+    )
+    kw = dict(
+        mc_ctx=mc_ctx, opt_ctx=opt_ctx, cleaner=cleaner, cost_model=CostModel(),
+        budget=1.0e12, freqs_ghz=FREQS, delens=coupling, bias_w=1.0,
+    )
+
+    def obj(eta_arr, **extra):
+        return float(design_objective(
+            n_det, net, eta_arr, MISSION_YEARS, beams, jnp.ones(len(BEAMS)), **kw, **extra
+        ))
+
+    default = obj(eta)
+    assert obj(eta, depth_f_sky=f_mask) == default
+    full = obj(eta, depth_f_sky=1.0)
+    rescaled = obj(eta * f_mask)
+    np.testing.assert_allclose(full, rescaled, rtol=RTOL_DEPTH, atol=0.0)
+    assert abs(full - default) > 1e-3 * abs(default)

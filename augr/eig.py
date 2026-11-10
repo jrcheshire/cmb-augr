@@ -497,6 +497,7 @@ def design_objective(
     bias_w: float | None = None,
     remat: bool = True,
     sim_batch: int = 1,
+    depth_f_sky: float | None = None,
 ):
     """Cost-constrained Bayesian-design objective to MINIMIZE.
 
@@ -527,6 +528,13 @@ def design_objective(
     coupling the gradient sees only the mode-count gain and runs away to full sky. The
     assumption it encodes is that the analysis mask *is* the survey footprint -- if a
     study ever analyses less sky than it observes, this term needs revisiting.
+
+    ``depth_f_sky`` (default ``None`` = that coupling) is the sky fraction the
+    integration time is spread over, for map depth and the delensing noise alike. A
+    full-sky L2 survey analysed on a mask takes ``1.0`` here; the mask (or ``mc_ctx``)
+    still sets the mode count. Build ``delens`` at the same ``f_sky`` so its reference
+    residual matches. Setting it holds depth fixed, so a traced ``mask`` then moves
+    only the mode count.
 
     ``delens`` (optional :class:`augr.optimize.DelensCoupling`) makes the **lensing
     B-mode floor design-dependent**: the design's own noise sets how well the
@@ -579,7 +587,12 @@ def design_objective(
     Returns ``-utility + budget_penalty`` (a minimization scalar): descent maximizes EIG
     while staying on the affordable side of the budget surface.
     """
-    f_sky_noise = mc_ctx.f_sky if mask is None else jnp.mean(jnp.asarray(mask))
+    if depth_f_sky is not None:
+        f_sky_noise = depth_f_sky
+    elif mask is None:
+        f_sky_noise = mc_ctx.f_sky
+    else:
+        f_sky_noise = jnp.mean(jnp.asarray(mask))
     w_inv = w_inv_from_noise_design(n_det, net, eta_total, mission_years, f_sky_noise)
     cl_bb_res = cl_bb_res_ells = None
     if delens is not None:
@@ -666,6 +679,7 @@ def physical_design_objective(
     sim_batch: int = 1,
     thermal=None,
     fractional_bandwidth: float = 0.25,
+    depth_f_sky: float | None = None,
 ):
     """Cost-constrained EIG objective from the physical horn-packing design knobs.
 
@@ -690,6 +704,8 @@ def physical_design_objective(
     ``thermal`` (:class:`augr.telescope.ThermalSpec`, default ``None`` = 4 K / 1% /
     eta 0.35) and ``fractional_bandwidth`` (default 0.25) set the photon-noise NET;
     see :func:`augr.optimize.design_to_channels`.
+
+    ``depth_f_sky`` is forwarded to :func:`design_objective` -- see there.
 
     ``delens`` (optional) is forwarded to :func:`design_objective` -- see there. It
     matters most on this entry point: ``design`` carries the aperture, and delensing
@@ -745,4 +761,5 @@ def physical_design_objective(
         bias_w=bias_w,
         remat=remat,
         sim_batch=sim_batch,
+        depth_f_sky=depth_f_sky,
     )
