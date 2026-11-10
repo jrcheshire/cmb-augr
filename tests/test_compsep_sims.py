@@ -603,3 +603,13 @@ def test_lens_scale_is_differentiable() -> None:
     g = float(jax.grad(power)(0.5))
     # power ~ a^2 * const at r=0 (lensing is the only B), so d/da at 0.5 is > 0.
     np.testing.assert_allclose(g, 2.0 * 0.5 * float(power(1.0)), rtol=1e-8)
+
+
+def test_ame_only_presets_are_static_and_extend_their_base_sky() -> None:
+    """``d10s5a2`` / ``d12s7a2`` are their base skies plus a2 only (no CO), and static."""
+    pytest.importorskip("pysm3")
+    from augr.compsep_sims import _FG_PRESETS
+
+    for base in ("d10s5", "d12s7"):
+        assert _FG_PRESETS[base + "a2"] == (*_FG_PRESETS[base], "a2")
+        assert fg_model_is_static(base + "a2")

@@ -90,6 +90,11 @@ _FG_PRESETS: dict[str, tuple[str, ...]] = {
     # a finite bandpass in every band (see _emission_iqu_bandpass).
     "d1s1a2co3": ("d1", "s1", "a2", "co3"),
     "d12s7a2co3": ("d12", "s7", "a2", "co3"),
+    # AME without CO, on the band-allocation truth skies: AME bears on how low the bands
+    # should reach, CO was nil on the PICO matrix, and without line emission the sky
+    # does not require a finite bandpass. Static.
+    "d10s5a2": ("d10", "s5", "a2"),
+    "d12s7a2": ("d12", "s7", "a2"),
 }
 
 
