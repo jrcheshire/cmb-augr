@@ -1596,15 +1596,19 @@ def _mc_cutsky_cov_master(
         # The cleaner's OWN weights applied to the foreground-only maps: what
         # survives cleaning, in the same estimator and bins as the data vector.
         # No second cleaner solve -- project() reuses the stored weights.
-        c_fg = master.bb_from_b_alm(result.project(band_sky.fg_qu))
+        b_fg = result.project(band_sky.fg_qu)
+        c_fg = master.bb_from_b_alm(b_fg)
         if residual == "fg":
             return full, c_fg
         # C_full is bilinear in the band maps, so subtracting the two pieces the
         # analysis models -- the CMB and the noise, each through the same weights --
         # leaves the foreground residual plus every chance-correlation cross term.
-        c_cmb = master.bb_from_b_alm(result.project(band_sky.cmb_qu))
-        noise_qu = total - band_sky.cmb_qu - band_sky.fg_qu
-        c_noise = master.bb_from_b_alm(result.project(noise_qu))
+        # With the weights fixed, project() is linear and cleaned_b_alm is
+        # project(total), so the noise-only projection (noise = total - cmb - fg) is
+        # cleaned_b_alm - b_cmb - b_fg: no third projection.
+        b_cmb = result.project(band_sky.cmb_qu)
+        c_cmb = master.bb_from_b_alm(b_cmb)
+        c_noise = master.bb_from_b_alm(result.cleaned_b_alm - b_cmb - b_fg)
         return full, jnp.stack([c_fg, full - c_cmb - c_noise])
 
     # Sharded across every visible device. w_inv and lens_scale ride as consts,
@@ -1706,8 +1710,9 @@ def mc_cutsky_cov_traced(
     so it sits on the debiased scale of ``mean_bandpower``.
 
     ``residual`` (default ``"fg"``, read only under ``fg_residual``) selects what counts
-    as unmodelled. ``"unmodelled"`` (MASTER branch only) adds two more projections per
-    sim, the CMB-only and noise-only maps through the same weights, and reports
+    as unmodelled. ``"unmodelled"`` (MASTER branch only) adds the CMB-only map through
+    the same weights (one more projection per sim; the noise-only projection follows by
+    linearity as the cleaned B alm minus the CMB and foreground projections) and reports
     ``unmodelled_bandpower = mean(C_full - C(cmb) - C(noise))``: the foreground residual
     plus the chance-correlation cross terms a blind ILC creates by fitting its weights to
     the data it cleans. That loss runs ~(n_band - 1) / n_modes per needlet band, so it is

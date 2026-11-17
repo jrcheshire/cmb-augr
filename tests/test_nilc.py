@@ -752,3 +752,37 @@ def test_needlet_batch_is_exact_on_ducc(batch):
         full = needlet_beta(b_alm, bands, lmax=lmax, nside=nside)
         chunked = needlet_beta(b_alm, bands, lmax=lmax, nside=nside, batch=batch)
     assert np.array_equal(np.asarray(full), np.asarray(chunked))
+
+
+@pytest.mark.parametrize("cleaner_name", ["nilc", "cmilc08"])
+def test_projection_is_linear_and_reproduces_the_cleaned_alm(cleaner_name) -> None:
+    """``project(total) == cleaned_b_alm`` and the noise leg follows by linearity.
+
+    Load-bearing for the MASTER ``residual="unmodelled"`` forward, which forms the
+    noise-only projection as ``cleaned_b_alm - project(cmb) - project(fg)`` instead of a
+    third projection. Measured here (2026-11-17, eager and jitted): self-projection
+    bitwise equal for both cleaners; derived vs projected noise 3.8e-15 (NILC),
+    3.4e-15 (cMILC08).
+    """
+    from augr.cmilc import cmilc_clean
+
+    nside, lmax = 32, 48
+    npix = 12 * nside**2
+    freqs = (40.0, 90.0, 150.0, 220.0, 350.0)
+    beams = (60.0, 40.0, 30.0, 25.0, 20.0)
+    k = jax.random.split(jax.random.PRNGKey(3), 3)
+    cmb = jnp.broadcast_to(jax.random.normal(k[0], (1, 2, npix)), (5, 2, npix))
+    sed = jnp.asarray([(f / 150.0) ** 1.5 for f in freqs])[:, None, None]
+    fg = 3.0 * sed * jax.random.normal(k[1], (1, 2, npix))
+    noise = 0.5 * jax.random.normal(k[2], (5, 2, npix))
+    total = cmb + fg + noise
+    if cleaner_name == "nilc":
+        res = nilc_clean(total, beams, lmax=lmax, nside=nside)
+    else:
+        res = cmilc_clean(total, beams, freqs, lmax=lmax, nside=nside)
+
+    np.testing.assert_array_equal(np.asarray(res.project(total)), np.asarray(res.cleaned_b_alm))
+    p_noise = res.project(noise)
+    derived = res.cleaned_b_alm - res.project(cmb) - res.project(fg)
+    rel = float(jnp.max(jnp.abs(derived - p_noise)) / jnp.max(jnp.abs(p_noise)))
+    assert rel <= 1e-12
