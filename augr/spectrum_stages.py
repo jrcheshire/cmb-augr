@@ -56,6 +56,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from . import masking as mk
+from . import sht
 from .cleaning import Cleaner
 from .compsep_sims import (
     HarmonicSky,
@@ -1435,6 +1436,18 @@ def _sim_map(
     if not leaves:
         raise ValueError("xs carries no arrays to map over.")
     n = leaves[0].shape[0]
+
+    # Stored jht tables scoped by the caller (sht.legendre_tables) enter the body as one
+    # more const and are re-scoped inside it, so a sharded body never closes over them.
+    scoped = sht.scoped_tables()
+    if scoped:
+        n_c = len(consts)
+        consts = (*consts, scoped)
+        body_unscoped = body
+
+        def body(v, *cs):
+            with sht.legendre_tables(cs[n_c]):
+                return body_unscoped(v, *cs[:n_c])
 
     # Bind consts here, so neither lax.map nor vmap ever sees them as a mapped
     # argument (vmap's in_axes default would map them along axis 0).

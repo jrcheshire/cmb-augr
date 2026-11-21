@@ -90,6 +90,7 @@ if an IAU consumer needs it.
 
 from __future__ import annotations
 
+import contextvars
 import os
 import warnings
 from contextlib import contextmanager
@@ -199,6 +200,94 @@ def sht_backend(name: str):
         yield
     finally:
         set_sht_backend(prev)
+
+
+# ---------------------------------------------------------------------------
+# stored Legendre tables for the jht backend (scoped)
+# ---------------------------------------------------------------------------
+# jht can read its Legendre / Wigner-d values from precomputed tables instead of
+# running the l-recursion in every transform (``jht.legendre_tables``). The tables
+# are large (~2.4 GB each at nside 512 / lmax 768), so they must enter a jitted
+# program as an argument: a closed-over array is compiled in as a constant. The
+# owner of the jitted function passes them in (e.g. inside its MC context) and opens
+# :func:`legendre_tables` at the top of the traced body; every jht-backend transform
+# traced inside the block with a matching ``(nside, lmax, spin)`` then uses them.
+
+_TABLES: contextvars.ContextVar[dict | None] = contextvars.ContextVar("augr_sht_tables", default=None)
+
+
+def build_legendre_tables(nside: int, lmax: int, spins=(0, 2)) -> tuple:
+    """Build ``jht.legendre_tables`` for each spin in ``spins`` (eagerly; device arrays).
+
+    See ``jht.legendre_tables_nbytes`` for the size before building.
+    """
+    jht = _require_jht()
+    return tuple(jht.legendre_tables(int(nside), int(lmax), int(s)) for s in spins)
+
+
+@contextmanager
+def legendre_tables(tables):
+    """Scope stored jht tables over the jht-backend transforms traced in the block.
+
+    ``tables`` is an iterable of ``jht.LegendreTables`` (or ``None`` / empty for a
+    no-op). Open it inside the traced function, with the tables received as an
+    argument of the jitted function: concrete tables found while tracing raise
+    in jht rather than being compiled in as constants. Transforms at an
+    ``(nside, lmax, spin)`` with no table keep the recursion. The ducc backend
+    ignores the tables.
+    """
+    mapping = dict(_TABLES.get() or {})
+    for t in tables or ():
+        mapping[(t.nside, t.lmax, t.spin)] = t
+    token = _TABLES.set(mapping)
+    try:
+        yield
+    finally:
+        _TABLES.reset(token)
+
+
+def tables_for(nside: int, lmax: int, spin: int):
+    """The scoped ``jht.LegendreTables`` for ``(nside, lmax, spin)``, or ``None``."""
+    return (_TABLES.get() or {}).get((int(nside), int(lmax), int(spin)))
+
+
+def _under_jit() -> bool:
+    """True while staging a jaxpr (``jit``, ``lax.scan`` / ``map`` bodies)."""
+    from jax._src import core as _core
+
+    f = getattr(_core, "unsafe_am_i_under_a_jit", None) or getattr(
+        _core, "unsafe_am_i_under_a_jit_DO_NOT_USE", None
+    )
+    return bool(f()) if f is not None else False
+
+
+def _traced_tables_for(nside: int, lmax: int, spin: int):
+    """:func:`tables_for`, refusing concrete tables while a jaxpr is being staged.
+
+    The check has to happen here, before the ``custom_vjp`` boundary: an explicit
+    argument of a ``custom_vjp`` call is lifted to a tracer (and the concrete array
+    becomes a compiled-in constant), so jht's own check could not see it.
+    """
+    from jax._src.core import Tracer
+
+    t = tables_for(nside, lmax, spin)
+    if t is not None and _under_jit() and not all(isinstance(a, Tracer) for a in t.lam):
+        raise ValueError(
+            "concrete Legendre tables inside a jit / lax.scan trace would be compiled in as "
+            "constants; pass them into the jitted function as an argument and open "
+            "sht.legendre_tables inside it"
+        )
+    return t
+
+
+def scoped_tables() -> tuple:
+    """Every ``jht.LegendreTables`` currently scoped by :func:`legendre_tables`.
+
+    For code that maps a body under ``shard_map`` (``spectrum_stages._sim_map``):
+    the tables must enter the mapped body as an argument, and the body re-opens
+    :func:`legendre_tables` with them.
+    """
+    return tuple((_TABLES.get() or {}).values())
 
 
 # ---------------------------------------------------------------------------
@@ -544,28 +633,48 @@ def _opaque(fn):
     return jax.checkpoint(fn, policy=jax.checkpoint_policies.nothing_saveable)
 
 
-def _synthesis_jht_raw(alm: jax.Array, spin: int, lmax: int, nside: int) -> jax.Array:
-    jht = _require_jht()
-    if int(spin) == 0:
-        f = _opaque(lambda a: jht.synthesis(a, nside=int(nside), lmax=int(lmax), spin=0))
-        return f(alm[0])[None, :]
-    f = _opaque(lambda a: jht.synthesis(a, nside=int(nside), lmax=int(lmax), spin=int(spin)))
-    return f(alm)
+def _tables_kw(tables) -> dict:
+    return {} if tables is None else {"tables": tables}
 
 
-def _adjoint_synthesis_jht_raw(m: jax.Array, spin: int, lmax: int, nside: int) -> jax.Array:
+def _synthesis_jht_raw(alm: jax.Array, spin: int, lmax: int, nside: int, tables=None) -> jax.Array:
     jht = _require_jht()
     if int(spin) == 0:
-        f = _opaque(lambda x: jht.adjoint_synthesis(x, nside=int(nside), lmax=int(lmax), spin=0))
-        return f(m[0])[None, :]
+        f = _opaque(
+            lambda a, t: jht.synthesis(a, nside=int(nside), lmax=int(lmax), spin=0, **_tables_kw(t))
+        )
+        return f(alm[0], tables)[None, :]
     f = _opaque(
-        lambda x: jht.adjoint_synthesis(x, nside=int(nside), lmax=int(lmax), spin=int(spin))
+        lambda a, t: jht.synthesis(
+            a, nside=int(nside), lmax=int(lmax), spin=int(spin), **_tables_kw(t)
+        )
     )
-    return f(m)
+    return f(alm, tables)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
-def _synthesis_jht(alm: jax.Array, spin: int, lmax: int, nside: int) -> jax.Array:
+def _adjoint_synthesis_jht_raw(
+    m: jax.Array, spin: int, lmax: int, nside: int, tables=None
+) -> jax.Array:
+    jht = _require_jht()
+    if int(spin) == 0:
+        f = _opaque(
+            lambda x, t: jht.adjoint_synthesis(
+                x, nside=int(nside), lmax=int(lmax), spin=0, **_tables_kw(t)
+            )
+        )
+        return f(m[0], tables)[None, :]
+    f = _opaque(
+        lambda x, t: jht.adjoint_synthesis(
+            x, nside=int(nside), lmax=int(lmax), spin=int(spin), **_tables_kw(t)
+        )
+    )
+    return f(m, tables)
+
+
+# ``tables`` (a ``jht.LegendreTables`` or ``None``) is a differentiable-position input
+# so that it can be a traced argument; its cotangent is always ``None`` (zero).
+@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4))
+def _synthesis_jht(alm: jax.Array, tables, spin: int, lmax: int, nside: int) -> jax.Array:
     """jht-backend synthesis ``alm → map``; matches the ducc primitive's shapes.
 
     jht uses bare ``(Nlm,)`` / ``(Npix,)`` arrays for spin 0; this wrapper adds /
@@ -577,40 +686,41 @@ def _synthesis_jht(alm: jax.Array, spin: int, lmax: int, nside: int) -> jax.Arra
     transform, no residuals (see the section comment above). As a consequence the
     gradient w.r.t. a free complex alm now matches ducc on every DOF including the
     non-physical ``Im(alm[m=0])``, which native jht AD left as the ambient complex
-    cotangent.
+    cotangent. ``tables``: stored jht tables for both directions (see
+    :func:`legendre_tables`), residual of the forward.
     """
-    return _synthesis_jht_raw(alm, spin, lmax, nside)
+    return _synthesis_jht_raw(alm, spin, lmax, nside, tables)
 
 
-def _synthesis_jht_fwd(alm, spin, lmax, nside):
-    return _synthesis_jht_raw(alm, spin, lmax, nside), None
+def _synthesis_jht_fwd(alm, tables, spin, lmax, nside):
+    return _synthesis_jht_raw(alm, spin, lmax, nside, tables), tables
 
 
-def _synthesis_jht_bwd(spin, lmax, nside, _res, map_cot):
-    raw = _adjoint_synthesis_jht_raw(map_cot, spin, lmax, nside)
-    return (_jax_convention_vjp_synth(raw, lmax),)
+def _synthesis_jht_bwd(spin, lmax, nside, tables, map_cot):
+    raw = _adjoint_synthesis_jht_raw(map_cot, spin, lmax, nside, tables)
+    return (_jax_convention_vjp_synth(raw, lmax), None)
 
 
 _synthesis_jht.defvjp(_synthesis_jht_fwd, _synthesis_jht_bwd)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
-def _adjoint_synthesis_jht(m: jax.Array, spin: int, lmax: int, nside: int) -> jax.Array:
+@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4))
+def _adjoint_synthesis_jht(m: jax.Array, tables, spin: int, lmax: int, nside: int) -> jax.Array:
     """jht-backend adjoint synthesis ``Yᵀ m``; matches the ducc primitive's shapes.
 
     VJP = one synthesis of the convention-corrected cotangent (see
     :func:`_synthesis_jht`).
     """
-    return _adjoint_synthesis_jht_raw(m, spin, lmax, nside)
+    return _adjoint_synthesis_jht_raw(m, spin, lmax, nside, tables)
 
 
-def _adjoint_synthesis_jht_fwd(m, spin, lmax, nside):
-    return _adjoint_synthesis_jht_raw(m, spin, lmax, nside), None
+def _adjoint_synthesis_jht_fwd(m, tables, spin, lmax, nside):
+    return _adjoint_synthesis_jht_raw(m, spin, lmax, nside, tables), tables
 
 
-def _adjoint_synthesis_jht_bwd(spin, lmax, nside, _res, alm_cot):
+def _adjoint_synthesis_jht_bwd(spin, lmax, nside, tables, alm_cot):
     modified = _jax_convention_vjp_adjsynth(alm_cot, lmax)
-    return (_synthesis_jht_raw(modified, spin, lmax, nside),)
+    return (_synthesis_jht_raw(modified, spin, lmax, nside, tables), None)
 
 
 _adjoint_synthesis_jht.defvjp(_adjoint_synthesis_jht_fwd, _adjoint_synthesis_jht_bwd)
@@ -636,14 +746,15 @@ def synthesis(alm: jax.Array, spin: int, lmax: int, nside: int, nthreads: int = 
         Spin of the transform; max multipole; HEALPix RING nside.
     nthreads
         ducc thread count (0 = all hardware threads); ignored by the jht backend
-        (XLA manages threading).
+        (XLA manages threading). The jht backend uses scoped stored tables when
+        :func:`legendre_tables` is open for this ``(nside, lmax, spin)``.
 
     Returns
     -------
     Real map, shape ``(nmaps, Npix)`` with ``nmaps=1`` (spin 0) or ``2`` (spin>0).
     """
     if _BACKEND == "jht":
-        return _synthesis_jht(alm, spin, lmax, nside)
+        return _synthesis_jht(alm, _traced_tables_for(nside, lmax, spin), spin, lmax, nside)
     return _synthesis_ducc(alm, spin, lmax, nside, nthreads)
 
 
@@ -666,7 +777,7 @@ def adjoint_synthesis(
     Complex alm, shape ``(ncomp, Nlm)``.
     """
     if _BACKEND == "jht":
-        return _adjoint_synthesis_jht(m, spin, lmax, nside)
+        return _adjoint_synthesis_jht(m, _traced_tables_for(nside, lmax, spin), spin, lmax, nside)
     return _adjoint_synthesis_ducc(m, spin, lmax, nside, nthreads)
 
 

@@ -1496,6 +1496,21 @@ if mode == "dense":
     np.savez(sys.argv[1], **out)
     sys.exit(0)
 ctx, cleaner = T._master_setup(6)
+if mode == "tables":
+    tabs = sht.build_legendre_tables(16, 24)
+    for b in (1, 3):
+        def g(ww, t, bb=b):
+            with sht.legendre_tables(t):
+                return T._sq_cov(ww, ctx, cleaner, remat=True, sim_batch=bb, residual="unmodelled")
+        out[f"sharded{b}"] = np.array(int("shard_map" in str(jax.make_jaxpr(g)(w, tabs))))
+        def gc(ww, t, bb=b):
+            with sht.legendre_tables(t):
+                return mc_cutsky_cov_traced(
+                    ww, ctx, cleaner, remat=True, sim_batch=bb, residual="unmodelled").covariance
+        out[f"cov{b}"] = np.asarray(jax.jit(gc)(w, tabs))
+        out[f"grad{b}"] = np.asarray(jax.jit(jax.grad(g))(w, tabs))
+    np.savez(sys.argv[1], **out)
+    sys.exit(0)
 for b in (1, 3):
     def f(ww, bb=b):
         return T._sq_cov(ww, ctx, cleaner, remat=True, sim_batch=bb)
@@ -1735,3 +1750,74 @@ def test_share_fg_defaults_on_and_keeps_a_varying_ensemble():
         np.asarray(built(varying)), np.asarray(varying.fg_eb_alm)
     ), "a varying ensemble was modified"
     assert built(constant, share_fg=False).ndim == 4, "share_fg=False was ignored"
+
+
+def _has_jht_tables() -> bool:
+    try:
+        import jht
+    except ImportError:
+        return False
+    return hasattr(jht, "legendre_tables")
+
+
+def _tables_cov_grad(ctx, cleaner, tabs, sim_batch):
+    """Jitted covariance and its gradient, ``tabs`` passed as an argument and scoped."""
+    from augr import sht
+
+    def cov(ww, t):
+        with sht.legendre_tables(t):
+            return mc_cutsky_cov_traced(
+                ww, ctx, cleaner, remat=True, sim_batch=sim_batch, residual="unmodelled"
+            ).covariance
+
+    w = jnp.asarray(W_INV)
+    c = jax.jit(cov)(w, tabs)
+    g = jax.jit(jax.grad(lambda ww, t: jnp.sum(cov(ww, t) ** 2)))(w, tabs)
+    return np.asarray(c), np.asarray(g)
+
+
+@pytest.mark.skipif(not _has_jht_tables(), reason="jht without legendre_tables")
+def test_stored_jht_tables_leave_the_mc_forward_unchanged() -> None:
+    """MASTER ``residual="unmodelled"`` covariance and gradient with scoped stored tables.
+
+    Measured bitwise (2026-11-21, CPU, sim_batch 1 and 3) against the recursion path.
+    Gated at 1e-12 (same values; another backend may fuse differently). The tables
+    are live: scaling the spin-2 table by 1.01 moved the covariance 3.5e-2, the
+    spin-0 table 7.9e-7 (the map2alm iteration absorbs most of a scale error).
+    """
+    import dataclasses
+
+    from augr import sht
+
+    with sht.sht_backend("jht"):
+        ctx, cleaner = _master_setup(6)
+        tabs = sht.build_legendre_tables(16, 24)
+        for b in (1, 3):
+            ref_c, ref_g = _tables_cov_grad(ctx, cleaner, None, b)
+            c, g = _tables_cov_grad(ctx, cleaner, tabs, b)
+            np.testing.assert_allclose(c, ref_c, rtol=1e-12, atol=0.0)
+            np.testing.assert_allclose(g, ref_g, rtol=1e-12, atol=0.0)
+        bad = tuple(dataclasses.replace(t, lam=tuple(1.01 * a for a in t.lam)) for t in tabs)
+        cb, _ = _tables_cov_grad(ctx, cleaner, bad, 1)
+        assert np.max(np.abs(cb - ref_c)) / np.max(np.abs(ref_c)) > 1e-3
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _has_jht_tables(), reason="jht without legendre_tables")
+def test_stored_jht_tables_sharded_sim_axis(tmp_path) -> None:
+    """Scoped tables reach a ``shard_map``-ed sim body as a const (4 CPU devices).
+
+    Against the one-device recursion path at the sharded-vs-one-device gate (1e-12).
+    """
+    from augr import sht
+
+    ref = {}
+    with sht.sht_backend("jht"):
+        ctx, cleaner = _master_setup(6)
+        for b in (1, 3):
+            ref[f"cov{b}"], ref[f"grad{b}"] = _tables_cov_grad(ctx, cleaner, None, b)
+    out = _shard_child(tmp_path, "tables", devices=4, backend="jht", mode="tables")
+    for b in (1, 3):
+        assert out[f"sharded{b}"] == 1, f"sim_batch={b}: no shard_map in the trace"
+        np.testing.assert_allclose(out[f"cov{b}"], ref[f"cov{b}"], rtol=1e-12, atol=0.0)
+        np.testing.assert_allclose(out[f"grad{b}"], ref[f"grad{b}"], rtol=1e-12, atol=0.0)

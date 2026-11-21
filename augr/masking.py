@@ -76,6 +76,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from . import sht
+
 
 def _require_jht():
     """Import jht or raise a helpful error pointing at the [masking] extra."""
@@ -481,8 +483,9 @@ def _normal_apply(x, w, nside: int, lmax: int):
     """``A x = T Sᵀ diag(w) S T⁻¹ x`` on one real-DOF vector; ``w`` is ``(1, npix)``."""
     jht = _require_jht()
     a = jht.real_to_alm(x, lmax, spin=2)
-    mp = w * jht.synthesis(a, nside, lmax, spin=2)
-    return jht.alm_to_real(jht.adjoint_synthesis(mp, nside, lmax, spin=2), lmax, spin=2)
+    t = {} if (tab := sht.tables_for(nside, lmax, 2)) is None else {"tables": tab}
+    mp = w * jht.synthesis(a, nside, lmax, spin=2, **t)
+    return jht.alm_to_real(jht.adjoint_synthesis(mp, nside, lmax, spin=2, **t), lmax, spin=2)
 
 
 def _prior_pw(cl_ee_prior, cl_bb_prior, ell: np.ndarray, lmax: int) -> np.ndarray:
@@ -833,8 +836,12 @@ def masked_wiener_eb_alm_dense(
     w = jnp.asarray(inv_noise)[None, :]
     pw = factor.pw
 
+    t = {} if (tab := sht.tables_for(nside, lmax, 2)) is None else {"tables": tab}
+
     def rhs(m):
-        return pw * jht.alm_to_real(jht.adjoint_synthesis(w * m, nside, lmax, spin=2), lmax, spin=2)
+        return pw * jht.alm_to_real(
+            jht.adjoint_synthesis(w * m, nside, lmax, spin=2, **t), lmax, spin=2
+        )
 
     b = jax.vmap(rhs)(legs)
     y = _dense_solve(factor, b)
